@@ -1,0 +1,638 @@
+name: rds-binlog-insight
+
+x-runtime-logging: &runtime-logging
+  # Docker's default delivery is blocking.  A saturated host disk must be
+  # allowed to drop bounded diagnostic output instead of stalling liveness.
+  driver: local
+  options:
+    mode: non-blocking
+    max-buffer-size: "4m"
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  insight:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: local/rds-binlog-insight:1.26.0-rawoss
+    container_name: rds-binlog-insight
+    restart: unless-stopped
+    logging: *runtime-logging
+    init: true
+    user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
+    env_file:
+      - .env
+      - ./clickhouse/runtime.env
+    environment:
+      TZ: Asia/Shanghai
+      RDS_BINLOG_DATA_DIR: /data
+      RDS_BINLOG_STAGING_DIR: /data/staging
+      TMPDIR: /data/scratch
+      RDS_BINLOG_PARSER: /app/tools/binlog-parser
+      RDS_BINLOG_ALLOWED_HOSTS: "${RDS_BINLOG_ALLOWED_HOSTS:-127.0.0.1}"
+      RDS_BINLOG_EXACT_SCHEMA_REGISTRY: "${RDS_BINLOG_EXACT_SCHEMA_REGISTRY:-}"
+      RDS_BINLOG_PARSER_NO_PROGRESS_SECONDS: "${RDS_BINLOG_PARSER_NO_PROGRESS_SECONDS:-300}"
+      RDS_BINLOG_SERVICE_PROBE_TIMEOUT: "${RDS_BINLOG_SERVICE_PROBE_TIMEOUT:-5}"
+      RDS_BINLOG_SERVICE_FAILURE_LIMIT: "${RDS_BINLOG_SERVICE_FAILURE_LIMIT:-9}"
+      RDS_BINLOG_QUERY_SCAN_WORKERS: "${RDS_BINLOG_QUERY_SCAN_WORKERS:-4}"
+      RDS_BINLOG_QUERY_TASK_WORKERS: "${RDS_BINLOG_QUERY_TASK_WORKERS:-2}"
+      RDS_BINLOG_GLOG_ENABLED: "${RDS_BINLOG_GLOG_ENABLED:-0}"
+      RDS_BINLOG_GLOG_HOST: "${RDS_BINLOG_GLOG_HOST:-}"
+      RDS_BINLOG_GLOG_PORT: "${RDS_BINLOG_GLOG_PORT:-3306}"
+      RDS_BINLOG_GLOG_USER: "${RDS_BINLOG_GLOG_USER:-}"
+      RDS_BINLOG_GLOG_PASSWORD: "${RDS_BINLOG_GLOG_PASSWORD:-}"
+      RDS_BINLOG_GLOG_INSTANCE_ID: "${RDS_BINLOG_GLOG_INSTANCE_ID:-}"
+      RDS_BINLOG_GLOG_POLL_SECONDS: "${RDS_BINLOG_GLOG_POLL_SECONDS:-120}"
+      RDS_BINLOG_GLOG_TRUNCATE_HOUR: "${RDS_BINLOG_GLOG_TRUNCATE_HOUR:-3}"
+      RDS_BINLOG_GLOG_TRUNCATE_MIN_INTERVAL_SECONDS: "${RDS_BINLOG_GLOG_TRUNCATE_MIN_INTERVAL_SECONDS:-3600}"
+      RDS_BINLOG_GLOG_TRUNCATE_USER: "${RDS_BINLOG_GLOG_TRUNCATE_USER:-}"
+      RDS_BINLOG_GLOG_TRUNCATE_PASSWORD: "${RDS_BINLOG_GLOG_TRUNCATE_PASSWORD:-}"
+      RDS_BINLOG_GLOG_EXCLUDE_USERS: "${RDS_BINLOG_GLOG_EXCLUDE_USERS:-readonly_user,service_admin,automation_user}"
+      RDS_BINLOG_GLOG_LABEL: "${RDS_BINLOG_GLOG_LABEL:-secondary-db}"
+      RDS_BINLOG_GLOG_OSS_PREFIX: "${RDS_BINLOG_GLOG_OSS_PREFIX:-}"
+      RDS_BINLOG_TABULARIS_AUDIT_TOKEN: "${RDS_BINLOG_TABULARIS_AUDIT_TOKEN:-}"
+      RDS_BINLOG_TABULARIS_AUDIT_OSS_PREFIX: "${RDS_BINLOG_TABULARIS_AUDIT_OSS_PREFIX:-tabularis-audit/}"
+      RDS_BINLOG_TABULARIS_AUDIT_ALLOWED_INSTANCES: "${RDS_BINLOG_TABULARIS_AUDIT_ALLOWED_INSTANCES:-}"
+      RDS_BINLOG_CLICKHOUSE_ENABLED: "1"
+      # Fail closed: bringing up ClickHouse and its ingester never changes the
+      # query path.  Set this explicitly to 1 only after parity/backfill gates.
+      RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED: "${RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED:-0}"
+      RDS_BINLOG_CLICKHOUSE_OSS_ENABLED: "${RDS_BINLOG_CLICKHOUSE_OSS_ENABLED:-0}"
+      RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED: "${RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED:-0}"
+      RDS_BINLOG_CLICKHOUSE_OSS_PREFIX: "${RDS_BINLOG_CLICKHOUSE_OSS_PREFIX:-sql-insight-clickhouse/v3/}"
+      RDS_BINLOG_CLICKHOUSE_OSS_CACHE_GB: "${RDS_BINLOG_CLICKHOUSE_OSS_CACHE_GB:-40}"
+      RDS_BINLOG_CLICKHOUSE_OSS_HISTORY_DAYS: "${RDS_BINLOG_CLICKHOUSE_OSS_HISTORY_DAYS:-0}"
+      RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS: "${RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS:-2}"
+      RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS: "${RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS:-1}"
+      RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS: "${RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS:-1}"
+      RDS_BINLOG_CLICKHOUSE_OSS_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_QUERY_TABLE:-events_query_oss_all_v3}"
+      RDS_BINLOG_CLICKHOUSE_OSS_NAME_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_NAME_QUERY_TABLE:-events_query_by_name_oss_all_v3}"
+      RDS_BINLOG_CLICKHOUSE_OSS_NAME_MV: "${RDS_BINLOG_CLICKHOUSE_OSS_NAME_MV:-events_query_oss_all_v3_to_name_mv}"
+      RDS_BINLOG_CLICKHOUSE_OSS_MANIFEST: "${RDS_BINLOG_CLICKHOUSE_OSS_MANIFEST:-oss-all-v3-manifest.sqlite3}"
+      RDS_BINLOG_CLICKHOUSE_OSS_STAGE_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_STAGE_QUERY_TABLE:-events_query_oss_all_v3_stage}"
+      RDS_BINLOG_CLICKHOUSE_OSS_STAGE_NAME_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_STAGE_NAME_QUERY_TABLE:-events_query_by_name_oss_all_v3_stage}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED:-0}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED:-0}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_MANIFEST_TABLE: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_MANIFEST_TABLE:-oss_active_parts_v1}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_PACKED_TABLE: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_PACKED_TABLE:-events_query_packed_v1}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_PREFIX: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_PREFIX:-sql-insight-clickhouse/raw-v1/}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_CACHE_GB: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_CACHE_GB:-20}"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_ENABLED: "1"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED: "${RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED:-0}"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_TABLE: slowlog_events
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_RETENTION_DAYS: "61"
+      RDS_BINLOG_CLICKHOUSE_HOST: rds-binlog-insight-clickhouse
+      RDS_BINLOG_CLICKHOUSE_PORT: "8123"
+      RDS_BINLOG_CLICKHOUSE_DATABASE: insight
+      RDS_BINLOG_CLICKHOUSE_TABLE: events
+      RDS_BINLOG_CLICKHOUSE_QUERY_TABLE: events_query
+      RDS_BINLOG_CLICKHOUSE_NAME_QUERY_TABLE: events_query_by_name
+      RDS_BINLOG_CLICKHOUSE_HOT_HOURS: "27"
+      RDS_BINLOG_CLICKHOUSE_SERVING_HOURS: "25"
+      GOMAXPROCS: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      ARROW_NUM_THREADS: "1"
+    command:
+      - python
+      - -m
+      - app.service_supervisor
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8769"
+      - --data-dir
+      - /data
+    ports:
+      - "0.0.0.0:${RDS_BINLOG_PORT:-8769}:8769"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /data/staging:size=1g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 5g
+    cpus: "2.0"
+    # Keep only relative I/O priority on this shared ext4 filesystem. Docker
+    # io.max limits caused cgroup writeback ownership stalls that blocked
+    # unrelated health checks; application batches and canaries bound work.
+    blkio_config:
+      weight: 500
+    stop_grace_period: 90s
+
+  indexer:
+    image: local/rds-binlog-insight:1.26.0-rawoss
+    container_name: rds-binlog-insight-indexer
+    restart: unless-stopped
+    logging: *runtime-logging
+    init: true
+    user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      RDS_BINLOG_DATA_DIR: /data
+      RDS_BINLOG_STAGING_DIR: /data/staging
+      TMPDIR: /data/scratch
+      RDS_BINLOG_EXACT_SCHEMA_REGISTRY: "${RDS_BINLOG_EXACT_SCHEMA_REGISTRY:-}"
+      RDS_BINLOG_INDEX_NO_PROGRESS_SECONDS: "${RDS_BINLOG_INDEX_NO_PROGRESS_SECONDS:-600}"
+      RDS_BINLOG_INDEX_IDLE_SECONDS: "${RDS_BINLOG_INDEX_IDLE_SECONDS:-15}"
+      # Exact/analytics/catalog indexing performs random reads.  Let the
+      # dedicated slow-log source queue finish reconciliation first so a
+      # restart cannot invert priority and keep the source safety fuse paused.
+      RDS_BINLOG_INDEX_SOURCE_PRIORITY_ENABLED: "1"
+      # Historical analytics catch-up shares the production data disk with
+      # collectors, the query API and ClickHouse.  Keep the default work unit
+      # bounded; larger temporary ramps made /api/storage stall for 35s+.
+      RDS_BINLOG_ANALYTICS_BATCH: "${RDS_BINLOG_ANALYTICS_BATCH:-2}"
+      RDS_BINLOG_ANALYTICS_WORKERS: "${RDS_BINLOG_ANALYTICS_WORKERS:-2}"
+      RDS_BINLOG_SLOWLOG_BATCH: "${RDS_BINLOG_SLOWLOG_BATCH:-128}"
+      RDS_BINLOG_SLOWLOG_WORKERS: "${RDS_BINLOG_SLOWLOG_WORKERS:-8}"
+      RDS_BINLOG_SLOWLOG_INDEX_ENABLED: "0"
+      RDS_BINLOG_SELECT_EXPLAIN_ENABLED: "${RDS_BINLOG_SELECT_EXPLAIN_ENABLED:-1}"
+      RDS_BINLOG_SELECT_EXPLAIN_DB_PRIORITY: "${RDS_BINLOG_SELECT_EXPLAIN_DB_PRIORITY:-example_source,example_target,example_app,example_warehouse}"
+      GOMAXPROCS: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      ARROW_NUM_THREADS: "1"
+    command:
+      - ionice
+      - -c
+      - "3"
+      - nice
+      - -n
+      - "10"
+      - python
+      - -m
+      - app.index_supervisor
+      - --data-dir
+      - /data
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 96
+    mem_limit: 8g
+    cpus: "1.0"
+    # Historical catch-up is bounded by the 2x2 application work unit and runs
+    # at idle I/O priority. Do not add device_* limits on this shared ext4;
+    # they can block writeback and Docker health checks across containers.
+    blkio_config:
+      weight: 10
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true
+    depends_on:
+      insight:
+        condition: service_healthy
+
+  slowlog-indexer:
+    image: local/rds-binlog-insight:1.26.0-rawoss
+    container_name: rds-binlog-insight-slowlog-indexer
+    restart: unless-stopped
+    logging: *runtime-logging
+    init: true
+    user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      RDS_BINLOG_DATA_DIR: /data
+      TMPDIR: /data/scratch
+      # One source part is the indivisible online-safe work unit.  Every unit
+      # is bracketed by a real /api/storage canary in the worker.
+      RDS_BINLOG_SLOWLOG_BATCH: "1"
+      RDS_BINLOG_SLOWLOG_WORKERS: "1"
+      # Startup crash-gap repair is also bounded; it may advance only this many
+      # registry rows before the serving-path postflight runs.
+      RDS_BINLOG_SLOWLOG_RECONCILE_BATCH: "128"
+      # Live writes enqueue durably at publication time and every worker start
+      # forces a bounded full repair.  Keep the steady-state safety sweep
+      # hourly so it cannot monopolize the shared disk's ten-second PSI window.
+      RDS_BINLOG_SLOWLOG_RECONCILE_SECONDS: "${RDS_BINLOG_SLOWLOG_RECONCILE_SECONDS:-3600}"
+      RDS_BINLOG_SLOWLOG_INDEX_ENABLED: "1"
+      # The source queue is the highest-priority bounded reader/writer.  Keep
+      # the normal ceiling conservative, but allow a one-off recovery ramp;
+      # recreating without the override restores 10% automatically.
+      RDS_BINLOG_SLOWLOG_IO_FULL_AVG10_MAX: "${RDS_BINLOG_SLOWLOG_SOURCE_IO_FULL_AVG10_MAX:-10}"
+      RDS_BINLOG_SLOWLOG_IO_RECOVERY_RATIO: "0.8"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_URL: http://insight:8769/api/storage
+      RDS_BINLOG_CLICKHOUSE_HEALTH_HOST: "${RDS_BINLOG_ALLOWED_HOSTS:-127.0.0.1}"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_MAX_SECONDS: "1"
+      GOMAXPROCS: "1"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      ARROW_NUM_THREADS: "1"
+    command:
+      - ionice
+      - -c
+      - "3"
+      - nice
+      - -n
+      - "10"
+      - python
+      - -m
+      - app.slowlog_worker
+      - --data-dir
+      - /data
+      - --idle-seconds
+      - "0.2"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: "0.5"
+    blkio_config:
+      weight: 10
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true
+    depends_on:
+      insight:
+        condition: service_healthy
+
+  clickhouse:
+    image: clickhouse/clickhouse-server@sha256:2ef11bbe2e44ab7022f37ff3019b3f2125ed09e919ea6194660be6130b7ca4b7
+    container_name: rds-binlog-insight-clickhouse
+    restart: unless-stopped
+    logging: *runtime-logging
+    init: true
+    entrypoint: ["sh", "/opt/sql-insight/oss-entrypoint.sh"]
+    env_file:
+      - ./clickhouse/runtime.env
+    environment:
+      TZ: Asia/Shanghai
+      CLICKHOUSE_DB: insight
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      RDS_BINLOG_CLICKHOUSE_OSS_ENABLED: "${RDS_BINLOG_CLICKHOUSE_OSS_ENABLED:-0}"
+      RDS_BINLOG_OSS_CREDENTIAL_FILE: /run/secrets/clickhouse_oss_credentials
+    volumes:
+      - ./clickhouse/data:/var/lib/clickhouse
+      - ./clickhouse/log:/var/log/clickhouse-server
+      - ./clickhouse/config.d/low-resource.xml:/etc/clickhouse-server/config.d/low-resource.xml:ro
+      - ./clickhouse/users.d/low-resource.xml:/etc/clickhouse-server/users.d/low-resource.xml:ro
+      - ./clickhouse/oss-entrypoint.sh:/opt/sql-insight/oss-entrypoint.sh:ro
+    secrets:
+      - clickhouse_oss_credentials
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${RDS_BINLOG_CLICKHOUSE_PIDS_LIMIT:-512}
+    mem_limit: 5g
+    # Keep the ordinary default conservative. Production may explicitly raise
+    # this during the observed all-OSS backfill; the host has 16 logical CPUs.
+    cpus: "${RDS_BINLOG_CLICKHOUSE_CPUS:-1.0}"
+    blkio_config:
+      weight: 10
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      # /ping can succeed while the global thread pool is starved.  A real
+      # query proves the server can schedule and execute work.
+      # Feed the password over stdin so it is not exposed in the process
+      # argument list or baked into the image/compose file.
+      test: ["CMD-SHELL", "printf '%s\\n' \"$$CLICKHOUSE_PASSWORD\" | clickhouse-client --user \"$$CLICKHOUSE_USER\" --password --query \"SELECT 1\""]
+      interval: 10s
+      timeout: 3s
+      start_period: 20s
+      retries: 6
+    stop_grace_period: 60s
+
+  clickhouse-ingester:
+    image: local/rds-binlog-insight:1.26.0-rawoss
+    container_name: rds-binlog-insight-clickhouse-ingester
+    restart: unless-stopped
+    logging: *runtime-logging
+    init: true
+    user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
+    env_file:
+      - .env
+      - ./clickhouse/runtime.env
+    environment:
+      TZ: Asia/Shanghai
+      RDS_BINLOG_DATA_DIR: /data
+      TMPDIR: /data/scratch
+      RDS_BINLOG_CLICKHOUSE_ENABLED: "1"
+      RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_HOST: rds-binlog-insight-clickhouse
+      RDS_BINLOG_CLICKHOUSE_PORT: "8123"
+      RDS_BINLOG_CLICKHOUSE_DATABASE: insight
+      RDS_BINLOG_CLICKHOUSE_TABLE: events
+      RDS_BINLOG_CLICKHOUSE_QUERY_TABLE: events_query
+      RDS_BINLOG_CLICKHOUSE_NAME_QUERY_TABLE: events_query_by_name
+      RDS_BINLOG_CLICKHOUSE_HOT_HOURS: "27"
+      RDS_BINLOG_CLICKHOUSE_SERVING_HOURS: "25"
+      RDS_BINLOG_CLICKHOUSE_RECONCILE_SECONDS: "30"
+      RDS_BINLOG_CLICKHOUSE_IDLE_SECONDS: "2"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_URL: http://insight:8769/api/storage
+      RDS_BINLOG_CLICKHOUSE_HEALTH_HOST: "${RDS_BINLOG_ALLOWED_HOSTS:-127.0.0.1}"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_MAX_SECONDS: "1"
+      RDS_BINLOG_CLICKHOUSE_MIN_FREE_GB: "120"
+      # Host PSI remains the first admission signal, but Linux also charges
+      # waits intentionally created by unrelated containers' cgroup limits to
+      # this global metric.  Above 10%, a forced healthy /api/storage canary
+      # may admit exactly one independently rate-limited iteration; a slow or
+      # failed canary still pauses immediately.  Hysteresis clears below 8%.
+      RDS_BINLOG_CLICKHOUSE_IO_FULL_AVG10_MAX: "${RDS_BINLOG_CLICKHOUSE_BACKFILL_IO_FULL_AVG10_MAX:-10}"
+      RDS_BINLOG_CLICKHOUSE_IO_RECOVERY_RATIO: "0.8"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      ARROW_NUM_THREADS: "1"
+    command:
+      - ionice
+      - -c
+      - "3"
+      - nice
+      - -n
+      - "15"
+      - python
+      - -m
+      - app.clickhouse_ingest
+      - --data-dir
+      - /data
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /data/scratch:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: "0.5"
+    blkio_config:
+      weight: 100
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true
+    depends_on:
+      insight:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  clickhouse-oss-ingester:
+    profiles: ["clickhouse-oss"]
+    image: local/rds-binlog-insight:1.26.0-rawoss
+    container_name: rds-binlog-insight-clickhouse-oss-ingester
+    restart: unless-stopped
+    logging: *runtime-logging
+    init: true
+    user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
+    env_file:
+      - .env
+      - ./clickhouse/runtime.env
+    environment:
+      TZ: Asia/Shanghai
+      RDS_BINLOG_DATA_DIR: /data
+      TMPDIR: /data/scratch
+      RDS_BINLOG_CLICKHOUSE_ENABLED: "1"
+      RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_OSS_ENABLED: "1"
+      RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_OSS_PREFIX: "${RDS_BINLOG_CLICKHOUSE_OSS_PREFIX:-sql-insight-clickhouse/v3/}"
+      RDS_BINLOG_CLICKHOUSE_OSS_CACHE_GB: "${RDS_BINLOG_CLICKHOUSE_OSS_CACHE_GB:-40}"
+      RDS_BINLOG_CLICKHOUSE_OSS_HISTORY_DAYS: "${RDS_BINLOG_CLICKHOUSE_OSS_HISTORY_DAYS:-0}"
+      RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS: "${RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS:-2}"
+      RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS: "${RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS:-1}"
+      RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS: "${RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS:-1}"
+      RDS_BINLOG_CLICKHOUSE_OSS_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_QUERY_TABLE:-events_query_oss_all_v3}"
+      RDS_BINLOG_CLICKHOUSE_OSS_NAME_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_NAME_QUERY_TABLE:-events_query_by_name_oss_all_v3}"
+      RDS_BINLOG_CLICKHOUSE_OSS_NAME_MV: "${RDS_BINLOG_CLICKHOUSE_OSS_NAME_MV:-events_query_oss_all_v3_to_name_mv}"
+      RDS_BINLOG_CLICKHOUSE_OSS_MANIFEST: "${RDS_BINLOG_CLICKHOUSE_OSS_MANIFEST:-oss-all-v3-manifest.sqlite3}"
+      RDS_BINLOG_CLICKHOUSE_OSS_STAGE_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_STAGE_QUERY_TABLE:-events_query_oss_all_v3_stage}"
+      RDS_BINLOG_CLICKHOUSE_OSS_STAGE_NAME_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_STAGE_NAME_QUERY_TABLE:-events_query_by_name_oss_all_v3_stage}"
+      RDS_BINLOG_CLICKHOUSE_HOST: rds-binlog-insight-clickhouse
+      RDS_BINLOG_CLICKHOUSE_PORT: "8123"
+      RDS_BINLOG_CLICKHOUSE_DATABASE: insight
+      RDS_BINLOG_CLICKHOUSE_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_QUERY_TABLE:-events_query_oss_all_v3}"
+      RDS_BINLOG_CLICKHOUSE_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_QUERY_TABLE:-events_query_oss_all_v3}"
+      RDS_BINLOG_CLICKHOUSE_NAME_QUERY_TABLE: "${RDS_BINLOG_CLICKHOUSE_OSS_NAME_QUERY_TABLE:-events_query_by_name_oss_all_v3}"
+      RDS_BINLOG_CLICKHOUSE_INGEST_MODE: query
+      RDS_BINLOG_CLICKHOUSE_RECONCILE_SECONDS: "300"
+      RDS_BINLOG_CLICKHOUSE_IDLE_SECONDS: "1"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_URL: http://insight:8769/api/storage
+      RDS_BINLOG_CLICKHOUSE_HEALTH_HOST: "${RDS_BINLOG_ALLOWED_HOSTS:-127.0.0.1}"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_MAX_SECONDS: "1"
+      RDS_BINLOG_CLICKHOUSE_MIN_FREE_GB: "120"
+      RDS_BINLOG_CLICKHOUSE_IO_FULL_AVG10_MAX: "${RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_IO_FULL_AVG10_MAX:-10}"
+      RDS_BINLOG_CLICKHOUSE_IO_RECOVERY_RATIO: "0.8"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      ARROW_NUM_THREADS: "1"
+    command:
+      - ionice
+      - -c
+      - "3"
+      - nice
+      - -n
+      - "15"
+      - python
+      - -m
+      - app.clickhouse_ingest
+      - --data-dir
+      - /data
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /data/scratch:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: "0.5"
+    blkio_config:
+      weight: 100
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true
+    depends_on:
+      insight:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  clickhouse-raw-oss-worker:
+    profiles: ["clickhouse-raw-oss"]
+    image: local/rds-binlog-insight:1.26.0-rawoss
+    container_name: rds-binlog-insight-clickhouse-raw-oss-worker
+    restart: unless-stopped
+    logging: *runtime-logging
+    init: true
+    user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
+    env_file:
+      - .env
+      - ./clickhouse/runtime.env
+    environment:
+      TZ: Asia/Shanghai
+      RDS_BINLOG_DATA_DIR: /data
+      TMPDIR: /data/scratch
+      RDS_BINLOG_CLICKHOUSE_ENABLED: "1"
+      RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED: "1"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_MANIFEST_TABLE: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_MANIFEST_TABLE:-oss_active_parts_v1}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_PACKED_TABLE: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_PACKED_TABLE:-events_query_packed_v1}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_PREFIX: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_PREFIX:-sql-insight-clickhouse/raw-v1/}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_CACHE_GB: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_CACHE_GB:-20}"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_IDLE_SECONDS: "2"
+      RDS_BINLOG_CLICKHOUSE_HOST: rds-binlog-insight-clickhouse
+      RDS_BINLOG_CLICKHOUSE_PORT: "8123"
+      RDS_BINLOG_CLICKHOUSE_DATABASE: insight
+      RDS_BINLOG_CLICKHOUSE_TABLE: events_query_packed_v1
+      RDS_BINLOG_CLICKHOUSE_QUERY_TABLE: events_query_packed_v1
+      RDS_BINLOG_CLICKHOUSE_NAME_QUERY_TABLE: events_query_packed_v1
+      RDS_BINLOG_CLICKHOUSE_HEALTH_URL: http://insight:8769/api/storage
+      RDS_BINLOG_CLICKHOUSE_HEALTH_HOST: "${RDS_BINLOG_ALLOWED_HOSTS:-127.0.0.1}"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_MAX_SECONDS: "1"
+      RDS_BINLOG_CLICKHOUSE_MIN_FREE_GB: "120"
+      RDS_BINLOG_CLICKHOUSE_IO_FULL_AVG10_MAX: "${RDS_BINLOG_CLICKHOUSE_RAW_OSS_IO_FULL_AVG10_MAX:-10}"
+      RDS_BINLOG_CLICKHOUSE_IO_RECOVERY_RATIO: "0.8"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      ARROW_NUM_THREADS: "1"
+    command:
+      - ionice
+      - -c
+      - "3"
+      - nice
+      - -n
+      - "15"
+      - python
+      - -m
+      - app.clickhouse_raw_worker
+      - --data-dir
+      - /data
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /data/scratch:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: "0.5"
+    blkio_config:
+      weight: 10
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true
+    depends_on:
+      insight:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  clickhouse-slowlog-ingester:
+    image: local/rds-binlog-insight:1.26.0-rawoss
+    container_name: rds-binlog-insight-clickhouse-slowlog-ingester
+    restart: unless-stopped
+    logging: *runtime-logging
+    init: true
+    user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
+    env_file:
+      - .env
+      - ./clickhouse/runtime.env
+    environment:
+      TZ: Asia/Shanghai
+      RDS_BINLOG_DATA_DIR: /data
+      TMPDIR: /data/scratch
+      RDS_BINLOG_CLICKHOUSE_ENABLED: "1"
+      RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_HOST: rds-binlog-insight-clickhouse
+      RDS_BINLOG_CLICKHOUSE_PORT: "8123"
+      RDS_BINLOG_CLICKHOUSE_DATABASE: insight
+      RDS_BINLOG_CLICKHOUSE_TABLE: events
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_ENABLED: "1"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_TABLE: slowlog_events
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_RETENTION_DAYS: "61"
+      # This is one serial commit, not 64 concurrent writers.  The exporter
+      # streams rows in 8192-row chunks and coalesces the many tiny source
+      # parts into one Parquet insert; the API canary, host PSI admission and
+      # explicit inter-batch pacing bound every batch without io.max.
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_BATCH_PARTS: "64"
+      # The MySQL collector already polls every 120 seconds.  A 30-second
+      # bounded reconciliation keeps ClickHouse within one short poll behind
+      # the exact SQLite index while preserving the full sweep as crash repair.
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_RECONCILE_SECONDS: "30"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_IDLE_SECONDS: "5"
+      # Protect the exact SQLite fallback while historical ClickHouse work is
+      # sharing the same disk.  The ingester reads the source worker's atomic
+      # status file and resumes automatically only after hysteresis recovery.
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_SOURCE_MAX_PENDING_PARTS: "128"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_SOURCE_MAX_PENDING_AGE_SECONDS: "600"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_SOURCE_RECOVERY_RATIO: "0.8"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_SOURCE_STATUS_STALE_SECONDS: "30"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_URL: http://insight:8769/api/storage
+      RDS_BINLOG_CLICKHOUSE_HEALTH_HOST: "${RDS_BINLOG_ALLOWED_HOSTS:-127.0.0.1}"
+      RDS_BINLOG_CLICKHOUSE_HEALTH_MAX_SECONDS: "1"
+      RDS_BINLOG_CLICKHOUSE_MIN_FREE_GB: "120"
+      RDS_BINLOG_CLICKHOUSE_IO_FULL_AVG10_MAX: "${RDS_BINLOG_CLICKHOUSE_SLOWLOG_BACKFILL_IO_FULL_AVG10_MAX:-10}"
+      RDS_BINLOG_CLICKHOUSE_IO_RECOVERY_RATIO: "0.8"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      ARROW_NUM_THREADS: "1"
+    command:
+      - ionice
+      - -c
+      - "3"
+      - nice
+      - -n
+      - "15"
+      - python
+      - -m
+      - app.clickhouse_slowlog
+      - --data-dir
+      - /data
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+      - /data/scratch:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: "0.5"
+    blkio_config:
+      weight: 10
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true
+    depends_on:
+      insight:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+secrets:
+  clickhouse_oss_credentials:
+    file: "${RDS_BINLOG_OSS_CREDENTIAL_FILE:-./clickhouse/empty-oss-credentials.json}"

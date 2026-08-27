@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>RDS SQL Insight</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css?v=1.26.0-rawoss">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M4 6.5C4 5.1 7.6 4 12 4s8 1.1 8 2.5S16.4 9 12 9 4 7.9 4 6.5Z"/><path d="M4 6.5v5C4 12.9 7.6 14 12 14s8-1.1 8-2.5v-5"/><path d="M4 11.5v5C4 17.9 7.6 19 12 19s8-1.1 8-2.5v-5"/></svg>
+        </div>
+        <div>
+          <strong>SQL Insight</strong>
+          <span>RDS 本地解析台</span>
+        </div>
+      </div>
+
+      <nav class="nav-list">
+        <button class="nav-item is-active" data-view="audit" type="button">
+          <svg viewBox="0 0 24 24"><path d="m21 21-4.35-4.35"/><circle cx="11" cy="11" r="7"/><path d="M8.5 11h5M11 8.5v5"/></svg>
+          <span>审计查询</span>
+        </button>
+        <button class="nav-item" data-view="analytics" type="button">
+          <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-6M22 20H2"/></svg>
+          <span>分析洞察</span>
+        </button>
+        <button class="nav-item" data-view="schema" type="button">
+          <svg viewBox="0 0 24 24"><path d="M4 5h6v14H4zM14 5h6v14h-6z"/><path d="M10 12h4"/></svg>
+          <span>结构对比</span>
+        </button>
+        <button class="nav-item" data-view="jobs" type="button">
+          <svg viewBox="0 0 24 24"><path d="M9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          <span>同步任务</span>
+          <span id="running-dot" class="nav-dot" hidden></span>
+        </button>
+        <button class="nav-item" data-view="storage" type="button">
+          <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></svg>
+          <span>物理存储</span>
+        </button>
+        <button class="nav-item" data-view="settings" type="button">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.1A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.1A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.38.34.73.64 1 .3.27.69.4 1.1.4h.1v4h-.1a1.7 1.7 0 0 0-1.74.6Z"/></svg>
+          <span>服务设置</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="service-state">
+          <span id="service-indicator" class="state-dot"></span>
+          <div><strong id="service-label">本地服务就绪</strong><span id="service-meta">正在读取状态</span></div>
+        </div>
+        <span id="app-version" class="version">版本加载中 · DYNAMIC CPU + FAST ZSTD + SAFE DIRECT OSS</span>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow" id="page-eyebrow">AUDIT EXPLORER</p>
+          <h1 id="page-title">审计查询</h1>
+        </div>
+        <div class="topbar-actions">
+          <span class="retention-label"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span id="retention-top">OSS 保留 60 天</span></span>
+          <button id="sync-top" class="button primary compact" type="button">
+            <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66L20 8"/><path d="M20 4v4h-4"/></svg>
+            指定时间同步
+          </button>
+        </div>
+      </header>
+
+      <section class="summary-strip" aria-label="数据摘要">
+        <div class="summary-item"><span>事件总量</span><strong id="summary-events">—</strong></div>
+        <div class="summary-item"><span>最新事件</span><strong id="summary-latest">—</strong></div>
+        <div class="summary-item"><span>本地搜索索引</span><strong id="summary-storage">—</strong></div>
+        <div class="summary-item"><span>同步状态</span><strong id="summary-sync" class="status-text">待配置</strong></div>
+      </section>
+
+      <div id="setup-banner" class="notice warning" hidden>
+        <svg viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5M12 18h.01"/></svg>
+        <div><strong>尚未连接 RDS</strong><span>先在“服务设置”填写实例、地域和最小权限凭据；生产数据目录当前为空。</span></div>
+        <button class="button secondary compact" data-go="settings" type="button">去设置</button>
+      </div>
+
+      <section id="view-audit" class="view is-active">
+        <div class="query-panel">
+          <div class="panel-heading">
+            <div><h2>查询条件</h2><p>所有结果按真实事件时间倒序；最多单页返回 1,000 条。</p></div>
+            <div class="segmented" aria-label="快捷时间范围">
+              <button data-range="15m" type="button">15 分钟</button>
+              <button data-range="1h" type="button">1 小时</button>
+              <button data-range="24h" class="is-active" type="button">24 小时</button>
+              <button data-range="7d" type="button">7 天</button>
+              <button data-range="30d" type="button">30 天</button>
+            </div>
+          </div>
+
+          <form id="query-form" class="query-grid">
+            <label class="field span-2"><span>实例</span><select id="filter-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
+            <label class="field span-2"><span>开始时间</span><input id="filter-start" type="datetime-local" step="1"></label>
+            <label class="field span-2"><span>结束时间</span><input id="filter-end" type="datetime-local" step="1"></label>
+            <label class="field"><span>查询方式</span><select id="filter-query-mode"><option value="keyword">常规</option><option value="primary-key">主键精确</option></select></label>
+            <label class="field span-2"><span id="filter-value-label">关键词</span><input id="filter-keyword" type="search" placeholder="SQL、行值、GTID 或文件名"></label>
+            <label id="filter-keyword-mode-field" class="field"><span>匹配</span><select id="filter-keyword-mode"><option value="AND">全部词</option><option value="OR">任一词</option></select></label>
+            <label class="field span-2"><span>数据库</span><input id="filter-database" type="text" placeholder="支持片段匹配"></label>
+            <label class="field span-2"><span>表名</span><input id="filter-table" type="text" placeholder="支持片段匹配"></label>
+            <label class="field span-2"><span>来源</span><select id="filter-source"><option value="">全部来源</option><option value="audit">本地执行日志</option><option value="binlog">Binlog / General log</option><option value="slowlog">慢日志</option></select></label>
+            <label class="field span-2"><span>连接</span><input id="filter-connection" type="text" placeholder="连接名或连接 ID"></label>
+            <label class="field span-2"><span>数据库账号</span><input id="filter-account" type="text" placeholder="支持片段匹配"></label>
+            <label class="field span-2"><span>执行状态</span><select id="filter-status"><option value="">全部状态</option><option value="success">成功</option><option value="failed">失败</option><option value="cancelled">已取消</option></select></label>
+            <fieldset class="operation-filter span-2">
+              <legend>操作类型</legend>
+              <label><input type="checkbox" value="INSERT"><span>INSERT</span></label>
+              <label><input type="checkbox" value="UPDATE"><span>UPDATE</span></label>
+              <label><input type="checkbox" value="DELETE"><span>DELETE</span></label>
+              <label><input type="checkbox" value="DDL"><span>DDL</span></label>
+              <label><input type="checkbox" value="QUERY"><span>QUERY</span></label>
+              <label><input type="checkbox" value="TRANSACTION"><span>事务</span></label>
+            </fieldset>
+            <div id="txn-drill-chip" class="txn-drill-chip span-8" hidden></div>
+            <div class="form-actions span-8">
+              <button id="query-submit" class="button primary" type="submit">
+                <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>查询
+              </button>
+              <button id="query-reset" class="button secondary" type="button">重置</button>
+              <button id="query-export" class="button ghost" type="button">
+                <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>导出 CSV
+              </button>
+            </div>
+          </form>
+        </div>
+
+        <section class="query-tasks" aria-labelledby="query-task-title">
+          <div class="section-heading query-task-heading">
+            <div><h2 id="query-task-title">查询任务</h2><span>每次查询独立运行；可同时排队、切换结果或停止</span></div>
+            <span id="query-task-summary" class="query-task-summary">暂无任务</span>
+          </div>
+          <div id="query-task-list" class="query-task-list"></div>
+          <div id="query-task-empty" class="query-task-empty">提交查询后，进度和预计扫描量会显示在这里。</div>
+        </section>
+
+        <div class="notice info compact-notice">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg>
+          <span>主键精确查询要求完整库名和表名；索引完整时直接返回定位列表且不读取 OSS，回填未完成时自动准确扫描。</span>
+        </div>
+
+        <div class="result-section">
+          <div class="section-heading">
+            <div><h2>解析事件</h2><span id="result-meta">等待查询</span></div>
+            <div class="pager">
+              <button id="page-prev" class="icon-button" title="上一页" aria-label="上一页" disabled type="button"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
+              <span id="page-label">第 1 页</span>
+              <button id="page-next" class="icon-button" title="下一页" aria-label="下一页" disabled type="button"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table">
+              <thead><tr><th>事件时间</th><th>SQL / 行变更</th><th>对象</th><th>操作 / 状态</th><th>连接 / 事务</th><th>来源</th><th aria-label="详情"></th></tr></thead>
+              <tbody id="event-rows"></tbody>
+            </table>
+            <div id="event-empty" class="empty-state">
+              <svg viewBox="0 0 24 24"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg>
+              <strong>还没有查询结果</strong>
+              <span>完成一次同步，或调整上方时间范围后查询。</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-analytics" class="view">
+        <div class="query-panel">
+          <div class="panel-heading">
+            <div><h2>分析范围</h2><p>按数据来源独立分析；慢日志按事件时间精确过滤和去重，Binlog 聚合保留原有边界口径。</p></div>
+            <div class="segmented" aria-label="快捷时间范围">
+              <button data-analytics-range="1h" type="button">1 小时</button>
+              <button data-analytics-range="6h" type="button">6 小时</button>
+              <button data-analytics-range="24h" class="is-active" type="button">24 小时</button>
+              <button data-analytics-range="7d" type="button">7 天</button>
+              <button data-analytics-range="30d" type="button">30 天</button>
+            </div>
+          </div>
+
+          <form id="analytics-form" class="query-grid">
+            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="Binlog 用于写入与事务推断；RDS 慢日志提供真实扫描行数和耗时"><option value="binlog" selected>Binlog 写入</option><option value="slowlog">RDS 慢日志</option></select></label>
+            <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
+            <label id="analytics-node-field" class="field span-2" hidden><span>Node ID</span><input id="analytics-node" type="text" list="analytics-node-options" maxlength="128" autocomplete="off" placeholder="留空表示全部已采集节点" title="阿里云 DAS Node ID；可从已配置节点中选择，也可直接填写"><datalist id="analytics-node-options"></datalist></label>
+            <label class="field span-2"><span>开始时间</span><input id="analytics-start" type="datetime-local" step="1"></label>
+            <label class="field span-2"><span>结束时间</span><input id="analytics-end" type="datetime-local" step="1"></label>
+            <label class="field span-2"><span>数据库</span><input id="analytics-database" type="text" placeholder="完整库名，留空表示全部"></label>
+            <label class="field span-2"><span>表名</span><input id="analytics-table" type="text" placeholder="完整表名，留空表示全部"></label>
+            <label class="field"><span>操作</span><select id="analytics-operation"><option value="">全部</option><option value="SELECT">SELECT</option><option value="SHOW">SHOW</option><option value="INSERT">INSERT</option><option value="UPDATE">UPDATE</option><option value="DELETE">DELETE</option><option value="DDL">DDL</option><option value="QUERY">QUERY（其他语句）</option></select></label>
+            <label class="field"><span>Top N</span><select id="analytics-limit"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
+            <div class="form-actions span-8">
+              <button id="analytics-submit" class="button primary" type="submit">
+                <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-6M22 20H2"/></svg>开始分析
+              </button>
+              <button id="analytics-reset" class="button secondary" type="button">重置</button>
+            </div>
+          </form>
+        </div>
+
+        <div id="analytics-coverage" class="notice info compact-notice">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg>
+          <span>提交分析后，这里显示分区覆盖度与后台补齐进度。</span>
+        </div>
+
+        <div id="analytics-lock-warning" class="notice warning compact-notice">
+          <svg viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5M12 18h.01"/></svg>
+          <span><strong>锁分析口径：</strong>Binlog 不含 InnoDB 锁等待、死锁和 MDL 信息。本页锁结论全部由事务大小、持续时间与同行改写频次<strong>推断</strong>得出；事务时长取自同一事务首末事件时间戳，是持锁时长的<strong>下界</strong>估计。</span>
+        </div>
+
+        <div class="result-section">
+          <div class="section-heading">
+            <div><h2>分析结果</h2><span id="analytics-meta">等待分析</span></div>
+            <div class="segmented" id="analytics-tabs" aria-label="分析维度">
+              <button data-analytics-tab="sql" class="is-active" type="button">SQL</button>
+              <button data-analytics-tab="transactions" type="button">事务</button>
+              <button data-analytics-tab="locks" type="button">锁争用推断</button>
+            </div>
+          </div>
+
+          <div id="analytics-empty" class="empty-state">
+            <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-6M22 20H2"/></svg>
+            <strong>还没有分析结果</strong>
+            <span>选择时间范围后点击“开始分析”。</span>
+          </div>
+
+          <div id="analytics-panel-sql" class="analytics-panel"></div>
+          <div id="analytics-panel-transactions" class="analytics-panel"></div>
+          <div id="analytics-panel-locks" class="analytics-panel"></div>
+        </div>
+      </section>
+
+      <section id="view-schema" class="view">
+        <div class="query-panel">
+          <div class="panel-heading">
+            <div><h2>对比范围</h2><p>以基准库为准，列出目标库需要补齐的结构差异；全程只读，本页不执行任何变更语句。</p></div>
+            <div class="segmented" id="schema-scope" aria-label="对比范围">
+              <button data-schema-scope="target" class="is-active" type="button">目标已有表</button>
+              <button data-schema-scope="both" type="button">两边都有</button>
+              <button data-schema-scope="all" type="button">全部表</button>
+            </div>
+          </div>
+
+          <form id="schema-form" class="query-grid">
+            <label class="field span-2"><span>基准实例</span><select id="schema-source-instance"></select></label>
+            <label class="field span-2"><span>基准库</span><select id="schema-source-database"></select></label>
+            <label class="field span-2"><span>目标实例</span><select id="schema-target-instance"></select></label>
+            <label class="field span-2"><span>目标库</span><select id="schema-target-database"></select></label>
+            <div class="form-actions span-8">
+              <button id="schema-submit" class="button primary" type="submit">
+                <svg viewBox="0 0 24 24"><path d="M4 5h6v14H4zM14 5h6v14h-6z"/><path d="M10 12h4"/></svg>开始对比
+              </button>
+              <button id="schema-swap" class="button secondary" type="button">
+                <svg viewBox="0 0 24 24"><path d="M7 10 4 7l3-3"/><path d="M4 7h11a5 5 0 0 1 0 10h-1"/><path d="m17 14 3 3-3 3"/></svg>互换方向
+              </button>
+              <span id="schema-identity" class="schema-identity"></span>
+            </div>
+          </form>
+        </div>
+
+        <div class="notice info compact-notice">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+          <span><strong>安全语句</strong>只含新增列/索引/外键与放宽类修改；<strong>高危语句</strong>（删除、类型收窄、字符集重建）默认注释，需人工确认数据影响后再放开。</span>
+        </div>
+
+        <section class="summary-strip" id="schema-summary" hidden aria-label="对比摘要">
+          <div class="summary-item"><span>对比表数</span><strong id="schema-stat-tables">—</strong></div>
+          <div class="summary-item"><span>结构一致</span><strong id="schema-stat-same">—</strong></div>
+          <div class="summary-item"><span>有差异</span><strong id="schema-stat-changed">—</strong></div>
+          <div class="summary-item"><span>目标缺表</span><strong id="schema-stat-missing">—</strong></div>
+          <div class="summary-item"><span>目标独有</span><strong id="schema-stat-extra">—</strong></div>
+          <div class="summary-item"><span>安全 / 高危</span><strong id="schema-stat-changes">—</strong></div>
+        </section>
+
+        <div class="result-section">
+          <div class="section-heading">
+            <div><h2>差异明细</h2><span id="schema-meta">等待对比</span></div>
+            <div class="segmented" id="schema-filter" aria-label="差异筛选">
+              <button data-schema-filter="diff" class="is-active" type="button">仅差异</button>
+              <button data-schema-filter="all" type="button">全部</button>
+            </div>
+          </div>
+          <div id="schema-empty" class="empty-state">
+            <svg viewBox="0 0 24 24"><path d="M4 5h6v14H4zM14 5h6v14h-6z"/><path d="M10 12h4"/></svg>
+            <strong>还没有对比结果</strong>
+            <span>选择基准库与目标库后点击“开始对比”。</span>
+          </div>
+          <div id="schema-diff-list" class="schema-diff-list"></div>
+        </div>
+
+        <div class="result-section" id="schema-sql-section" hidden>
+          <div class="section-heading">
+            <div><h2>差异恢复 SQL</h2><span id="schema-sql-meta">按表分组，可直接复制执行</span></div>
+            <div class="toolbar-actions">
+              <label class="schema-toggle"><input id="schema-include-risky" type="checkbox"><span>展开高危语句</span></label>
+              <button id="schema-copy-sql" class="button secondary compact" type="button">
+                <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/></svg>复制
+              </button>
+              <button id="schema-download-sql" class="button primary compact" type="button">
+                <svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m7 11 5 5 5-5"/><path d="M5 21h14"/></svg>下载 .sql
+              </button>
+            </div>
+          </div>
+          <pre id="schema-sql" class="schema-sql"></pre>
+        </div>
+      </section>
+
+      <section id="view-jobs" class="view">
+        <div class="view-toolbar sync-toolbar">
+          <div class="sync-toolbar-copy"><h2>指定时间顺序同步</h2><p>只下载与所选时间相交的 Completed Binlog，并严格按时间逐个处理。</p></div>
+          <div class="sync-controls">
+            <label class="field"><span>Binlog 开始时间</span><input id="sync-start-time" type="datetime-local" step="1" required></label>
+            <label class="field"><span>Binlog 结束时间</span><input id="sync-end-time" type="datetime-local" step="1" required></label>
+            <div class="toolbar-actions">
+              <button id="pause-sync" class="button secondary" type="button"><svg viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></svg>文件边界暂停</button>
+              <button id="start-sync" class="button primary" type="button"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66L20 8"/><path d="M20 4v4h-4"/></svg>按时间同步</button>
+            </div>
+          </div>
+        </div>
+        <div class="notice info compact-notice sync-publish-note">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
+          <div><strong>解析完成即刻可查</strong><span>每批已解析事件的 Parquet 回读通过并原子发布后，GUI 会自动刷新，不等待整个 Binlog 或整批任务结束。</span></div>
+        </div>
+        <div id="active-job" class="active-job" hidden>
+          <div class="active-job-head"><div><span class="status-chip running">运行中</span><strong id="active-job-file">核验实例</strong></div><span id="active-job-count">0 / 0</span></div>
+          <div class="progress-track"><span id="active-job-progress"></span></div>
+          <div class="active-job-metrics" aria-live="polite">
+            <div class="active-job-metric">
+              <span title="下载、解析、Parquet、OSS 与原文件删除全部完成的节奏">全链路速度</span>
+              <strong id="active-job-speed">计算中</strong>
+              <small id="active-job-speed-note">等待完整发布样本</small>
+            </div>
+            <div class="active-job-metric">
+              <span>预计追平时间</span>
+              <strong id="active-job-eta">计算中</strong>
+              <small id="active-job-eta-note">会扣除实例持续新增的 Binlog</small>
+            </div>
+          </div>
+          <p id="active-job-message"></p>
+        </div>
+        <div id="secondary-section" class="result-section" hidden>
+          <div class="section-heading"><div><h2>附加实例</h2><span>与主实例并行同步，各自独立追平</span></div></div>
+          <div id="secondary-list" class="secondary-list"></div>
+        </div>
+        <div class="result-section">
+          <div class="section-heading"><div><h2>任务历史</h2><span>失败会停在原文件，不会越过缺口</span></div></div>
+          <div id="job-list" class="job-list"></div>
+          <div id="job-empty" class="empty-state"><strong>还没有任务记录</strong><span>配置 RDS 后启动第一次同步。</span></div>
+        </div>
+      </section>
+
+      <section id="view-storage" class="view">
+        <div class="storage-hero">
+          <div>
+            <p class="eyebrow">PHYSICAL FORMAT</p>
+            <h2>Parquet <span>+</span> ZSTD 1</h2>
+            <p>按时间、库表和操作聚簇，并切成独立 Row Group。本地倒排索引直接定位相关 Row Group，正文只从 OSS Range 拉取所需列和字节。</p>
+          </div>
+          <div class="storage-metrics">
+            <div><span>本地临时正文</span><strong id="storage-local">—</strong></div>
+            <div><span>OSS 已归档</span><strong id="storage-oss">—</strong></div>
+            <div><span>表目录覆盖率</span><strong id="storage-catalog">—</strong></div>
+            <div><span>索引覆盖率</span><strong id="storage-cap">—</strong></div>
+            <div><span>索引 Row Group</span><strong id="storage-query-cache">—</strong></div>
+            <div><span>元数据</span><strong id="storage-metadata">—</strong></div>
+            <div><span>待处理临时文件</span><strong id="storage-downloads">—</strong></div>
+            <div><span>物理分区</span><strong id="storage-parts">—</strong></div>
+          </div>
+        </div>
+        <div class="view-toolbar storage-toolbar">
+          <div><h2>分区清单</h2><p id="storage-retention-copy">本地只保留最小搜索索引；正文上传 OSS 并校验后立即释放。</p></div>
+          <button id="run-cleanup" class="button secondary" type="button"><svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13"/><path d="M10 11v5M14 11v5"/></svg>立即执行保留清理</button>
+        </div>
+        <div class="table-wrap storage-table-wrap">
+          <table class="data-table">
+            <thead><tr><th>事件日期</th><th>源 Binlog</th><th>事件数</th><th>压缩大小</th><th>时间范围</th><th>保存层</th><th>SHA-256</th></tr></thead>
+            <tbody id="storage-rows"></tbody>
+          </table>
+          <div id="storage-empty" class="empty-state"><strong>还没有物理分区</strong><span>完成解析后会在这里看到真实 Parquet 文件。</span></div>
+        </div>
+      </section>
+
+      <section id="view-settings" class="view">
+        <div class="settings-layout">
+          <form id="settings-form" class="settings-form">
+            <section class="settings-group">
+              <div class="settings-group-title"><h2>RDS 实例身份</h2><p>仅使用 Region ID、RDS 实例 ID 和 API 返回属性核验目标实例。</p></div>
+              <div class="settings-grid">
+                <label class="field span-2"><span>RDS 实例 ID <em>必填</em></span><input id="setting-instance" type="text" autocomplete="off" placeholder="rm-xxxxxxxx" required></label>
+                <label class="field span-2"><span>Region ID</span><input id="setting-region" type="text" autocomplete="off" placeholder="cn-hangzhou"></label>
+                <label class="field span-4"><span>RDS API Endpoint</span><input id="setting-endpoint" type="text" autocomplete="off" placeholder="rds.aliyuncs.com"></label>
+              </div>
+            </section>
+
+            <section class="settings-group">
+              <div class="settings-group-title"><h2>阿里云受保护凭据</h2><p>供 RDS 只读 API 使用；选择 AccessKey 认证时也供 OSS 使用。Windows 存入凭据管理器，Linux 存入权限为 0600 的受保护文件，不写入设置、SQLite 或日志。</p></div>
+              <div class="credential-state" id="credential-state"><span class="state-dot neutral"></span><span>未检测到凭据</span></div>
+              <div class="settings-grid">
+                <label class="field span-2"><span>AccessKey ID</span><input id="setting-ak-id" type="text" autocomplete="off" placeholder="留空表示不修改"></label>
+                <label class="field span-2"><span>AccessKey Secret</span><input id="setting-ak-secret" type="password" autocomplete="new-password" placeholder="留空表示不修改"></label>
+                <label class="field span-4"><span>Security Token（可选）</span><input id="setting-token" type="password" autocomplete="new-password" placeholder="仅 STS 临时凭据需要"></label>
+              </div>
+              <div class="permission-note"><strong>最小 RAM Action</strong><code>rds:DescribeDBInstanceAttribute</code><code>rds:DescribeDBInstanceHAConfig</code><code>rds:DescribeBinlogFiles</code></div>
+            </section>
+
+            <section class="settings-group">
+              <div class="settings-group-title"><h2>OSS 分层归档</h2><p>只使用同地域内网 Endpoint；正文上传并校验后立即释放，本地只保留精确到 Row Group 的搜索索引。</p></div>
+              <div class="settings-grid">
+                <label class="switch-field span-2"><span><strong>启用 OSS 归档</strong><small>查询顺序固定为本地索引 → OSS Range → RDS 范围核对</small></span><input id="setting-oss-enabled" type="checkbox" role="switch"></label>
+                <label class="field"><span>Bucket</span><input id="setting-oss-bucket" type="text" autocomplete="off" placeholder="example-binlog-bucket"></label>
+                <label class="field"><span>OSS Region ID</span><input id="setting-oss-region" type="text" autocomplete="off" placeholder="cn-hangzhou"></label>
+                <label class="field span-2"><span>内网 Endpoint</span><input id="setting-oss-endpoint" type="text" autocomplete="off" placeholder="oss-cn-hangzhou-internal.aliyuncs.com"></label>
+                <label class="field span-2"><span>对象前缀</span><input id="setting-oss-prefix" type="text" autocomplete="off" placeholder="mysql-binlog/rm-xxxxxxxx/"></label>
+                <label class="field"><span>认证方式</span><select id="setting-oss-auth"><option value="ecs_ram_role">ECS RAM 角色</option><option value="access_key">受保护 AccessKey</option></select></label>
+                <label class="field"><span>RAM 角色名（可选）</span><input id="setting-oss-role" type="text" autocomplete="off" placeholder="自动发现已挂载角色"></label>
+                <label class="field"><span>OSS 保留天数</span><input id="setting-oss-retention" type="number" min="1" max="3650" value="60"></label>
+              </div>
+              <div class="permission-note"><strong>OSS RAM Action</strong><code>oss:ListObjects</code><code>oss:GetObject</code><code>oss:PutObject</code><code>oss:GetBucketLifecycle</code><code>oss:PutBucketLifecycle</code></div>
+            </section>
+
+            <section class="settings-group">
+              <div class="settings-group-title"><h2>同步与保留</h2><p>每 5 分钟重扫完整保留窗口，缺失 Binlog 严格按最早时间顺序下载、解析并归档。</p></div>
+              <div class="settings-grid">
+                <label class="field"><span>首次回看天数</span><input id="setting-lookback" type="number" min="1" max="365" value="60"></label>
+                <label class="field"><span>可查询保留天数</span><input id="setting-retention" type="number" min="1" max="365" value="60"></label>
+                <label class="field"><span>自动轮询（分钟）</span><input id="setting-poll" type="number" min="1" max="1440" value="5"></label>
+                <label class="switch-field"><span><strong>后台自动同步</strong><small>启动后按间隔追到 API 最新 Completed 文件</small></span><input id="setting-auto" type="checkbox" role="switch"></label>
+                <label class="switch-field span-2"><span><strong>仅使用内网下载 URL</strong><small>固定启用；RDS 未返回内网地址时停止，不回退公网</small></span><input id="setting-intranet" type="checkbox" role="switch" checked disabled></label>
+              </div>
+            </section>
+
+            <div class="settings-actions">
+              <button id="save-settings" class="button primary" type="submit">保存设置</button>
+              <button id="test-settings" class="button secondary" type="button"><svg viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></svg>核验 RDS、OSS 与生命周期</button>
+            </div>
+          </form>
+          <aside class="settings-aside">
+            <div class="aside-block"><span class="aside-index">01</span><strong>RDS 零写入</strong><p>只调用只读 RDS API 与内网下载链接；不连接 MySQL，不调用 Purge，不删除远端日志。</p></div>
+            <div class="aside-block"><span class="aside-index">02</span><strong>最早缺口优先</strong><p>校验、下载、解析或归档失败会停在当前 Binlog，不会越过缺口处理后续文件。</p></div>
+            <div class="aside-block"><span class="aside-index">03</span><strong>OSS 校验后释放</strong><p>每个 Parquet 在 OSS 通过大小与 SHA-256 校验且本地索引完成后，立即删除临时正文。</p></div>
+            <button id="stop-service" class="button danger ghost-wide" type="button">停止后台服务</button>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <aside id="detail-drawer" class="detail-drawer" aria-hidden="true" aria-label="事件详情">
+    <div class="drawer-head"><div><p class="eyebrow">EVENT DETAIL</p><h2 id="detail-title">事件详情</h2></div><button id="close-drawer" class="icon-button" title="关闭" aria-label="关闭" type="button"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+    <div id="detail-body" class="drawer-body"></div>
+  </aside>
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <script src="/assets/app.js?v=1.26.0-rawoss" defer></script>
+</body>
+</html>

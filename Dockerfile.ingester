@@ -1,0 +1,7 @@
+ARG BASE_IMAGE=local/rds-binlog-insight:1.24.16-generic-psi-canary
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="RDS Binlog Insight" \
+      org.opencontainers.image.version="1.24.17-generic-paced-canary"
+
+COPY app/clickhouse_ingest.py /app/app/clickhouse_ingest.py

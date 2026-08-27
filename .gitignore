@@ -1,0 +1,11 @@
+.venv/
+data/
+work/
+*.pyc
+__pycache__/
+*.bak
+*.bak-*
+tools/*.exe
+parser-go/bin/
+.env
+clickhouse/runtime.env

@@ -1,0 +1,21 @@
+{
+  "regionId": "cn-hangzhou",
+  "dbInstanceId": "rm-example-primary",
+  "endpoint": "rds.aliyuncs.com",
+  "initialLookbackDays": 7,
+  "retentionDays": 30,
+  "pollMinutes": 5,
+  "autoSync": false,
+  "preferIntranetDownload": true,
+  "pageSize": 100,
+  "ossEnabled": false,
+  "ossBucket": "example-binlog-bucket",
+  "ossRegionId": "cn-hangzhou",
+  "ossEndpoint": "oss-cn-hangzhou-internal.aliyuncs.com",
+  "ossPrefix": "mysql-binlog/rm-example-primary/",
+  "ossAuthMode": "access_key",
+  "ossRoleName": "",
+  "ossRetentionDays": 30,
+  "localCacheBytes": 1073741824,
+  "queryCacheBytes": 10737418240
+}

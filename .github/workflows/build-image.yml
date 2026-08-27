@@ -1,0 +1,124 @@
+name: build-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Push the verified image to GHCR
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - v1.26.0-rawoss
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  VERSION: 1.26.0-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.26.0-rawoss
+
+jobs:
+  build-test-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Reject credentials and deployment identifiers
+        run: python tools/public_sanitization_check.py --history
+
+      - name: Set image coordinates
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GHCR_IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build once in cloud CI
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: |
+            ${{ env.LOCAL_IMAGE }}
+            ${{ env.GHCR_IMAGE }}:${{ env.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run release regression suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --entrypoint python \
+            --workdir /src \
+            --volume "$PWD:/src:ro" \
+            "$LOCAL_IMAGE" \
+            -m unittest \
+            tests.test_clickhouse_oss \
+            tests.test_clickhouse_hot \
+            tests.test_clickhouse_slowlog \
+            tests.test_clickhouse_slowlog_verify \
+            tests.test_clickhouse_stage \
+            tests.test_clickhouse_oss_verify \
+            tests.test_clickhouse_poc_benchmark \
+            tests.test_index_worker \
+            tests.test_metadata_wal \
+            tests.test_public_config
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.version\" }}' "$LOCAL_IMAGE")" = "$VERSION"
+          docker run --rm --entrypoint python "$LOCAL_IMAGE" -c \
+            "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"
+
+      - name: Export immutable deployment artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker save "$LOCAL_IMAGE" | gzip -1 > "dist/rds-binlog-insight-${VERSION}.tar.gz"
+          sha256sum "dist/rds-binlog-insight-${VERSION}.tar.gz" \
+            > "dist/rds-binlog-insight-${VERSION}.tar.gz.sha256"
+          docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" \
+            > "dist/rds-binlog-insight-${VERSION}.image-id.txt"
+          cp compose.yaml "dist/compose-${VERSION}.yaml"
+          cp docs/clickhouse-oss-v3-runbook.md \
+            "dist/clickhouse-oss-v3-runbook-${VERSION}.md"
+          printf '%s\n' "$GITHUB_SHA" \
+            > "dist/rds-binlog-insight-${VERSION}.source-sha.txt"
+          sha256sum \
+            "dist/compose-${VERSION}.yaml" \
+            "dist/clickhouse-oss-v3-runbook-${VERSION}.md" \
+            "dist/rds-binlog-insight-${VERSION}.source-sha.txt" \
+            > "dist/rds-binlog-insight-${VERSION}.metadata.sha256"
+
+      - name: Upload cloud-built deployment artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rds-binlog-insight-${{ env.VERSION }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Authenticate to GHCR
+        if: github.event_name == 'push' || inputs.publish
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish verified image
+        if: github.event_name == 'push' || inputs.publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$GHCR_IMAGE:$VERSION"

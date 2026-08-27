@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <profiles>
+        <default>
+            <max_threads>2</max_threads>
+            <max_memory_usage>500000000</max_memory_usage>
+            <max_execution_time>60</max_execution_time>
+            <max_concurrent_queries_for_user>2</max_concurrent_queries_for_user>
+            <use_query_cache>0</use_query_cache>
+        </default>
+    </profiles>
+</clickhouse>

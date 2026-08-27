@@ -1,0 +1,28 @@
+[Unit]
+Description=RDS Binlog Insight host CPU governor
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=yy
+ExecStart=/usr/bin/python3 /opt/rds-binlog-insight/deploy/cpu_governor.py --container rds-binlog-insight --exclude-prefix rds-binlog-insight --threshold 40 --interval-seconds 5 --window-samples 3 --minimum-state-seconds 30
+ExecStopPost=-/usr/bin/docker update --cpus 2.0 rds-binlog-insight
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+MemoryMax=128M
+TasksMax=32
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

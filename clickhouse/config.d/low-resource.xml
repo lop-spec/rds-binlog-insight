@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- This host is shared and the container is capped at 5 GiB / 2 CPUs. -->
+    <!-- Keep the upstream global thread-pool default.  It is a capacity
+         ceiling, not CPU concurrency; setting it to 128 starved even
+         SELECT 1 after the server had created its background workers. -->
+    <background_schedule_pool_size>32</background_schedule_pool_size>
+    <background_buffer_flush_schedule_pool_size>2</background_buffer_flush_schedule_pool_size>
+    <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
+    <!-- One uninterrupted merge worker can saturate the container's aggregate
+         block-I/O cap. More workers add memory/CPU pressure without increasing
+         the configured write ceiling, including temporary backfill ramps. -->
+    <background_pool_size>1</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>1</background_merges_mutations_concurrency_ratio>
+    <merge_tree>
+        <!-- All three values must remain below pool size x concurrency ratio. -->
+        <number_of_free_entries_in_pool_to_execute_mutation>0</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>0</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>0</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <!-- This server-level default protects an existing table during the
+             short interval before the explicit schema migration reapplies the
+             same table setting after a cold start. -->
+        <max_bytes_to_merge_at_max_space_in_pool>134217728</max_bytes_to_merge_at_max_space_in_pool>
+    </merge_tree>
+    <max_server_memory_usage>4200000000</max_server_memory_usage>
+    <max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio>
+    <storage_configuration>
+        <disks>
+            <default>
+                <keep_free_space_bytes>128849018880</keep_free_space_bytes>
+            </default>
+        </disks>
+    </storage_configuration>
+    <logger>
+        <level>information</level>
+        <console>true</console>
+    </logger>
+</clickhouse>

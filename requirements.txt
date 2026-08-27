@@ -1,0 +1,5 @@
+duckdb==1.5.4
+pyarrow==25.0.0
+oss2==2.19.1
+pymysql==1.1.2
+alibabacloud-credentials==1.0.10
