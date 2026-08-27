@@ -938,6 +938,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if code == "QUERY_END_AFTER_LATEST"
                 else 409
                 if code == "BINLOG_BACKFILL_QUEUED"
+                else 503
+                if code == "CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE"
                 else 500
             )
             self._error(status, code, str(exc))

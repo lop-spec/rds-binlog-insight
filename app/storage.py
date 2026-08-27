@@ -3323,9 +3323,19 @@ class EventStorage:
                     limit_cap=limit_cap,
                     control=control,
                 )
-            except Exception:
+            except Exception as exc:
                 if control is not None:
                     control.check_cancelled()
+                if bool(getattr(self.clickhouse_backend, "raw_serving", False)):
+                    LOGGER.exception(
+                        "ClickHouse raw OSS query failed; refusing unbounded "
+                        "Parquet fallback"
+                    )
+                    raise StorageError(
+                        "ClickHouse OSS 查询暂时不可用；为保护主服务，未执行 "
+                        "Parquet 全量回退",
+                        "CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE",
+                    ) from exc
                 LOGGER.exception(
                     "ClickHouse hot query failed; falling back to Parquet"
                 )

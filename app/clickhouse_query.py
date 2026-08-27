@@ -25,7 +25,10 @@ TABULARIS_AUDIT_EVENT_TYPE = "TABULARIS_AUDIT"
 SLOW_LOG_EVENT_TYPE = "SLOW_LOG"
 NAME_PAIR_LIMIT = 64
 RAW_CANDIDATE_PAGE_SIZE = 64
-RAW_OBJECT_BATCH_SIZE = 16
+# Wide binlog Parquet columns can approach the 500 MB interactive query cap
+# before ClickHouse has produced the first block. Keep each exact S3 source
+# small; candidate pagination still amortizes the manifest lookup.
+RAW_OBJECT_BATCH_SIZE = 4
 
 RESULT_COLUMNS = (
     "event_id",
@@ -509,10 +512,21 @@ class ClickHouseQueryBackend:
             )
         raw_settings = {
             "input_format_parquet_use_native_reader_v3": 0,
+            # Production wide-string parts exceeded the 500 MB query cap with
+            # the default 65k-row block and four parallel object readers.
+            # These are the same bounded reader settings used by the verified
+            # Parquet ingest path, but retain the interactive 500 MB cap.
+            "input_format_parquet_max_block_size": 1024,
+            "input_format_parquet_prefer_block_bytes": 8 * 1024 * 1024,
+            "input_format_max_block_size_bytes": 32 * 1024 * 1024,
+            "input_format_parquet_enable_row_group_prefetch": 0,
             "input_format_parquet_allow_missing_columns": 1,
             "input_format_defaults_for_omitted_fields": 1,
             "input_format_null_as_default": 1,
-            "max_threads": 4,
+            "max_block_size": 1024,
+            "max_threads": 1,
+            "max_download_threads": 1,
+            "max_parsing_threads": 1,
         }
         where = self._where(query, start_us, end_us)
         cursor_max: int | None = None

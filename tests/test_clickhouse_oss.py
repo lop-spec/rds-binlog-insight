@@ -36,6 +36,7 @@ from app.clickhouse_oss import (
     split_direct_and_ranged_parts,
 )
 from app.rds_api import RemoteBinlog
+from app.storage import EventStorage, StorageError
 
 
 class ClickHouseOssConfigTests(unittest.TestCase):
@@ -473,9 +474,11 @@ class ClickHouseOssConfigTests(unittest.TestCase):
         class _Client:
             def __init__(self):
                 self.sql: list[str] = []
+                self.calls: list[tuple[str, dict]] = []
 
             def json_rows(self, sql, **_kwargs):
                 self.sql.append(sql)
+                self.calls.append((sql, dict(_kwargs)))
                 if "FROM insight.oss_active_parts_v1 FINAL" in sql:
                     return [
                         {
@@ -554,6 +557,89 @@ class ClickHouseOssConfigTests(unittest.TestCase):
         self.assertTrue(any("FROM s3(" in sql for sql in client.sql))
         self.assertFalse(any("**" in sql for sql in client.sql))
         self.assertFalse(any("_path GLOBAL IN" in sql for sql in client.sql))
+        raw_calls = [
+            kwargs
+            for sql, kwargs in client.calls
+            if "AS raw_oss_source" in sql
+        ]
+        self.assertEqual(len(raw_calls), 1)
+        raw_settings = raw_calls[0]["settings"]
+        self.assertEqual(raw_settings["max_threads"], 1)
+        self.assertEqual(raw_settings["max_download_threads"], 1)
+        self.assertEqual(raw_settings["max_parsing_threads"], 1)
+        self.assertEqual(raw_settings["input_format_parquet_max_block_size"], 1024)
+        self.assertEqual(
+            raw_settings["input_format_parquet_prefer_block_bytes"],
+            8 * 1024 * 1024,
+        )
+        self.assertEqual(
+            raw_settings["input_format_max_block_size_bytes"],
+            32 * 1024 * 1024,
+        )
+        self.assertEqual(
+            raw_settings["input_format_parquet_enable_row_group_prefetch"], 0
+        )
+        self.assertEqual(raw_settings["max_block_size"], 1024)
+
+    def test_raw_backend_failure_never_falls_back_to_parquet_in_web_process(self):
+        class _FailingRawBackend:
+            raw_serving = True
+
+            @staticmethod
+            def query_events(*_args, **_kwargs):
+                raise RuntimeError("simulated ClickHouse memory limit")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            metadata = MetadataStore(root / "metadata.sqlite3")
+            event_us = int(datetime.now(UTC).timestamp() * 1_000_000)
+            with patch.dict(
+                os.environ,
+                {"RDS_BINLOG_CLICKHOUSE_ENABLED": "0"},
+                clear=False,
+            ):
+                storage = EventStorage(metadata, root)
+            storage.clickhouse_backend = _FailingRawBackend()
+            query = {
+                "source": "binlog",
+                "start_epoch_us": event_us - 1,
+                "end_epoch_us": event_us + 1,
+                "limit": 20,
+            }
+            with (
+                patch.object(
+                    metadata,
+                    "storage_metadata_stats",
+                    return_value={
+                        "oldest_epoch_us": event_us - 1,
+                        "latest_epoch_us": event_us + 1,
+                    },
+                ),
+                patch.object(
+                    metadata,
+                    "complete_query_certificate",
+                    return_value=({"part_count": 0}, None),
+                ),
+                patch.object(
+                    metadata,
+                    "parts_in_range",
+                    side_effect=AssertionError("Parquet fallback must not run"),
+                ) as parts_in_range,
+                patch("app.storage.LOGGER.exception") as log_exception,
+            ):
+                with self.assertRaises(StorageError) as raised:
+                    storage._query_events_tiered_impl(
+                        query,
+                        Settings(retention_days=60),
+                        None,
+                    )
+
+            self.assertEqual(
+                raised.exception.code,
+                "CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE",
+            )
+            parts_in_range.assert_not_called()
+            log_exception.assert_called_once()
 
     def test_source_change_queue_is_durable_coalesced_and_version_acked(self):
         with tempfile.TemporaryDirectory() as temp:
