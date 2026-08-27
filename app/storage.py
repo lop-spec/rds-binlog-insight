@@ -4056,6 +4056,9 @@ class EventStorage:
         instance: str = "",
     ) -> dict[str, Any] | None:
         with self.query_activity():
+            local_execution = self._local_execution_event_detail(event_id, instance)
+            if local_execution is not None:
+                return local_execution
             slowlog = self._slowlog_event_detail(event_id, settings, instance)
             if slowlog is not None:
                 return slowlog
@@ -4065,6 +4068,26 @@ class EventStorage:
                 archive,
                 locator,
             )
+
+    def local_execution_event_detail(
+        self,
+        event_id: str,
+        instance: str = "",
+    ) -> dict[str, Any] | None:
+        """Read permanent DBX/Tabularis execution detail before body-tier fallback."""
+
+        with self.query_activity():
+            return self._local_execution_event_detail(event_id, instance)
+
+    def _local_execution_event_detail(
+        self,
+        event_id: str,
+        instance: str = "",
+    ) -> dict[str, Any] | None:
+        detail = self.metadata.local_execution_event_detail(event_id, instance)
+        if detail is not None:
+            detail["tiers_used"] = ["audit-index"]
+        return detail
 
     def slowlog_event_detail(
         self, event_id: str, settings: Settings, instance: str = ""

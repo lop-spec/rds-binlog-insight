@@ -319,6 +319,7 @@ ON tabularis_audit_events(state, updated_at);
 
 -- 本地执行日志的可查询副本。
 --
+-- 表名沿用最初的 Tabularis 接入命名，实际同时永久保存 DBX 与 Tabularis 事件。
 -- 事件本体仍按 binlog 管道走 Parquet 并归档到 OSS（合规存档不变），但每条事件
 -- 在那条管道里都是一个独立的伪 binlog 文件 + 一个单行 Parquet 分区；查询时要
 -- 打开几千个文件，实测 3896 条要 0.8 秒。这一类数据量只有几千条，直接放带索引
@@ -1504,6 +1505,32 @@ class MetadataStore:
             + "Z"
         )
         return item
+
+    def local_execution_event_detail(
+        self,
+        event_id: str,
+        instance_id: str = "",
+    ) -> dict[str, Any] | None:
+        """按事件 ID 读取永久保存的 DBX/Tabularis 本地执行日志。"""
+
+        normalized_id = str(event_id or "").strip()
+        if not normalized_id:
+            return None
+        clauses = ["event_id = ?"]
+        params: list[Any] = [normalized_id]
+        normalized_instance = str(instance_id or "").strip()
+        if normalized_instance:
+            clauses.append("instance_id = ?")
+            params.append(normalized_instance)
+        columns = ",".join(self.TABULARIS_AUDIT_LOG_COLUMNS)
+        with self.connection() as conn:
+            row = conn.execute(
+                f"SELECT {columns} FROM tabularis_audit_log WHERE "
+                + " AND ".join(clauses)
+                + " LIMIT 1",
+                params,
+            ).fetchone()
+        return self._audit_log_row(row) if row is not None else None
 
     def tabularis_audit_log_count(self) -> int:
         with self.connection() as conn:

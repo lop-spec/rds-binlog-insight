@@ -819,9 +819,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 event_id = _query_value(query, "id")
                 locator = _query_value(query, "locator")
                 instance = _query_value(query, "instance")
-                result = self.app.storage.slowlog_event_detail(
-                    event_id, settings, instance
+                result = self.app.storage.local_execution_event_detail(
+                    event_id, instance
                 )
+                if result is None:
+                    result = self.app.storage.slowlog_event_detail(
+                        event_id, settings, instance
+                    )
                 if result is None:
                     archive = self.app.sync.archive_for_settings(settings)
                     result = self.app.storage.event_detail_tiered(

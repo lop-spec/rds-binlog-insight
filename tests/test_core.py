@@ -4824,6 +4824,10 @@ class QueryIsolationTests(unittest.TestCase):
 
         class Storage:
             @staticmethod
+            def local_execution_event_detail(_event_id, _instance):
+                return None
+
+            @staticmethod
             def slowlog_event_detail(event_id, _settings, instance):
                 return {
                     "event_id": event_id,
