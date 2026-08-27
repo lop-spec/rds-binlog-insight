@@ -75,7 +75,7 @@ jobs:
             tests.test_index_worker \
             tests.test_metadata_wal \
             tests.test_public_config
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.version\" }}' "$LOCAL_IMAGE")" = "$VERSION"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$LOCAL_IMAGE")" = "$VERSION"
           docker run --rm --entrypoint python "$LOCAL_IMAGE" -c \
             "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"
 
