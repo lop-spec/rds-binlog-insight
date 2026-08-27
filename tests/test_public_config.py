@@ -99,6 +99,27 @@ class RuntimeIdentifierConfigTests(unittest.TestCase):
                 {"primary-db": "rm-example-primary"},
             )
 
+    def test_sqlite_indexers_do_not_inherit_clickhouse_serving_routes(self) -> None:
+        compose = (
+            Path(__file__).resolve().parents[1] / "compose.yaml"
+        ).read_text(encoding="utf-8")
+        service_ranges = {
+            "indexer": ("  indexer:\n", "  slowlog-indexer:\n"),
+            "slowlog-indexer": ("  slowlog-indexer:\n", "  clickhouse:\n"),
+        }
+        serving_keys = (
+            "RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED",
+            "RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED",
+            "RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED",
+            "RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED",
+        )
+        for service, (start_marker, end_marker) in service_ranges.items():
+            with self.subTest(service=service):
+                block = compose.split(start_marker, 1)[1].split(end_marker, 1)[0]
+                for key in serving_keys:
+                    self.assertIn(f'{key}: "0"', block)
+                self.assertNotIn("./clickhouse/runtime.env", block)
+
 
 if __name__ == "__main__":
     unittest.main()

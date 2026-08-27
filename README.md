@@ -271,7 +271,7 @@ Node ID 从新采集事件开始持久化；升级前已入索引但没有节点
 
 ## ClickHouse 分析层（v1.24.0）
 
-### 全历史 OSS v3（v1.26.0）
+### 全历史 OSS v3（v1.26.1）
 
 v3 不再把 ClickHouse 定义为最近若干天的缓存。所有查询可见 database part 都以
 `history_days=0` 回填到 OSS-backed MergeTree，原始数据仍保存在 OSS，扩容后的

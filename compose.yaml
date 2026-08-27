@@ -15,7 +15,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local/rds-binlog-insight:1.26.0-rawoss
+    image: local/rds-binlog-insight:1.26.1-rawoss
     container_name: rds-binlog-insight
     restart: unless-stopped
     logging: *runtime-logging
@@ -127,7 +127,7 @@ services:
     stop_grace_period: 90s
 
   indexer:
-    image: local/rds-binlog-insight:1.26.0-rawoss
+    image: local/rds-binlog-insight:1.26.1-rawoss
     container_name: rds-binlog-insight-indexer
     restart: unless-stopped
     logging: *runtime-logging
@@ -140,6 +140,13 @@ services:
       RDS_BINLOG_DATA_DIR: /data
       RDS_BINLOG_STAGING_DIR: /data/staging
       TMPDIR: /data/scratch
+      # This worker maintains SQLite-derived indexes only.  Keep query-serving
+      # backends disabled here instead of granting it ClickHouse credentials
+      # merely because the shared .env enables them for the HTTP service.
+      RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED: "0"
       RDS_BINLOG_EXACT_SCHEMA_REGISTRY: "${RDS_BINLOG_EXACT_SCHEMA_REGISTRY:-}"
       RDS_BINLOG_INDEX_NO_PROGRESS_SECONDS: "${RDS_BINLOG_INDEX_NO_PROGRESS_SECONDS:-600}"
       RDS_BINLOG_INDEX_IDLE_SECONDS: "${RDS_BINLOG_INDEX_IDLE_SECONDS:-15}"
@@ -198,7 +205,7 @@ services:
         condition: service_healthy
 
   slowlog-indexer:
-    image: local/rds-binlog-insight:1.26.0-rawoss
+    image: local/rds-binlog-insight:1.26.1-rawoss
     container_name: rds-binlog-insight-slowlog-indexer
     restart: unless-stopped
     logging: *runtime-logging
@@ -210,6 +217,12 @@ services:
       TZ: Asia/Shanghai
       RDS_BINLOG_DATA_DIR: /data
       TMPDIR: /data/scratch
+      # The source slow-log indexer writes the exact SQLite fallback and does
+      # not query ClickHouse.  Do not inherit serving routes or their secrets.
+      RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED: "0"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED: "0"
       # One source part is the indivisible online-safe work unit.  Every unit
       # is bracketed by a real /api/storage canary in the worker.
       RDS_BINLOG_SLOWLOG_BATCH: "1"
@@ -320,7 +333,7 @@ services:
     stop_grace_period: 60s
 
   clickhouse-ingester:
-    image: local/rds-binlog-insight:1.26.0-rawoss
+    image: local/rds-binlog-insight:1.26.1-rawoss
     container_name: rds-binlog-insight-clickhouse-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -395,7 +408,7 @@ services:
 
   clickhouse-oss-ingester:
     profiles: ["clickhouse-oss"]
-    image: local/rds-binlog-insight:1.26.0-rawoss
+    image: local/rds-binlog-insight:1.26.1-rawoss
     container_name: rds-binlog-insight-clickhouse-oss-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -478,7 +491,7 @@ services:
 
   clickhouse-raw-oss-worker:
     profiles: ["clickhouse-raw-oss"]
-    image: local/rds-binlog-insight:1.26.0-rawoss
+    image: local/rds-binlog-insight:1.26.1-rawoss
     container_name: rds-binlog-insight-clickhouse-raw-oss-worker
     restart: unless-stopped
     logging: *runtime-logging
@@ -550,7 +563,7 @@ services:
         condition: service_healthy
 
   clickhouse-slowlog-ingester:
-    image: local/rds-binlog-insight:1.26.0-rawoss
+    image: local/rds-binlog-insight:1.26.1-rawoss
     container_name: rds-binlog-insight-clickhouse-slowlog-ingester
     restart: unless-stopped
     logging: *runtime-logging
