@@ -271,7 +271,7 @@ Node ID 从新采集事件开始持久化；升级前已入索引但没有节点
 
 ## ClickHouse 分析层（v1.24.0）
 
-### 全历史 OSS v3（v1.26.3）
+### 全历史 OSS v3（v1.26.4）
 
 v3 不再把 ClickHouse 定义为最近若干天的缓存。所有查询可见 database part 都以
 `history_days=0` 回填到 OSS-backed MergeTree，原始数据仍保存在 OSS，扩容后的
@@ -280,11 +280,13 @@ MV 的两阶段 staging 回填，验证双表后按日期 `MOVE PARTITION`；随
 pack、实时新增、内容替换和删除进入同一 durable manifest。任一请求窗口覆盖不完整时
 仍自动回到原 Parquet/OSS 链路，因此迁移期间和故障时都不会形成查询空洞。
 
-`1.26.3-rawoss` 对直接查询原始 OSS 的路径采用独立保护：单次 S3 查询最多组合 4 个
+`1.26.4-rawoss` 对直接查询原始 OSS 的路径采用独立保护：单次 S3 查询最多组合 4 个
 对象，Parquet reader 使用 1024 行 block、单下载/解析线程并关闭 row-group 预取，
 继续保留 500 MB 交互查询上限。raw-serving 已声明全量接管后，ClickHouse 异常会返回
 明确的 `CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE`（HTTP 503），不会再在 Web 进程内
-启动无界 Parquet/OSS 回退；普通 hot 模式原有的小窗口回退保持不变。
+启动无界 Parquet/OSS 回退。持续采集期间的覆盖门按请求时间窗判断：窗外 pending
+不会使完整历史查询闪回旧链，窗内 pending、删除或未就绪 pack 则安全返回 503；
+普通 hot 模式原有的小窗口回退保持不变。
 
 正式切流由 `tools/clickhouse_oss_verify.py` 和
 `tools/clickhouse_poc_benchmark.py` 双门控制：前者全量逐 part 对账 time/name 两张

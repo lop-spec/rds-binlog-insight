@@ -596,6 +596,73 @@ class ClickHouseManifest:
             else 0,
         }
 
+    def window_coverage(
+        self,
+        *,
+        source_complete: bool,
+        source_pending: bool,
+        source_pending_in_window: bool,
+        start_epoch_us: int,
+        end_epoch_us: int,
+    ) -> dict[str, Any]:
+        """Return the serving gate for one bounded event-time window.
+
+        Continuous collection keeps the global source queue non-empty while a
+        new part is archived. Historical windows remain safe when neither that
+        source work nor an unready packed exception overlaps the request.
+        """
+
+        start_us = int(start_epoch_us)
+        end_us = int(end_epoch_us)
+        with self.connection() as connection:
+            state = connection.execute(
+                "SELECT * FROM clickhouse_reconcile_state WHERE singleton = 1"
+            ).fetchone()
+            unready = connection.execute(
+                """
+                SELECT status FROM clickhouse_parts
+                WHERE status IN (
+                    'pending', 'loading', 'load_failed',
+                    'delete_pending', 'deleting', 'delete_failed'
+                )
+                  AND min_event_epoch_us <= ?
+                  AND max_event_epoch_us >= ?
+                LIMIT 1
+                """,
+                (end_us, start_us),
+            ).fetchone()
+        reconciled = bool(state and int(state["completed_at_us"] or 0))
+        manifest_error = str(state["last_error"] or "") if state else ""
+        complete = bool(
+            source_complete
+            and not source_pending_in_window
+            and reconciled
+            and not manifest_error
+            and unready is None
+        )
+        total_parts = int(state["eligible_parts"] or 0) if state else 0
+        return {
+            "complete": complete,
+            "total_parts": total_parts,
+            "covered_parts": total_parts if complete else 0,
+            "covered_rows": 0,
+            "missing_parts": [],
+            "source_complete": bool(source_complete),
+            "source_pending": bool(source_pending),
+            "source_pending_in_window": bool(source_pending_in_window),
+            "manifest_pending": unready is not None,
+            "manifest_pending_in_window": unready is not None,
+            "reconcile_start_epoch_us": int(state["start_epoch_us"] or 0)
+            if state
+            else 0,
+            "reconcile_end_epoch_us": int(state["end_epoch_us"] or 0)
+            if state
+            else 0,
+            "reconcile_completed_at_us": int(state["completed_at_us"] or 0)
+            if state
+            else 0,
+        }
+
     def coverage(self, parts: list[dict[str, Any]]) -> dict[str, Any]:
         expected = {
             str(part["path"]): part_identity(part)

@@ -17,7 +17,10 @@ from app.clickhouse_client import (
     validate_part_state_batch_size,
 )
 from app.clickhouse_manifest import ClickHouseManifest
-from app.clickhouse_query import ClickHouseQueryBackend
+from app.clickhouse_query import (
+    ClickHouseQueryBackend,
+    ClickHouseRawOssUnavailable,
+)
 from app.clickhouse_raw_oss import (
     ClickHouseRawOssConfig,
     build_exact_raw_oss_source_sql,
@@ -456,7 +459,17 @@ class ClickHouseOssConfigTests(unittest.TestCase):
         class _Metadata:
             @staticmethod
             def clickhouse_change_tracking_state():
-                return {"complete": True, "pending": False}
+                # A newly collected part outside this query window must not
+                # disable already complete historical OSS coverage.
+                return {"complete": True, "pending": True}
+
+            @staticmethod
+            def clickhouse_pending_changes_overlap(
+                *, start_epoch_us, end_epoch_us
+            ):
+                self.assertEqual(start_epoch_us, event_us - 1)
+                self.assertEqual(end_epoch_us, event_us + 1)
+                return False
 
             @staticmethod
             def load_settings():
@@ -552,6 +565,22 @@ class ClickHouseOssConfigTests(unittest.TestCase):
                 retention_days=60,
                 limit_cap=1000,
             )
+            with patch.object(
+                _Metadata,
+                "clickhouse_pending_changes_overlap",
+                return_value=True,
+            ):
+                with self.assertRaises(ClickHouseRawOssUnavailable):
+                    backend.query_events(
+                        {
+                            "source": "binlog",
+                            "start_epoch_us": event_us - 1,
+                            "end_epoch_us": event_us + 1,
+                            "limit": 100,
+                        },
+                        retention_days=60,
+                        limit_cap=1000,
+                    )
 
         self.assertEqual(result["tiers_used"], ["clickhouse-raw-oss"])
         self.assertTrue(any("FROM s3(" in sql for sql in client.sql))
@@ -580,6 +609,10 @@ class ClickHouseOssConfigTests(unittest.TestCase):
             raw_settings["input_format_parquet_enable_row_group_prefetch"], 0
         )
         self.assertEqual(raw_settings["max_block_size"], 1024)
+        self.assertTrue(result["clickhouse_coverage"]["source_pending"])
+        self.assertFalse(
+            result["clickhouse_coverage"]["source_pending_in_window"]
+        )
 
     def test_raw_backend_failure_never_falls_back_to_parquet_in_web_process(self):
         class _FailingRawBackend:
@@ -696,6 +729,18 @@ class ClickHouseOssConfigTests(unittest.TestCase):
             self.assertEqual(
                 second[0]["oss_key"], "mysql-binlog/rm-prod/part.parquet"
             )
+            self.assertTrue(
+                metadata.clickhouse_pending_changes_overlap(
+                    start_epoch_us=10,
+                    end_epoch_us=20,
+                )
+            )
+            self.assertFalse(
+                metadata.clickhouse_pending_changes_overlap(
+                    start_epoch_us=21,
+                    end_epoch_us=30,
+                )
+            )
             self.assertEqual(
                 metadata.ack_clickhouse_changes([(str(source), first_version)]),
                 0,
@@ -739,6 +784,12 @@ class ClickHouseOssConfigTests(unittest.TestCase):
             self.assertEqual(len(deleted), 1)
             self.assertEqual(deleted[0]["path"], str(source))
             self.assertFalse(deleted[0]["exists"])
+            self.assertTrue(
+                metadata.clickhouse_pending_changes_overlap(
+                    start_epoch_us=1_000,
+                    end_epoch_us=2_000,
+                )
+            )
 
     def test_ranged_source_page_excludes_standalone_objects(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -922,11 +973,47 @@ class ClickHouseOssConfigTests(unittest.TestCase):
                     source_complete=True, source_pending=False
                 )["complete"]
             )
+            self.assertFalse(
+                manifest.window_coverage(
+                    source_complete=True,
+                    source_pending=True,
+                    source_pending_in_window=False,
+                    start_epoch_us=10,
+                    end_epoch_us=20,
+                )["complete"]
+            )
+            self.assertTrue(
+                manifest.window_coverage(
+                    source_complete=True,
+                    source_pending=True,
+                    source_pending_in_window=False,
+                    start_epoch_us=30,
+                    end_epoch_us=40,
+                )["complete"]
+            )
             manifest.claim_next()
             manifest.mark_ready(part["path"], part["logical_part_id"], 1)
             self.assertTrue(
                 manifest.global_coverage(
                     source_complete=True, source_pending=False
+                )["complete"]
+            )
+            self.assertFalse(
+                manifest.window_coverage(
+                    source_complete=True,
+                    source_pending=True,
+                    source_pending_in_window=True,
+                    start_epoch_us=10,
+                    end_epoch_us=20,
+                )["complete"]
+            )
+            self.assertTrue(
+                manifest.window_coverage(
+                    source_complete=True,
+                    source_pending=True,
+                    source_pending_in_window=False,
+                    start_epoch_us=10,
+                    end_epoch_us=20,
                 )["complete"]
             )
             manifest.queue_missing_paths([part["path"]])

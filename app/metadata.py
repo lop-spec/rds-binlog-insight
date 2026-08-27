@@ -2549,6 +2549,40 @@ class MetadataStore:
             "pending": bool(row and row["pending"]),
         }
 
+    def clickhouse_pending_changes_overlap(
+        self,
+        *,
+        start_epoch_us: int,
+        end_epoch_us: int,
+    ) -> bool:
+        """Return whether durable ClickHouse work can affect one query window.
+
+        Existing parts retain their exact event bounds in ``parquet_parts``.
+        A deletion no longer has that row, so it conservatively overlaps every
+        window until the versioned delete is acknowledged.
+        """
+
+        start_us = int(start_epoch_us)
+        end_us = int(end_epoch_us)
+        if end_us < start_us:
+            return False
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM parquet_clickhouse_pending q
+                LEFT JOIN parquet_parts p ON p.path = q.path
+                WHERE p.path IS NULL
+                   OR (
+                       p.min_event_epoch_us <= ?
+                       AND p.max_event_epoch_us >= ?
+                   )
+                LIMIT 1
+                """,
+                (end_us, start_us),
+            ).fetchone()
+        return row is not None
+
     def clickhouse_source_parts_page(
         self,
         *,

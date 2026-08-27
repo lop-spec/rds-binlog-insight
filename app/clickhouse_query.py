@@ -30,6 +30,11 @@ RAW_CANDIDATE_PAGE_SIZE = 64
 # small; candidate pagination still amortizes the manifest lookup.
 RAW_OBJECT_BATCH_SIZE = 4
 
+
+class ClickHouseRawOssUnavailable(RuntimeError):
+    """The requested raw-OSS window cannot be served completely yet."""
+
+
 RESULT_COLUMNS = (
     "event_id",
     "event_epoch_us",
@@ -484,14 +489,29 @@ class ClickHouseQueryBackend:
         control: Any | None,
     ) -> dict[str, Any] | None:
         if self.raw_pack_manifest is None:
-            return None
+            raise ClickHouseRawOssUnavailable(
+                "Raw OSS packed manifest is unavailable"
+            )
         source_state = self.metadata.clickhouse_change_tracking_state()
-        coverage = self.raw_pack_manifest.global_coverage(
+        source_pending = bool(source_state.get("pending"))
+        source_pending_in_window = bool(
+            source_pending
+            and self.metadata.clickhouse_pending_changes_overlap(
+                start_epoch_us=start_us,
+                end_epoch_us=end_us,
+            )
+        )
+        coverage = self.raw_pack_manifest.window_coverage(
             source_complete=bool(source_state.get("complete")),
-            source_pending=bool(source_state.get("pending")),
+            source_pending=source_pending,
+            source_pending_in_window=source_pending_in_window,
+            start_epoch_us=start_us,
+            end_epoch_us=end_us,
         )
         if not bool(coverage.get("complete")):
-            return None
+            raise ClickHouseRawOssUnavailable(
+                "Raw OSS coverage is incomplete for the requested window"
+            )
         settings = self.metadata.load_settings()
         limit = min(max(int(query.get("limit") or 100), 1), limit_cap)
         offset = min(max(int(query.get("offset") or 0), 0), 100_000)

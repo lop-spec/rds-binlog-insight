@@ -1,6 +1,6 @@
 # ClickHouse OSS v3 全历史回填与切流
 
-本流程只接受云端 CI 生成的 `1.26.3-rawoss` 镜像。整个迁移是加法变更：
+本流程只接受云端 CI 生成的 `1.26.4-rawoss` 镜像。整个迁移是加法变更：
 旧查询链、旧镜像、v2 表和源 OSS 对象均保留；在所有硬门通过前，
 `RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED` 必须保持 `0`。
 
@@ -16,6 +16,8 @@
 - 通用 v3 object-serving 在 manifest 覆盖不全时仍可返回旧 Parquet/OSS 路径；
   raw-serving 已声明全量接管后，ClickHouse 异常必须返回明确的 HTTP 503，禁止在
   Web 进程启动无界 Parquet/OSS 回退，也不允许把“未覆盖”当作“无结果”。
+- raw-serving 的持续采集门必须按请求时间窗判断；窗外 pending/unready 不得使历史
+  查询闪回旧链，窗内 pending、未知范围删除或未就绪 pack 必须 fail closed。
 
 ## 0. 发布前冻结与证据
 
