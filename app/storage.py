@@ -4099,6 +4099,15 @@ class EventStorage:
             detail["tiers_used"] = ["audit-index"]
         return detail
 
+    def slowlog_existing_event_ids(
+        self,
+        event_ids: Iterable[str],
+        instance: str = "",
+    ) -> set[str]:
+        """Return canonical slow-log ids already durable in the serving index."""
+
+        return self.slowlog_index.existing_event_ids(event_ids, instance)
+
     def slowlog_event_detail(
         self, event_id: str, settings: Settings, instance: str = ""
     ) -> dict[str, Any] | None:

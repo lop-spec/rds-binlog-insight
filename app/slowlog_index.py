@@ -67,6 +67,38 @@ def slowlog_order_key(
         str(row.get("fingerprint") or ""),
     )
 
+
+class _ArgMaxEvent:
+    """Return the event id attached to the greatest deterministic metric key."""
+
+    def __init__(self) -> None:
+        self.best_key: tuple[int, int, int, str] | None = None
+        self.best_event_id = ""
+
+    def step(
+        self,
+        event_id: Any,
+        primary: Any,
+        secondary: Any,
+        event_epoch_us: Any,
+    ) -> None:
+        value = str(event_id or "")
+        if not value:
+            return
+        key = (
+            int(primary or 0),
+            int(secondary or 0),
+            int(event_epoch_us or 0),
+            value,
+        )
+        if self.best_key is None or key > self.best_key:
+            self.best_key = key
+            self.best_event_id = value
+
+    def finalize(self) -> str:
+        return self.best_event_id
+
+
 CLICKHOUSE_SLOWLOG_SCHEMA = pa.schema(
     [
         ("event_id", pa.string()),
@@ -625,6 +657,7 @@ class SlowLogIndex:
             _decompress_sql,
             deterministic=True,
         )
+        conn.create_aggregate("slowlog_arg_max", 4, _ArgMaxEvent)
         cancelled: list[BaseException] = []
         if control is not None:
             def check_cancelled() -> int:
@@ -1548,11 +1581,13 @@ class SlowLogIndex:
             "end_position": 0,
             "row_index": 0,
             "execution_time_ms": int(row["query_time_ms"] or 0),
+            "query_time_ms": int(row["query_time_ms"] or 0),
             "error_code": 0,
             "row_query": "",
             "raw_event_type": SLOWLOG_EVENT_TYPE,
             "connection_id": "",
             "connection_name": str(row["client_ip"]),
+            "client_ip": str(row["client_ip"]),
             "database_account": str(row["database_account"]),
             "execution_status": "success",
             "error_message": "",
@@ -1614,6 +1649,73 @@ class SlowLogIndex:
             "range_start_epoch_us": int(start_epoch_us),
             "range_end_epoch_us": int(end_epoch_us),
         }
+
+    def existing_event_ids(
+        self,
+        event_ids: Iterable[str],
+        instance: str = "",
+    ) -> set[str]:
+        values = sorted({str(value) for value in event_ids if str(value)})
+        if not values:
+            return set()
+        instance = str(instance or "").strip()
+        found: set[str] = set()
+        with self.connection() as conn:
+            for position in range(0, len(values), 400):
+                chunk = values[position : position + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                instance_clause = " AND instance_id = ?" if instance else ""
+                params: tuple[Any, ...] = (
+                    (*chunk, instance) if instance else tuple(chunk)
+                )
+                rows = conn.execute(
+                    "SELECT event_id FROM slowlog_events "
+                    f"WHERE is_canonical = 1 AND event_id IN ({placeholders})"
+                    f"{instance_clause}",
+                    params,
+                ).fetchall()
+                found.update(str(row["event_id"]) for row in rows)
+        return found
+
+    def _event_details_with_connection(
+        self,
+        conn: sqlite3.Connection,
+        event_ids: Iterable[str],
+        instance: str = "",
+    ) -> dict[str, dict[str, Any]]:
+        values = sorted({str(value) for value in event_ids if str(value)})
+        if not values:
+            return {}
+        instance = str(instance or "").strip()
+        results: dict[str, dict[str, Any]] = {}
+        for position in range(0, len(values), 300):
+            chunk = values[position : position + 300]
+            placeholders = ",".join("?" for _ in chunk)
+            instance_clause = " AND e.instance_id = ?" if instance else ""
+            params: tuple[Any, ...] = (
+                (*chunk, instance) if instance else tuple(chunk)
+            )
+            rows = conn.execute(
+                "SELECT e.*, d.sql_text_z FROM slowlog_events e "
+                "JOIN slowlog_event_details d "
+                "ON d.event_id = e.event_id AND d.part_path = e.part_path "
+                f"WHERE e.event_id IN ({placeholders}) "
+                f"AND e.is_canonical = 1{instance_clause} "
+                "ORDER BY e.event_id, e.instance_id",
+                params,
+            ).fetchall()
+            for row in rows:
+                event_id = str(row["event_id"])
+                results.setdefault(event_id, self._event_result(row, detail=True))
+        return results
+
+    def event_details(
+        self,
+        event_ids: Iterable[str],
+        instance: str = "",
+    ) -> dict[str, dict[str, Any]]:
+        with self.connection() as conn:
+            return self._event_details_with_connection(conn, event_ids, instance)
 
     def event_detail(
         self,
@@ -1758,6 +1860,14 @@ class SlowLogIndex:
                        MIN(e.operation) AS operation,
                        MAX(e.sql_id) AS sql_id,
                        MIN(e.event_id) AS sample_event_id,
+                       slowlog_arg_max(
+                           e.event_id, e.rows_examined,
+                           e.query_time_ms, e.event_epoch_us
+                       ) AS max_scan_event_id,
+                       slowlog_arg_max(
+                           e.event_id, e.query_time_ms,
+                           e.rows_examined, e.event_epoch_us
+                       ) AS max_query_event_id,
                        MIN(st.action) AS action,
                        MIN(st.normalized_sql) AS normalized_sql,
                        MIN(st.sample_sql) AS sample_sql
@@ -1834,6 +1944,17 @@ class SlowLogIndex:
                 """,
                 {"width": width},
             ).fetchall()
+            sample_ids = {
+                str(row.get(key) or "")
+                for row in orders[order]
+                for key in ("max_scan_event_id", "max_query_event_id")
+                if str(row.get(key) or "")
+            }
+            sample_events = self._event_details_with_connection(
+                conn,
+                sample_ids,
+                instance,
+            )
         if control is not None:
             control.check_cancelled()
         executions = int(totals["executions"] or 0)
@@ -1874,6 +1995,7 @@ class SlowLogIndex:
                 },
                 "statements": orders[order],
                 "orders": orders,
+                "sample_events": sample_events,
                 "objects": [dict(row) for row in objects],
                 "operations": [dict(row) for row in operations],
                 "trend": [dict(row) for row in trend],

@@ -488,6 +488,76 @@ class SlowLogIndexTests(unittest.TestCase):
                 " ".join(str(row[3]) for row in plan),
             )
 
+    def test_analytics_exposes_exact_max_samples_and_existing_event_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "slow-attribution.parquet"
+            scan_event = _event(
+                "max-scan",
+                1_787_286_000_000_000,
+                rows_examined=18_974_956,
+                rows_sent=0,
+                query_ms=49_476,
+            )
+            scan_event.update(
+                {
+                    "sql_text": (
+                        "/* api_writer@10.0.0.62 db=example_app */ "
+                        "SELECT * FROM orders WHERE id = 971"
+                    ),
+                    "database_account": "api_writer",
+                    "connection_name": "10.0.0.62",
+                    "thread_id": 971,
+                }
+            )
+            query_event = _event(
+                "max-query",
+                1_787_286_060_000_000,
+                rows_examined=3_643_736,
+                rows_sent=3_643_736,
+                query_ms=1_530_038,
+            )
+            query_event.update(
+                {
+                    "sql_text": (
+                        "/* batch_export@10.0.0.16 db=example_app */ "
+                        "SELECT * FROM orders WHERE id = 972"
+                    ),
+                    "database_account": "batch_export",
+                    "connection_name": "10.0.0.16",
+                    "thread_id": 972,
+                }
+            )
+            part = _part(source, "logical-attribution", [scan_event, query_event])
+            index = SlowLogIndex(root / "slowlog.sqlite3")
+            index.build_part(part, source)
+
+            summary = index.summarize(
+                start_epoch_us=1_787_285_900_000_000,
+                end_epoch_us=1_787_286_100_000_000,
+                instance="rm-prod",
+                limit=20,
+                order="scan_rows",
+            )
+            statement = summary["sql"]["statements"][0]
+            self.assertEqual(statement["max_scan_event_id"], "max-scan")
+            self.assertEqual(statement["max_query_event_id"], "max-query")
+            samples = summary["sql"]["sample_events"]
+            self.assertEqual(samples["max-scan"]["database_account"], "api_writer")
+            self.assertEqual(samples["max-scan"]["client_ip"], "10.0.0.62")
+            self.assertEqual(samples["max-scan"]["thread_id"], 971)
+            self.assertIn("id = 971", samples["max-scan"]["sql_text"])
+            self.assertEqual(samples["max-query"]["database_account"], "batch_export")
+            self.assertEqual(samples["max-query"]["client_ip"], "10.0.0.16")
+            self.assertEqual(samples["max-query"]["query_time_ms"], 1_530_038)
+            self.assertEqual(
+                index.existing_event_ids(
+                    {"max-scan", "max-query", "missing"},
+                    instance="rm-prod",
+                ),
+                {"max-scan", "max-query"},
+            )
+
     def test_changed_part_replaces_old_events_without_stale_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

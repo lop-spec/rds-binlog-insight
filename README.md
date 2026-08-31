@@ -233,7 +233,13 @@ binlog 的争用风险推断，界面同样如实标注：
 OSS 以约 128 MiB 聚合后提交，每文件最多积压两个上传任务。DuckDB 溢写继续
 使用 `/data/scratch` 的 NVMe，不占 RAM 暂存盘。
 
-## 慢 SQL 的 Node ID 与明细
+## 慢 SQL 的完整性、Node ID 与明细（v1.26.5）
+
+DAS 按 `QueryStartTime` 过滤，但慢日志可能到语句执行结束后才发布。采集器因此在
+前向水位之外默认回放最近 7,200 秒；`replaySeconds` 可在每个采集项中覆盖。事件只在
+Parquet/元数据提交成功后才进入跨轮去重集合，多个 Node 的提交段进程内串行，历史回放
+还会用 canonical serving index 跳过已持久化事件。这样长查询晚到、SQLite 短时写锁和
+服务重启都不会再把记录永久越过水位，也不会靠重复写入换完整性。
 
 `data/slow-log-instances.json` 的每个采集项可选填阿里云 DAS `NodeId`。同一个
 RDS 实例可以按节点写多项；每项拥有独立水位线与默认 OSS 前缀，采集请求会把
@@ -245,7 +251,8 @@ RDS 实例可以按节点写多项；每项拥有独立水位线与默认 OSS �
     {
       "instanceId": "rm-example",
       "nodeId": "pi-node-a",
-      "enabled": true
+      "enabled": true,
+      "replaySeconds": 7200
     },
     {
       "instanceId": "rm-example",
@@ -257,8 +264,11 @@ RDS 实例可以按节点写多项；每项拥有独立水位线与默认 OSS �
 ```
 
 「分析洞察」切到「RDS 慢日志」后可按 Node ID 过滤。Top 慢 SQL 的 SQL 文本是
-可点击入口，点开后复用事件详情抽屉展示该指纹的一条代表样本，包括完整 SQL、
-执行耗时、锁等待、扫描/返回行数、账号、客户端、线程、实例和 Node ID。
+可点击入口，点开后复用事件详情抽屉展示完整 SQL、执行耗时、锁等待、扫描/返回行数、
+账号、客户端、线程、实例和 Node ID。`/api/analytics?source=slowlog` 的每条选中指纹
+同时返回 `max_scan_event_id` 与 `max_query_event_id`；对应原始执行统一放在
+`sql.sample_events[event_id]`，包含精确 UTC 时间、账号、`client_ip`、线程、实际 SQL、
+扫描/返回行数、耗时与锁等待。调用方无需再用任意代表 SQL 猜测最坏执行的来源。
 
 Node ID 从新采集事件开始持久化；升级前已入索引但没有节点元数据的历史记录保留
 为空，因此显式选择节点时不会被错误归入任何节点。未配置 `nodeId` 的旧配置继续
@@ -271,7 +281,7 @@ Node ID 从新采集事件开始持久化；升级前已入索引但没有节点
 
 ## ClickHouse 分析层（v1.24.0）
 
-### 全历史 OSS v3（v1.26.4）
+### 全历史 OSS v3（v1.26.4，v1.26.5 持续兼容）
 
 v3 不再把 ClickHouse 定义为最近若干天的缓存。所有查询可见 database part 都以
 `history_days=0` 回填到 OSS-backed MergeTree，原始数据仍保存在 OSS，扩容后的
@@ -280,7 +290,7 @@ MV 的两阶段 staging 回填，验证双表后按日期 `MOVE PARTITION`；随
 pack、实时新增、内容替换和删除进入同一 durable manifest。任一请求窗口覆盖不完整时
 仍自动回到原 Parquet/OSS 链路，因此迁移期间和故障时都不会形成查询空洞。
 
-`1.26.4-rawoss` 对直接查询原始 OSS 的路径采用独立保护：单次 S3 查询最多组合 4 个
+`1.26.5-rawoss` 对直接查询原始 OSS 的路径采用独立保护：单次 S3 查询最多组合 4 个
 对象，Parquet reader 使用 1024 行 block、单下载/解析线程并关闭 row-group 预取，
 继续保留 500 MB 交互查询上限。raw-serving 已声明全量接管后，ClickHouse 异常会返回
 明确的 `CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE`（HTTP 503），不会再在 Web 进程内

@@ -10,15 +10,15 @@ on:
         default: false
   push:
     tags:
-      - v1.26.4-rawoss
+      - v1.26.5-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.26.4-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.26.4-rawoss
+  VERSION: 1.26.5-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.26.5-rawoss
 
 jobs:
   build-test-package:
@@ -69,6 +69,8 @@ jobs:
             tests.test_clickhouse_hot \
             tests.test_clickhouse_slowlog \
             tests.test_clickhouse_slowlog_verify \
+            tests.test_slowlog_collector \
+            tests.test_slowlog_index \
             tests.test_clickhouse_stage \
             tests.test_clickhouse_oss_verify \
             tests.test_clickhouse_poc_benchmark \

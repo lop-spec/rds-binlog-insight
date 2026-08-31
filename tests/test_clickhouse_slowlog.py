@@ -110,6 +110,8 @@ class _Client:
                     "operation": "SELECT",
                     "sql_id": "sql-1",
                     "sample_event_id": "event-1",
+                    "max_scan_event_id": "event-scan",
+                    "max_query_event_id": "event-query",
                     "action": "SELECT",
                     "instance_ids": ["rm-prod"],
                     "fingerprints": 1,
@@ -161,6 +163,7 @@ class _Client:
 class _StatementIndex:
     def __init__(self) -> None:
         self.calls: list[list[tuple[str, str]]] = []
+        self.detail_calls: list[set[str]] = []
 
     def statement_profiles(self, keys):
         batch = list(keys)
@@ -174,6 +177,23 @@ class _StatementIndex:
                 "normalized_sql": "SELECT * FROM orders WHERE id=?",
                 "sample_sql": "SELECT * FROM orders WHERE id=1",
             }
+        }
+
+    def event_details(self, event_ids, instance: str = ""):
+        values = set(event_ids)
+        self.detail_calls.append(values)
+        return {
+            event_id: {
+                "event_id": event_id,
+                "event_time_utc": "2026-08-31T00:00:00Z",
+                "database_account": "batch_export",
+                "client_ip": "10.0.0.16",
+                "thread_id": 7,
+                "query_time_ms": 60,
+                "rows_examined": 20,
+                "sql_text": "SELECT * FROM orders WHERE id=1",
+            }
+            for event_id in values
         }
 
 
@@ -960,9 +980,16 @@ class ClickHouseSlowLogQueryTests(unittest.TestCase):
             self.assertEqual(result["sql"]["statements"][0]["source_kind"], "slowlog")
             self.assertEqual(set(result["sql"]["orders"]), set(SQL_ORDERS))
             self.assertEqual(result["clickhouse_slowlog_coverage"]["covered_parts"], 1)
+            statement = result["sql"]["statements"][0]
             self.assertEqual(
-                result["sql"]["statements"][0]["normalized_sql"],
+                statement["normalized_sql"],
                 "SELECT * FROM orders WHERE id=?",
+            )
+            self.assertEqual(statement["max_scan_event_id"], "event-scan")
+            self.assertEqual(statement["max_query_event_id"], "event-query")
+            self.assertEqual(
+                result["sql"]["sample_events"]["event-scan"]["client_ip"],
+                "10.0.0.16",
             )
             self.assertEqual(len(client.queries), 1)
             rollup = client.queries[0]
@@ -970,6 +997,7 @@ class ClickHouseSlowLogQueryTests(unittest.TestCase):
             self.assertIn("GROUP BY instance_id,event_epoch_us,event_id", rollup)
             self.assertIn("argMin(tuple(", rollup)
             self.assertEqual(rollup.count("argMin("), 1)
+            self.assertEqual(rollup.count("argMax("), 2)
             self.assertTrue(
                 all(
                     clause.endswith("fingerprint DESC")
@@ -987,6 +1015,10 @@ class ClickHouseSlowLogQueryTests(unittest.TestCase):
                 },
             )
             self.assertEqual(statements.calls, [[("rm-prod", "f" * 32)]])
+            self.assertEqual(
+                statements.detail_calls,
+                [{"event-scan", "event-query"}],
+            )
 
 
 if __name__ == "__main__":

@@ -952,6 +952,20 @@ class ClickHouseSlowLogQueryBackend:
                    max(metric_query_time_ms) AS query_time_ms_max,
                    sum(metric_lock_time_ms) AS lock_time_ms_total,
                    max(metric_lock_time_ms) AS lock_time_ms_max,
+                   argMax(
+                       scope_event_id,
+                       tuple(
+                           metric_rows_examined,metric_query_time_ms,
+                           metric_event_epoch_us,scope_event_id
+                       )
+                   ) AS max_scan_event_id,
+                   argMax(
+                       scope_event_id,
+                       tuple(
+                           metric_query_time_ms,metric_rows_examined,
+                           metric_event_epoch_us,scope_event_id
+                       )
+                   ) AS max_query_event_id,
                    sum(metric_sql_bytes) AS sql_bytes,
                    min(metric_event_epoch_us) AS first_epoch_us,
                    max(metric_event_epoch_us) AS last_epoch_us,
@@ -1024,6 +1038,12 @@ class ClickHouseSlowLogQueryBackend:
                         "operation": str(row.get("operation") or ""),
                         "sql_id": str(row.get("sql_id") or ""),
                         "sample_event_id": str(row.get("sample_event_id") or ""),
+                        "max_scan_event_id": str(
+                            row.get("max_scan_event_id") or ""
+                        ),
+                        "max_query_event_id": str(
+                            row.get("max_query_event_id") or ""
+                        ),
                         "action": str(row.get("action") or ""),
                         "normalized_sql": "",
                         "sample_sql": "",
@@ -1099,6 +1119,16 @@ class ClickHouseSlowLogQueryBackend:
         scan_rows = sum(int(row.get("scan_rows") or 0) for row in groups)
         rows_sent = sum(int(row.get("rows_sent") or 0) for row in groups)
         sql_bytes = sum(int(row.get("sql_bytes") or 0) for row in groups)
+        sample_ids = {
+            str(row.get(key) or "")
+            for row in orders[order]
+            for key in ("max_scan_event_id", "max_query_event_id")
+            if str(row.get(key) or "")
+        }
+        sample_events = self.statement_index.event_details(
+            sample_ids,
+            instance=str(query.get("instance") or ""),
+        )
         missing = list(coverage.get("missing_parts") or [])
         public_coverage = {
             **coverage,
@@ -1158,6 +1188,7 @@ class ClickHouseSlowLogQueryBackend:
                 },
                 "statements": orders[order],
                 "orders": orders,
+                "sample_events": sample_events,
                 "objects": objects,
                 "operations": operations,
                 "trend": trend,

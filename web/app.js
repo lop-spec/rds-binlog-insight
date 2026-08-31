@@ -1148,13 +1148,21 @@ function millisText(value) {
   return humanMicros(Math.max(0, Number(value || 0)) * 1000);
 }
 
-function slowSqlDetailCell(item) {
+function slowSqlDetailCell(item, order) {
   const sql = item.normalized_sql || item.sample_sql || "—";
   const body = `${sourceMark("slowlog")}${escapeHtml(sql)}`;
-  if (!item.sample_event_id) {
+  const eventId = order === "scan_rows"
+    ? (item.max_scan_event_id || item.sample_event_id)
+    : (order === "exec_time"
+      ? (item.max_query_event_id || item.sample_event_id)
+      : item.sample_event_id);
+  const sampleLabel = order === "scan_rows"
+    ? "最大扫描样本"
+    : (order === "exec_time" ? "最大耗时样本" : "代表样本");
+  if (!eventId) {
     return `<code class="sql-cell" title="${escapeHtml(item.sample_sql || "")}">${body}</code>`;
   }
-  return `<button class="slow-sql-link" type="button" data-slow-event-id="${escapeHtml(item.sample_event_id)}" data-slow-instance="${escapeHtml(item.instance_id || "")}" title="查看该慢 SQL 的样本明细" aria-label="查看慢 SQL 明细：${escapeHtml(sql)}"><code class="sql-cell">${body}</code></button>`;
+  return `<button class="slow-sql-link" type="button" data-slow-event-id="${escapeHtml(eventId)}" data-slow-instance="${escapeHtml(item.instance_id || "")}" title="查看该慢 SQL 的${sampleLabel}明细" aria-label="查看慢 SQL ${sampleLabel}：${escapeHtml(sql)}"><code class="sql-cell">${body}</code></button>`;
 }
 
 function renderAnalyticsSlowlogSql(data) {
@@ -1182,7 +1190,7 @@ function renderAnalyticsSlowlogSql(data) {
       const scanned = Number(item.scan_rows || 0);
       const sent = Number(item.rows_sent || 0);
       return [
-        slowSqlDetailCell(item),
+        slowSqlDetailCell(item, order),
         `<span class="mono">${escapeHtml(item.sql_id || "—")}</span>`,
         `<strong>${humanCount(count)}</strong>`,
         `<strong>${humanCount(scanned)}</strong>`,
@@ -1217,7 +1225,7 @@ function renderAnalyticsSlowlogSql(data) {
     <div class="analytics-block"><h3>慢 SQL 趋势</h3>${sparkline(data.trend || [])}</div>
     <div class="analytics-block">
       <div class="block-head"><h3>Top 慢 SQL</h3>${sorter}</div>
-      <p class="analytics-note"><strong>实际扫描行数</strong>来自 RDS 慢日志 <code>RowsExamined</code>，<strong>返回行数</strong>来自 <code>RowsSent</code>，查询耗时与锁等待分别来自 <code>QueryTime</code> 和 <code>LockTime</code>；这里不使用 EXPLAIN 估算。扫描/返回比高通常意味着索引选择性不足或缺少合适索引，仍需结合 SQL、过滤条件与执行计划确认。</p>
+      <p class="analytics-note"><strong>实际扫描行数</strong>来自 RDS 慢日志 <code>RowsExamined</code>，<strong>返回行数</strong>来自 <code>RowsSent</code>，查询耗时与锁等待分别来自 <code>QueryTime</code> 和 <code>LockTime</code>；这里不使用 EXPLAIN 估算。按扫描或耗时排序时，点击 SQL 会打开该指纹的最大扫描或最大耗时原始执行，包含账号、客户端 IP、线程、时间和完整 SQL。扫描/返回比高通常意味着索引选择性不足或缺少合适索引，仍需结合 SQL、过滤条件与执行计划确认。</p>
       ${statements}
     </div>
     <div class="analytics-split">

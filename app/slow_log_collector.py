@@ -12,8 +12,9 @@
   也不在目标实例上执行任何语句。
 - 采集批以"虚拟 binlog 文件"的形式复用 EventStorage.ingest_ndjson_file →
   finalize_file_parts → metadata 状态机，Parquet/索引/OSS 链路零改动。
-- **水位线只推进到 now - lag_seconds**：慢日志落库有分钟级延迟，水位线贴着当前时间
-  走会让晚到的记录永久落在窗口之外。lag 期内的重复由 event_id 去重兜底。
+- **水位线只推进到 now - lag_seconds，并回放 replay_seconds**：慢日志在语句结束后
+  才可能可见，长查询的开始时间会落在旧窗口；滑动回放负责找回晚到记录，稳定
+  event_id、已提交集合和 serving index 三层去重保证回放幂等。
 - **每轮必须翻完窗口内所有页**：DAS 的 OrderBy 只支持耗时/行数，没有按时间排序，
   拿不到"最后一条的时间"，所以水位线按窗口末尾推进，而不是按最大事件时间。
 """
@@ -51,6 +52,10 @@ _API_PAGE_SIZE = 100
 # 单轮页数有硬上限；超出时保留水位并在下一轮继续。
 _MAX_PAGES = 300
 DAS_ENDPOINT = "https://das.cn-shanghai.aliyuncs.com"
+# Multiple node collectors share MetadataStore/EventStorage in one process.
+# Serialize only their short commit section so synchronized polls cannot make
+# each other fail with SQLite "database is locked".
+_SLOWLOG_INGEST_LOCK = threading.Lock()
 _OPERATIONS = {
     "select": "SELECT",
     "insert": "INSERT",
@@ -155,8 +160,11 @@ class SlowLogConfig:
         self.label = str(data.get("label") or default_label).strip()
         self.enabled = bool(data.get("enabled", False))
         self.poll_seconds = self._int(data, "pollSeconds", 120, 30, 3600)
-        # RDS 侧落库延迟裕量：水位线只推进到 now - lag，避免晚到记录被跳过。
+        # RDS 侧落库延迟裕量：水位线只推进到 now - lag，避免短时晚到。
         self.lag_seconds = self._int(data, "lagSeconds", 300, 60, 3600)
+        # DAS 按 QueryStartTime 过滤、但慢日志可能到语句结束后才发布。每轮回放
+        # 已提交水位之前的窗口，默认两小时覆盖当前最长 25 分钟样本并保留余量。
+        self.replay_seconds = self._int(data, "replaySeconds", 7200, 300, 86400)
         # 首次启动回溯窗口，之后由水位线接管。
         self.initial_lookback_minutes = self._int(
             data, "initialLookbackMinutes", 60, 1, 7 * 24 * 60
@@ -231,6 +239,7 @@ class SlowLogCollector:
             "lastBatchRows": 0,
             "watermarkEpochUs": 0,
             "lastWindow": "",
+            "replaySeconds": config.replay_seconds,
             "lastQueuedParts": 0,
             "lastIndexedParts": 0,
             "lastIndexError": "",
@@ -284,8 +293,9 @@ class SlowLogCollector:
         payload = json.dumps(
             {
                 "watermark_epoch_us": int(epoch_us),
-                # 只落最近一批的 id，文件不会无限增长。
-                "recent_event_ids": sorted(self._seen_ids)[-20000:],
+                # 单轮 API 最多返回 _MAX_PAGES * _API_PAGE_SIZE 条；完整保存
+                # 当前回放窗的 id，不能随机截断后让下一轮重新灌入旧事件。
+                "recent_event_ids": sorted(self._seen_ids),
                 "updated_utc": utc_now_text(),
             }
         )
@@ -297,11 +307,12 @@ class SlowLogCollector:
 
     def _run(self) -> None:
         LOGGER.info(
-            "慢日志采集启动: instance=%s node=%s poll=%ss lag=%ss",
+            "慢日志采集启动: instance=%s node=%s poll=%ss lag=%ss replay=%ss",
             self.config.instance_id,
             self.config.node_id or "(默认)",
             self.config.poll_seconds,
             self.config.lag_seconds,
+            self.config.replay_seconds,
         )
         watermark = self._load_watermark()
         if watermark <= 0:
@@ -313,8 +324,7 @@ class SlowLogCollector:
             started = time.monotonic()
             try:
                 watermark, ingested = self._poll_once(watermark)
-                if ingested:
-                    self._save_watermark(watermark)
+                self._save_watermark(watermark)
                 self._set_status(
                     lastPollUtc=utc_now_text(),
                     lastError="",
@@ -352,18 +362,22 @@ class SlowLogCollector:
 
     def _poll_once(self, watermark_epoch_us: int) -> tuple[int, int]:
         now = time.time()
-        window_end = now - self.config.lag_seconds
-        window_start = watermark_epoch_us / 1_000_000
-        if window_end <= window_start:
+        forward_end = now - self.config.lag_seconds
+        forward_start = watermark_epoch_us / 1_000_000
+        if forward_end <= forward_start:
             return watermark_epoch_us, 0
         limit = self.config.max_window_minutes * 60
-        window_end = min(window_end, window_start + limit)
-        start_ms = int(window_start * 1000)
-        end_ms = int(window_end * 1000)
+        forward_end = min(forward_end, forward_start + limit)
+        # Watermark advancement and query start are deliberately separate:
+        # replay must not slow forward progress, but it must revisit records whose
+        # QueryStartTime predates the point at which DAS finally published them.
+        query_start = max(forward_start - self.config.replay_seconds, 0)
+        start_ms = int(query_start * 1000)
+        end_ms = int(forward_end * 1000)
         self._set_status(
             lastWindow=(
-                f"{datetime.fromtimestamp(window_start, UTC):%Y-%m-%dT%H:%M:%SZ} → "
-                f"{datetime.fromtimestamp(window_end, UTC):%Y-%m-%dT%H:%M:%SZ}"
+                f"{datetime.fromtimestamp(query_start, UTC):%Y-%m-%dT%H:%M:%SZ} → "
+                f"{datetime.fromtimestamp(forward_end, UTC):%Y-%m-%dT%H:%M:%SZ}"
             )
         )
 
@@ -402,23 +416,48 @@ class SlowLogCollector:
                 break
             page += 1
 
-        events = self._build_events(records)
+        events, observed_ids = self._build_event_batch(records)
         if events:
-            self._ingest_batch(events)
+            try:
+                existing_ids = self.storage.slowlog_existing_event_ids(
+                    (str(event["event_id"]) for event in events),
+                    self.config.instance_id,
+                )
+            except Exception:  # noqa: BLE001 - index lag/failure must not lose source data
+                LOGGER.warning(
+                    "慢日志历史去重索引暂不可用，回退为稳定 event_id 去重",
+                    exc_info=True,
+                )
+                existing_ids = set()
+            if existing_ids:
+                events = [
+                    event
+                    for event in events
+                    if str(event["event_id"]) not in existing_ids
+                ]
+        if events:
+            # Commit first, then publish observed ids.  Publishing before commit
+            # made a transient SQLite lock permanently suppress the retry.
+            with _SLOWLOG_INGEST_LOCK:
+                self._ingest_batch(events)
             with self._status_lock:
                 self._status["ingestedTotal"] += len(events)
                 self._status["lastBatchRows"] = len(events)
         else:
             self._set_status(lastBatchRows=0)
+        self._seen_ids = observed_ids
         # DAS 的 OrderBy 不支持按时间排序，拿不到"最后一条的时间"，所以水位线按
-        # 窗口末尾推进——本轮已经翻完窗口内所有页。页数触顶时不推进，下一轮重来。
+        # 前向窗口末尾推进。页数触顶时不推进，下一轮重来。
         if truncated:
             return watermark_epoch_us, len(events)
-        return int(window_end * 1_000_000), len(events)
+        return int(forward_end * 1_000_000), len(events)
 
-    def _build_events(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _build_event_batch(
+        self,
+        records: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], set[str]]:
         events: list[dict[str, Any]] = []
-        seen_now: set[str] = set()
+        observed_ids: set[str] = set()
         for index, record in enumerate(records):
             sql_text = str(record.get("SQLText") or "").strip()
             if not sql_text:
@@ -447,9 +486,10 @@ class SlowLogCollector:
                 ).encode("utf-8", "replace")
             ).hexdigest()
             event_id = f"slow-{digest[:40]}"
-            if event_id in self._seen_ids or event_id in seen_now:
+            already_observed = event_id in observed_ids
+            observed_ids.add(event_id)
+            if event_id in self._seen_ids or already_observed:
                 continue
-            seen_now.add(event_id)
             database = str(record.get("DBName") or "")
             prefix_parts = [part for part in (account, client_ip) if part]
             prefix = f"/* {'@'.join(prefix_parts)}" if prefix_parts else "/* slow-log"
@@ -538,9 +578,12 @@ class SlowLogCollector:
                     "transaction_context_id": "",
                 }
             )
-        if seen_now:
-            # 只保留本轮见到的 id：水位线之前的窗口不会再被拉到，留着只会无限增长。
-            self._seen_ids = seen_now
+        return events, observed_ids
+
+    def _build_events(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Pure compatibility helper used by focused parser tests."""
+
+        events, _observed_ids = self._build_event_batch(records)
         return events
 
     def _ingest_batch(self, events: list[dict[str, Any]]) -> None:
@@ -552,7 +595,15 @@ class SlowLogCollector:
                 "%Y-%m-%dT%H:%M:%SZ"
             )
 
-        stamp = f"{begin_us}-{end_us}"
+        event_set_digest = hashlib.sha256(
+            "\x1f".join(sorted(str(item["event_id"]) for item in events)).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:16]
+        # Two late-arrival batches can share the same min/max timestamp while
+        # containing different events.  Include content identity so an older
+        # completed metadata row cannot make the new recovery batch look done.
+        stamp = f"{begin_us}-{end_us}-{event_set_digest}"
         source_scope = "/".join(
             part for part in (self.config.instance_id, self.config.node_id) if part
         )
