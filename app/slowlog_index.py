@@ -68,37 +68,6 @@ def slowlog_order_key(
     )
 
 
-class _ArgMaxEvent:
-    """Return the event id attached to the greatest deterministic metric key."""
-
-    def __init__(self) -> None:
-        self.best_key: tuple[int, int, int, str] | None = None
-        self.best_event_id = ""
-
-    def step(
-        self,
-        event_id: Any,
-        primary: Any,
-        secondary: Any,
-        event_epoch_us: Any,
-    ) -> None:
-        value = str(event_id or "")
-        if not value:
-            return
-        key = (
-            int(primary or 0),
-            int(secondary or 0),
-            int(event_epoch_us or 0),
-            value,
-        )
-        if self.best_key is None or key > self.best_key:
-            self.best_key = key
-            self.best_event_id = value
-
-    def finalize(self) -> str:
-        return self.best_event_id
-
-
 CLICKHOUSE_SLOWLOG_SCHEMA = pa.schema(
     [
         ("event_id", pa.string()),
@@ -657,7 +626,6 @@ class SlowLogIndex:
             _decompress_sql,
             deterministic=True,
         )
-        conn.create_aggregate("slowlog_arg_max", 4, _ArgMaxEvent)
         cancelled: list[BaseException] = []
         if control is not None:
             def check_cancelled() -> int:
@@ -1779,6 +1747,45 @@ class SlowLogIndex:
     def _statement_row(row: sqlite3.Row) -> dict[str, Any]:
         return slowlog_statement_result(row)
 
+    @staticmethod
+    def _attach_extreme_event_ids(
+        conn: sqlite3.Connection,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        fingerprints = sorted(
+            {str(row.get("fingerprint") or "") for row in rows}
+            - {""}
+        )
+        for row in rows:
+            row["max_scan_event_id"] = ""
+            row["max_query_event_id"] = ""
+        if not fingerprints:
+            return
+        placeholders = ",".join("?" for _ in fingerprints)
+        extremes = conn.execute(
+            "SELECT s.fingerprint, "
+            "COALESCE((SELECT e.event_id FROM temp.slow_events_scope e "
+            "WHERE e.fingerprint = s.fingerprint "
+            "ORDER BY e.rows_examined DESC, e.query_time_ms DESC, "
+            "e.event_epoch_us DESC, e.event_id DESC LIMIT 1), '') "
+            "AS max_scan_event_id, "
+            "COALESCE((SELECT e.event_id FROM temp.slow_events_scope e "
+            "WHERE e.fingerprint = s.fingerprint "
+            "ORDER BY e.query_time_ms DESC, e.rows_examined DESC, "
+            "e.event_epoch_us DESC, e.event_id DESC LIMIT 1), '') "
+            "AS max_query_event_id "
+            "FROM temp.slow_scope s "
+            f"WHERE s.fingerprint IN ({placeholders})",
+            tuple(fingerprints),
+        ).fetchall()
+        by_fingerprint = {str(row["fingerprint"]): row for row in extremes}
+        for row in rows:
+            extreme = by_fingerprint.get(str(row.get("fingerprint") or ""))
+            if extreme is None:
+                continue
+            row["max_scan_event_id"] = str(extreme["max_scan_event_id"] or "")
+            row["max_query_event_id"] = str(extreme["max_query_event_id"] or "")
+
     def summarize(
         self,
         *,
@@ -1860,14 +1867,6 @@ class SlowLogIndex:
                        MIN(e.operation) AS operation,
                        MAX(e.sql_id) AS sql_id,
                        MIN(e.event_id) AS sample_event_id,
-                       slowlog_arg_max(
-                           e.event_id, e.rows_examined,
-                           e.query_time_ms, e.event_epoch_us
-                       ) AS max_scan_event_id,
-                       slowlog_arg_max(
-                           e.event_id, e.query_time_ms,
-                           e.rows_examined, e.event_epoch_us
-                       ) AS max_query_event_id,
                        MIN(st.action) AS action,
                        MIN(st.normalized_sql) AS normalized_sql,
                        MIN(st.sample_sql) AS sample_sql
@@ -1944,6 +1943,7 @@ class SlowLogIndex:
                 """,
                 {"width": width},
             ).fetchall()
+            self._attach_extreme_event_ids(conn, orders[order])
             sample_ids = {
                 str(row.get(key) or "")
                 for row in orders[order]

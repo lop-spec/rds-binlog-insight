@@ -233,7 +233,7 @@ binlog 的争用风险推断，界面同样如实标注：
 OSS 以约 128 MiB 聚合后提交，每文件最多积压两个上传任务。DuckDB 溢写继续
 使用 `/data/scratch` 的 NVMe，不占 RAM 暂存盘。
 
-## 慢 SQL 的完整性、Node ID 与明细（v1.26.5）
+## 慢 SQL 的完整性、Node ID 与明细（v1.26.5+）
 
 DAS 按 `QueryStartTime` 过滤，但慢日志可能到语句执行结束后才发布。采集器因此在
 前向水位之外默认回放最近 7,200 秒；`replaySeconds` 可在每个采集项中覆盖。事件只在
@@ -281,7 +281,7 @@ Node ID 从新采集事件开始持久化；升级前已入索引但没有节点
 
 ## ClickHouse 分析层（v1.24.0）
 
-### 全历史 OSS v3（v1.26.4，v1.26.5 持续兼容）
+### 全历史 OSS v3（v1.26.4，v1.26.6 持续兼容）
 
 v3 不再把 ClickHouse 定义为最近若干天的缓存。所有查询可见 database part 都以
 `history_days=0` 回填到 OSS-backed MergeTree，原始数据仍保存在 OSS，扩容后的
@@ -290,7 +290,7 @@ MV 的两阶段 staging 回填，验证双表后按日期 `MOVE PARTITION`；随
 pack、实时新增、内容替换和删除进入同一 durable manifest。任一请求窗口覆盖不完整时
 仍自动回到原 Parquet/OSS 链路，因此迁移期间和故障时都不会形成查询空洞。
 
-`1.26.5-rawoss` 对直接查询原始 OSS 的路径采用独立保护：单次 S3 查询最多组合 4 个
+`1.26.6-rawoss` 对直接查询原始 OSS 的路径采用独立保护：单次 S3 查询最多组合 4 个
 对象，Parquet reader 使用 1024 行 block、单下载/解析线程并关闭 row-group 预取，
 继续保留 500 MB 交互查询上限。raw-serving 已声明全量接管后，ClickHouse 异常会返回
 明确的 `CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE`（HTTP 503），不会再在 Web 进程内
