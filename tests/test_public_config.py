@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.config import Settings
+from app.config import APP_VERSION, Settings
 from app.exact_index import _load_schema_registry
 from app.tabularis_audit import AuditIngestError, TabularisAuditIngest
 from tools.backfill_audit_log import _instance_aliases
@@ -117,6 +117,20 @@ class RuntimeIdentifierConfigTests(unittest.TestCase):
                 _instance_aliases(),
                 {"primary-db": "rm-example-primary"},
             )
+
+    def test_release_version_is_consistent_across_build_artifacts(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+        workflow = (root / ".github" / "workflows" / "build-image.yml").read_text(
+            encoding="utf-8"
+        )
+        compose = (root / "compose.yaml").read_text(encoding="utf-8")
+        index = (root / "web" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn(f'org.opencontainers.image.version="{APP_VERSION}"', dockerfile)
+        self.assertIn(f"VERSION: {APP_VERSION}", workflow)
+        self.assertIn(f"local/rds-binlog-insight:{APP_VERSION}", compose)
+        self.assertIn(f"app.js?v={APP_VERSION}", index)
 
     def test_sqlite_indexers_do_not_inherit_clickhouse_serving_routes(self) -> None:
         compose = (
