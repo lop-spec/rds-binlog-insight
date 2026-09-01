@@ -59,6 +59,25 @@ class RuntimeIdentifierConfigTests(unittest.TestCase):
         )
         self.assertEqual(ingest.allowed_instances, {"rm-example-a", "rm-example-b"})
 
+    def test_audit_accepts_unknown_client_result_status(self) -> None:
+        ingest = self._ingest(
+            instance_id="mongodb-example",
+            allowed_instances="mongodb-example",
+        )
+        event = _audit_event("mongodb-example")
+        event["execution_status"] = "unknown"
+
+        self.assertEqual(
+            ingest._validate_event(event)["execution_status"],
+            "unknown",
+        )
+
+    def test_unknown_client_result_status_has_a_human_label(self) -> None:
+        app_js = (
+            Path(__file__).resolve().parents[1] / "web" / "app.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn('unknown: "结果未知"', app_js)
+
     def test_exact_registry_uses_external_runtime_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "registry.json"

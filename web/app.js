@@ -279,7 +279,7 @@ function operationClass(value) {
 }
 
 function executionStatusLabel(value) {
-  return ({ success: "成功", failed: "失败", cancelled: "已取消" })[value] || value || "";
+  return ({ success: "成功", failed: "失败", cancelled: "已取消", unknown: "结果未知" })[value] || value || "";
 }
 
 function executionStatusClass(value) {

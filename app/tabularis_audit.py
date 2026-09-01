@@ -12,7 +12,9 @@ from .storage import EventStorage
 
 # 投递方必须用 RDS 实例 ID，与 binlog / general log 两条链路同一口径。允许列表
 # 来自运行时配置，避免把任何部署环境的实例标识写入镜像或源代码。
-_ALLOWED_STATUSES = frozenset({"success", "failed", "cancelled", "skipped"})
+_ALLOWED_STATUSES = frozenset(
+    {"success", "failed", "cancelled", "skipped", "unknown"}
+)
 _MAX_EVENTS = 1000
 _MAX_SQL_LENGTH = 1_000_000
 _MAX_TEXT_LENGTH = 4000

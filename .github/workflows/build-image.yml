@@ -10,15 +10,15 @@ on:
         default: false
   push:
     tags:
-      - v1.26.6-rawoss
+      - v1.26.7-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.26.6-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.26.6-rawoss
+  VERSION: 1.26.7-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.26.7-rawoss
 
 jobs:
   build-test-package:

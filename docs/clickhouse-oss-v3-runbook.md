@@ -1,6 +1,6 @@
 # ClickHouse OSS v3 全历史回填与切流
 
-本流程只接受云端 CI 生成的 `1.26.6-rawoss` 镜像。整个迁移是加法变更：
+本流程只接受云端 CI 生成的 `1.26.7-rawoss` 镜像。整个迁移是加法变更：
 旧查询链、旧镜像、v2 表和源 OSS 对象均保留；在所有硬门通过前，
 `RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED` 必须保持 `0`。
 
