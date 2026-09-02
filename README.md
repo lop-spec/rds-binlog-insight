@@ -290,7 +290,7 @@ MV 的两阶段 staging 回填，验证双表后按日期 `MOVE PARTITION`；随
 pack、实时新增、内容替换和删除进入同一 durable manifest。任一请求窗口覆盖不完整时
 仍自动回到原 Parquet/OSS 链路，因此迁移期间和故障时都不会形成查询空洞。
 
-`1.26.9-rawoss` 对直接查询原始 OSS 的路径采用独立保护：单次 S3 查询最多组合 4 个
+`1.26.10-rawoss` 对直接查询原始 OSS 的路径采用独立保护：单次 S3 查询最多组合 4 个
 对象，Parquet reader 使用 1024 行 block、单下载/解析线程并关闭 row-group 预取，
 继续保留 500 MB 交互查询上限。raw-serving 已声明全量接管后，ClickHouse 异常会返回
 明确的 `CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE`（HTTP 503），不会再在 Web 进程内

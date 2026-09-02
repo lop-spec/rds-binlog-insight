@@ -32,6 +32,20 @@ LOGGER = logging.getLogger(__name__)
 STATUS_NAME = "clickhouse-raw-oss-worker-status.json"
 
 
+def _sync_progressed(
+    ingested: dict[str, Any] | None,
+    *sync_results: dict[str, int],
+) -> bool:
+    return bool(
+        ingested
+        or any(
+            int(result.get("inserted") or 0)
+            or int(result.get("acknowledged") or 0)
+            for result in sync_results
+        )
+    )
+
+
 def run_worker(data_dir: Path, *, once: bool = False) -> int:
     base_config = ClickHouseConfig.from_env()
     raw_config = ClickHouseRawOssConfig.from_env()
@@ -170,7 +184,7 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
                     )
                     if once:
                         return 0
-                    if not ingested and not before["scanned"]:
+                    if not _sync_progressed(ingested, before, after):
                         time.sleep(idle_seconds)
                 except IngestPaused as exc:
                     was_paused = io_pressure_paused

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from app.clickhouse_client import ClickHouseConfig
 from app.clickhouse_raw_oss import ClickHouseRawOssConfig
-from app.clickhouse_raw_worker import run_worker
+from app.clickhouse_raw_worker import _sync_progressed, run_worker
 from app.io_pressure import IoPressurePaused
 
 
@@ -47,6 +47,20 @@ def _raw_config() -> ClickHouseRawOssConfig:
 
 
 class RawOssWorkerAdmissionTest(unittest.TestCase):
+    def test_deferred_source_scan_without_applied_changes_is_idle(self):
+        deferred = {
+            "rounds": 1,
+            "scanned": 6,
+            "inserted": 0,
+            "acknowledged": 0,
+            "deferred": 6,
+        }
+        self.assertFalse(_sync_progressed(None, deferred, deferred))
+        self.assertTrue(_sync_progressed({"state": "ready"}, deferred, deferred))
+        self.assertTrue(
+            _sync_progressed(None, deferred, {**deferred, "acknowledged": 1})
+        )
+
     def test_healthy_serving_canary_overrides_host_psi_for_one_bounded_part(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
