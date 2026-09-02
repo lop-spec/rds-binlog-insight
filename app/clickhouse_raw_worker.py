@@ -14,6 +14,7 @@ from .clickhouse_ingest import (
     HealthCanary,
     IngestPartError,
     IngestPaused,
+    _admit_io_pressure,
     _worker_lock,
     ingest_one,
 )
@@ -73,6 +74,8 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
         canary = HealthCanary(packed_config)
         recovered = pack_manifest.recover_loading()
         stopping = False
+        io_pressure_paused = False
+        io_pressure_override_active = False
 
         def stop(_signum: int, _frame: Any) -> None:
             nonlocal stopping
@@ -93,7 +96,31 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
         try:
             while not stopping:
                 try:
-                    canary.probe()
+                    io_pressure_canary_override, pressure_exc = (
+                        _admit_io_pressure(
+                            packed_config,
+                            canary,
+                            paused=io_pressure_paused,
+                        )
+                    )
+                    if io_pressure_canary_override:
+                        io_pressure_paused = True
+                        if not io_pressure_override_active:
+                            LOGGER.warning(
+                                "Host I/O PSI is above the raw OSS worker "
+                                "ceiling but the serving canary is healthy; "
+                                "allowing one bounded part: %s",
+                                pressure_exc,
+                            )
+                        io_pressure_override_active = True
+                    else:
+                        io_pressure_paused = False
+                        if io_pressure_override_active:
+                            LOGGER.info(
+                                "Host I/O PSI recovered below the raw OSS "
+                                "worker ceiling"
+                            )
+                        io_pressure_override_active = False
                     before = apply_pending_raw_oss_changes(
                         metadata,
                         pack_manifest,
@@ -113,6 +140,7 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
                         paths["root"],
                         health_probe=canary.probe,
                         prefer_newest=False,
+                        allow_high_io_pressure=io_pressure_canary_override,
                         verify_name_table=False,
                     )
                     after = apply_pending_raw_oss_changes(
@@ -133,6 +161,9 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
                             "reconcileBefore": before,
                             "lastPart": ingested or {},
                             "reconcileAfter": after,
+                            "ioPressureCanaryOverride": (
+                                io_pressure_canary_override
+                            ),
                             "source": metadata.clickhouse_change_tracking_state(),
                             "pack": pack_manifest.stats(),
                         },
@@ -142,6 +173,11 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
                     if not ingested and not before["scanned"]:
                         time.sleep(idle_seconds)
                 except IngestPaused as exc:
+                    was_paused = io_pressure_paused
+                    io_pressure_paused = True
+                    if not was_paused:
+                        LOGGER.warning("Raw OSS worker paused: %s", exc)
+                    io_pressure_override_active = False
                     write_json_status(
                         status_path,
                         {

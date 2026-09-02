@@ -30,7 +30,7 @@ RUN curl --fail --show-error --silent --location \
 FROM python:3.12-slim-bookworm@sha256:b64e9d3a71eddaa1b3f80c04abf292b3139e3b7c4dd272d19c31dc1f91194d1b
 
 LABEL org.opencontainers.image.title="RDS Binlog Insight" \
-      org.opencontainers.image.version="1.26.8-rawoss" \
+      org.opencontainers.image.version="1.26.9-rawoss" \
       org.opencontainers.image.sqlite.version="3.53.4"
 
 COPY --from=sqlite-builder /usr/local/lib/ /usr/local/lib/
