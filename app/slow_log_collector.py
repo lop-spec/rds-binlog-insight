@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import ssl
 import tempfile
 import threading
@@ -56,6 +57,12 @@ DAS_ENDPOINT = "https://das.cn-shanghai.aliyuncs.com"
 # Serialize only their short commit section so synchronized polls cannot make
 # each other fail with SQLite "database is locked".
 _SLOWLOG_INGEST_LOCK = threading.Lock()
+# The slow-log index is shared with the isolated indexer process.  Its 15 s
+# busy_timeout absorbs ordinary writes; a longer holder (part rebuild,
+# checkpoint, migration) must not turn an already persisted batch into a
+# silently unqueued one.
+_ENQUEUE_ATTEMPTS = 4
+_ENQUEUE_RETRY_SECONDS = 5.0
 _OPERATIONS = {
     "select": "SELECT",
     "insert": "INSERT",
@@ -274,6 +281,45 @@ class SlowLogCollector:
     def status(self) -> dict[str, Any]:
         with self._status_lock:
             return dict(self._status)
+
+    def _enqueue_with_retry(self, parts: list[dict[str, Any]]) -> int:
+        """Queue published parts for the indexer, riding out a busy writer.
+
+        Retries a bounded number of times on SQLite lock contention and leaves
+        a trace on every failure path.  After the final failure the parts are
+        already durable on disk and in metadata; the indexer's reconcile sweep
+        re-queues them, so the loss is latency, never data.
+        """
+
+        attempts = max(int(_ENQUEUE_ATTEMPTS), 1)
+        for attempt in range(1, attempts + 1):
+            try:
+                return int(self.storage.slowlog_index.enqueue_parts(parts))
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                if attempt >= attempts:
+                    LOGGER.error(
+                        "慢日志分区入队放弃: 连续 %s 次遇到 %s;%s 个分区已落盘但未入队,"
+                        "等待索引器 reconcile 补齐",
+                        attempt,
+                        exc,
+                        len(parts),
+                    )
+                    self._set_status(
+                        lastIndexError=f"enqueue: {type(exc).__name__}: {exc}"
+                    )
+                    raise
+                LOGGER.warning(
+                    "慢日志分区入队遇到写锁 (%s/%s): %s;%.0fs 后重试",
+                    attempt,
+                    attempts,
+                    exc,
+                    _ENQUEUE_RETRY_SECONDS,
+                )
+                time.sleep(_ENQUEUE_RETRY_SECONDS)
+        raise AssertionError("unreachable")
 
     def _set_status(self, **values: Any) -> None:
         with self._status_lock:
@@ -662,7 +708,7 @@ class SlowLogCollector:
             )
             self.metadata.set_file_state(file_id, "stored", event_count=count)
             self.metadata.set_file_state(file_id, "done", event_count=count)
-            queued_parts = self.storage.slowlog_index.enqueue_parts(parts)
+            queued_parts = self._enqueue_with_retry(parts)
             self._set_status(
                 lastQueuedParts=queued_parts,
                 # 建索引属于独立 indexer 进程；主服务只负责持久化和入队。

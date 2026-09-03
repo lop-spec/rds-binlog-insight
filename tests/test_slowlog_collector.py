@@ -92,6 +92,41 @@ def _collector(root: Path, storage: _Storage, client: _Client) -> SlowLogCollect
 
 
 class SlowLogCollectorReliabilityTests(unittest.TestCase):
+    def test_enqueue_retries_bounded_on_sqlite_lock_and_leaves_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = _Storage(Path(directory))
+            collector = _collector(Path(directory), storage, _Client(_record()))
+            locked = sqlite3.OperationalError("database is locked")
+            storage.slowlog_index = Mock(  # type: ignore[attr-defined]
+                enqueue_parts=Mock(side_effect=[locked, locked, 2])
+            )
+            parts = [{"path": "/data/events/a.parquet"}, {"path": "/data/events/b.parquet"}]
+
+            with patch("app.slow_log_collector.time.sleep") as sleep:
+                self.assertEqual(collector._enqueue_with_retry(parts), 2)
+            self.assertEqual(storage.slowlog_index.enqueue_parts.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+
+            storage.slowlog_index = Mock(  # type: ignore[attr-defined]
+                enqueue_parts=Mock(side_effect=locked)
+            )
+            with patch("app.slow_log_collector.time.sleep") as sleep:
+                with self.assertLogs("app.slow_log_collector", level="ERROR") as logs:
+                    with self.assertRaisesRegex(sqlite3.OperationalError, "locked"):
+                        collector._enqueue_with_retry(parts)
+            self.assertEqual(storage.slowlog_index.enqueue_parts.call_count, 4)
+            self.assertEqual(sleep.call_count, 3)
+            self.assertTrue(any("reconcile" in line for line in logs.output))
+            self.assertIn("locked", collector._status["lastIndexError"])
+
+            storage.slowlog_index = Mock(  # type: ignore[attr-defined]
+                enqueue_parts=Mock(side_effect=sqlite3.OperationalError("no such table"))
+            )
+            with patch("app.slow_log_collector.time.sleep") as sleep:
+                with self.assertRaisesRegex(sqlite3.OperationalError, "no such table"):
+                    collector._enqueue_with_retry(parts)
+            self.assertEqual(sleep.call_count, 0)
+
     def test_failed_ingest_does_not_mark_records_seen_before_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             storage = _Storage(Path(directory))

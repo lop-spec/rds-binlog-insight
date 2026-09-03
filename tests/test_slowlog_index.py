@@ -108,6 +108,67 @@ def _register_slowlog_part(
 
 
 class SlowLogIndexTests(unittest.TestCase):
+    def test_part_rebuild_removes_details_without_scanning_details_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            epoch_us = int(time.time() * 1_000_000) - 60_000_000
+            source = root / "slow.parquet"
+            first = _part(
+                source,
+                "logical-v1",
+                [
+                    _event("keep", epoch_us, rows_examined=3, rows_sent=1, query_ms=2),
+                    _event("drop", epoch_us + 1, rows_examined=3, rows_sent=1, query_ms=2),
+                ],
+            )
+            index = SlowLogIndex(root / "slowlog.sqlite3")
+            index.build_part(first, source)
+            with index.connection() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM slowlog_event_details").fetchone()[0],
+                    2,
+                )
+                plan = " ".join(
+                    str(row[-1])
+                    for row in conn.execute(
+                        "EXPLAIN QUERY PLAN DELETE FROM slowlog_event_details "
+                        "WHERE part_path = ? AND event_id IN ("
+                        "SELECT event_id FROM slowlog_events WHERE part_path = ?)",
+                        (str(source), str(source)),
+                    ).fetchall()
+                )
+            self.assertNotIn("SCAN slowlog_event_details", plan)
+            self.assertIn("SEARCH slowlog_event_details USING PRIMARY KEY", plan)
+
+            second = _part(
+                source,
+                "logical-v2",
+                [_event("keep", epoch_us, rows_examined=3, rows_sent=1, query_ms=2)],
+            )
+            second["content_revision"] = 2
+            index.build_part(second, source)
+            with index.connection() as conn:
+                remaining = [
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT event_id FROM slowlog_event_details ORDER BY event_id"
+                    ).fetchall()
+                ]
+                events = conn.execute("SELECT count(*) FROM slowlog_events").fetchone()[0]
+            self.assertEqual(remaining, ["keep"])
+            self.assertEqual(events, 1)
+
+            index.remove_path(str(source))
+            with index.connection() as conn:
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM slowlog_event_details").fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    conn.execute("SELECT count(*) FROM slowlog_parts").fetchone()[0],
+                    0,
+                )
+
     def test_summary_verifier_can_keep_temp_tables_in_memory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

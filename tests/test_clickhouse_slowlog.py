@@ -254,6 +254,31 @@ class ClickHouseSlowLogSchemaTests(unittest.TestCase):
             ):
                 gate.check(now=now)
 
+    def test_source_reconcile_sweep_alone_does_not_pause_clickhouse_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status_path = Path(directory) / "slowlog-worker-status.json"
+            now = datetime(2026, 9, 3, 11, 0, tzinfo=UTC)
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "running": True,
+                        "state": "completed",
+                        "updatedAt": now.isoformat().replace("+00:00", "Z"),
+                        "stats": {
+                            "pending_parts": 3,
+                            "failed_parts": 0,
+                            "oldest_pending_age_seconds": 5,
+                            "reconcile_complete": False,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gate = SourceIndexPriorityGate(status_path)
+            status = gate.check(now=now)
+            self.assertEqual(status["pending_parts"], 3)
+            self.assertFalse(status["reconcile_complete"])
+
     def test_clickhouse_lane_may_use_its_own_fuses_when_source_is_clean(self):
         with tempfile.TemporaryDirectory() as directory:
             status_path = Path(directory) / "slowlog-worker-status.json"

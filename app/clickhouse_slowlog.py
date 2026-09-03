@@ -271,8 +271,12 @@ class SourceIndexPriorityGate:
             reasons.append("source slow-log worker is in error state")
         if failed:
             reasons.append(f"source slow-log index has {failed} failed parts")
-        if not bool(stats.get("reconcile_complete")):
-            reasons.append("source slow-log reconcile is incomplete")
+        # A running reconcile sweep only re-queues crash-gap parts and says
+        # nothing about lag by itself.  At 128 registry rows per source
+        # iteration it would otherwise pause this lane for most of every hour
+        # once the registry is large (2026-09-03: 57k parts, sweep 445
+        # iterations).  Pending count and age below capture real backlog; the
+        # flag stays in the result for observability only.
         if pending > pending_limit:
             reasons.append(
                 f"source pending parts {pending} > {pending_limit}"

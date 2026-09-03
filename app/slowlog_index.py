@@ -754,6 +754,33 @@ class SlowLogIndex:
                 ),
             )
 
+    @staticmethod
+    def _delete_part_rows(conn: sqlite3.Connection, path: str) -> None:
+        """Drop one part's event rows through primary-key seeks only.
+
+        ``slowlog_event_details`` is keyed ``(event_id, part_path)`` and holds
+        the compressed SQL text, so it is the largest table in the index.  A
+        bare ``part_path`` predicate has no usable index there and scans the
+        whole table inside the ``BEGIN IMMEDIATE`` build transaction
+        (2026-09-03 production: ~1.5 GB read and two minutes per 75-row part,
+        the write lock held far longer than the collector's 15 s busy timeout,
+        so live enqueues failed with ``database is locked``).  Every detail
+        row is written together with its ``slowlog_events`` row, so the part's
+        event ids from the covering part index bound the delete to PK seeks.
+        """
+
+        conn.execute(
+            """
+            DELETE FROM slowlog_event_details
+            WHERE part_path = ?
+              AND event_id IN (
+                  SELECT event_id FROM slowlog_events WHERE part_path = ?
+              )
+            """,
+            (path, path),
+        )
+        conn.execute("DELETE FROM slowlog_events WHERE part_path = ?", (path,))
+
     def remove_path(self, path: str) -> None:
         """Remove a deleted/non-slow part from the rebuildable index and queue."""
 
@@ -761,11 +788,7 @@ class SlowLogIndex:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 conn.execute("DELETE FROM slowlog_queue WHERE part_path = ?", (str(path),))
-                conn.execute(
-                    "DELETE FROM slowlog_event_details WHERE part_path = ?",
-                    (str(path),),
-                )
-                conn.execute("DELETE FROM slowlog_events WHERE part_path = ?", (str(path),))
+                self._delete_part_rows(conn, str(path))
                 conn.execute("DELETE FROM slowlog_parts WHERE part_path = ?", (str(path),))
                 conn.execute("COMMIT")
             except BaseException:
@@ -1076,14 +1099,7 @@ class SlowLogIndex:
                     conn.execute("ROLLBACK")
                     return {"built": 0, "indexed_rows": 0, "skipped": "stale-revision"}
 
-                conn.execute(
-                    "DELETE FROM slowlog_event_details WHERE part_path = ?",
-                    (str(part["path"]),),
-                )
-                conn.execute(
-                    "DELETE FROM slowlog_events WHERE part_path = ?",
-                    (str(part["path"]),),
-                )
+                self._delete_part_rows(conn, str(part["path"]))
                 if events:
                     conn.executemany(
                         """
@@ -2100,11 +2116,7 @@ class SlowLogIndex:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 for path in stale:
-                    conn.execute(
-                        "DELETE FROM slowlog_event_details WHERE part_path = ?",
-                        (path,),
-                    )
-                    conn.execute("DELETE FROM slowlog_events WHERE part_path = ?", (path,))
+                    self._delete_part_rows(conn, path)
                     removed += int(
                         conn.execute(
                             "DELETE FROM slowlog_parts WHERE part_path = ?", (path,)
