@@ -4,6 +4,8 @@
 
 ## 已实现
 
+- [慢 SQL 性能关联排序与 Pod 详情](docs/slowlog-resource-overlap.md)：基于昨日同窗增量、执行区间和节点 IOPS 的确定性排序，不调用模型；三个固定历史性能点与原调查明确优先序匹配。Pod 身份只读获授权的元数据源，未接入和历史绑定不明均显式标注。
+
 - 使用阿里云 RDS `DescribeDBInstanceAttribute` 核验实例身份，并通过
   `DescribeDBInstanceHAConfig` 自动锁定当前 Master 节点，避免把一主多备
   的同一批 Binlog 重复解析。

@@ -44,6 +44,8 @@ from .credentials import (
 )
 from .general_log_collector import GeneralLogCollector, GeneralLogConfig
 from .slow_log_collector import SlowLogCollector, SlowLogConfig
+from .slowlog_impact_service import query_resource_overlap
+from .pod_lookup import attach_pod_detail
 from .metadata import MetadataStore
 from .pipeline import PipelineError, SyncManager
 from .query_tasks import QueryTaskManager
@@ -842,7 +844,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if result is None:
                     self._error(404, "EVENT_NOT_FOUND", "事件不存在或已超过保留期")
                 else:
+                    if result.get("raw_event_type") == "SLOW_LOG":
+                        attach_pod_detail(result, self.app.storage.paths["root"])
                     self._json({"ok": True, "data": result})
+            elif parsed.path == "/api/slowlog-impact":
+                settings = self.app.metadata.load_settings()
+                result = query_resource_overlap(
+                    self.app.metadata,
+                    self.app.storage.clickhouse_slowlog_backend,
+                    _analytics_query(query), settings,
+                )
+                self._json({"ok": True, "data": result})
             elif parsed.path == "/api/analytics":
                 settings = self.app.metadata.load_settings()
                 analytics_query = _analytics_query(query)

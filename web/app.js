@@ -592,6 +592,7 @@ async function openDetail(eventId, locator = "", instance = "") {
         ${detailMeta("Node ID", row.node_id)}
         ${detailMeta("数据库账号", row.database_account)}
         ${detailMeta("客户端 IP", row.connection_name)}
+        ${podDetail(row.pod)}
         ${detailMeta("Thread", row.thread_id ? String(row.thread_id) : "—")}
         ${detailMeta("来源", "RDS 慢日志")}
       </div>
@@ -1658,6 +1659,8 @@ async function runAnalytics(orderOverride = "") {
     `${$("#analytics-start").value.replace('T', ' ')} → ${$("#analytics-end").value.replace('T', ' ')}`,
     $("#analytics-filter-summary").textContent].filter(Boolean).join(' · ');
   const result = await api(`/api/analytics?${query}`);
+  state.analyticsQuery = query;
+  state.performanceCache = null;
   renderAnalytics(result);
   $("#analytics-meta").textContent = scope;
   const pending = Number(result.coverage?.pending_parts || 0);
