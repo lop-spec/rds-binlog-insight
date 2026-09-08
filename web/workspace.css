@@ -1,0 +1,56 @@
+/* Workspace controls share one disclosure pattern across query and analysis. */
+summary { cursor: pointer; }
+summary:focus-visible { outline: 3px solid #a8c9f7; outline-offset: 3px; border-radius: 5px; }
+.compact-notice > span strong { display: inline; }
+.service-overview { margin: 12px 0; color: var(--muted); font-size: 12px; }
+.service-overview .summary-strip { margin: 10px 0 16px; }
+.nav-management { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 14px; }
+.nav-management > summary { padding: 7px 12px; color: var(--muted); font-size: 12px; }
+.nav-management:has(.is-active) { border-color: #adc9eb; }
+.range-picker { display: inline-flex; align-items: center; flex-shrink: 0; gap: 8px; color: var(--muted); font-size: 12px; }
+.range-picker select { background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 7px 28px 7px 10px; font-size: 13px; max-width: 190px; }
+.filter-disclosure { border-top: 1px solid var(--border); padding-top: 10px; }
+.filter-disclosure > summary { display: list-item; width: fit-content; color: var(--accent); font-size: 13px; }
+.filter-disclosure .query-grid { margin-top: 12px; padding-bottom: 8px; }
+.filter-count { color: var(--muted); }
+.active-filters { font-size: 12px; color: var(--accent); overflow-wrap: anywhere; }
+.action-menu { position: relative; }
+.action-menu > summary { list-style: none; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; color: var(--muted); background: var(--surface); }
+.action-menu > summary::after { content: ' ▾'; }
+.action-menu > summary::-webkit-details-marker { display: none; }
+.menu-content { position: absolute; top: calc(100% + 6px); left: 0; min-width: 150px; z-index: 25; display: grid; padding: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow-overlay); }
+.menu-content .button { justify-content: flex-start; }
+.analytics-more { margin: 16px 0 8px; border-top: 1px solid var(--border); padding-top: 12px; }
+.analytics-more > summary { width: fit-content; margin-bottom: 12px; color: var(--muted); font-size: 12px; }
+.slowlog-ranking .analytics-table { width: 100%; min-width: 860px; table-layout: fixed; }
+.slowlog-ranking .analytics-table th:first-child { width: 37% !important; }
+.slowlog-ranking .analytics-table th:nth-child(2) { width: 110px !important; }
+.slowlog-ranking .analytics-table th:not(:first-child), .slowlog-ranking .analytics-table td:not(:first-child) { white-space: nowrap; font-size: 12px; }
+.slowlog-ranking .analytics-table th { position: sticky; top: 0; background: var(--surface-soft); z-index: 1; }
+.slowlog-ranking .table-wrap { max-height: 620px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; }
+.slowlog-ranking .slow-sql-link, .slowlog-ranking .sql-cell { max-width: 100%; width: 100%; }
+.slowlog-ranking .sql-cell { white-space: normal; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; color: var(--accent); line-height: 1.6; }
+.correlation-cell { display: grid; gap: 2px; text-align: left; border: 0; background: transparent; padding: 0; cursor: pointer; }
+.correlation-cell strong { color: var(--accent); font-size: 14px; font-variant-numeric: tabular-nums; }
+.correlation-cell span { color: var(--muted); font-size: 10px; }
+.detail-drawer { width: min(760px, 100vw); }
+.sql-aggregate { padding: 16px; margin-bottom: 22px; border: 1px solid var(--border); border-radius: 10px; background: #f8faff; }
+.sql-aggregate .analytics-more .table-wrap { max-height: 300px; overflow: auto; }
+.sql-aggregate .analytics-table td, .sql-aggregate .analytics-table th { white-space: nowrap; }
+.detail-meta strong { overflow-wrap: anywhere; }
+.compact-kpis .stat-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.compact-kpis > .stat-tiles > .stat-tile { padding: 14px 16px; }
+.compact-kpis .analytics-more { margin-top: 6px; border-top: 0; padding-top: 0; }
+.compact-kpis .analytics-more > summary { margin-bottom: 4px; }
+@media (max-width: 1100px) {
+  .topbar-actions .retention-label { display: none; }
+  .workspace { padding-inline: 18px; }
+  .slowlog-ranking .analytics-table th:first-child { width: 29% !important; }
+}
+@media (max-width: 760px) {
+  .compact-kpis .stat-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .range-picker { flex-wrap: wrap; }
+  .panel-heading { align-items: flex-start; flex-wrap: wrap; }
+  .nav-management { margin-top: 0; padding-top: 0; border-top: 0; }
+  .nav-management[open] { min-width: 140px; }
+}

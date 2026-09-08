@@ -10,15 +10,15 @@ on:
         default: false
   push:
     tags:
-      - v1.26.11-rawoss
+      - v1.27.0-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.26.11-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.26.11-rawoss
+  VERSION: 1.27.0-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.27.0-rawoss
 
 jobs:
   build-test-package:
@@ -72,6 +72,8 @@ jobs:
             tests.test_clickhouse_slowlog_verify \
             tests.test_slowlog_collector \
             tests.test_slowlog_index \
+            tests.test_slowlog_correlation \
+            tests.test_slowlog_correlation_engines \
             tests.test_clickhouse_stage \
             tests.test_clickhouse_oss_verify \
             tests.test_clickhouse_poc_benchmark \
@@ -82,6 +84,9 @@ jobs:
           test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$LOCAL_IMAGE")" = "$VERSION"
           docker run --rm --entrypoint python "$LOCAL_IMAGE" -c \
             "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"
+
+      - name: Verify workspace rendering and disclosure contracts
+        run: node --test tests/test_workspace.cjs
 
       - name: Export immutable deployment artifact
         shell: bash

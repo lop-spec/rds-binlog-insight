@@ -755,6 +755,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("app.css")
             elif parsed.path == "/assets/app.js":
                 self._serve_static("app.js")
+            elif parsed.path == "/assets/workspace.js":
+                self._serve_static("workspace.js")
+            elif parsed.path == "/assets/workspace.css":
+                self._serve_static("workspace.css")
             elif parsed.path == "/favicon.svg":
                 self._serve_static("favicon.svg")
             elif parsed.path == "/healthz":

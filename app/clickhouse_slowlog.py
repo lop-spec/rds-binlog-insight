@@ -26,6 +26,7 @@ from .clickhouse_manifest import (
 )
 from .clickhouse_query import query_rows_with_cancel
 from .maintenance_status import read_json_status
+from .slowlog_correlation import attach_correlations
 from .slowlog_index import (
     BUCKET_US,
     SLOWLOG_ORDER_KEYS,
@@ -948,6 +949,7 @@ class ClickHouseSlowLogQueryBackend:
                    metric_operation AS group_operation,
                    metric_bucket AS group_ts,
                    count() AS executions,
+                   sumMap([metric_bucket], [toUInt64(1)]) AS bucket_counts,
                    sum(metric_rows_examined) AS scan_rows,
                    max(metric_rows_examined) AS scan_rows_max,
                    sum(metric_rows_sent) AS rows_sent,
@@ -1005,6 +1007,7 @@ class ClickHouseSlowLogQueryBackend:
         operations: list[dict[str, Any]] = []
         trend: list[dict[str, Any]] = []
         instances: dict[str, tuple[str, ...]] = {}
+        series: dict[str, dict[int, int]] = {}
         for row in rollups:
             mask = self._integer(row, "grouping_mask")
             if mask == _STATEMENT_GROUP_MASK:
@@ -1012,6 +1015,11 @@ class ClickHouseSlowLogQueryBackend:
                 instances[fingerprint] = tuple(
                     sorted(str(value) for value in row.get("instance_ids") or [])
                 )
+                # sumMap shares the rollup's canonical snapshot: no extra scan,
+                # no per-SQL requests and no race with a live ingest batch.
+                buckets = row.get("bucket_counts")
+                if buckets is not None:
+                    series[fingerprint] = {int(ts): int(n) for ts, n in zip(*buckets)}
                 groups.append(
                     {
                         "fingerprint": fingerprint,
@@ -1115,7 +1123,10 @@ class ClickHouseSlowLogQueryBackend:
             key=lambda row: int(row.get("events") or 0),
             reverse=True,
         )
-        trend = sorted(trend, key=lambda row: int(row.get("ts") or 0))
+        trend, correlation_meta = attach_correlations(
+            orders, trend, series,
+            start_us=start_us, end_us=end_us, width_us=width,
+        )
         order = str(query.get("order") or "executions")
         if order not in SQL_ORDERS:
             order = "executions"
@@ -1196,6 +1207,7 @@ class ClickHouseSlowLogQueryBackend:
                 "objects": objects,
                 "operations": operations,
                 "trend": trend,
+                "correlation": correlation_meta,
             },
             "transactions": slowlog_empty_transactions(),
             "locks": {

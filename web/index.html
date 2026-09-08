@@ -6,7 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.26.11-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.27.0-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.27.0-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -54,7 +55,7 @@
           <span id="service-indicator" class="state-dot"></span>
           <div><strong id="service-label">本地服务就绪</strong><span id="service-meta">正在读取状态</span></div>
         </div>
-        <span id="app-version" class="version">版本加载中 · DYNAMIC CPU + FAST ZSTD + SAFE DIRECT OSS</span>
+        <span id="app-version" class="version">版本加载中</span>
       </div>
     </aside>
 
@@ -73,12 +74,12 @@
         </div>
       </header>
 
-      <section class="summary-strip" aria-label="数据摘要">
+      <details class="service-overview"><summary>服务与同步概览</summary><section class="summary-strip" aria-label="数据摘要">
         <div class="summary-item"><span>事件总量</span><strong id="summary-events">—</strong></div>
         <div class="summary-item"><span>最新事件</span><strong id="summary-latest">—</strong></div>
         <div class="summary-item"><span>本地搜索索引</span><strong id="summary-storage">—</strong></div>
         <div class="summary-item"><span>同步状态</span><strong id="summary-sync" class="status-text">待配置</strong></div>
-      </section>
+      </section></details>
 
       <div id="setup-banner" class="notice warning" hidden>
         <svg viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5M12 18h.01"/></svg>
@@ -90,21 +91,16 @@
         <div class="query-panel">
           <div class="panel-heading">
             <div><h2>查询条件</h2><p>所有结果按真实事件时间倒序；最多单页返回 1,000 条。</p></div>
-            <div class="segmented" aria-label="快捷时间范围">
-              <button data-range="15m" type="button">15 分钟</button>
-              <button data-range="1h" type="button">1 小时</button>
-              <button data-range="24h" class="is-active" type="button">24 小时</button>
-              <button data-range="7d" type="button">7 天</button>
-              <button data-range="30d" type="button">30 天</button>
-            </div>
+            <label class="range-picker">时间范围<select id="audit-range" aria-label="查询时间范围"><option value="15m">最近 15 分钟</option><option value="1h">最近 1 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></label>
           </div>
 
           <form id="query-form" class="query-grid">
             <label class="field span-2"><span>实例</span><select id="filter-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
             <label class="field span-2"><span>开始时间</span><input id="filter-start" type="datetime-local" step="1"></label>
             <label class="field span-2"><span>结束时间</span><input id="filter-end" type="datetime-local" step="1"></label>
-            <label class="field"><span>查询方式</span><select id="filter-query-mode"><option value="keyword">常规</option><option value="primary-key">主键精确</option></select></label>
             <label class="field span-2"><span id="filter-value-label">关键词</span><input id="filter-keyword" type="search" placeholder="SQL、行值、GTID 或文件名"></label>
+            <details id="audit-filters" class="filter-disclosure span-8"><summary>更多筛选 <span class="filter-count"></span></summary><div class="query-grid">
+            <label class="field"><span>查询方式</span><select id="filter-query-mode"><option value="keyword">常规</option><option value="primary-key">主键精确</option></select></label>
             <label id="filter-keyword-mode-field" class="field"><span>匹配</span><select id="filter-keyword-mode"><option value="AND">全部词</option><option value="OR">任一词</option></select></label>
             <label class="field span-2"><span>数据库</span><input id="filter-database" type="text" placeholder="支持片段匹配"></label>
             <label class="field span-2"><span>表名</span><input id="filter-table" type="text" placeholder="支持片段匹配"></label>
@@ -121,15 +117,17 @@
               <label><input type="checkbox" value="QUERY"><span>QUERY</span></label>
               <label><input type="checkbox" value="TRANSACTION"><span>事务</span></label>
             </fieldset>
+            </div></details>
+            <div id="audit-filter-summary" class="active-filters span-8" hidden></div>
             <div id="txn-drill-chip" class="txn-drill-chip span-8" hidden></div>
             <div class="form-actions span-8">
               <button id="query-submit" class="button primary" type="submit">
                 <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>查询
               </button>
-              <button id="query-reset" class="button secondary" type="button">重置</button>
-              <button id="query-export" class="button ghost" type="button">
-                <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>导出 CSV
-              </button>
+              <details class="action-menu"><summary>更多操作</summary><div class="menu-content">
+                <button id="query-reset" class="button ghost" type="button">重置条件</button>
+                <button id="query-export" class="button ghost" type="button">导出 CSV</button>
+              </div></details>
             </div>
           </form>
         </div>
@@ -174,31 +172,28 @@
       <section id="view-analytics" class="view">
         <div class="query-panel">
           <div class="panel-heading">
-            <div><h2>分析范围</h2><p>按数据来源独立分析；慢日志按事件时间精确过滤和去重，Binlog 聚合保留原有边界口径。</p></div>
-            <div class="segmented" aria-label="快捷时间范围">
-              <button data-analytics-range="1h" type="button">1 小时</button>
-              <button data-analytics-range="6h" type="button">6 小时</button>
-              <button data-analytics-range="24h" class="is-active" type="button">24 小时</button>
-              <button data-analytics-range="7d" type="button">7 天</button>
-              <button data-analytics-range="30d" type="button">30 天</button>
-            </div>
+            <div><h2>分析范围</h2><p>查看趋势，定位高影响 SQL；更多条件按需展开。</p></div>
+            <label class="range-picker">时间范围<select id="analytics-range" aria-label="分析时间范围"><option value="1h">最近 1 小时</option><option value="6h">最近 6 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></label>
           </div>
 
           <form id="analytics-form" class="query-grid">
-            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="Binlog 用于写入与事务推断；RDS 慢日志提供真实扫描行数和耗时"><option value="binlog" selected>Binlog 写入</option><option value="slowlog">RDS 慢日志</option></select></label>
+            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="Binlog 用于写入与事务推断；RDS 慢日志提供真实扫描行数和耗时"><option value="slowlog">RDS 慢日志</option><option value="binlog">Binlog 写入</option></select></label>
             <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
             <label id="analytics-node-field" class="field span-2" hidden><span>Node ID</span><input id="analytics-node" type="text" list="analytics-node-options" maxlength="128" autocomplete="off" placeholder="留空表示全部已采集节点" title="阿里云 DAS Node ID；可从已配置节点中选择，也可直接填写"><datalist id="analytics-node-options"></datalist></label>
             <label class="field span-2"><span>开始时间</span><input id="analytics-start" type="datetime-local" step="1"></label>
             <label class="field span-2"><span>结束时间</span><input id="analytics-end" type="datetime-local" step="1"></label>
+            <details id="analytics-filters" class="filter-disclosure span-8"><summary>更多筛选 <span class="filter-count"></span></summary><div class="query-grid">
             <label class="field span-2"><span>数据库</span><input id="analytics-database" type="text" placeholder="完整库名，留空表示全部"></label>
             <label class="field span-2"><span>表名</span><input id="analytics-table" type="text" placeholder="完整表名，留空表示全部"></label>
             <label class="field"><span>操作</span><select id="analytics-operation"><option value="">全部</option><option value="SELECT">SELECT</option><option value="SHOW">SHOW</option><option value="INSERT">INSERT</option><option value="UPDATE">UPDATE</option><option value="DELETE">DELETE</option><option value="DDL">DDL</option><option value="QUERY">QUERY（其他语句）</option></select></label>
             <label class="field"><span>Top N</span><select id="analytics-limit"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
+            </div></details>
+            <div id="analytics-filter-summary" class="active-filters span-8" hidden></div>
             <div class="form-actions span-8">
               <button id="analytics-submit" class="button primary" type="submit">
                 <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-6M22 20H2"/></svg>开始分析
               </button>
-              <button id="analytics-reset" class="button secondary" type="button">重置</button>
+              <details class="action-menu"><summary>更多操作</summary><div class="menu-content"><button id="analytics-reset" class="button ghost" type="button">重置条件</button></div></details>
             </div>
           </form>
         </div>
@@ -450,12 +445,13 @@
     </main>
   </div>
 
-  <aside id="detail-drawer" class="detail-drawer" aria-hidden="true" aria-label="事件详情">
+  <aside id="detail-drawer" class="detail-drawer" role="dialog" aria-modal="true" aria-hidden="true" aria-label="SQL 与事件详情" inert>
     <div class="drawer-head"><div><p class="eyebrow">EVENT DETAIL</p><h2 id="detail-title">事件详情</h2></div><button id="close-drawer" class="icon-button" title="关闭" aria-label="关闭" type="button"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
     <div id="detail-body" class="drawer-body"></div>
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/app.js?v=1.26.11-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.27.0-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.27.0-rawoss" defer></script>
 </body>
 </html>

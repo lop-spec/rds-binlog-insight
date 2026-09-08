@@ -23,6 +23,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .sql_fingerprint import FINGERPRINT_FORMAT_VERSION, statement_profile
+from .slowlog_correlation import attach_correlations
 
 
 SLOWLOG_INDEX_VERSION = 8
@@ -1959,7 +1960,30 @@ class SlowLogIndex:
                 """,
                 {"width": width},
             ).fetchall()
-            self._attach_extreme_event_ids(conn, orders[order])
+            # One bounded aggregation for the union of all existing sort views;
+            # every count comes from the same materialized canonical scope.
+            selected = sorted({row["fingerprint"] for rows in orders.values() for row in rows})
+            series: dict[str, dict[int, int]] = {fp: {} for fp in selected}
+            if selected:
+                placeholders = ",".join("?" for _ in selected)
+                for point in conn.execute(
+                    "SELECT fingerprint, (event_epoch_us / ?) * ? AS ts, COUNT(*) AS events "
+                    "FROM temp.slow_events_scope "
+                    f"WHERE fingerprint IN ({placeholders}) GROUP BY fingerprint, ts",
+                    (width, width, *selected),
+                ):
+                    series[point["fingerprint"]][int(point["ts"])] = int(point["events"])
+            trend, correlation_meta = attach_correlations(
+                orders, [dict(row) for row in trend], series,
+                start_us=start_epoch_us, end_us=end_epoch_us, width_us=width,
+            )
+            representatives = {row["fingerprint"]: row for rows in orders.values() for row in rows}
+            self._attach_extreme_event_ids(conn, list(representatives.values()))
+            for rows in orders.values():
+                for row in rows:
+                    representative = representatives[row["fingerprint"]]
+                    row["max_scan_event_id"] = representative["max_scan_event_id"]
+                    row["max_query_event_id"] = representative["max_query_event_id"]
             sample_ids = {
                 str(row.get(key) or "")
                 for row in orders[order]
@@ -2014,7 +2038,8 @@ class SlowLogIndex:
                 "sample_events": sample_events,
                 "objects": [dict(row) for row in objects],
                 "operations": [dict(row) for row in operations],
-                "trend": [dict(row) for row in trend],
+                "trend": trend,
+                "correlation": correlation_meta,
             },
             "transactions": _empty_transactions(),
             "locks": {

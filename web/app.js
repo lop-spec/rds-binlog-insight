@@ -150,6 +150,10 @@ function switchView(name) {
     state.schemaInitialized = true;
     initSchemaView();
   }
+  if (["jobs", "storage", "settings"].includes(name)) {
+    const management = $(".nav-management");
+    if (management) management.open = true;
+  }
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -161,7 +165,7 @@ function setQuickRange(range) {
   endInput.value = toLocalInput(end);
   endInput.setCustomValidity("");
   $("#filter-start").value = toLocalInput(new Date(end.getTime() - units[range]));
-  $$("[data-range]").forEach((button) => button.classList.toggle("is-active", button.dataset.range === range));
+  $("#audit-range").value = range;
 }
 
 function setDefaultSyncWindow() {
@@ -550,13 +554,12 @@ function prettyJson(value) {
 }
 
 async function openDetail(eventId, locator = "", instance = "") {
-  const drawer = $("#detail-drawer");
+  const request = state.detailRequest = (state.detailRequest || 0) + 1;
   $("#detail-body").innerHTML = '<div class="empty-state"><strong>正在读取事件…</strong></div>';
-  drawer.classList.add("is-open");
-  drawer.setAttribute("aria-hidden", "false");
-  $("#drawer-backdrop").hidden = false;
+  showDetailDrawer();
   try {
     const row = await api(`/api/event?id=${encodeURIComponent(eventId)}&locator=${encodeURIComponent(locator)}&instance=${encodeURIComponent(instance)}`);
+    if (request !== state.detailRequest) return false;
     $("#detail-title").textContent = `${row.operation || "EVENT"} · ${row.database_name || "—"}.${row.table_name || "—"}`;
     const auditEvent = row.raw_event_type === "TABULARIS_AUDIT";
     const slowEvent = row.raw_event_type === "SLOW_LOG";
@@ -611,8 +614,10 @@ async function openDetail(eventId, locator = "", instance = "") {
       ${detailBlock("事件 ID", row.event_id)}
     `;
   } catch (error) {
+    if (request !== state.detailRequest) return false;
     $("#detail-body").innerHTML = `<div class="empty-state"><strong>读取失败</strong><span>${escapeHtml(error.message)}</span></div>`;
   }
+  return true;
 }
 
 function detailMeta(label, value) {
@@ -624,9 +629,15 @@ function detailBlock(title, content) {
 }
 
 function closeDetail() {
-  $("#detail-drawer").classList.remove("is-open");
-  $("#detail-drawer").setAttribute("aria-hidden", "true");
+  const drawer = $("#detail-drawer");
+  if (!drawer.classList.contains("is-open")) return;
+  state.detailRequest = (state.detailRequest || 0) + 1;
+  drawer.classList.remove("is-open");
+  drawer.setAttribute("aria-hidden", "true");
+  drawer.inert = true;
+  $(".app-shell").inert = false;
   $("#drawer-backdrop").hidden = true;
+  state.detailReturnFocus?.focus();
 }
 
 function renderJobStatus(job) {
@@ -985,7 +996,7 @@ async function refreshStatus() {
     syncInstanceOptions(data.instances || [], instanceLabels(data));
     syncSlowLogNodeOptions(data.slowLogs || []);
     $("#app-version").textContent =
-      `v${data.version || "—"} · DYNAMIC CPU + FAST ZSTD + SAFE DIRECT OSS`;
+      `v${data.version || "—"}`;
     const summary = data.summary || {};
     $("#summary-events").textContent = humanCount(summary.eventCount);
     $("#summary-latest").textContent = summary.latestEpochUs ? formatTime(Number(summary.latestEpochUs), true) : "暂无数据";
@@ -1068,7 +1079,8 @@ function barList(rows, { valueKey = "count", labelKey = "label", format = humanC
 function sparkline(points, { valueKey = "events" } = {}) {
   const values = points.map((point) => Number(point[valueKey] || 0));
   if (values.length < 2) return '<p class="analytics-empty">时间点不足，无法绘制趋势</p>';
-  const max = Math.max(...values, 1);
+  const peak = Math.max(...values, 0);
+  const max = Math.max(peak, 1);
   const width = 1000;
   const height = 120;
   const step = width / (values.length - 1);
@@ -1081,8 +1093,9 @@ function sparkline(points, { valueKey = "events" } = {}) {
     <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="时间趋势">
       <path class="spark-area" d="${area}"></path>
       <path class="spark-line" d="${line}"></path>
+      ${coords.map(([x, y], i) => `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="5" fill="${points[i].partial ? '#94a3b8' : 'transparent'}" stroke="none"><title>${escapeHtml(formatTime(Number(points[i].ts)))} · ${humanCount(values[i])}${points[i].partial ? '（不完整桶，不参与相关度）' : ''}</title></circle>`).join('')}
     </svg>
-    <div class="spark-axis"><span>${escapeHtml(formatTime(Number(first.ts), true))}</span><span>峰值 ${escapeHtml(humanCount(max))}</span><span>${escapeHtml(formatTime(Number(last.ts), true))}</span></div>
+    <div class="spark-axis"><span>${escapeHtml(formatTime(Number(first.ts), true))}</span><span>峰值 ${escapeHtml(humanCount(peak))}</span><span>${escapeHtml(formatTime(Number(last.ts), true))}</span></div>
   </div>`;
 }
 
@@ -1150,7 +1163,7 @@ function millisText(value) {
 
 function slowSqlDetailCell(item, order) {
   const sql = item.normalized_sql || item.sample_sql || "—";
-  const body = `${sourceMark("slowlog")}${escapeHtml(sql)}`;
+  const body = escapeHtml(sql);
   const eventId = order === "scan_rows"
     ? (item.max_scan_event_id || item.sample_event_id)
     : (order === "exec_time"
@@ -1162,7 +1175,7 @@ function slowSqlDetailCell(item, order) {
   if (!eventId) {
     return `<code class="sql-cell" title="${escapeHtml(item.sample_sql || "")}">${body}</code>`;
   }
-  return `<button class="slow-sql-link" type="button" data-slow-event-id="${escapeHtml(eventId)}" data-slow-instance="${escapeHtml(item.instance_id || "")}" title="查看该慢 SQL 的${sampleLabel}明细" aria-label="查看慢 SQL ${sampleLabel}：${escapeHtml(sql)}"><code class="sql-cell">${body}</code></button>`;
+  return `<button class="slow-sql-link" type="button" data-slow-event-id="${escapeHtml(eventId)}" data-slow-instance="${escapeHtml(item.instance_id || "")}" data-slow-fingerprint="${escapeHtml(item.fingerprint || "")}" title="查看该慢 SQL 的${sampleLabel}明细" aria-label="查看慢 SQL ${sampleLabel}：${escapeHtml(sql)}"><code class="sql-cell">${body}</code></button>`;
 }
 
 function renderAnalyticsSlowlogSql(data) {
@@ -1170,7 +1183,7 @@ function renderAnalyticsSlowlogSql(data) {
   const order = data.order || "executions";
   const executions = Number(totals.executions || 0);
   const averageMs = executions > 0 ? Number(totals.query_time_ms_total || 0) / executions : 0;
-  const tiles = statTiles([
+  const tiles = compactStatTiles([
     { label: "慢 SQL 次数", value: humanCount(executions), hint: "RDS 慢日志实际记录数" },
     { label: "实际扫描行数", value: humanCount(totals.actual_scan_rows), hint: "RowsExamined 原始值求和" },
     { label: "返回行数", value: humanCount(totals.rows_sent), hint: "RowsSent 原始值求和" },
@@ -1180,27 +1193,20 @@ function renderAnalyticsSlowlogSql(data) {
     { label: "累计锁等待", value: millisText(totals.lock_time_ms_total), hint: "LockTime 原始值求和" },
     { label: "SQL 指纹", value: humanCount(totals.fingerprints), hint: "参数归一后的慢 SQL" },
   ]);
-  const sorter = `<div class="segmented sort-bar" aria-label="慢 SQL 排序">${SLOWLOG_ORDER_LABELS.map(
-    ([key, label]) => `<button type="button" data-sql-order="${key}"${key === order ? ' class="is-active"' : ""}>${escapeHtml(label)}</button>`
-  ).join("")}</div>`;
+  const sorter = sqlSorter(SLOWLOG_ORDER_LABELS, order);
   const statements = analyticsTable(
-    ["SQL", "SQL ID", "执行次数", "实际扫描", "单次扫描", "返回行数", "扫描/返回", "累计耗时", "平均耗时", "最大耗时", "锁等待", "最近出现"],
+    ["SQL", "相关度 r", "执行次数", "实际扫描", "返回行数", "累计耗时", "最近出现"],
     (data.statements || []).map((item) => {
       const count = Number(item.executions || 0);
       const scanned = Number(item.scan_rows || 0);
       const sent = Number(item.rows_sent || 0);
       return [
         slowSqlDetailCell(item, order),
-        `<span class="mono">${escapeHtml(item.sql_id || "—")}</span>`,
+        correlationCell(item),
         `<strong>${humanCount(count)}</strong>`,
         `<strong>${humanCount(scanned)}</strong>`,
-        count > 0 ? humanCount(Math.round(scanned / count)) : "—",
         humanCount(sent),
-        sent > 0 ? `${(scanned / sent).toFixed(scanned / sent < 100 ? 1 : 0)}×` : (scanned > 0 ? "∞" : "—"),
         millisText(item.query_time_ms_total),
-        count > 0 ? millisText(Number(item.query_time_ms_total || 0) / count) : "—",
-        millisText(item.query_time_ms_max),
-        millisText(item.lock_time_ms_total),
         escapeHtml(formatTime(Number(item.last_epoch_us))),
       ];
     }),
@@ -1222,16 +1228,16 @@ function renderAnalyticsSlowlogSql(data) {
     (data.operations || []).map((item) => ({ label: item.operation || "—", count: item.events })),
   );
   return `${tiles}
-    <div class="analytics-block"><h3>慢 SQL 趋势</h3>${sparkline(data.trend || [])}</div>
-    <div class="analytics-block">
-      <div class="block-head"><h3>Top 慢 SQL</h3>${sorter}</div>
-      <p class="analytics-note"><strong>实际扫描行数</strong>来自 RDS 慢日志 <code>RowsExamined</code>，<strong>返回行数</strong>来自 <code>RowsSent</code>，查询耗时与锁等待分别来自 <code>QueryTime</code> 和 <code>LockTime</code>；这里不使用 EXPLAIN 估算。按扫描或耗时排序时，点击 SQL 会打开该指纹的最大扫描或最大耗时原始执行，包含账号、客户端 IP、线程、时间和完整 SQL。扫描/返回比高通常意味着索引选择性不足或缺少合适索引，仍需结合 SQL、过滤条件与执行计划确认。</p>
+    <div class="analytics-block"><div class="block-head"><h3>慢 SQL 次数趋势</h3><span class="muted">${humanMicros(data.correlation?.bucket_us || state.analytics?.window?.trend_bucket_us || 0)} / 桶 · 含零记录桶</span></div>${sparkline(data.trend || [])}</div>
+    <div class="analytics-block slowlog-ranking">
+      <div class="block-head"><h3>Top 慢 SQL <span class="chip">慢日志实测</span></h3>${sorter}</div>
+      <p class="analytics-note">相关度比较相邻桶的次数增量，不代表因果或贡献率。点击 SQL / 相关度查看计算序列、SQL ID 与执行明细。</p>
       ${statements}
     </div>
-    <div class="analytics-split">
-      <div class="analytics-block"><h3>对象分布</h3>${objects}</div>
-      <div class="analytics-block"><h3>操作分布</h3>${operations}</div>
-    </div>`;
+    <details class="analytics-more"><summary>指标口径与分布</summary>
+      <p class="analytics-note">RowsExamined / RowsSent / QueryTime / LockTime 均来自原始慢日志，不使用 EXPLAIN 估算。相关度仅描述当前筛选范围内已采集日志；分区索引全覆盖不保证云端日志已全部到齐。趋势含不完整首尾桶，相关系数只用完整桶，至少 6 桶；不平滑、不插值、不搜索时滞。总体曲线包含该 SQL，明细另列剔除自身的相关度。单次低频尖峰也可能产生高相关，须核对活跃桶和占比。</p>
+      <div class="analytics-split"><div class="analytics-block"><h3>对象分布</h3>${objects}</div><div class="analytics-block"><h3>操作分布</h3>${operations}</div></div>
+    </details>`;
 }
 
 function renderAnalyticsSql(data) {
@@ -1250,9 +1256,7 @@ function renderAnalyticsSql(data) {
     { label: "慢语句事件", value: humanCount(totals.slow_events), hint: "exec_time>0，即执行跨秒" },
     { label: "事务边界事件", value: humanCount(totals.boundary_events), hint: "BEGIN/COMMIT，已从榜单排除" },
   ]);
-  const sorter = `<div class="segmented sort-bar" aria-label="语句排序">${SQL_ORDER_LABELS.map(
-    ([key, label]) => `<button type="button" data-sql-order="${key}"${key === order ? ' class="is-active"' : ""}>${escapeHtml(label)}</button>`
-  ).join("")}</div>`;
+  const sorter = sqlSorter(SQL_ORDER_LABELS, order);
   const scanCell = (item) => {
     if (item.est_rows_per_exec === null || item.est_rows_per_exec === undefined) {
       return '<span class="muted">—</span>';
@@ -1564,6 +1568,7 @@ function renderAnalyticsCoverage(coverage, window, source = "binlog", indexStats
 function syncAnalyticsMode(slowSource) {
   const warning = $("#analytics-lock-warning");
   if (warning) warning.hidden = slowSource;
+  $("#analytics-tabs").hidden = slowSource;
   const nodeField = $("#analytics-node-field");
   const nodeInput = $("#analytics-node");
   if (nodeField) nodeField.hidden = !slowSource;
@@ -1572,6 +1577,7 @@ function syncAnalyticsMode(slowSource) {
     const button = $(`[data-analytics-tab="${name}"]`);
     if (button) {
       button.disabled = slowSource;
+      button.hidden = slowSource;
       button.title = slowSource ? "慢日志洞察不推断事务与锁争用，请切换到 Binlog 写入" : "";
     }
   }
@@ -1612,7 +1618,7 @@ function setAnalyticsRange(range) {
   const end = latestEpochUs > 0 ? new Date(latestEpochUs / 1000) : new Date();
   $("#analytics-end").value = toLocalInput(end);
   $("#analytics-start").value = toLocalInput(new Date(end.getTime() - units[range]));
-  $$("[data-analytics-range]").forEach((button) => button.classList.toggle("is-active", button.dataset.analyticsRange === range));
+  $("#analytics-range").value = range;
 }
 
 function analyticsQueryString(orderOverride = "") {
@@ -1648,8 +1654,12 @@ async function runAnalytics(orderOverride = "") {
   if (orderOverride) state.sqlOrder = orderOverride;
   // 换排序不需要重新扫描分区：已覆盖的聚合直接重排即可。
   const query = analyticsQueryString(orderOverride);
+  const scope = [$("#analytics-source").selectedOptions[0].textContent, $("#analytics-instance").selectedOptions[0].textContent,
+    `${$("#analytics-start").value.replace('T', ' ')} → ${$("#analytics-end").value.replace('T', ' ')}`,
+    $("#analytics-filter-summary").textContent].filter(Boolean).join(' · ');
   const result = await api(`/api/analytics?${query}`);
   renderAnalytics(result);
+  $("#analytics-meta").textContent = scope;
   const pending = Number(result.coverage?.pending_parts || 0);
   if (pending) {
     toast(`分析完成；还有 ${pending} 个分区未建索引，后台补齐后重新分析可得到完整结果`, "info", 6000);
@@ -1962,8 +1972,10 @@ function bindEvents() {
   bindSchemaEvents();
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
   $$("[data-go]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
-  $$("[data-range]").forEach((button) => button.addEventListener("click", () => setQuickRange(button.dataset.range)));
-  $$("[data-analytics-range]").forEach((button) => button.addEventListener("click", () => setAnalyticsRange(button.dataset.analyticsRange)));
+  setupWorkspaceControls();
+  $("#audit-range").addEventListener("change", (event) => { if (event.target.value !== "custom") setQuickRange(event.target.value); });
+  $("#analytics-range").addEventListener("change", (event) => { if (event.target.value !== "custom") setAnalyticsRange(event.target.value); });
+  $("#view-analytics").addEventListener("change", (event) => { if (event.target.matches("[data-sql-sort]")) changeSqlOrder(event.target); });
   $$("[data-analytics-tab]").forEach((button) => button.addEventListener("click", () => switchAnalyticsTab(button.dataset.analyticsTab)));
   $("#analytics-source").addEventListener("change", () => {
     syncAnalyticsMode($("#analytics-source").value === "slowlog");
@@ -1976,13 +1988,9 @@ function bindEvents() {
   });
   // 排序与事务下钻都在重渲染后的节点上，用事件委托绑定一次。
   $("#view-analytics").addEventListener("click", async (event) => {
-    const slowEvent = event.target.closest("[data-slow-event-id]");
+    const slowEvent = event.target.closest("[data-slow-fingerprint]");
     if (slowEvent) {
-      await openDetail(
-        slowEvent.dataset.slowEventId,
-        "",
-        slowEvent.dataset.slowInstance || "",
-      );
+      await openSlowSqlDetail(slowEvent.dataset.slowFingerprint);
       return;
     }
     const drill = event.target.closest("[data-txn-drill]");
@@ -1994,28 +2002,12 @@ function bindEvents() {
       $("#txn-drill-title")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
-    const sort = event.target.closest("[data-sql-order]");
-    if (sort && state.analytics) {
-      const key = sort.dataset.sqlOrder;
-      const sql = state.analytics.sql || {};
-      if (key === (sql.order || "executions")) return;
-      state.sqlOrder = key;
-      // 响应里带了全部排序的 TopN 快照：本地切换，零请求零扫描。
-      if (sql.orders && sql.orders[key]) {
-        sql.order = key;
-        sql.statements = sql.orders[key];
-        $("#analytics-panel-sql").innerHTML = renderAnalyticsSql(sql);
-        return;
-      }
-      // 兜底：旧格式响应没有快照时退回重新请求。
-      try {
-        await withBusy(sort, () => runAnalytics(key), "排序中…");
-      } catch (error) { toast(error.message, "error", 6000); }
-    }
+
   });
   $("#analytics-reset").addEventListener("click", () => {
-    $("#analytics-source").value = "binlog";
-    syncAnalyticsMode(false);
+    $("#analytics-source").value = "slowlog";
+    $("#analytics-instance").value = "";
+    syncAnalyticsMode(true);
     $("#analytics-node").value = "";
     $("#analytics-database").value = "";
     $("#analytics-table").value = "";
