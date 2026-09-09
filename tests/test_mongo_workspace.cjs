@@ -16,6 +16,12 @@ test('allocator free supports native field versions and excludes unmapped pages'
  assert.equal(vm.runInContext('mongoAllocatorFree({tcmalloc:{central_cache_free:3,pageheap_free_bytes:5,pageheap_unmapped_bytes:900}})',c),8);
  assert.equal(vm.runInContext('mongoAllocatorFree({tcmalloc:{central_cache_free_bytes:3,pageheap_free_bytes:5}})',c),8);
 });
+test('Mongo charts obey existing CSP and native memory includes queue/cursor evidence',()=>{
+ assert.doesNotMatch(source,/style="/);
+ assert.match(source,/tracked dirty bytes in the cache/);
+ assert.match(source,/x\.cursor\?\.open\?\.total/);
+ assert.match(source,/currentQueue/);
+});
 test('native command rate changes retain observed-coverage disclosure',()=>{
  assert.match(source,/qps_delta/);assert.match(source,/baseline_coverage_seconds/);assert.match(source,/不等于全窗口次数增长/);
 });
