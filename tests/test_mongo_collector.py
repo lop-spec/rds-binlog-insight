@@ -18,6 +18,20 @@ class CollectorGates(unittest.TestCase):
         client=Mock();client.call.side_effect=responses;c.rpc=lambda cms=False:client
         return c
 
+    def test_command_bson_utc_is_independent_of_local_timezone(self):
+        from datetime import datetime,timezone,timedelta
+        from app.mongo_collector import bson_epoch_us
+        utc=datetime(2026,9,9,13,0,tzinfo=timezone.utc)
+        expected=int(utc.timestamp()*1e6)
+        import os,time
+        try:
+            with patch.dict(os.environ,{'TZ':'Asia/Shanghai'}):
+                if hasattr(time,'tzset'):time.tzset()
+                self.assertEqual(bson_epoch_us(utc.replace(tzinfo=None)),expected)
+                self.assertEqual(bson_epoch_us(utc.astimezone(timezone(timedelta(hours=8)))),expected)
+        finally:
+            if hasattr(time,'tzset'):time.tzset()
+
     def test_provider_partial_never_publishes(self):
         c=self.collector([{'TotalRecordCount':100,'Items':{'LogRecords':[]}}])
         with self.assertRaisesRegex(RuntimeError,'incomplete'):c.slow_window(T,T+5*MINUTE)

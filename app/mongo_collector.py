@@ -35,6 +35,11 @@ def iso(t):
     return datetime.fromtimestamp(t/1e6,timezone.utc).strftime('%Y-%m-%dT%H:%MZ')
 
 
+def bson_epoch_us(value):
+    # Database.command defaults to naive UTC, independently of client codecs.
+    return epoch_us(value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value)
+
+
 def load_instances(root: Path):
     path=root/'mongo-instances.json'
     if not path.exists():
@@ -169,7 +174,7 @@ class MongoCollector:
                 begin=time.time_ns()//1000
                 s=self.clients[host].admin.command({'serverStatus':1,'opLatencies':{'histograms':True},'opWorkingTime':{'histogram':True}})
                 finish=time.time_ns()//1000
-                server_us=int(s['localTime'].timestamp()*1e6)
+                server_us=bson_epoch_us(s['localTime'])
                 node=str(s['host'])
                 repl=s.get('repl',{})
                 role='Primary' if repl.get('isWritablePrimary',repl.get('ismaster')) else 'Secondary' if repl.get('secondary') else 'Unknown'
@@ -178,7 +183,7 @@ class MongoCollector:
                 commands={name:{k:int(v[k]) for k in ('total','failed','rejected') if k in v}
                           for name,v in s.get('metrics',{}).get('commands',{}).items() if name in COMMANDS and isinstance(v,dict) and 'total' in v}
                 sample=dict(node=node,endpoint=host,role=role,epoch=epoch,time_us=(begin+finish)//2,timestamp=(begin+finish)//2000,
-                            server_time_us=server_us,clock_skew_us=server_us-(begin+finish)//2,rtt_us=finish-begin,commands=commands,
+                            server_time_us=server_us,server_time_source='bson_utc',clock_skew_us=server_us-(begin+finish)//2,rtt_us=finish-begin,commands=commands,
                             mem=s.get('mem',{}),connections=s.get('connections',{}),global_lock=s.get('globalLock',{}),
                             op_latencies=s.get('opLatencies',{}),op_working_time=s.get('opWorkingTime',{}),
                             locks=s.get('locks',{}),tcmalloc=s.get('tcmalloc',{}),
