@@ -18,6 +18,8 @@ test('allocator free supports native field versions and excludes unmapped pages'
 });
 test('Mongo charts obey existing CSP and native memory includes queue/cursor evidence',()=>{
  assert.doesNotMatch(source,/style="/);
+ assert.match(source,/<div class="spark"><svg/);
+ assert.match(fs.readFileSync('web/app.css','utf8'),/\.spark svg\s*\{[^}]*width:\s*100%/);
  assert.match(source,/tracked dirty bytes in the cache/);
  assert.match(source,/x\.cursor\?\.open\?\.total/);
  assert.match(source,/currentQueue/);

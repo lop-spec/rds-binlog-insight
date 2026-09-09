@@ -72,7 +72,7 @@ function mongoSparkline(points) {
   // Separate segments at missing minutes instead of drawing through gaps.
   const segments=[];let current=[];
   rows.forEach((p,i)=>{if(i&&p.timestamp-rows[i-1].timestamp>90000){segments.push(current);current=[];}current.push(`${((p.timestamp-lo)/(hi-lo)*900).toFixed(2)},${(110-Number(p.value)/max*100).toFixed(2)}`);});segments.push(current);
-  return `<svg viewBox="0 0 920 125" role="img" aria-label="${escapeHtml(MONGO_METRICS[rows[0].metric]||rows[0].metric)}性能曲线，断点保留缺口" width="100%" height="160">${segments.map(x=>`<polyline points="${x.join(' ')}" fill="none" stroke="var(--accent,#216e57)" stroke-width="2"/>`).join('')}</svg>`;
+  return `<div class="spark"><svg viewBox="0 0 920 125" role="img" aria-label="${escapeHtml(MONGO_METRICS[rows[0].metric]||rows[0].metric)}性能曲线，断点保留缺口">${segments.map(x=>`<polyline points="${x.join(' ')}" fill="none" stroke="var(--accent,#216e57)" stroke-width="2"/>`).join('')}</svg></div>`;
 }
 
 function renderMongoAnalytics(data) {
