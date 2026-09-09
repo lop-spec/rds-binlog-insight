@@ -10,6 +10,15 @@ test('Mongo source is inside existing workspace, not a second application',()=>{
 test('missing values are not rendered as zero',()=>{
  const c=context();vm.runInContext(source,c);assert.equal(vm.runInContext('mongoNumber(null)',c),'—');
 });
+test('allocator free supports native field versions and excludes unmapped pages',()=>{
+ const c=context();vm.runInContext(source,c);
+ assert.equal(vm.runInContext('mongoAllocatorFree(null)',c),null);
+ assert.equal(vm.runInContext('mongoAllocatorFree({tcmalloc:{central_cache_free:3,pageheap_free_bytes:5,pageheap_unmapped_bytes:900}})',c),8);
+ assert.equal(vm.runInContext('mongoAllocatorFree({tcmalloc:{central_cache_free_bytes:3,pageheap_free_bytes:5}})',c),8);
+});
+test('native command rate changes retain observed-coverage disclosure',()=>{
+ assert.match(source,/qps_delta/);assert.match(source,/baseline_coverage_seconds/);assert.match(source,/不等于全窗口次数增长/);
+});
 test('performance curve does not bridge missing minutes',()=>{
  const c=context();vm.runInContext(source,c);
  const html=vm.runInContext(`mongoSparkline([{timestamp:0,value:1,metric:'CPUUtilization'},{timestamp:60000,value:2,metric:'CPUUtilization'},{timestamp:240000,value:3,metric:'CPUUtilization'}])`,c);

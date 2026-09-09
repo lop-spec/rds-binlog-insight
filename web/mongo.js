@@ -1,7 +1,12 @@
 /* Mongo is an engine adapter inside the existing analytics workspace. */
 let mongoStatus = null, mongoResult = null, mongoRequest = 0, mongoBindings = false;
-const MONGO_METRICS = {CPUUtilization:'CPU 使用率 %',MemoryUtilization:'内存使用率 %',ConnectionAmount:'连接数',IOPSUtilization:'IOPS 使用率 %',ReplicationLatency:'复制延迟 s',QPS:'QPS',ScannedDocs:'扫描文档 / 秒',ScannedKeys:'扫描索引 / 秒',ReadIops:'读 IOPS',WriteIops:'写 IOPS',AvgRt:'平均响应 μs',ReadAvgRt:'读取平均响应',WriteAvgRt:'写入平均响应',WtCacheUsage:'WT 缓存使用率 %',WtCacheDirtyUsage:'WT 脏页使用率 %',ConcurrentReads:'读等待',ConcurrentWrites:'写等待',CentralCacheFree:'TCMalloc 中央空闲',TcmallocCacheMemRatio:'TCMalloc 内存碎片率'};
+const MONGO_METRICS = {CPUUtilization:'CPU 使用率 %',MemoryUtilization:'内存使用率 %',ConnectionAmount:'连接数',IOPSUtilization:'IOPS 使用率 %',ReplicationLag:'复制延迟 s',QPS:'QPS',ScannedDocs:'扫描文档 / 秒',ScannedKeys:'扫描索引 / 秒',ReadIops:'读 IOPS',WriteIops:'写 IOPS',AvgRt:'平均响应 μs',ReadAvgRt:'读取平均响应 μs',WriteAvgRt:'写入平均响应 μs',WtCacheUsage:'WT 缓存使用率 %',WtCacheDirtyUsage:'WT 脏页使用率 %',ConcurrentReads:'读等待',ConcurrentWrites:'写等待',CentralCacheFree:'TCMalloc 中央空闲 MiB',TcmallocCacheMemRatio:'TCMalloc 内存碎片率 %'};
 function mongoNumber(v, digits=2) { return v == null || !Number.isFinite(Number(v)) ? '—' : Number(v).toLocaleString('zh-CN',{maximumFractionDigits:digits}); }
+function mongoAllocatorFree(value) {
+  const t=value?.tcmalloc||{},groups=[['pageheap_free_bytes'],['central_cache_free','central_cache_free_bytes'],['transfer_cache_free','transfer_cache_free_bytes'],['thread_cache_free','thread_cache_free_bytes'],['cpu_free'],['sharded_transfer_cache_free']];
+  const known=groups.map(keys=>keys.map(k=>t[k]).find(v=>v!=null&&Number.isFinite(Number(v)))).filter(v=>v!=null);
+  return known.length?known.reduce((s,v)=>s+Number(v),0):null;
+}
 function mongoScale(v, divisor) { return v == null ? null : v/divisor; }
 function mongoDelta(v) { return v == null ? '基线或字段未完整' : `${v>0?'+':''}${mongoNumber(v)}`; }
 function mongoOptions(rows) { return rows.map(([v,t])=>`<option value="${escapeHtml(v)}">${escapeHtml(t)}</option>`).join(''); }
@@ -41,7 +46,13 @@ async function syncMongoMode(enabled) {
 
 async function runMongoAnalytics() {
   const request=++mongoRequest;
-  const start=new Date($('#analytics-start').value).getTime()*1000,end=new Date($('#analytics-end').value).getTime()*1000;
+  let start=new Date($('#analytics-start').value).getTime()*1000,end=new Date($('#analytics-end').value).getTime()*1000;
+  if ($('#analytics-range').value!=='custom') {
+    const current=await api('/api/mongo/status');
+    if(request!==mongoRequest||$('#analytics-source').value!=='mongodb')return;
+    const watermark=current.collectors?.find(x=>x.instanceId===$('#mongo-instance').value)?.slowlog_window;
+    if(Number.isFinite(watermark)&&watermark>0){const span=end-start;end=watermark;start=end-span;$('#analytics-start').value=toLocalInput(new Date(start/1000));$('#analytics-end').value=toLocalInput(new Date(end/1000));}
+  }
   if (!Number.isFinite(start)||!Number.isFinite(end)||end<=start) throw new Error('请选择有效的异常窗口');
   let baseline=$('#mongo-baseline').value==='previous'?start-(end-start):start-86400*1e6;
   if ($('#mongo-baseline').value==='custom') baseline=new Date($('#mongo-baseline-start').value).getTime()*1000;
@@ -82,17 +93,17 @@ function renderMongoAnalytics(data) {
   const performance=(data.metric_points||[]).filter(x=>!$('#mongo-role').value||x.role===$('#mongo-role').value);
   const roles=[...new Set(performance.map(x=>x.role))];
   const outlierRows=(data.outliers||[]).map(x=>[`<button class="button ghost compact" data-mongo-group="${escapeHtml(x.group_id)}" data-mongo-role="${escapeHtml(x.role)}">${escapeHtml(x.namespace)} · ${escapeHtml(x.command)}</button>`,mongoNumber(x.max_us/1000)+' ms',formatTime(x.sample.start_us),(x.exclusions||[]).map(escapeHtml).join('；')||'没有足够反证，不等于已证明因果']);
-  const counterRows=(data.native_counters||[]).map(x=>[escapeHtml(x.node),escapeHtml(x.role),escapeHtml(x.command),mongoNumber(x.count),mongoNumber(x.qps),`${mongoNumber(x.coverage_seconds)} / ${mongoNumber(x.window_seconds)} 秒`,mongoNumber(x.failed)]);
+  const counterRows=(data.native_counters||[]).map(x=>[escapeHtml(x.node),escapeHtml(x.role),`<details><summary>${escapeHtml(x.command)} · 分钟趋势</summary>${mongoSparkline((x.intervals||[]).map(p=>({timestamp:p.end_us/1000,value:p.qps,metric:'QPS'})))}</details>`,mongoNumber(x.count),`${mongoNumber(x.baseline_qps)} → ${mongoNumber(x.qps)}`,mongoDelta(x.qps_delta),`${mongoNumber(x.coverage_seconds)} / ${mongoNumber(x.window_seconds)} 秒；基线 ${mongoNumber(x.baseline_coverage_seconds)} 秒`,mongoNumber(x.failed)]);
   const memory=(data.native_latest||[]).map(x=>{
-    const g=x.tcmalloc?.generic||{},c=x.wt_cache||{},free=x.tcmalloc?.tcmalloc_derived||{};
-    return [escapeHtml(x.node),escapeHtml(x.role),formatTime(x.timestamp*1000),mongoNumber(x.mem?.resident/1024),mongoNumber(c['bytes currently in the cache']/2**30),mongoNumber(c['maximum bytes configured']/2**30),mongoNumber(g.current_allocated_bytes/2**30),mongoNumber(free.total_free_bytes/2**30),mongoNumber(x.connections?.current)];
+    const g=x.tcmalloc?.generic||{},c=x.wt_cache||{},free=mongoAllocatorFree(x.tcmalloc);
+    return [escapeHtml(x.node),escapeHtml(x.role),formatTime(x.timestamp*1000),mongoNumber(x.mem?.resident/1024),mongoNumber(c['bytes currently in the cache']/2**30),mongoNumber(c['maximum bytes configured']/2**30),mongoNumber(g.current_allocated_bytes/2**30),mongoNumber(mongoScale(free,2**30)),mongoNumber(x.connections?.current)];
   });
   const clients=(data.client_aggregates||[]).map(x=>[escapeHtml(x.service),escapeHtml(x.namespace),escapeHtml(x.command),mongoNumber(x.count),mongoNumber(x.failed),mongoNumber(x.lost)]);
-  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>慢命令增量与性能关联</h3><p>${totals}</p><p class="analytics-note">${escapeHtml(data.warning)} · 只对所选层级计算。缺 CPU/读取字段显示未知，不补零。</p>
+  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>慢命令增量与性能关联</h3><p>${totals}</p><p class="analytics-note">${escapeHtml(data.warning)} · 只对所选层级计算。缺 CPU/读取字段显示未知，不补零。快捷时间对齐最新完整慢日志窗口；自定义时间不改写。</p>
     ${roles.map(role=>`<h4>${escapeHtml(role)} · ${escapeHtml(MONGO_METRICS[data.metric]||data.metric)}</h4>${mongoSparkline(performance.filter(x=>x.role===role))}`).join('')||'<p>没有匹配的性能数据。</p>'}
     ${analyticsTable(['集合族 / 命令','慢记录次数与增量','平均 / 最大耗时','累计耗时增量','扫描文档增量','性能差分 r','判断'],rows)}
-    </section><details class="detail-block"><summary>最长慢命令与反证（独立于增量榜）</summary>${analyticsTable(['命令','最长耗时','代表样本开始','排除项'],outlierRows)}</details><details class="detail-block"><summary>节点命令总次数（不是慢日志计数）</summary><p>按服务器原生计数器的连续区间相减；缺失和跨进程区间不计。QPS 使用已覆盖秒数，不外推完整窗口。</p>${analyticsTable(['节点','角色','命令','计数增量','QPS','覆盖 / 窗口','失败'],counterRows,'该历史窗口未采集原生命令计数，不能从慢日志补出来。')}${detailBlock('计数缺口',JSON.stringify(data.native_gaps||[]))}</details>
-    <details class="detail-block"><summary>内存组成与当前节点状态</summary>${analyticsTable(['节点','角色','样本时间','RSS GiB','WT GiB','WT 上限 GiB','实际分配 GiB','分配器空闲 GiB','连接'],memory,'该窗口无原生内存快照。')}</details>
+    </section><details class="detail-block"><summary>最长慢命令与反证（独立于增量榜）</summary>${analyticsTable(['命令','最长耗时','代表样本开始','排除项'],outlierRows)}</details><details class="detail-block"><summary>节点命令总次数（不是慢日志计数）</summary><p>按服务器原生计数器的连续区间相减；缺失和跨进程区间不计。QPS 使用已覆盖秒数，不外推完整窗口。基线与当前各至少两个有效区间才比较观测 QPS；不等于全窗口次数增长。</p>${analyticsTable(['节点','角色','命令','计数增量','基线 → 当前 QPS','观测 QPS 变化','当前 / 窗口；基线覆盖','失败'],counterRows,'该历史窗口未采集原生命令计数，不能从慢日志补出来。')}${detailBlock('计数缺口',JSON.stringify({current:data.native_gaps||[],baseline:data.native_baseline_gaps||[]}))}</details>
+    <details class="detail-block"><summary>内存组成与当前节点状态</summary>${analyticsTable(['节点','角色','样本时间','RSS GiB','WT GiB','WT 上限 GiB','实际分配 GiB','已知空闲 GiB（不含 unmapped）','连接'],memory,'该窗口无原生内存快照。')}</details>
     <details class="detail-block"><summary>集合 / 模板全量次数（接入服务范围）</summary><p>仅统计注册 Command Monitoring 的服务；未接入时不显示虚构的全量次数。</p>${analyticsTable(['服务','集合','命令','尝试次数','失败','丢失'],clients,'尚无应用命令聚合接入。')}</details>
     <details class="detail-block"><summary>可复算数据与缺口</summary>${detailBlock('数据覆盖',JSON.stringify({coverage,baseline,optional:data.optional_unavailable},null,2))}</details>`;
   switchAnalyticsTab('sql');

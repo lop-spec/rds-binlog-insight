@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from .mongo_collector import MongoCollector, load_instances, METRICS
-from .mongo_insight import analyze, MINUTE, canonical, digest
+from .mongo_insight import analyze, MINUTE, canonical, digest, summarize_native_intervals
 from .mongo_store import MongoStore
 
 LOGGER=logging.getLogger(__name__)
@@ -69,29 +69,25 @@ class MongoService:
                 LOGGER.warning('mongo_query %s unavailable: %s',name,optional[name]);return []
         points=read_optional('metrics',lambda:store.read_telemetry(instance,'metrics',start,end,metric=metric))
         native=read_optional('native',lambda:store.read_telemetry(instance,'native',start,end,compact=True))
+        native_before=read_optional('native_baseline',lambda:store.read_telemetry(instance,'native',base,base_end,compact=True))
         latest=read_optional('native_latest',lambda:store.latest_native(instance,end))
         clients=read_optional('client',lambda:store.read_telemetry(instance,'client',start,end))
         result=analyze(rows,before,points,start,end,coverage=coverage['complete'],baseline_coverage=baseline['complete'],
                        metric=metric,order=get('order','duration_growth'),limit=int(get('limit','50')),bucket_width=width)
-        counter_groups={};counter_gaps=[]
-        for sample in native:
-            interval=sample.get('interval',{})
-            if role and sample.get('role')!=role:continue
-            if interval.get('status')!='ok' or interval.get('start_us',0)<start or interval.get('end_us',0)>end:
-                counter_gaps.append({'node':sample.get('node'),'timestamp':sample.get('timestamp'),'reason':interval.get('status','missing_interval')});continue
-            for name,counts in interval.get('commands',{}).items():
-                key=sample['node'],sample['role'],name
-                row=counter_groups.setdefault(key,dict(node=key[0],role=key[1],command=name,count=0,failed=0,rejected=0,seconds=0,intervals=[]))
-                for dest,source in [('count','total'),('failed','failed'),('rejected','rejected')]:row[dest]+=int(counts.get(source,0))
-                seconds=(interval['end_us']-interval['start_us'])/1e6
-                row['seconds']+=seconds
-                row['intervals'].append(dict(start_us=interval['start_us'],end_us=interval['end_us'],count=counts.get('total'),qps=counts.get('total',0)/seconds))
-        counter_rows=sorted(counter_groups.values(),key=lambda x:-x['count'])
-        for row in counter_rows:
-            row['qps']=row['count']/row['seconds'] if row['seconds'] else None
-            row['coverage_seconds']=row['seconds'];row['window_seconds']=(end-start)/1e6
+        counter_groups,counter_gaps=summarize_native_intervals(native,start,end,role)
+        baseline_groups,baseline_gaps=summarize_native_intervals(native_before,base,base_end,role)
+        for key,row in counter_groups.items():
+            previous=baseline_groups.get(key)
+            comparable=bool(previous and len(previous['intervals'])>=2 and len(row['intervals'])>=2)
+            row.update(baseline_qps=previous['qps'] if previous else None,
+                       baseline_coverage_seconds=previous['seconds'] if previous else 0,
+                       qps_delta=row['qps']-previous['qps'] if comparable else None,
+                       comparison_scope='observed_interval_rates' if comparable else 'insufficient_intervals')
+        counter_rows=sorted(counter_groups.values(),key=lambda x:-(x['qps_delta'] if x['qps_delta'] is not None else x['qps']))
+        if not counter_rows or any(r['qps_delta'] is None for r in counter_rows):
+            LOGGER.warning('mongo_native_comparison unavailable: instance=%s missing_or_insufficient_observed_intervals',instance)
         result.update(instance=instance,baseline_start=base,baseline_end=base_end,coverage=coverage,baseline_coverage=baseline,
-                      metric_points=points,native_counters=counter_rows,native_gaps=counter_gaps[:20],
+                      metric_points=points,native_counters=counter_rows,native_gaps=counter_gaps[:20],native_baseline_gaps=baseline_gaps[:20],
                       native_latest=latest,client_aggregates=clients,optional_unavailable=optional)
         result['client_count_scope']='connected_services_only' if clients else 'not_connected'
         return result

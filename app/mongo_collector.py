@@ -18,7 +18,7 @@ from .mongo_insight import COMMANDS, MINUTE, WINDOW, epoch_us, counter_interval
 from .mongo_store import atomic_json
 
 LOGGER=logging.getLogger(__name__)
-METRICS=('CPUUtilization','MemoryUtilization','ConnectionAmount','IOPSUtilization','ReplicationLatency',
+METRICS=('CPUUtilization','MemoryUtilization','ConnectionAmount','IOPSUtilization','ReplicationLag',
          'QPS','ScannedDocs','ScannedKeys','ReadIops','WriteIops','AvgRt','ReadAvgRt','WriteAvgRt',
          'WtCacheUsage','WtCacheDirtyUsage','ConcurrentReads','ConcurrentWrites','CentralCacheFree','TcmallocCacheMemRatio')
 
@@ -62,7 +62,7 @@ class MongoCollector:
     def __init__(self, store, entry, settings_loader, archive_loader=None):
         self.store=store;self.entry=entry;self.instance=entry['instanceId']
         self.settings_loader=settings_loader;self.archive_loader=archive_loader
-        self.stop_event=threading.Event();self.threads=[];self.clients={};self.before={}
+        self.stop_event=threading.Event();self.threads=[];self.clients={};self.before={};self.unsupported_metrics={}
         self.state={'instanceId':self.instance,'label':entry.get('label',self.instance),'enabled':entry.get('enabled',False),
                     'slowlog':'not_started','metrics':'not_started','counters':'not_started','client_aggregates':'not_connected'}
 
@@ -96,13 +96,25 @@ class MongoCollector:
 
     def cloud_window(self,start,end):
         client=self.rpc(cms=True);points=[]
+        unavailable={}
         for metric in METRICS:
-            token=None;seen=set();got=0
+            if self.unsupported_metrics.get(metric,0)>time.time():
+                unavailable[metric]='provider_unsupported_cached'
+                LOGGER.warning('mongo_metric unavailable: instance=%s metric=%s provider_unsupported_cached',self.instance,metric)
+                continue
+            token=None;seen=set();got=0;unsupported=False
             for page in range(50):
                 params={'Namespace':'acs_mongodb','MetricName':metric,'Dimensions':json.dumps([{'instanceId':self.instance}]),
                         'StartTime':str(start//1000),'EndTime':str(end//1000),'Period':'60','Length':'1000'}
                 if token:params['NextToken']=token
-                r=client.call('DescribeMetricList',params)
+                try:r=client.call('DescribeMetricList',params)
+                except RuntimeError as exc:
+                    if re.search(r'metric.*is not exist',str(exc),re.I):
+                        self.unsupported_metrics[metric]=time.time()+6*3600
+                        unavailable[metric]='provider_unsupported'
+                        LOGGER.warning('mongo_metric unavailable: instance=%s metric=%s provider_unsupported',self.instance,metric)
+                        unsupported=True;break
+                    raise
                 if str(r.get('Code'))!='200':raise RuntimeError('cms_error:'+str(r.get('Code')))
                 rows=json.loads(r.get('Datapoints') or '[]')
                 for row in rows:
@@ -116,7 +128,11 @@ class MongoCollector:
                 if token in seen:raise RuntimeError('cms_pagination_cycle')
                 seen.add(token)
             else:raise RuntimeError('cms_page_limit')
-            if not got:LOGGER.warning('mongo_metric unavailable: instance=%s metric=%s no_points',self.instance,metric)
+            if not got and not unsupported:
+                unavailable[metric]='no_points'
+                LOGGER.warning('mongo_metric unavailable: instance=%s metric=%s no_points',self.instance,metric)
+        self.state['metrics_unavailable']=unavailable
+        if not points:raise RuntimeError('cms_no_points')
         self.store.telemetry(self.instance,'metrics',points)
         return len(points)
 
@@ -194,6 +210,7 @@ class MongoCollector:
             atomic_json(checkpoint,{'next':start+WINDOW})
             self.state['slowlog_window']=m['end'];return m['records']
         # Refresh closed but recently completed windows for delayed provider logs.
+        self.state['slowlog_window']=end
         t=end-(1+int(time.time()//60)%3)*WINDOW
         return self.slow_window(t,t+WINDOW)['records']
 

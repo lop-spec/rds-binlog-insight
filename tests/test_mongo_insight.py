@@ -83,6 +83,18 @@ class MongoGates(unittest.TestCase):
         self.assertEqual(result['outliers'][0]['max_us'],65_000_000)
         self.assertTrue(result['outliers'][0]['evidence']['sample_after_resource_peak'])
 
+    def test_native_counts_use_actual_intervals_and_missing_failures_remain_unknown(self):
+        from app.mongo_insight import summarize_native_intervals
+        samples=[dict(node='n',role='Primary',timestamp=T//1000,interval=dict(status='ok',start_us=T,end_us=T+MINUTE,commands={'update':{'total':120}})),
+                 dict(node='n',role='Primary',timestamp=T//1000,interval=dict(status='warmup'))]
+        rows,gaps=summarize_native_intervals(samples,T,T+5*MINUTE)
+        row=rows[('n','Primary','update')]
+        self.assertEqual(row['qps'],2)
+        self.assertEqual(row['coverage_seconds'],60)
+        self.assertEqual(row['window_seconds'],300)
+        self.assertIsNone(row['failed'])
+        self.assertEqual(len(gaps),1)
+
     def test_no_baseline_no_growth_claim(self):
         rows=rollup_records([record()], 'dds-example', ['messages'])
         t=rows[0]['bucket']

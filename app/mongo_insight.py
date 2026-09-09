@@ -179,6 +179,30 @@ def rollup_records(records: list[dict], instance: str, prefixes: list[str]) -> l
     return rollup_events([normalize_record(r, instance, prefixes) for r in records])
 
 
+def summarize_native_intervals(samples, start, end, role=''):
+    groups={};gaps=[]
+    for sample in samples:
+        if role and sample.get('role')!=role:continue
+        interval=sample.get('interval',{})
+        lo=interval.get('start_us',0);hi=interval.get('end_us',0)
+        if interval.get('status')!='ok' or lo<start or hi>end or hi<=lo:
+            gaps.append(dict(node=sample.get('node'),timestamp=sample.get('timestamp'),reason=interval.get('status','missing_interval')))
+            continue
+        seconds=(hi-lo)/1e6
+        for name,counts in interval.get('commands',{}).items():
+            key=sample['node'],sample['role'],name
+            row=groups.setdefault(key,dict(node=key[0],role=key[1],command=name,count=0,failed=0,rejected=0,seconds=0,intervals=[]))
+            row['count']+=int(counts['total'])
+            for field in ('failed','rejected'):
+                if field not in counts:row[field]=None
+                elif row[field] is not None:row[field]+=int(counts[field])
+            row['seconds']+=seconds
+            row['intervals'].append(dict(start_us=lo,end_us=hi,count=counts['total'],qps=counts['total']/seconds))
+    for row in groups.values():
+        row.update(qps=row['count']/row['seconds'],coverage_seconds=row['seconds'],window_seconds=(end-start)/1e6)
+    return groups,gaps
+
+
 def counter_interval(before: dict | None, after: dict) -> dict:
     status = 'ok'
     if before is None:

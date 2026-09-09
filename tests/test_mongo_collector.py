@@ -40,6 +40,16 @@ class CollectorGates(unittest.TestCase):
             (root/'mongo-instances.json').write_text(json.dumps([dict(instanceId='dds-example',region='cn-example-1',nodes=['unrelated.example.com'])]))
             with self.assertRaisesRegex(ValueError,'allowlist'):load_instances(root)
 
+    def test_unsupported_metric_does_not_discard_other_series(self):
+        response={'Code':200,'Datapoints':json.dumps([dict(instanceId='dds-example',role='Primary',timestamp=T//1000,Average=42)])}
+        c=self.collector([RuntimeError('the metric(NoMetric) is not exist'),response,response])
+        with patch('app.mongo_collector.METRICS',('NoMetric','CPUUtilization')):
+            self.assertEqual(c.cloud_window(T,T+MINUTE),1)
+            self.assertEqual(c.state['metrics_unavailable']['NoMetric'],'provider_unsupported')
+            self.assertEqual(c.cloud_window(T,T+MINUTE),1)
+            self.assertEqual(c.state['metrics_unavailable']['NoMetric'],'provider_unsupported_cached')
+        self.assertEqual(c.store.telemetry.call_count,2)
+
     def test_region_identifiers_with_and_without_numeric_suffix(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td)
@@ -67,6 +77,22 @@ class CollectorGates(unittest.TestCase):
             service=MongoService(Path(td),lambda:None,start=False)
             self.assertEqual(service.status()['status'],'not_configured')
             service.shutdown()
+
+    def test_native_growth_requires_observed_intervals_in_both_windows(self):
+        with tempfile.TemporaryDirectory() as td:
+            service=MongoService(Path(td),lambda:None,start=False);store=Mock();service.stores['dds-example']=store
+            store.width.return_value=MINUTE;store.read.return_value=([],{'complete':False});store.latest_native.return_value=[]
+            base=T-86400*1_000_000
+            def samples(start,count):
+                return [dict(node='n',role='Primary',interval=dict(status='ok',start_us=start+i*MINUTE,end_us=start+(i+1)*MINUTE,commands={'update':{'total':count}})) for i in range(2)]
+            old=samples(base,120)
+            def read(instance,kind,lo,hi,**kw):return (old if lo==base else samples(T,240)) if kind=='native' else []
+            store.read_telemetry.side_effect=read
+            params=dict(instance='dds-example',startEpochUs=T,endEpochUs=T+5*MINUTE,baselineStart=base)
+            row=service.query(params)['native_counters'][0]
+            self.assertEqual(row['qps_delta'],2);self.assertEqual(row['baseline_coverage_seconds'],120)
+            old.pop()
+            self.assertIsNone(service.query(params)['native_counters'][0]['qps_delta'])
 
     def test_ingest_auth_is_not_optional(self):
         with tempfile.TemporaryDirectory() as td:
