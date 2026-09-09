@@ -2,7 +2,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 from app.mongo_collector import MongoCollector, load_instances
 from app.mongo_service import MongoService
@@ -38,6 +39,28 @@ class CollectorGates(unittest.TestCase):
             root=Path(td)
             (root/'mongo-instances.json').write_text(json.dumps([dict(instanceId='dds-example',region='cn-example-1',nodes=['unrelated.example.com'])]))
             with self.assertRaisesRegex(ValueError,'allowlist'):load_instances(root)
+
+    def test_region_identifiers_with_and_without_numeric_suffix(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            for region in ['cn-example','ap-example-1']:
+                value=[dict(instanceId='dds-example',region=region,nodes=['dds-example1.mongodb.'+region+'.rds.aliyuncs.com'])]
+                (root/'mongo-instances.json').write_text(json.dumps(value))
+                self.assertEqual(load_instances(root),value)
+
+    def test_failed_identity_is_never_cached(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);secret=root/'readonly.json';secret.write_text(json.dumps(dict(username='fixture',password='fixture-test-only',authSource='admin')));secret.chmod(0o600)
+            client=Mock();client.admin.command.return_value={'authInfo':{'authenticatedUsers':[{'user':'fixture','db':'admin'}],'authenticatedUserRoles':[{'role':'root','db':'admin'}]}}
+            factory=Mock(return_value=client)
+            store=Mock();store.root=root/'mongo-insight'
+            c=MongoCollector(store,dict(instanceId='dds-example',nodes=['fixture-node'],credentialsFile=str(secret),readonlyUsername='fixture'),lambda:None)
+            with patch.dict('sys.modules',{'pymongo':SimpleNamespace(MongoClient=factory,ReadPreference=SimpleNamespace(NEAREST='nearest'))}):
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeError,'incomplete_node'):c.sample_nodes()
+                    self.assertEqual(c.clients,{})
+            self.assertEqual(client.close.call_count,2)
+            self.assertEqual(client.admin.command.call_count,2)
 
     def test_missing_configuration_does_not_change_mysql(self):
         with tempfile.TemporaryDirectory() as td:

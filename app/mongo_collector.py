@@ -48,7 +48,7 @@ def load_instances(root: Path):
         if not re.fullmatch(r'dds-[a-z0-9-]+',instance) or instance in seen:raise ValueError('invalid_or_duplicate_mongo_instance')
         seen.add(instance)
         region=item.get('region','')
-        if not re.fullmatch(r'[a-z]+-[a-z]+-\d+',region):raise ValueError('invalid_mongo_region')
+        if not re.fullmatch(r'[a-z]+-[a-z]+(?:-\d+)?',region):raise ValueError('invalid_mongo_region')
         for host in item.get('nodes',[]):
             if not re.fullmatch(re.escape(instance)+r'\d+\.mongodb\.'+re.escape(region)+r'\.rds\.aliyuncs\.com',host):
                 raise ValueError('mongo_node_outside_instance_allowlist')
@@ -133,19 +133,23 @@ class MongoCollector:
             raise RuntimeError('mongo_readonly_identity_required')
         success=0
         for host in self.entry['nodes']:
+            candidate_client=None
             try:
                 if host not in self.clients:
-                    self.clients[host]=MongoClient(host=host,port=3717,username=auth['username'],password=auth['password'],
+                    candidate_client=MongoClient(host=host,port=3717,username=auth['username'],password=auth['password'],
+                        tls=bool(self.entry.get('tls',False)),
                         authSource='admin',authMechanism='SCRAM-SHA-256',directConnection=True,read_preference=ReadPreference.NEAREST,
                         retryWrites=False,tz_aware=True,appname='sql-insight-readonly',maxPoolSize=1,serverSelectionTimeoutMS=5000,
                         connectTimeoutMS=5000,socketTimeoutMS=10000)
-                    identity=self.clients[host].admin.command({'connectionStatus':1})
+                    identity=candidate_client.admin.command({'connectionStatus':1})
                     users=identity.get('authInfo',{}).get('authenticatedUsers',[])
                     roles=identity.get('authInfo',{}).get('authenticatedUserRoles',[])
                     if not any(u.get('user')==approved_user and u.get('db')=='admin' for u in users):
                         raise RuntimeError('mongo_authenticated_identity_mismatch')
                     if roles and any(r.get('role') not in {'read','readAnyDatabase','clusterMonitor'} for r in roles):
                         raise RuntimeError('mongo_identity_has_unapproved_roles')
+                    self.clients[host]=candidate_client
+                    candidate_client=None
                 begin=time.time_ns()//1000
                 s=self.clients[host].admin.command({'serverStatus':1,'opLatencies':{'histograms':True},'opWorkingTime':{'histogram':True}})
                 finish=time.time_ns()//1000
@@ -174,7 +178,8 @@ class MongoCollector:
                 self.before[host]=sample
                 success+=1
             except Exception as exc:
-                LOGGER.warning('mongo_node_sample unavailable: endpoint=%s reason=%s',host,type(exc).__name__)
+                if candidate_client is not None:candidate_client.close()
+                LOGGER.warning('mongo_node_sample unavailable: endpoint=%s reason=%s',host,type(exc).__name__+':'+str(exc)[:300])
                 self.state['node:'+host]=type(exc).__name__
         if success!=len(self.entry['nodes']):raise RuntimeError('incomplete_node_sampling')
         return success
