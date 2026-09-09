@@ -10,15 +10,15 @@ on:
         default: false
   push:
     tags:
-      - v1.27.1-rawoss
+      - v1.28.0-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.27.1-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.27.1-rawoss
+  VERSION: 1.28.0-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.28.0-rawoss
 
 jobs:
   build-test-package:
@@ -75,6 +75,8 @@ jobs:
             tests.test_slowlog_correlation \
             tests.test_slowlog_correlation_engines \
             tests.test_slowlog_impact \
+            tests.test_mongo_insight \
+            tests.test_mongo_collector \
             tests.test_pod_lookup \
             tests.test_clickhouse_stage \
             tests.test_clickhouse_oss_verify \
@@ -88,7 +90,27 @@ jobs:
             "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"
 
       - name: Verify workspace rendering and disclosure contracts
-        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs
+        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs
+
+      - name: Verify Mongo serving against isolated ClickHouse
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name mongo-ci-clickhouse -p 127.0.0.1:18123:8123 \
+            -e CLICKHOUSE_DB=mongo_ci_fixture -e CLICKHOUSE_USER=fixture \
+            -e CLICKHOUSE_PASSWORD=fixture-ci-only \
+            clickhouse/clickhouse-server@sha256:2ef11bbe2e44ab7022f37ff3019b3f2125ed09e919ea6194660be6130b7ca4b7
+          trap 'docker logs --tail 30 mongo-ci-clickhouse; docker rm -f mongo-ci-clickhouse' EXIT
+          for n in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18123/ping; then break; fi
+            sleep 2
+          done
+          docker run --rm --network host --entrypoint python --workdir /src \
+            --volume "$PWD:/src:ro" \
+            -e MONGO_CI_FIXTURE=1 -e RDS_BINLOG_CLICKHOUSE_DATABASE=mongo_ci_fixture \
+            -e RDS_BINLOG_CLICKHOUSE_HOST=127.0.0.1 -e RDS_BINLOG_CLICKHOUSE_PORT=18123 \
+            -e CLICKHOUSE_USER=fixture -e CLICKHOUSE_PASSWORD=fixture-ci-only \
+            "$LOCAL_IMAGE" -m unittest tests.test_mongo_clickhouse -v
 
       - name: Export immutable deployment artifact
         shell: bash

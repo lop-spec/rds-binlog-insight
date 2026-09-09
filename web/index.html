@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.27.1-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.27.1-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.28.0-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.0-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -177,7 +177,7 @@
           </div>
 
           <form id="analytics-form" class="query-grid">
-            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="Binlog 用于写入与事务推断；RDS 慢日志提供真实扫描行数和耗时"><option value="slowlog">RDS 慢日志</option><option value="binlog">Binlog 写入</option></select></label>
+            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="Binlog 用于写入与事务推断；RDS 慢日志提供真实扫描行数和耗时"><option value="slowlog">RDS 慢日志</option><option value="binlog">Binlog 写入</option><option value="mongodb">MongoDB 慢日志 / 命令</option></select></label>
             <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
             <label id="analytics-node-field" class="field span-2" hidden><span>Node ID</span><input id="analytics-node" type="text" list="analytics-node-options" maxlength="128" autocomplete="off" placeholder="留空表示全部已采集节点" title="阿里云 DAS Node ID；可从已配置节点中选择，也可直接填写"><datalist id="analytics-node-options"></datalist></label>
             <label class="field span-2"><span>开始时间</span><input id="analytics-start" type="datetime-local" step="1"></label>
@@ -188,6 +188,18 @@
             <label class="field"><span>操作</span><select id="analytics-operation"><option value="">全部</option><option value="SELECT">SELECT</option><option value="SHOW">SHOW</option><option value="INSERT">INSERT</option><option value="UPDATE">UPDATE</option><option value="DELETE">DELETE</option><option value="DDL">DDL</option><option value="QUERY">QUERY（其他语句）</option></select></label>
             <label class="field"><span>Top N</span><select id="analytics-limit"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></label>
             </div></details>
+            <div id="mongo-controls" class="query-grid span-8" hidden>
+              <label class="field span-2"><span>MongoDB 实例</span><select id="mongo-instance"></select></label>
+              <label class="field"><span>角色</span><select id="mongo-role"><option value="Primary">Primary</option><option value="Secondary">Secondary</option><option value="">全部角色（分开计算）</option></select></label>
+              <label class="field"><span>慢记录层级</span><select id="mongo-kind"><option value="command">外层命令</option><option value="suboperation">内部操作</option></select></label>
+              <label class="field span-2"><span>性能指标</span><select id="mongo-metric"></select></label>
+              <label class="field span-2"><span>增量排序</span><select id="mongo-order"><option value="duration_growth">累计耗时增长</option><option value="count_growth">慢记录次数增长</option><option value="scan_growth">扫描文档增长</option><option value="cpu_growth">CPU 时间增长</option><option value="read_growth">读取字节增长</option><option value="performance">资源高位重合（非因果）</option><option value="count">慢记录次数</option><option value="max_latency">最长单次耗时（不代表根因）</option><option value="duration_total">累计耗时</option></select></label>
+              <label class="field"><span>命令</span><select id="mongo-command"><option value="">全部</option><option>find</option><option>aggregate</option><option>distinct</option><option>update</option><option>insert</option><option>delete</option><option>getMore</option><option>count</option><option>findAndModify</option></select></label>
+              <label class="field span-2"><span>集合 / 集合族</span><input id="mongo-namespace" placeholder="库.集合；支持片段筛选"></label>
+              <label class="field"><span>对照基线</span><select id="mongo-baseline"><option value="yesterday">昨日同窗</option><option value="previous">前一个等长窗口</option><option value="custom">指定开始时间</option></select></label>
+              <label class="field span-2"><span>指定基线开始（等长）</span><input id="mongo-baseline-start" type="datetime-local" step="1"></label>
+              <label class="field span-2"><span>真实问题回放</span><select id="mongo-replay"><option value="">选择已固定的异常与基线</option></select></label>
+            </div>
             <div id="analytics-filter-summary" class="active-filters span-8" hidden></div>
             <div class="form-actions span-8">
               <button id="analytics-submit" class="button primary" type="submit">
@@ -451,7 +463,8 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.27.1-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.27.1-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.28.0-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.28.0-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.28.0-rawoss" defer></script>
 </body>
 </html>

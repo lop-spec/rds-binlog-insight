@@ -1567,6 +1567,11 @@ function renderAnalyticsCoverage(coverage, window, source = "binlog", indexStats
 }
 
 function syncAnalyticsMode(slowSource) {
+  if (typeof syncMongoMode === 'function') {
+    const mongo = $("#analytics-source").value === "mongodb";
+    syncMongoMode(mongo);
+    if (mongo) return;
+  }
   const warning = $("#analytics-lock-warning");
   if (warning) warning.hidden = slowSource;
   $("#analytics-tabs").hidden = slowSource;
@@ -1615,7 +1620,7 @@ function renderAnalytics(result) {
 
 function setAnalyticsRange(range) {
   const units = { "1h": 60 * 60_000, "6h": 6 * 60 * 60_000, "24h": 24 * 60 * 60_000, "7d": 7 * 24 * 60 * 60_000, "30d": 30 * 24 * 60 * 60_000 };
-  const latestEpochUs = Number(state.status?.summary?.latestEpochUs || 0);
+  const latestEpochUs = $("#analytics-source").value === "mongodb" ? 0 : Number(state.status?.summary?.latestEpochUs || 0);
   const end = latestEpochUs > 0 ? new Date(latestEpochUs / 1000) : new Date();
   $("#analytics-end").value = toLocalInput(end);
   $("#analytics-start").value = toLocalInput(new Date(end.getTime() - units[range]));
@@ -1652,6 +1657,7 @@ function analyticsQueryString(orderOverride = "") {
 }
 
 async function runAnalytics(orderOverride = "") {
+  if ($("#analytics-source").value === "mongodb") return runMongoAnalytics();
   if (orderOverride) state.sqlOrder = orderOverride;
   // 换排序不需要重新扫描分区：已覆盖的聚合直接重排即可。
   const query = analyticsQueryString(orderOverride);

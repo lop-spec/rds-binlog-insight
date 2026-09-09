@@ -323,6 +323,8 @@ class Application:
         # 兼容既有调用与状态字段：第一个采集器仍作为 general_log 暴露。
         self.general_log = self.general_logs[0]
         self.slow_logs = self._start_slow_log_collectors(credential_loader)
+        from .mongo_service import MongoService
+        self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
         try:
             self.schema_diff = SchemaDiffService(name_resolver=self._rds_instance_name)
         except SchemaDiffError as exc:
@@ -607,6 +609,8 @@ class Application:
         }
 
     def stop(self) -> None:
+        if getattr(self, 'mongo', None) is not None:
+            self.mongo.shutdown()
         for collector in self.general_logs:
             collector.shutdown()
         self.queries.shutdown()
@@ -761,6 +765,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("workspace.js")
             elif parsed.path == "/assets/workspace.css":
                 self._serve_static("workspace.css")
+            elif parsed.path == "/assets/mongo.js":
+                self._serve_static("mongo.js")
+            elif parsed.path == "/api/mongo/status":
+                self._json({"ok": True, "data": self.app.mongo.status()})
+            elif parsed.path == "/api/mongo/analytics":
+                self._json({"ok": True, "data": self.app.mongo.query(query)})
             elif parsed.path == "/favicon.svg":
                 self._serve_static("favicon.svg")
             elif parsed.path == "/healthz":
@@ -962,6 +972,21 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/ingest/mongo-commands":
+            if not self._valid_host():
+                self._error(421, "INVALID_HOST", "请求 Host 不受信任")
+                return
+            if not self.app.mongo.authorized(self.headers.get("Authorization", "")):
+                self._error(401, "MONGO_AUTH_REQUIRED", "Mongo aggregate authentication required")
+                return
+            try:
+                self._json({"ok": True, "data": self.app.mongo.ingest(self._body_json())}, 202)
+            except (ValueError, TypeError, KeyError) as exc:
+                self._error(400, "MONGO_INVALID_PAYLOAD", str(exc))
+            except Exception:
+                LOGGER.exception("Mongo command aggregate ingestion failed")
+                self._error(503, "MONGO_INGEST_FAILED", "聚合写入失败；请按同一 batch_id 重试")
+            return
         if parsed.path == "/api/ingest/tabularis-audit":
             if not self._valid_host():
                 self._error(421, "INVALID_HOST", "请求 Host 不受信任")
