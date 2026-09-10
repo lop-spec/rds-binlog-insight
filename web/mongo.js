@@ -8,7 +8,26 @@ function mongoAllocatorFree(value) {
   return known.length?known.reduce((s,v)=>s+Number(v),0):null;
 }
 function mongoScale(v, divisor) { return v == null ? null : v/divisor; }
-function mongoDelta(v) { return v == null ? '基线或字段未完整' : `${v>0?'+':''}${mongoNumber(v)}`; }
+function mongoDelta(v) { return v == null ? '不可比较' : `${v>0?'+':''}${mongoNumber(v)}`; }
+const MONGO_ORDERS={duration_growth:'累计耗时增量',count_growth:'慢记录次数增量',scan_growth:'扫描文档增量',cpu_growth:'CPU 增量',read_growth:'读取量增量',performance:'性能重合',count:'已采集慢记录数',max_latency:'最长单次耗时',duration_total:'已记录累计耗时',scan_total:'已记录扫描文档',cpu_total:'已记录 CPU',read_total:'已记录读取量'};
+const MONGO_REASONS={incomplete_source:'当前采集有缺口',incomplete_baseline:'基线采集有缺口',incomplete_source_or_baseline:'当前或基线采集有缺口',metric_gaps:'性能点有缺口',coarse_grain_zoom_required:'请缩至 3 小时内计算分钟关联',memory_requires_component_deltas:'内存需看组成变化',insufficient_buckets:'不足 6 个完整分钟',insufficient_points:'有效点不足',constant_sql:'命令时序无变化',constant_total:'性能时序无变化',ranking_evidence_unavailable:'排序所需证据不足',ranking_field_unavailable:'排序字段未上报',ok:'当前窗口关联（非因果）'};
+function mongoReason(code){return MONGO_REASONS[code]||'当前关联不可计算';}
+function mongoCost(v,scale=1,unit='') {
+  if(!v||v.observed==null)return '未上报';
+  const n=v.observed/scale,shown=n>0&&n<0.01?'＜0.01':mongoNumber(n);
+  const field=v.known<v.total?`<br><small>字段覆盖 ${v.known}/${v.total}；仅已记录值</small>`:'';
+  const delta=v.delta==null?'':`<br><small>增量 ${mongoDelta(v.delta/scale)} ${unit}</small>`;
+  return `<strong>${shown} ${unit}</strong>${field}${delta}`;
+}
+function mongoAssessment(x){
+  const names={incomplete_source:'仅列已采集成本；不判断增长',incomplete_baseline:'基线待补齐；不判断增长',incomplete_command:'命令正文不完整',after_peak:'首次出现晚于性能峰值',candidate:'增量候选（未证明因果）',insufficient_cost_fields:'部分成本未上报，不能排除增长',no_observed_growth:'已记录成本未增长'};
+  return names[x.assessment]||(x.conclusion==='candidate'?names.candidate:'当前证据不足');
+}
+function mongoCoverageText(c){
+  const ranges=[...(c.missing_ranges||[]),...(c.index_missing_ranges||[])];
+  return `${c.collected_windows??0}/${c.expected_windows??0} 个五分钟窗口${c.complete?'，完整':`，缺 ${c.missing_count??'?'} 个${c.index_missing_count?`，另有 ${c.index_missing_count} 个索引缺口`:''}`}`+
+    (ranges.length?`；缺口 ${ranges.slice(0,3).map(x=>`${formatTime(x.start_us)}—${formatTime(x.end_us)}`).join('；')}${ranges.length>3?` 等 ${ranges.length} 段`:''}`:'');
+}
 function mongoOptions(rows) { return rows.map(([v,t])=>`<option value="${escapeHtml(v)}">${escapeHtml(t)}</option>`).join(''); }
 
 async function syncMongoMode(enabled) {
@@ -32,6 +51,7 @@ async function syncMongoMode(enabled) {
     });
     $('#analytics-panel-sql').addEventListener('click',e=>{
       const button=e.target.closest('[data-mongo-group]'); if (button) openMongoDetail(button.dataset.mongoGroup,button.dataset.mongoRole);
+      if(e.target.closest('[data-mongo-recent]')){setAnalyticsRange('1h');$('#mongo-baseline').value='previous';runMongoAnalytics().catch(err=>toast(err.message,'error'));}
     });
   }
   if (mongoStatus) return;
@@ -72,23 +92,28 @@ function mongoSparkline(points) {
   // Separate segments at missing minutes instead of drawing through gaps.
   const segments=[];let current=[];
   rows.forEach((p,i)=>{if(i&&p.timestamp-rows[i-1].timestamp>90000){segments.push(current);current=[];}current.push(`${((p.timestamp-lo)/(hi-lo)*900).toFixed(2)},${(110-Number(p.value)/max*100).toFixed(2)}`);});segments.push(current);
-  return `<div class="spark"><svg viewBox="0 0 920 125" role="img" aria-label="${escapeHtml(MONGO_METRICS[rows[0].metric]||rows[0].metric)}性能曲线，断点保留缺口">${segments.map(x=>`<polyline points="${x.join(' ')}" fill="none" stroke="var(--accent,#216e57)" stroke-width="2"/>`).join('')}</svg></div>`;
+  return `<div class="spark"><svg viewBox="0 0 920 125" role="img" aria-label="${escapeHtml(MONGO_METRICS[rows[0].metric]||rows[0].metric)}性能曲线，断点保留缺口">${segments.map(x=>`<polyline points="${x.join(' ')}" fill="none" stroke="var(--accent,#216e57)" stroke-width="2"/>`).join('')}</svg></div><p class="analytics-note">${formatTime(lo*1000)} — ${formatTime(hi*1000)} · 已有点范围 ${mongoNumber(Math.min(...rows.map(x=>Number(x.value))))} — ${mongoNumber(Math.max(...rows.map(x=>Number(x.value))))}；断线表示缺点，不补零。</p>`;
 }
 
 function renderMongoAnalytics(data) {
   $('#analytics-empty').hidden=true;
   const coverage=data.coverage||{},baseline=data.baseline_coverage||{};
-  $('#analytics-coverage').innerHTML=`<span>MongoDB · 当前 ${coverage.collected_windows??0}/${coverage.expected_windows??0} 窗口，基线 ${baseline.collected_windows??0}/${baseline.expected_windows??0} 窗口 · ${coverage.complete&&baseline.complete?'窗口采集完整（仍是慢记录子集）':'存在缺口，增长结论不可用'} · 分桶 ${mongoNumber(data.bucket_width/6e7)} 分钟</span>`;
-  const totals=(data.totals||[]).map(x=>`${escapeHtml(x.role)} ${escapeHtml(x.kind)}：${mongoNumber(x.baseline_count)} → ${mongoNumber(x.count)}`).join('；');
-  $('#analytics-meta').textContent=`${data.total_groups} 个命令模板 · ${data.status} · 基线 ${formatTime(data.baseline_start)} → ${formatTime(data.baseline_end)}`;
+  $('#analytics-coverage').innerHTML=`<span>MongoDB · 当前 ${escapeHtml(mongoCoverageText(coverage))}<br>基线 ${escapeHtml(mongoCoverageText(baseline))}</span>`;
+  const totals=(data.totals||[]).map(x=>`${escapeHtml(x.role)} ${x.kind==='suboperation'?'内部操作':'外层命令'}：当前已采集 ${mongoNumber(x.count)} 条${x.baseline_count==null?'':`，基线 ${mongoNumber(x.baseline_count)} 条`}`).join('；');
+  $('#analytics-meta').textContent=`${data.total_groups} 个命令模板 · 按${MONGO_ORDERS[data.order]||data.order}排序 · 基线 ${formatTime(data.baseline_start)} → ${formatTime(data.baseline_end)}`;
+  const history=data.collection_status||{},slow=history.history_slow_progress,metricProgress=history.history_metric_progress;
+  const recovery=history.enabled?`后台近 48 小时回补：慢日志 ${slow?`${slow.collected_windows}/${slow.expected_windows} 窗口`:'等待调度'}；云指标 ${metricProgress?`${metricProgress.collected_hours}/${metricProgress.expected_hours} 小时已抓取`:'等待调度'}。实时采集优先，不倒退水位；历史原生命令计数无法补造。${history.history_pause?' 当前暂停，优先追赶实时水位。':''}`:'历史回补未启用。';
+  const historyErrors=['history_slowlog','history_metrics'].filter(k=>history[k]&&history[k]!=='ok').map(k=>`${k}：${history[k]}`).join('；');
+  const scopeNotice=(!coverage.complete||!baseline.complete)?`当前窗口：${mongoCoverageText(coverage)}。基线：${mongoCoverageText(baseline)}。下面仍展示已采集记录的成本；不外推全窗口，不判断增减。`:'';
+  const orderNotice=data.order_reason?`原排序“${MONGO_ORDERS[data.requested_order]||data.requested_order}”不可用（${mongoReason(data.order_reason)}），已明确改按“${MONGO_ORDERS[data.order]||data.order}”排序，不是异常增量榜。`:'';
   const rows=(data.statements||[]).map(x=>[
-    `<button type="button" class="button ghost compact" data-mongo-group="${escapeHtml(x.group_id)}" data-mongo-role="${escapeHtml(x.role)}">${escapeHtml(x.namespace)}<br><strong>${escapeHtml(x.command)}</strong> · ${escapeHtml(x.role)}</button>`,
-    `${mongoNumber(x.baseline_count)} → ${mongoNumber(x.count)}<br>${mongoDelta(x.count_delta)}`,
-    `${mongoNumber(x.avg_us/1000)} ms / ${mongoNumber(x.max_us/1000)} ms`,
-    `${mongoDelta(x.costs.duration_us.delta==null?null:x.costs.duration_us.delta/1e6)} s`,
-    mongoDelta(x.costs.docs.delta),
-    `${mongoNumber(x.evidence.difference_r,3)}<br>${escapeHtml(x.evidence.metric_status)}`,
-    `${x.conclusion==='candidate'?'增量候选（未证明因果）':'证据不足 / 无成本增长'}${x.new_slow_shape?'<br>新出现于慢日志':''}`,
+    `<button type="button" class="button ghost compact" data-mongo-group="${escapeHtml(x.group_id)}" data-mongo-role="${escapeHtml(x.role)}">${escapeHtml(x.namespace)}<br><strong>${['unknown','command'].includes(x.command)?'命令类型未识别':escapeHtml(x.command)}</strong> · ${escapeHtml(x.role)}</button>${x.incomplete?'<br><small>正文不完整，详情保留已知成本</small>':''}`,
+    `<strong>${mongoNumber(x.count)} 条</strong>${x.baseline_count==null?'':`<br>基线 ${mongoNumber(x.baseline_count)} 条`}${x.count_delta==null?'':`<br>增量 ${mongoDelta(x.count_delta)}`}`,
+    `${mongoCost(x.costs.duration_us,1e6,'s')}<br>平均 ${mongoNumber(x.avg_us/1000)} ms<br>最大 ${mongoNumber(x.max_us/1000)} ms`,
+    `扫描 ${mongoCost(x.costs.docs)}<br>读取 ${mongoCost(x.costs.bytes_read,2**20,'MiB')}`,
+    `CPU ${mongoCost(x.costs.cpu_ns,1e9,'s')}<br>写关注等待 ${mongoCost(x.costs.write_wait_us,1e6,'s')}`,
+    `r ${mongoNumber(x.evidence.pearson,3)} / 差分 ${mongoNumber(x.evidence.difference_r,3)}<br>${escapeHtml(mongoReason(x.evidence.metric_status))}`,
+    `${mongoAssessment(x)}${x.new_slow_shape?'<br>新出现于慢日志':''}`,
   ]);
   const performance=(data.metric_points||[]).filter(x=>!$('#mongo-role').value||x.role===$('#mongo-role').value);
   const roles=[...new Set(performance.map(x=>x.role))];
@@ -99,9 +124,9 @@ function renderMongoAnalytics(data) {
     return [escapeHtml(x.node),escapeHtml(x.role),formatTime(x.timestamp*1000),mongoNumber(x.mem?.resident/1024),mongoNumber(c['bytes currently in the cache']/2**30),mongoNumber(c['maximum bytes configured']/2**30),mongoNumber(c['tracked dirty bytes in the cache']/2**30),mongoNumber(g.current_allocated_bytes/2**30),mongoNumber(mongoScale(free,2**30)),mongoNumber(x.connections?.current),mongoNumber(x.cursor?.open?.total),`${mongoNumber(x.global_lock?.currentQueue?.readers)} / ${mongoNumber(x.global_lock?.currentQueue?.writers)}`];
   });
   const clients=(data.client_aggregates||[]).map(x=>[escapeHtml(x.service),escapeHtml(x.namespace),escapeHtml(x.command),mongoNumber(x.count),mongoNumber(x.failed),mongoNumber(x.lost)]);
-  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>慢命令增量与性能关联</h3><p>${totals}</p><p class="analytics-note">${escapeHtml(data.warning)} · 只对所选层级计算。缺 CPU/读取字段显示未知，不补零。快捷时间对齐最新完整慢日志窗口；自定义时间不改写。</p>
+  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>慢命令成本与性能关联</h3><p>${totals}</p>${scopeNotice||orderNotice?`<div class="notice"><div><strong>${escapeHtml(orderNotice||'窗口数据尚未完整')}</strong><p>${escapeHtml(scopeNotice)}</p><button type="button" class="button secondary compact" data-mongo-recent>改查最近 1 小时，对比前 1 小时</button></div></div>`:''}<p class="analytics-note">${escapeHtml(recovery)} ${escapeHtml(historyErrors)} 重新分析可查看回补后的结果。</p><p class="analytics-note">${escapeHtml(data.warning)} · 只对所选层级计算。字段未上报不补零；部分字段展示覆盖条数。快捷时间对齐最新完整慢日志窗口；自定义时间不改写。</p>
     ${roles.map(role=>`<h4>${escapeHtml(role)} · ${escapeHtml(MONGO_METRICS[data.metric]||data.metric)}</h4>${mongoSparkline(performance.filter(x=>x.role===role))}`).join('')||'<p>没有匹配的性能数据。</p>'}
-    ${analyticsTable(['集合族 / 命令','慢记录次数与增量','平均 / 最大耗时','累计耗时增量','扫描文档增量','性能差分 r','判断'],rows)}
+    ${analyticsTable(['集合族 / 命令','已采集慢记录','累计 / 平均 / 最大耗时','已记录扫描 / 读取量','已记录 CPU / 等待','当前窗口关联','判断'],rows)}
     </section><details class="detail-block"><summary>最长慢命令与反证（独立于增量榜）</summary>${analyticsTable(['命令','最长耗时','代表样本开始','排除项'],outlierRows)}</details><details class="detail-block"><summary>节点命令总次数（不是慢日志计数）</summary><p>按服务器原生计数器的连续区间相减；缺失和跨进程区间不计。QPS 使用已覆盖秒数，不外推完整窗口。基线与当前各至少两个有效区间才比较观测 QPS；不等于全窗口次数增长。</p>${analyticsTable(['节点','角色','命令','计数增量','基线 → 当前 QPS','观测 QPS 变化','当前 / 窗口；基线覆盖','失败'],counterRows,'该历史窗口未采集原生命令计数，不能从慢日志补出来。')}${detailBlock('计数缺口',JSON.stringify({current:data.native_gaps||[],baseline:data.native_baseline_gaps||[]}))}</details>
     <details class="detail-block"><summary>内存组成与当前节点状态</summary>${analyticsTable(['节点','角色','样本时间','RSS GiB','WT GiB','WT 上限 GiB','WT 脏页 GiB','实际分配 GiB','已知空闲 GiB（不含 unmapped）','连接','打开游标','读 / 写排队'],memory,'该窗口无原生内存快照。')}</details>
     <details class="detail-block"><summary>集合 / 模板全量次数（接入服务范围）</summary><p>仅统计注册 Command Monitoring 的服务；未接入时不显示虚构的全量次数。</p>${analyticsTable(['服务','集合','命令','尝试次数','失败','丢失'],clients,'尚无应用命令聚合接入。')}</details>
@@ -112,8 +137,8 @@ function renderMongoAnalytics(data) {
 function openMongoDetail(id,role) {
   const x=[...(mongoResult?.statements||[]),...(mongoResult?.outliers||[])].find(x=>x.group_id===id&&x.role===role); if(!x)return;
   $('#detail-title').textContent=`${x.namespace} · ${x.command}`;
-  const costRows=Object.entries(x.costs).map(([k,v])=>[escapeHtml(k),mongoNumber(v.baseline),mongoNumber(v.observed),mongoDelta(v.delta),`${v.known}/${v.total}`]);
-  $('#detail-body').innerHTML=`<section class="detail-block"><h3>异常增量与反证</h3><p>${x.conclusion==='candidate'?'该模板有成本或慢记录增量，是排查候选，不等于已经证明性能根因。':'当前证据不能确认该模板导致异常。'}</p><p>${(x.exclusions||[]).map(escapeHtml).join('；')||'未触发时序排除项，仍需直接成本和业务验证。'}</p>
+  const costRows=Object.entries(x.costs).map(([k,v])=>[escapeHtml(k),mongoNumber(v.baseline),mongoNumber(v.observed),v.delta==null?'不可比较（见窗口与字段覆盖）':mongoDelta(v.delta),`${v.known}/${v.total}；基线 ${v.baseline_known??'?'}/${v.baseline_total??'?'}`]);
+  $('#detail-body').innerHTML=`<section class="detail-block"><h3>异常增量与反证</h3><p>${mongoAssessment(x)}。这里展示已记录值，不外推缺失数据。</p><p>${(x.exclusions||[]).map(escapeHtml).join('；')||'未触发时序排除项，仍需直接成本和业务验证。'}</p>
     <p>次数 ${mongoNumber(x.baseline_count)} → ${mongoNumber(x.count)}；频次成本项 ${mongoNumber(mongoScale(x.frequency_cost_delta_us,1e6))} s；单次成本项 ${mongoNumber(mongoScale(x.per_call_cost_delta_us,1e6))} s。基线为零时不能计算该分解。</p>
     ${analyticsTable(['指标（原始单位）','基线已记录值','当前已记录值','完整字段增量','当前字段覆盖'],costRows)}
     ${detailBlock('规范化命令（脱敏）',JSON.stringify(x.shape,null,2))}${detailBlock('代表慢记录与成本',JSON.stringify(x.sample,null,2))}

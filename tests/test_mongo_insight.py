@@ -102,6 +102,53 @@ class MongoGates(unittest.TestCase):
         self.assertIsNone(r['statements'][0]['count_delta'])
         self.assertEqual(r['status'],'incomplete_baseline')
 
+    def test_missing_baseline_keeps_current_costs_and_sorts_by_real_cost(self):
+        rows=rollup_records([record(ms=120),record(command={'aggregate':'messages_1','pipeline':[]},ms=5000)],'dds-example',['messages'])
+        t=rows[0]['bucket']
+        r=analyze(rows,[],[],t,t+MINUTE,coverage=False,baseline_coverage=False)
+        self.assertEqual(r['order'],'duration_total')
+        self.assertEqual(r['requested_order'],'duration_growth')
+        self.assertEqual(r['statements'][0]['max_us'],5_000_000)
+        self.assertEqual(r['statements'][0]['costs']['duration_us']['observed'],5_000_000)
+        self.assertIsNone(r['statements'][0]['costs']['duration_us']['delta'])
+        self.assertEqual(r['statements'][0]['assessment'],'incomplete_source')
+        self.assertEqual([x['kind'] for x in r['totals']],['command'])
+
+    def test_baseline_gap_does_not_block_current_window_correlation(self):
+        from app.mongo_insight import rollup_events
+        events=[]
+        for i in range(1,11):
+            a=self.norm(record(ms=i*100));a['start_us']=T+(i-1)*MINUTE;a['finish_us']=a['start_us']+a['duration_us'];events.append(a)
+        points=[dict(timestamp=(T+i*MINUTE)//1000,role='Primary',metric='CPUUtilization',value=i*i) for i in range(1,11)]
+        r=analyze(rollup_events(events),[],points,T,T+10*MINUTE,coverage=True,baseline_coverage=False)
+        row=r['statements'][0]
+        self.assertGreater(row['evidence']['pearson'],0.9)
+        self.assertEqual(row['assessment'],'incomplete_baseline')
+        self.assertIsNone(row['count_delta'])
+        missing=analyze(rollup_events(events),[],points,T,T+10*MINUTE,coverage=False,baseline_coverage=False)
+        self.assertIsNone(missing['statements'][0]['evidence']['pearson'])
+
+    def test_known_baseline_remains_visible_when_current_source_partial(self):
+        rows=rollup_records([record()], 'dds-example', ['messages']);t=rows[0]['bucket']
+        r=analyze(rows,rows,[],t,t+MINUTE,coverage=False,baseline_coverage=True)
+        row=r['statements'][0]
+        self.assertEqual(row['baseline_count'],1)
+        self.assertEqual(row['costs']['duration_us']['baseline'],120000)
+        self.assertIsNone(row['count_delta'])
+
+    def test_field_coverage_and_unavailable_ranking_are_explicit(self):
+        rows=rollup_records([record(cpuNanos=500),record()], 'dds-example', ['messages']);t=rows[0]['bucket']
+        r=analyze(rows,[],[],t,t+MINUTE,coverage=True,baseline_coverage=True,order='cpu_growth')
+        self.assertEqual(r['order'],'cpu_total')
+        cost=r['statements'][0]['costs']['cpu_ns']
+        self.assertEqual((cost['observed'],cost['known'],cost['total']),(500,1,2))
+        self.assertIsNone(cost['delta'])
+
+    def test_missing_window_ranges_are_compacted_without_losing_gaps(self):
+        from app.mongo_store import window_ranges
+        self.assertEqual(window_ranges([T,T+5*MINUTE,T+15*MINUTE]),[
+            {'start_us':T,'end_us':T+10*MINUTE},{'start_us':T+15*MINUTE,'end_us':T+20*MINUTE}])
+
     def test_counter_reset_node_and_epoch(self):
         a=dict(node='a',epoch=1,time_us=T,commands={'find':{'total':100}})
         b=dict(node='a',epoch=1,time_us=T+60_000_000,commands={'find':{'total':130}})

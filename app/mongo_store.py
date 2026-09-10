@@ -30,6 +30,16 @@ SCHEMA = pa.schema([(k,pa.int64()) for k in NUMBERS]+[(k,pa.string()) for k in S
 MAX_ROWS = 250_000
 
 
+def window_ranges(windows):
+    ranges=[]
+    for t in sorted(set(windows)):
+        if ranges and ranges[-1]['end_us']==t:
+            ranges[-1]['end_us']=t+WINDOW
+        else:
+            ranges.append(dict(start_us=t,end_us=t+WINDOW))
+    return ranges
+
+
 def atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True,exist_ok=True)
     temporary = path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
@@ -155,6 +165,7 @@ class MongoStore:
             found.append((path,m))
         return found,dict(complete=not missing,expected_windows=len(found)+len(missing),
                           collected_windows=len(found),missing_windows=missing[:20],missing_count=len(missing),
+                          missing_ranges=window_ranges(missing),
                           records=sum(m['records'] for _,m in found),source='dds_slow_records')
 
     @staticmethod
@@ -186,7 +197,8 @@ class MongoStore:
             indexed={r['revision']:int(r['n']) for r in counts}
             gaps=[m['start'] for _,m in manifests if indexed.get(m['revision'],0)!=m['rollup_rows']]
             if gaps:
-                coverage.update(complete=False,index_missing_windows=gaps[:20])
+                coverage.update(complete=False,index_missing_windows=gaps[:20],index_missing_count=len(gaps),
+                                index_missing_ranges=window_ranges(gaps))
                 LOGGER.warning('mongo_query incomplete_index: instance=%s windows=%s',instance,len(gaps))
             scope+=' AND bucket >= {lo:Int64} AND bucket < {hi:Int64}'
             if role:

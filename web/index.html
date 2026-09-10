@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.28.5-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.5-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.28.6-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.6-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -193,7 +193,7 @@
               <label class="field"><span>角色</span><select id="mongo-role"><option value="Primary">Primary</option><option value="Secondary">Secondary</option><option value="">全部角色（分开计算）</option></select></label>
               <label class="field"><span>慢记录层级</span><select id="mongo-kind"><option value="command">外层命令</option><option value="suboperation">内部操作</option></select></label>
               <label class="field span-2"><span>性能指标</span><select id="mongo-metric"></select></label>
-              <label class="field span-2"><span>增量排序</span><select id="mongo-order"><option value="duration_growth">累计耗时增长</option><option value="count_growth">慢记录次数增长</option><option value="scan_growth">扫描文档增长</option><option value="cpu_growth">CPU 时间增长</option><option value="read_growth">读取字节增长</option><option value="performance">资源高位重合（非因果）</option><option value="count">慢记录次数</option><option value="max_latency">最长单次耗时（不代表根因）</option><option value="duration_total">累计耗时</option></select></label>
+              <label class="field span-2"><span>排序（增量或实测成本）</span><select id="mongo-order"><option value="duration_growth">累计耗时增长</option><option value="count_growth">慢记录次数增长</option><option value="scan_growth">扫描文档增长</option><option value="cpu_growth">CPU 时间增长</option><option value="read_growth">读取字节增长</option><option value="performance">资源高位重合（非因果）</option><option value="count">慢记录次数</option><option value="max_latency">最长单次耗时（不代表根因）</option><option value="duration_total">已记录累计耗时</option><option value="scan_total">已记录扫描文档</option><option value="cpu_total">已记录 CPU 时间</option><option value="read_total">已记录读取量</option></select></label>
               <label class="field"><span>命令</span><select id="mongo-command"><option value="">全部</option><option>find</option><option>aggregate</option><option>distinct</option><option>update</option><option>insert</option><option>delete</option><option>getMore</option><option>count</option><option>findAndModify</option></select></label>
               <label class="field span-2"><span>集合 / 集合族</span><input id="mongo-namespace" placeholder="库.集合；支持片段筛选"></label>
               <label class="field"><span>对照基线</span><select id="mongo-baseline"><option value="yesterday">昨日同窗</option><option value="previous">前一个等长窗口</option><option value="custom">指定开始时间</option></select></label>
@@ -463,8 +463,8 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.28.5-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.28.5-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.28.5-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.28.6-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.28.6-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.28.6-rawoss" defer></script>
 </body>
 </html>

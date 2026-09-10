@@ -273,14 +273,14 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         value = p.get('value')
         if value is not None and math.isfinite(float(value)) and start < t <= end:
             metric_series[str(p.get('role', 'Unknown'))][t] = round(float(value)*1000)
-    roles = set(k[0] for k in now)
+    # Only report populations actually selected; filtered-out layers are not zero.
+    populations = {(k[0], v['profile']['kind']) for source in (now, previous) for k,v in source.items()}
     totals = []
-    for role in sorted(roles):
-        for kind in ('command','suboperation'):
-            selected = [v for k,v in now.items() if k[0] == role and v['profile']['kind'] == kind]
-            before = [v for k,v in previous.items() if k[0] == role and v['profile']['kind'] == kind]
-            totals.append(dict(role=role,kind=kind,count=sum(v['count'] for v in selected),
-                               baseline_count=sum(v['count'] for v in before) if baseline_coverage else None))
+    for role,kind in sorted(populations):
+        selected = [v for k,v in now.items() if k[0] == role and v['profile']['kind'] == kind]
+        before = [v for k,v in previous.items() if k[0] == role and v['profile']['kind'] == kind]
+        totals.append(dict(role=role,kind=kind,count=sum(v['count'] for v in selected),
+                           baseline_count=sum(v['count'] for v in before) if baseline_coverage else None))
     for key, a in now.items():
         role, group_id = key
         b = previous.get(key)
@@ -289,7 +289,7 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
                    first_us=a['first_us'], last_us=a['last_us'], sample=json.loads(a['sample']),
                    trend=[{'bucket':t,'count':v,'runtime_us':a['runtime'].get(t,0)} for t,v in sorted(a['trend'].items())])
         valid = coverage and baseline_coverage
-        row['baseline_count'] = (b['count'] if b else 0) if valid else None
+        row['baseline_count'] = (b['count'] if b else 0) if baseline_coverage else None
         row['count_delta'] = a['count'] - row['baseline_count'] if valid else None
         row['new_slow_shape'] = valid and row['baseline_count'] == 0
         row['costs'] = {}
@@ -297,10 +297,11 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
             known = a[k+'_known']
             before_known = b[k+'_known'] if b else 0
             value = a[k] if known else None
-            before_value = (b[k] if b else 0) if valid and (not b or before_known) else None
+            before_value = (b[k] if b else 0) if baseline_coverage and (not b or before_known) else None
             complete_cost = known == a['count'] and (not b or before_known == b['count'])
             delta = value-before_value if value is not None and before_value is not None and valid and complete_cost else None
-            row['costs'][k] = dict(observed=value, known=known, total=a['count'], baseline=before_value, delta=delta)
+            row['costs'][k] = dict(observed=value, known=known, total=a['count'], baseline=before_value, delta=delta,
+                                   baseline_known=before_known, baseline_total=b['count'] if b else 0)
         row['avg_us'] = a['duration_us']/a['count'] if a['count'] else None
         n0 = row['baseline_count']
         c0 = b['duration_us']/b['count'] if valid and b and b['count'] else None
@@ -320,22 +321,29 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
             y = [points[t] for t in expected]
             x = [a['runtime'].get(t-MINUTE,0) for t in expected]
             peak_time = expected[y.index(max(y))]
-            precedes = a['first_us'] >= peak_time
+            precedes = coverage and a['first_us'] >= peak_time
             low = sorted(y)[(len(y)-1)//5]
             overlap = sum(v*max(m-low,0) for v,m in zip(x,y))
             if len(x) >= 6:
                 r, reason = pearson(x,y)
                 dr, _ = pearson(differences(x),differences(y))
-        if not valid:
-            reason = 'incomplete_source_or_baseline'
-        row['evidence'] = dict(metric=metric,metric_status=reason,pearson=r if valid else None,
-                               difference_r=dr if valid else None, resource_overlap=str(overlap) if valid else None,
+        # Current-window correlation does not require historical baseline data.
+        correlation_valid = coverage and points_ok
+        if not coverage:
+            reason = 'incomplete_source'
+        row['evidence'] = dict(metric=metric,metric_status=reason,pearson=r if correlation_valid else None,
+                               difference_r=dr if correlation_valid else None, resource_overlap=str(overlap) if correlation_valid else None,
                                peak_end_us=peak_time,resource_peak_precedes_candidate=precedes,
                                source_scope='collected_slow_records',count_is_total_execution=False,
                                direct_cost_complete={k:a[k+'_known']==a['count'] for k in ('cpu_ns','bytes_read','docs')})
         growth = row['count_delta'] is not None and row['count_delta'] > 0
         cost_growth = any((row['costs'][k]['delta'] or 0)>0 for k in ('duration_us','docs','cpu_ns','bytes_read'))
         row['conclusion'] = 'candidate' if valid and cost_growth and not precedes and not row['incomplete'] else 'insufficient_evidence'
+        row['assessment'] = ('incomplete_source' if not coverage else 'incomplete_baseline' if not baseline_coverage
+                             else 'incomplete_command' if row['incomplete'] else 'after_peak' if precedes
+                             else 'candidate' if cost_growth else 'insufficient_cost_fields'
+                             if any(row['costs'][k]['delta'] is None for k in ('duration_us','docs','cpu_ns','bytes_read'))
+                             else 'no_observed_growth')
         row['exclusions'] = []
         row['evidence']['sample_after_resource_peak'] = bool(peak_time is not None and row['sample']['start_us'] >= peak_time)
         if row['evidence']['sample_after_resource_peak']:
@@ -353,12 +361,28 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         if row['incomplete']:
             row['exclusions'].append('命令正文截断或类型不完整')
         statements.append(row)
+    requested_order = order
+    order_reason = ''
     order_cost = {'duration_growth':'duration_us','scan_growth':'docs','cpu_growth':'cpu_ns','read_growth':'bytes_read'}
+    total_cost = {'duration_total':'duration_us','scan_total':'docs','cpu_total':'cpu_ns','read_total':'bytes_read'}
+    if not (coverage and baseline_coverage) and order in (*order_cost, 'count_growth', 'performance'):
+        order = {'count_growth':'count','scan_growth':'scan_total','cpu_growth':'cpu_total','read_growth':'read_total'}.get(order,'duration_total')
+        order_reason = 'incomplete_source' if not coverage else 'incomplete_baseline'
+    if statements and ((order in order_cost and not any(r['costs'][order_cost[order]]['delta'] is not None for r in statements))
+                       or (order == 'performance' and not any(r['evidence']['resource_overlap'] is not None for r in statements))):
+        order = {'scan_growth':'scan_total','cpu_growth':'cpu_total','read_growth':'read_total'}.get(order,'duration_total')
+        order_reason = 'ranking_evidence_unavailable'
+    if statements and order in total_cost and not any(r['costs'][total_cost[order]]['observed'] is not None for r in statements):
+        order = 'count';order_reason = 'ranking_field_unavailable'
+    if order_reason:
+        LOGGER.warning('mongo_analysis ordering changed: requested=%s effective=%s reason=%s',requested_order,order,order_reason)
     def score(row):
         if order=='count_growth': return row['count_delta'] if row['count_delta'] is not None else -1
         if order=='count': return row['count']
         if order=='max_latency': return row['max_us']
-        if order=='duration_total': return row['costs']['duration_us']['observed'] or 0
+        if order in total_cost:
+            v = row['costs'][total_cost[order]]['observed']
+            return v if v is not None else -1
         if order=='performance': return int(row['evidence']['resource_overlap'] or 0) if row['conclusion']=='candidate' else -1
         c = order_cost.get(order,'duration_us')
         v = row['costs'][c]['delta']
@@ -372,6 +396,7 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         LOGGER.warning('mongo_analysis unavailable: %s',status)
     return dict(engine='mongodb',status=status,statements=statements[:max(1,min(limit,200))],
                 outliers=sorted(statements,key=lambda row:(-row['max_us'],row['group_id']))[:3],
-                total_groups=len(statements),totals=totals,order=order,metric=metric,start_us=start,end_us=end,
+                total_groups=len(statements),totals=totals,order=order,requested_order=requested_order,order_reason=order_reason,
+                metric=metric,start_us=start,end_us=end,
                 bucket_width=bucket_width,warning='慢记录不是全部执行；相关与重合不是因果。父子操作分层统计。',
                 command_count_scope='serverStatus_node_native_counts',client_count_scope='not_connected')

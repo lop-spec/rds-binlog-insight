@@ -88,7 +88,8 @@ class MongoService:
             LOGGER.warning('mongo_native_comparison unavailable: instance=%s missing_or_insufficient_observed_intervals',instance)
         result.update(instance=instance,baseline_start=base,baseline_end=base_end,coverage=coverage,baseline_coverage=baseline,
                       metric_points=points,native_counters=counter_rows,native_gaps=counter_gaps[:20],native_baseline_gaps=baseline_gaps[:20],
-                      native_latest=latest,client_aggregates=clients,optional_unavailable=optional)
+                      native_latest=latest,client_aggregates=clients,optional_unavailable=optional,
+                      collection_status=next((c.status() for c in self.collectors if c.instance==instance),{}))
         result['client_count_scope']='connected_services_only' if clients else 'not_connected'
         return result
 

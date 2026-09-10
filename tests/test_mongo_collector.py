@@ -108,6 +108,48 @@ class CollectorGates(unittest.TestCase):
             old.pop()
             self.assertIsNone(service.query(params)['native_counters'][0]['qps_delta'])
 
+    def test_history_fills_missing_windows_without_rewinding_live_checkpoint(self):
+        from app.mongo_store import MongoStore,atomic_json
+        window=5*MINUTE
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            c=MongoCollector(store,dict(instanceId='dds-example'),lambda:None)
+            c.history_bounds=Mock(return_value=(T-10*window,T))
+            p=store.base(c.instance)/'slow-checkpoint.json';atomic_json(p,{'next':T});before=p.read_bytes()
+            c.slow_window=Mock(side_effect=lambda lo,hi:store.publish(c.instance,lo,hi,[],[]))
+            c.history_slow_tick();self.assertEqual(c.slow_window.call_args.args,(T-4*window,T-3*window))
+            c.history_slow_tick();self.assertEqual(c.slow_window.call_args.args,(T-5*window,T-4*window))
+            self.assertEqual(p.read_bytes(),before)
+            c.slow_window.side_effect=RuntimeError('provider rate limited')
+            with self.assertRaises(RuntimeError):c.history_slow_tick()
+            c.slow_window.side_effect=lambda lo,hi:store.publish(c.instance,lo,hi,[],[])
+            c.history_slow_tick();self.assertEqual(c.slow_window.call_args.args,(T-7*window,T-6*window))
+            atomic_json(p,{'next':T-2*window});c.slow_window.reset_mock();c.history_slow_tick()
+            c.slow_window.assert_not_called()
+            self.assertEqual(c.state['history_pause'],'realtime_slowlog_catching_up')
+
+    def test_history_metric_hour_is_persistent_and_no_native_backfill(self):
+        from app.mongo_store import MongoStore,atomic_json
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            c=MongoCollector(store,dict(instanceId='dds-example'),lambda:None)
+            c.history_bounds=Mock(return_value=(T-60*MINUTE,T))
+            atomic_json(store.base(c.instance)/'slow-checkpoint.json',{'next':T})
+            c.cloud_window=Mock(return_value=120);c.sample_nodes=Mock()
+            c.history_metric_tick();c.history_metric_tick()
+            c.cloud_window.assert_called_once_with(T-60*MINUTE,T,state_key='history_metrics_unavailable')
+            c.sample_nodes.assert_not_called()
+            self.assertEqual(c.state['history_metric_progress']['missing_hours'],0)
+
+    def test_history_target_does_not_age_out_initial_missing_baseline(self):
+        from app.mongo_store import MongoStore
+        with tempfile.TemporaryDirectory() as td:
+            c=MongoCollector(MongoStore(Path(td),backend='parquet'),dict(instanceId='dds-example'),lambda:None)
+            with patch('app.mongo_collector.time.time',return_value=T/1e6):start,end=c.history_bounds()
+            with patch('app.mongo_collector.time.time',return_value=T/1e6+3600):later_start,later_end=c.history_bounds()
+            self.assertEqual(start,later_start)
+            self.assertEqual(later_end-end,3600*1e6)
+
     def test_ingest_auth_is_not_optional(self):
         with tempfile.TemporaryDirectory() as td:
             service=MongoService(Path(td),lambda:None,start=False)

@@ -68,6 +68,7 @@ class MongoCollector:
         self.store=store;self.entry=entry;self.instance=entry['instanceId']
         self.settings_loader=settings_loader;self.archive_loader=archive_loader
         self.stop_event=threading.Event();self.threads=[];self.clients={};self.before={};self.unsupported_metrics={}
+        self.history_retry={}
         self.state={'instanceId':self.instance,'label':entry.get('label',self.instance),'enabled':entry.get('enabled',False),
                     'slowlog':'not_started','metrics':'not_started','counters':'not_started','client_aggregates':'not_connected'}
 
@@ -99,7 +100,7 @@ class MongoCollector:
         archive=self.archive_loader(self.settings_loader()) if self.archive_loader else None
         return self.store.publish(self.instance,start,end,records,self.entry.get('families',[]),archive=archive)
 
-    def cloud_window(self,start,end):
+    def cloud_window(self,start,end,*,state_key='metrics_unavailable'):
         client=self.rpc(cms=True);points=[]
         unavailable={}
         for metric in METRICS:
@@ -136,7 +137,7 @@ class MongoCollector:
             if not got and not unsupported:
                 unavailable[metric]='no_points'
                 LOGGER.warning('mongo_metric unavailable: instance=%s metric=%s no_points',self.instance,metric)
-        self.state['metrics_unavailable']=unavailable
+        self.state[state_key]=unavailable
         if not points:raise RuntimeError('cms_no_points')
         self.store.telemetry(self.instance,'metrics',points)
         return len(points)
@@ -219,6 +220,67 @@ class MongoCollector:
         t=end-(1+int(time.time()//60)%3)*WINDOW
         return self.slow_window(t,t+WINDOW)['records']
 
+    def history_bounds(self):
+        end=(int(time.time()*1e6)-180_000_000)//WINDOW*WINDOW
+        path=self.store.base(self.instance)/'history-target.json'
+        with self.store.lock:
+            if not path.exists():atomic_json(path,{'start':end-48*60*MINUTE})
+            start=min(int(json.loads(path.read_text())['start']),end-48*60*MINUTE)
+        if start<end-7*24*60*MINUTE:
+            LOGGER.warning('mongo_history expired_target: instance=%s incomplete recovery exceeded seven-day budget',self.instance)
+            start=end-7*24*60*MINUTE
+        return start,end
+
+    def history_ready(self):
+        _,end=self.history_bounds()
+        checkpoint=self.store.base(self.instance)/'slow-checkpoint.json'
+        if not checkpoint.exists() or int(json.loads(checkpoint.read_text())['next'])<end-WINDOW:
+            LOGGER.warning('mongo_history paused: realtime_slowlog_catching_up instance=%s',self.instance)
+            self.state['history_pause']='realtime_slowlog_catching_up'
+            return False
+        self.state['history_pause']=''
+        return True
+
+    def history_slow_tick(self):
+        # Discover missing immutable windows; never rewind the live checkpoint.
+        if not self.history_ready():return 0
+        start,end=self.history_bounds()
+        found,coverage=self.store.manifests(self.instance,start,end)
+        self.state['history_slow_progress']={k:coverage[k] for k in ('collected_windows','expected_windows','missing_count')}
+        existing={m['start'] for _,m in found}
+        if not coverage['missing_count'] and self.state.get('history_metric_progress',{}).get('missing_hours')==0:
+            atomic_json(self.store.base(self.instance)/'history-target.json',{'start':end-48*60*MINUTE})
+        for t in range(end-4*WINDOW,start-WINDOW,-WINDOW):
+            if t in existing or self.history_retry.get(('slow',t),0)>time.time():continue
+            self.state['history_slow_window']=t
+            try:m=self.slow_window(t,t+WINDOW)
+            except Exception:
+                self.history_retry[('slow',t)]=time.time()+600
+                raise
+            return m['records']
+        return 0
+
+    def history_metric_tick(self):
+        if not self.history_ready():return 0
+        hour=60*MINUTE
+        start,end=self.history_bounds();start=start//hour*hour;end=end//hour*hour
+        path=self.store.base(self.instance)/'history-metrics.json'
+        done=json.loads(path.read_text()) if path.exists() else {}
+        pending=[t for t in range(end-hour,start-hour,-hour) if str(t) not in done]
+        self.state['history_metric_progress']=dict(collected_hours=(end-start)//hour-len(pending),expected_hours=(end-start)//hour,missing_hours=len(pending))
+        for t in pending:
+            if self.history_retry.get(('metrics',t),0)>time.time():continue
+            self.state['history_metric_hour']=t
+            try:n=self.cloud_window(t,t+hour,state_key='history_metrics_unavailable')
+            except Exception:
+                self.history_retry[('metrics',t)]=time.time()+600
+                raise
+            # This records completed provider fetches, not guaranteed metric coverage.
+            done[str(t)]=dict(points=n,fetched_at=time.time())
+            atomic_json(path,done)
+            return n
+        return 0
+
     def _loop(self,name,callback,seconds):
         while not self.stop_event.is_set():
             begin=time.monotonic()
@@ -234,7 +296,9 @@ class MongoCollector:
             LOGGER.warning('mongo_collector disabled: instance=%s configuration_disabled',self.instance);return
         for name,callback,seconds in [('slowlog',self.slow_tick,30),
                 ('metrics',lambda:self.cloud_window(int(time.time()*1e6)-6*MINUTE,int(time.time()*1e6)),60),
-                ('counters',self.sample_nodes,60)]:
+                ('counters',self.sample_nodes,60),
+                ('history_slowlog',self.history_slow_tick,60),
+                ('history_metrics',self.history_metric_tick,120)]:
             thread=threading.Thread(target=self._loop,args=(name,callback,seconds),daemon=True,name='mongo-'+name)
             thread.start();self.threads.append(thread)
 
