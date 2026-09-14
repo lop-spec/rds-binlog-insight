@@ -49,7 +49,7 @@ from .pod_lookup import attach_pod_detail
 from .metadata import MetadataStore
 from .pipeline import PipelineError, SyncManager
 from .query_tasks import QueryTaskManager
-from .rds_api import RdsRpcClient
+from .rds_api import RdsApiError, RdsRpcClient
 from .schema_diff import SchemaDiffError, SchemaDiffService
 from .storage import EventStorage
 from .tabularis_audit import AuditIngestError, TabularisAuditIngest
@@ -1067,11 +1067,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                 logs = [
                     item
                     for item in client.list_binlogs(
-                        (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                     )
                     if item.host_instance_id == primary_host_instance_id
+                    and item.remote_status.lower() == "completed"
                 ]
+                if not logs:
+                    raise RdsApiError(
+                        "最近 10 分钟无主节点 Completed Binlog，未能验证下载能力",
+                        code="BINLOG_DOWNLOAD_PROBE_UNAVAILABLE",
+                    )
+                download_probe = logs[-1].probe_intranet_download()
                 oss_result = None
                 if settings.oss_enabled:
                     archive = self.app.sync.archive_for_settings(settings)
@@ -1085,11 +1092,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                             "identity": identity,
                             "primaryHostInstanceId": primary_host_instance_id,
                             "recentBinlogCount": len(logs),
+                            "binlogWindowMinutes": 10,
+                            "intranetDownload": download_probe,
                             "oss": oss_result,
                             "message": (
-                                "实例身份、Binlog 列表、OSS 访问和生命周期均已验证"
+                                "实例身份、Binlog 内网实际读取、OSS 访问和生命周期均已验证"
                                 if oss_result
-                                else "实例身份和 Binlog 列表权限均已验证"
+                                else "实例身份和 Binlog 内网实际读取均已验证"
                             ),
                         },
                     }
@@ -1192,7 +1201,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             code = getattr(exc, "code", "INTERNAL_ERROR")
             status = 409 if code in {"JOB_ALREADY_RUNNING"} else 400
             LOGGER.exception("POST request failed")
-            self._error(status, code, str(exc))
+            message = str(exc)
+            if getattr(exc, "request_id", ""):
+                message += f"；RequestId={exc.request_id}"
+            self._error(status, code, message)
 
 
 def run_server(

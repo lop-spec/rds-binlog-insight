@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import ssl
 import urllib.error
 import urllib.parse
@@ -16,12 +17,22 @@ from typing import Any
 from .config import Settings
 from .credentials import CloudCredential
 
+LOGGER = logging.getLogger(__name__)
+
 
 class RdsApiError(RuntimeError):
     def __init__(self, message: str, *, code: str = "RDS_API_ERROR", request_id: str = ""):
         super().__init__(message)
         self.code = code
         self.request_id = request_id
+
+
+class _NoDownloadRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RdsApiError(
+            "内网下载核验收到重定向，已停止；不跟随到其他地址",
+            code="INTRANET_DOWNLOAD_REDIRECT",
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -36,6 +47,7 @@ class RemoteBinlog:
     link_expired_utc: str
     remote_status: str
     host_instance_id: str
+    request_id: str = ""
 
     @property
     def stable_id(self) -> str:
@@ -51,12 +63,62 @@ class RemoteBinlog:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def selected_url(self, _prefer_intranet: bool = True) -> str:
-        if not self.intranet_download_link.strip():
+        url = self.intranet_download_link.strip()
+        code = "INTRANET_DOWNLOAD_LINK_INVALID"
+        reason = "RDS 返回的内网 Binlog 地址不是有效 HTTP(S) URL"
+        if not url:
+            code = "INTRANET_DOWNLOAD_LINK_MISSING"
+            reason = "RDS 未返回内网 Binlog 下载地址"
+        elif url.lower() == "sub account not auth permission":
+            code = "BINLOG_DOWNLOAD_FORBIDDEN"
+            reason = "RDS 已允许列举 Binlog，但拒绝签发下载链接：sub account not auth permission"
+        else:
+            try:
+                parsed = urllib.parse.urlsplit(url)
+                if (parsed.scheme in {"http", "https"} and parsed.hostname
+                        and not parsed.username and not parsed.password
+                        and not parsed.fragment and not any(c.isspace() for c in url)):
+                    return url
+            except ValueError:
+                pass
+        # Never log arbitrary link values (they may contain signed credentials).
+        LOGGER.warning("%s file=%s requestId=%s: %s; no public fallback",
+                       code, self.log_file_name, self.request_id, reason)
+        raise RdsApiError(
+            reason + "；已停止，不回退公网或旧 AccessKey",
+            code=code, request_id=self.request_id,
+        )
+
+    def probe_intranet_download(self) -> dict[str, Any]:
+        """Read only the four-byte binlog magic, without persisting a signed URL."""
+        request = urllib.request.Request(
+            self.selected_url(), headers={"Range": "bytes=0-3"}, method="GET"
+        )
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoDownloadRedirect(),
+            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+        )
+        try:
+            with opener.open(request, timeout=15) as response:
+                status = response.getcode()
+                magic = response.read(4)
+                if status not in {200, 206} or magic != b"\xfebin":
+                    raise RdsApiError(
+                        "内网 Range 核验未返回有效 Binlog 文件头",
+                        code="BINLOG_DOWNLOAD_PROBE_INVALID",
+                    )
+        except urllib.error.HTTPError as exc:
             raise RdsApiError(
-                "RDS 未返回内网 Binlog 下载地址；已禁止回退公网下载链接",
-                code="INTRANET_DOWNLOAD_LINK_MISSING",
-            )
-        return self.intranet_download_link
+                f"内网 Binlog 下载核验失败：HTTP {exc.code}",
+                code="BINLOG_DOWNLOAD_PROBE_FAILED",
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RdsApiError(
+                f"内网 Binlog 下载核验网络失败：{type(exc).__name__}",
+                code="BINLOG_DOWNLOAD_PROBE_FAILED",
+            ) from None
+        return {"verified": True, "logFileName": self.log_file_name,
+                "hostInstanceId": self.host_instance_id, "bytesRead": len(magic)}
 
 
 def _percent(value: Any) -> str:
@@ -237,6 +299,7 @@ class RdsRpcClient:
                         link_expired_utc=str(item.get("LinkExpiredTime") or ""),
                         remote_status=str(item.get("RemoteStatus") or ""),
                         host_instance_id=str(item.get("HostInstanceID") or ""),
+                        request_id=str(payload.get("RequestId") or ""),
                     )
                 )
             total = int(payload.get("TotalRecordCount") or len(results))

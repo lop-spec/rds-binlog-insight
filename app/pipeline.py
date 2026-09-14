@@ -459,6 +459,9 @@ class SyncManager:
                 f"实例未找到 {range_text} 范围的 Binlog",
                 "BINLOG_RANGE_NOT_FOUND",
             )
+        # Listing permission is not evidence that files can be downloaded.
+        for item in available:
+            item.selected_url()
         try:
             job_id = self.start(
                 reason="query-backfill",
@@ -588,6 +591,8 @@ class SyncManager:
         ) as exc:
             code = getattr(exc, "code", exc.__class__.__name__.upper())
             message = str(exc)
+            if getattr(exc, "request_id", ""):
+                message += f"；RequestId={exc.request_id}"
             self._event(job_id, "error", code, message)
             self.metadata.finish_job(job_id, "failed", message, code)
         except Exception as exc:
@@ -758,10 +763,11 @@ class SyncManager:
 
         try:
             result = attempt(item)
-        except DownloadError as exc:
+        except (DownloadError, RdsApiError) as exc:
             if exc.code not in {
                 "LINK_EXPIRED",
                 "DOWNLOAD_LINK_MISSING",
+                "INTRANET_DOWNLOAD_LINK_MISSING",
                 "HTTP_404",
             }:
                 raise

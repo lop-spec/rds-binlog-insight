@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.28.8-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.8-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.28.9-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.9-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -412,7 +412,7 @@
                 <label class="field span-2"><span>AccessKey Secret</span><input id="setting-ak-secret" type="password" autocomplete="new-password" placeholder="留空表示不修改"></label>
                 <label class="field span-4"><span>Security Token（可选）</span><input id="setting-token" type="password" autocomplete="new-password" placeholder="仅 STS 临时凭据需要"></label>
               </div>
-              <div class="permission-note"><strong>最小 RAM Action</strong><code>rds:DescribeDBInstanceAttribute</code><code>rds:DescribeDBInstanceHAConfig</code><code>rds:DescribeBinlogFiles</code></div>
+              <div class="permission-note"><strong>调用的 RDS Action（不等于下载最小权限）</strong><code>rds:DescribeDBInstanceAttribute</code><code>rds:DescribeDBInstanceHAConfig</code><code>rds:DescribeBinlogFiles</code><span>能列日志不代表能下载；核验会读取内网文件头。下载鉴权失败时停止，不自动扩权。</span></div>
             </section>
 
             <section class="settings-group">
@@ -463,8 +463,8 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.28.8-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.28.8-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.28.8-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.28.9-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.28.9-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.28.9-rawoss" defer></script>
 </body>
 </html>
