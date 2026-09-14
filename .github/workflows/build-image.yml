@@ -84,13 +84,9 @@ jobs:
             -m unittest \
             tests.test_sync_lifecycle \
             tests.test_rds_download \
-            tests.test_core.RdsClientTests \
-            tests.test_core.MetadataSecurityTests \
-            tests.test_core.PipelinePrefetchTests \
+            tests.test_core \
             tests.test_cloud_credentials \
             tests.test_clickhouse_credentials \
-            tests.test_core.CredentialBackendTests \
-            tests.test_core.ConfigAndChecksumTests \
             tests.test_clickhouse_oss \
             tests.test_clickhouse_hot \
             tests.test_clickhouse_raw_worker \
@@ -98,6 +94,8 @@ jobs:
             tests.test_clickhouse_slowlog_verify \
             tests.test_slowlog_collector \
             tests.test_slowlog_index \
+            tests.test_serving_handoff \
+            tests.test_sqlite_serving_performance \
             tests.test_slowlog_correlation \
             tests.test_slowlog_correlation_engines \
             tests.test_slowlog_impact \

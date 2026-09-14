@@ -10,6 +10,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
@@ -2349,6 +2350,7 @@ class EventStorage:
         *,
         control: Any | None = None,
         scan_limit: int = 8,
+        archive_factory: Callable[[], OssArchive | None] | None = None,
     ) -> dict[str, Any]:
         """按时间窗返回三类分析结果，并如实报告覆盖度。
 
@@ -2459,6 +2461,14 @@ class EventStorage:
                     ],
                 }
                 return summary
+            LOGGER.warning(
+                "Slow-log analytics index coverage incomplete; using legacy fallback"
+            )
+        # HTTP supplies a request-local factory, not an early coverage probe.
+        # This keeps both the part scan and repair enqueue single-pass and avoids
+        # constructing OSS clients on a complete SQLite/ClickHouse serving path.
+        if archive is None and archive_factory is not None:
+            archive = archive_factory()
         coverage = self.analytics_index.coverage(parts)
         scanned: list[str] = []
         scan_errors: list[str] = []
@@ -3020,6 +3030,7 @@ class EventStorage:
         *,
         limit_cap: int = 1000,
         control: Any | None = None,
+        archive_factory: Callable[[], OssArchive | None] | None = None,
     ) -> dict[str, Any]:
         source = str(query.get("source") or "").strip().lower()
         if source == "audit":
@@ -3081,6 +3092,11 @@ class EventStorage:
                 result["available_start_epoch_us"] = available.get("oldest_epoch_us")
                 result["available_end_epoch_us"] = latest_us
                 return result
+            LOGGER.warning(
+                "Slow-log event index coverage incomplete; using legacy fallback"
+            )
+        if archive is None and archive_factory is not None:
+            archive = archive_factory()
         with self.query_activity():
             if control is not None:
                 result = self._query_events_tiered_impl(

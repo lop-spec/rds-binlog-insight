@@ -4794,7 +4794,7 @@ class QueryIsolationTests(unittest.TestCase):
                 return {"complete": True}
 
             @staticmethod
-            def query_events_tiered(_query, _settings, archive):
+            def query_events_tiered(_query, _settings, archive, **_kwargs):
                 if archive is not None:
                     raise AssertionError("complete slow-log query must stay local")
                 return {"rows": [], "tiers_used": ["slowlog-index"]}

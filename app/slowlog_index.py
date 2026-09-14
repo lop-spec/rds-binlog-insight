@@ -1645,6 +1645,10 @@ class SlowLogIndex:
             return set()
         instance = str(instance or "").strip()
         found: set[str] = set()
+        # With an instance, both canonical-key columns are equality lookups.
+        # The wide analytics index otherwise scans the entire instance for IN.
+        # Leave unscoped lookups to the planner: they lack the leading key.
+        index_hint = " INDEXED BY idx_slowlog_event_canonical" if instance else ""
         with self.connection() as conn:
             for position in range(0, len(values), 400):
                 chunk = values[position : position + 400]
@@ -1654,7 +1658,7 @@ class SlowLogIndex:
                     (*chunk, instance) if instance else tuple(chunk)
                 )
                 rows = conn.execute(
-                    "SELECT event_id FROM slowlog_events "
+                    f"SELECT event_id FROM slowlog_events{index_hint} "
                     f"WHERE is_canonical = 1 AND event_id IN ({placeholders})"
                     f"{instance_clause}",
                     params,

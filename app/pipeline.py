@@ -137,6 +137,7 @@ class SyncManager:
         start_scheduler: bool = True,
         settings_loader: Callable[[], Settings] | None = None,
         role: str = "primary",
+        retention_owner: SyncManager | None = None,
         scope_instance_id: str = "",
         display_name: str = "",
     ):
@@ -148,6 +149,7 @@ class SyncManager:
         # binlog 同步进来，否则同一份 storage 会被清理逻辑重复执行。
         self._settings_loader = settings_loader or metadata.load_settings
         self.role = "secondary" if role == "secondary" else "primary"
+        self._retention_owner = self if self.role == "primary" else retention_owner
         self.scope_instance_id = str(scope_instance_id or "").strip()
         self.display_name = display_name or self.scope_instance_id
         self.client_factory = client_factory or (
@@ -1665,14 +1667,7 @@ class SyncManager:
                     "当前清单已处理完，正在确认是否有新的 Completed Binlog"
                 ),
             )
-        cleanup = self.storage.cleanup(
-            settings.retention_days,
-            archive_enabled=settings.oss_enabled,
-        )
-        cache = self.storage.enforce_local_cache_limit(0)
-        query_cache = self.storage.enforce_query_cache_limit(0)
-        cleanup["errors"].extend(cache["errors"])
-        cleanup["errors"].extend(query_cache["errors"])
+        cleanup = self._cleanup_after_sync(settings)
         if unavailable:
             completed_message = (
                 "指定时间范围内其余可用 Completed Binlog 已全部解析；"
@@ -1717,6 +1712,65 @@ class SyncManager:
                 "success",
                 completed_message,
             )
+
+    def _cleanup_after_sync(self, settings: Settings) -> dict[str, Any]:
+        # The live Application always has a primary scheduler over this shared
+        # storage. It runs retention and both cache sweeps even with auto_sync
+        # disabled. Standalone managers and per-instance overrides are NOT an
+        # equivalent handoff, so retain their existing cleanup/error behavior.
+        owner = self._retention_owner
+        shared_owner = (
+            owner is not None
+            and owner.role == "primary"
+            and owner.storage is self.storage
+        )
+        global_settings = owner._settings() if shared_owner else None
+        owner_busy = False
+        if shared_owner:
+            # The hourly sweep skips a running primary worker. A secondary
+            # cannot hand off to it during a potentially long catch-up run.
+            # The primary itself is at its final step and about to go idle.
+            with owner._state_lock:
+                owner_busy = (
+                    owner is not self
+                    and owner._worker is not None
+                    and owner._worker.is_alive()
+                )
+        equivalent = (
+            global_settings is not None
+            and settings.retention_days == global_settings.retention_days
+            and settings.oss_enabled == global_settings.oss_enabled
+        )
+        if (
+            equivalent
+            and owner is not None
+            and owner._scheduler is not None
+            and owner._scheduler.is_alive()
+            and not owner._shutdown.is_set()
+            and not owner_busy
+        ):
+            LOGGER.info(
+                "Sync cleanup delegated to the primary hourly retention scheduler"
+            )
+            return {"errors": []}
+        if not shared_owner:
+            reason = "no-shared-primary-owner"
+        elif not equivalent:
+            reason = "retention-settings-differ"
+        elif owner_busy:
+            reason = "primary-worker-active"
+        else:
+            reason = "scheduler-stopped-or-stopping"
+        LOGGER.info("Sync cleanup retained: %s", reason)
+        result = self.storage.cleanup(
+            settings.retention_days,
+            archive_enabled=settings.oss_enabled,
+        )
+        cache = self.storage.enforce_local_cache_limit(0)
+        query_cache = self.storage.enforce_query_cache_limit(0)
+        result["errors"].extend(cache["errors"])
+        result["errors"].extend(query_cache["errors"])
+        return result
 
     def _run_retention_cleanup_if_due(self, settings: Settings) -> None:
         now = time.monotonic()
