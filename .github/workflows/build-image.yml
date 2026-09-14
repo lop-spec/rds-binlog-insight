@@ -10,15 +10,15 @@ on:
         default: false
   push:
     tags:
-      - v1.28.10-rawoss
+      - v1.28.11-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.28.10-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.28.10-rawoss
+  VERSION: 1.28.11-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.28.11-rawoss
 
 jobs:
   build-test-package:
@@ -65,6 +65,7 @@ jobs:
             --volume "$PWD:/src:ro" \
             "$LOCAL_IMAGE" \
             -m unittest \
+            tests.test_sync_lifecycle \
             tests.test_rds_download \
             tests.test_core.RdsClientTests \
             tests.test_core.MetadataSecurityTests \
@@ -97,7 +98,7 @@ jobs:
             "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"
 
       - name: Verify workspace rendering and disclosure contracts
-        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs
+        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs tests/test_sync_lifecycle.cjs
 
       - name: Verify Mongo serving against isolated ClickHouse
         shell: bash

@@ -17,6 +17,7 @@ from .credentials import CloudCredential, load_credential
 from .downloader import DownloadError, download_file
 from .maintenance_status import SUPERVISOR_STATUS_NAME, read_json_status
 from .metadata import MetadataStore
+from .sync_lifecycle import PauseControl, sync_health
 from .oss_store import OSS_PACK_TARGET_BYTES, OssArchive, OssArchiveError
 from .parser_bridge import ParserError, parse_ndjson_chunks_buffered
 from .rds_api import RdsApiError, RdsRpcClient, RemoteBinlog
@@ -164,7 +165,12 @@ class SyncManager:
         self._state_lock = threading.RLock()
         self._worker: threading.Thread | None = None
         self._pause_after_current = threading.Event()
+        self._pause_controls: dict[str, PauseControl] = {}
+        if self._pause_control().state["mode"] != "none":
+            self._pause_after_current.set()
         self._shutdown = threading.Event()
+        self._last_health_log = ("", 0.0)
+        self._last_auto_error = ""
         self._last_auto_start = 0.0
         # Monotonic clocks may be below one hour shortly after host boot.
         # A negative sentinel guarantees the first scheduled cleanup is due.
@@ -260,6 +266,32 @@ class SyncManager:
     def _settings(self) -> Settings:
         return self._settings_loader()
 
+    def _pause_control(self) -> PauseControl:
+        instance_id = self.scope_instance_id or self._settings().db_instance_id
+        with self._state_lock:
+            if instance_id not in self._pause_controls:
+                self._pause_controls[instance_id] = PauseControl(self.metadata.path.parent, instance_id)
+            return self._pause_controls[instance_id]
+
+    def _collection_health(self, running: bool, latest: dict | None) -> dict:
+        with self._state_lock:
+            health = sync_health(self._settings(), running, self._pause_after_current.is_set(),
+                                 dict(self._pause_control().state), latest)
+            if self._last_auto_error and not running and health["state"] in {"waiting", "stalled", "failed"}:
+                health.update(ok=False, state="scheduler_error", message=f"自动采集启动失败（{self._last_auto_error}）；请检查服务日志")
+            return health
+
+    def _log_collection_health(self, running: bool) -> None:
+        latest = self.metadata.latest_job(self._job_scope())
+        health = self._collection_health(running, latest)
+        key = str(health["state"])
+        previous, at = self._last_health_log
+        if key != previous or time.monotonic() - at >= 300:
+            log = LOGGER.info if health["ok"] else LOGGER.warning
+            log("SYNC_HEALTH instance=%s state=%s progress=%s reason=%s",
+                self._job_scope(), key, health["lastProgressAt"], health["message"])
+            self._last_health_log = (key, time.monotonic())
+
     def _job_scope(self) -> str:
         if self.scope_instance_id:
             return self.scope_instance_id
@@ -293,6 +325,8 @@ class SyncManager:
         return {
             "running": running,
             "pauseRequested": self._pause_after_current.is_set(),
+            "pause": dict(self._pause_control().state),
+            "health": self._collection_health(running, latest),
             "latestJob": latest,
             "pipeline": pipeline_status,
             "archive": dict(self._archive_status),
@@ -503,7 +537,12 @@ class SyncManager:
         with self._cold_boundary_lock, self._state_lock:
             if self._worker and self._worker.is_alive():
                 raise PipelineError("已有同步任务正在运行", "JOB_ALREADY_RUNNING")
+            control = self._pause_control()
+            if reason == "auto" and (control.state["mode"] != "none" or self._pause_after_current.is_set()):
+                raise PipelineError("采集已暂停；自动任务不得清除操作暂停", "SYNC_PAUSED")
+            control.clear()
             self._pause_after_current.clear()
+            LOGGER.info("SYNC_START instance=%s reason=%s autoSync=%s", settings.db_instance_id, reason, settings.auto_sync)
             window_text = (
                 f"{_utc_api(requested_start)} 至 {_utc_api(requested_end)}"
                 if requested_start and requested_end
@@ -535,12 +574,18 @@ class SyncManager:
             self._worker.start()
             return job_id
 
-    def request_pause(self) -> bool:
+    def request_pause(self, *, resume_after_seconds: int | None = None) -> bool:
         with self._state_lock:
             running = bool(self._worker and self._worker.is_alive())
-        if running:
-            self._pause_after_current.set()
-        return running
+            if resume_after_seconds is not None and not self._settings().auto_sync:
+                raise PipelineError("自动同步已关闭；维护暂停不能代替启用自动同步", "AUTO_SYNC_DISABLED")
+            if running or resume_after_seconds is not None:
+                control = self._pause_control()
+                control.pause(resume_after_seconds)
+                self._pause_after_current.set()
+                LOGGER.warning("SYNC_PAUSE instance=%s mode=%s resumeAt=%s running=%s",
+                               self._job_scope(), control.state["mode"], control.state["resumeAt"], running)
+            return running
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -1900,15 +1945,17 @@ class SyncManager:
                 # 执行一次；secondary 一起跑会对同一批分区重复清理。
                 if self.role == "primary":
                     self._run_retention_cleanup_if_due(settings)
-                # A pause is a durable operator state, not a one-file hint.
-                # request_pause() lets the active file reach its atomic commit
-                # boundary; after that the scheduler must stay idle until an
-                # explicit /api/sync/start calls start(), which clears the flag.
-                # Otherwise the next 15-second scheduler pass silently starts a
-                # new job and defeats the production safety control.
-                if self._pause_after_current.is_set():
-                    continue
-                if not settings.auto_sync or not settings.db_instance_id:
+                # Only an explicitly timed maintenance pause expires. Never
+                # flip autoSync or resume an indefinite operator pause.
+                with self._state_lock:
+                    if self._pause_control().expire():
+                        self._pause_after_current.clear()
+                        self._last_auto_start = 0.0
+                        LOGGER.info("SYNC_MAINTENANCE_EXPIRED instance=%s autoSync=%s", self._job_scope(), settings.auto_sync)
+                    running = bool(self._worker and self._worker.is_alive())
+                    paused = self._pause_after_current.is_set()
+                self._log_collection_health(running)
+                if paused or not settings.auto_sync or not settings.db_instance_id:
                     continue
                 interval = settings.poll_minutes * 60
                 if time.monotonic() - self._last_auto_start < interval:
@@ -1918,11 +1965,14 @@ class SyncManager:
                         continue
                 try:
                     self.start(reason="auto")
+                    self._last_auto_error = ""
                 except PipelineError as exc:
+                    self._last_auto_error = exc.code
                     LOGGER.warning("Auto sync skipped: %s", exc)
                 finally:
                     self._last_auto_start = time.monotonic()
             except Exception:
+                self._last_auto_error = "SYNC_SCHEDULER_ERROR"
                 LOGGER.exception("Auto sync scheduler failed")
 
     def _index_loop(self) -> None:

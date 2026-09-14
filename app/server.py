@@ -48,6 +48,7 @@ from .slowlog_impact_service import query_resource_overlap
 from .pod_lookup import attach_pod_detail
 from .metadata import MetadataStore
 from .pipeline import PipelineError, SyncManager
+from .sync_lifecycle import CollectorLease
 from .query_tasks import QueryTaskManager
 from .rds_api import RdsApiError, RdsRpcClient
 from .schema_diff import SchemaDiffError, SchemaDiffService
@@ -784,6 +785,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/status":
                 self._json({"ok": True, "data": self.app.public_status()})
+            elif parsed.path == "/api/sync/health":
+                managers = [self.app.sync, *self.app.secondary_syncs]
+                data = [{"instanceId": manager._job_scope(), **manager.status()["health"]}
+                        for manager in managers]
+                ok = all(item["ok"] for item in data)
+                self._json({"ok": ok, "data": data}, 200 if ok else 503)
             elif parsed.path == "/api/settings":
                 settings = self.app.metadata.load_settings()
                 self._json(
@@ -1015,6 +1022,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/settings":
                 current = self.app.metadata.load_settings()
                 updated = parse_settings_payload(payload, current)
+                if current.auto_sync and not updated.auto_sync and payload.get("confirmDisableAutoSync") is not True:
+                    raise PipelineError("关闭自动同步会无限期停止后续采集；请显式确认 confirmDisableAutoSync=true。临时维护请使用带 resumeAfterSeconds 的暂停接口", "AUTO_SYNC_DISABLE_CONFIRMATION_REQUIRED")
                 if payload.get("clearCredentials"):
                     delete_credential(current.credential_target)
                 access_id = str(payload.get("accessKeyId") or "").strip()
@@ -1026,6 +1035,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                         CloudCredential(access_id, access_secret, token),
                     )
                 self.app.metadata.save_settings(updated)
+                if current.auto_sync != updated.auto_sync:
+                    LOGGER.warning("AUTO_SYNC_CHANGED instance=%s old=%s new=%s source=api/settings",
+                                   updated.db_instance_id, current.auto_sync, updated.auto_sync)
                 query_cache = self.app.storage.enforce_query_cache_limit(0)
                 if query_cache["errors"]:
                     LOGGER.warning(
@@ -1150,20 +1162,20 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/sync/pause":
                 pause_id = str(payload.get("instanceId") or "").strip()
                 pause_target = self.app.secondary_sync(pause_id) if pause_id else None
-                running = (pause_target or self.app.sync).request_pause()
-                self._json(
-                    {
-                        "ok": True,
-                        "data": {
-                            "requested": running,
-                            "message": (
-                                "将在当前文件完成后暂停"
-                                if running
-                                else "当前没有运行中的任务"
-                            ),
-                        },
-                    }
-                )
+                if pause_id and pause_target is None and pause_id != self.app.sync._job_scope():
+                    raise PipelineError("采集实例不存在；未暂停任何其他实例", "SYNC_INSTANCE_NOT_FOUND")
+                target = pause_target or self.app.sync
+                seconds = payload.get("resumeAfterSeconds")
+                if "resumeAfterSeconds" in payload and (isinstance(seconds, bool) or not isinstance(seconds, int) or not 1 <= seconds <= 86400):
+                    raise ValueError("resumeAfterSeconds 必须为 1 到 86400 的整数")
+                running = target.request_pause(resume_after_seconds=seconds)
+                self._json({"ok": True, "data": {
+                    "requested": running or seconds is not None,
+                    "pause": dict(target._pause_control().state),
+                    "message": (f"维护暂停已登记；当前文件原子提交后暂停，{seconds} 秒后按原自动同步设置恢复"
+                                if seconds is not None else "将在当前文件完成后暂停，需手动恢复"
+                                if running else "当前没有运行中的任务"),
+                }})
             elif parsed.path == "/api/storage/cleanup":
                 settings = self.app.metadata.load_settings()
                 result = self.app.storage.cleanup(
@@ -1213,6 +1225,13 @@ def run_server(
     root: Path | None = None,
     host: str = "127.0.0.1",
 ) -> None:
+    # Acquire before Application starts collectors or reconciles interrupted jobs.
+    # A second port/container is not a second owner of the same data directory.
+    with CollectorLease(root or data_root()):
+        _run_server_owned(port, root=root, host=host)
+
+
+def _run_server_owned(port: int, *, root: Path | None, host: str) -> None:
     try:
         faulthandler.enable(file=sys.stderr, all_threads=True)
         diagnostic_signal = getattr(signal, "SIGUSR1", None)

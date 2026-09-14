@@ -847,7 +847,14 @@ function settingsPayload() {
 async function saveSettings() {
   const button = $("#save-settings");
   await withBusy(button, async () => {
-    const data = await api("/api/settings", { method: "POST", body: JSON.stringify(settingsPayload()) });
+    const payload = settingsPayload();
+    if (!payload.autoSync && state.settings?.autoSync !== false) {
+      if (!window.confirm("关闭自动同步后将无限期停止后续采集，不会自动恢复。临时维护请使用“维护暂停 15 分钟”。确定永久关闭吗？")) {
+        throw new Error("已取消关闭自动同步；设置未更改");
+      }
+      payload.confirmDisableAutoSync = true;
+    }
+    const data = await api("/api/settings", { method: "POST", body: JSON.stringify(payload) });
     $("#setting-ak-id").value = "";
     $("#setting-ak-secret").value = "";
     $("#setting-token").value = "";
@@ -922,7 +929,9 @@ function renderSecondarySyncs(items) {
       const running = Boolean(sync.running);
       const state = perf.state || "";
       const failed = job.status === "failed";
-      const chip = failed
+      const chip = sync.health?.ok === false
+        ? `<span class="status-chip warning">${escapeHtml(sync.health.message)}</span>`
+        : failed
         ? '<span class="status-chip query-failed">失败</span>'
         : running
         ? '<span class="status-chip running">同步中</span>'
@@ -1009,18 +1018,23 @@ async function refreshStatus() {
     const checkingLatest = performanceState === "checking_latest";
     const liveFollowing = performanceState === "live_following";
     renderSyncPerformance(latest?.performance, running);
-    $("#summary-sync").textContent = running
+    const syncHealth = data.sync?.health;
+    const syncWarning = syncHealth?.ok === false;
+    const warningLabels = { disabled: "自动同步已关闭", paused: "手动暂停未恢复", maintenance: "维护暂停中", stalled: "同步停滞", failed: "采集失败", scheduler_error: "自动采集启动失败", unconfigured: "待配置" };
+    $("#summary-sync").textContent = syncWarning ? warningLabels[syncHealth.state] || "同步异常" : running
       ? liveFollowing ? "已追平" : checkingLatest ? "核验最新" : "正在同步"
       : latest?.status === "failed" ? "失败待处理"
       : caughtUp ? "已追平"
       : data.configured ? "已到断点" : "待配置";
-    $("#summary-sync").style.color = latest?.status === "failed" ? "var(--danger)" : running ? "var(--accent)" : "var(--teal)";
+    $("#summary-sync").style.color = syncWarning ? "var(--warning)" : latest?.status === "failed" ? "var(--danger)" : running ? "var(--accent)" : "var(--teal)";
     $("#running-dot").hidden = !running;
     $("#setup-banner").hidden = data.configured;
     $("#sync-top").disabled = running;
     $("#start-sync").disabled = running;
     $("#pause-sync").disabled = !running;
-    $("#service-meta").textContent = running
+    $("#service-meta").textContent = syncWarning
+      ? `${syncHealth.message}${data.sync?.pause?.resumeAt ? `；恢复时间 ${formatTime(data.sync.pause.resumeAt * 1000000, true)}` : ""}`
+      : running
       ? liveFollowing ? "正在处理最新 Binlog，队列无历史积压"
       : checkingLatest ? "正在确认最新 Completed Binlog" : "后台顺序任务运行中"
       : caughtUp ? "等待新的 Completed Binlog"
@@ -2085,7 +2099,15 @@ function bindEvents() {
     setDefaultSyncWindow();
     $("#sync-start-time").focus();
   });
+  $("#maintenance-sync").addEventListener("click", async () => {
+    try {
+      const data = await api("/api/sync/pause", { method: "POST", body: JSON.stringify({ resumeAfterSeconds: 900 }) });
+      toast(data.message, "info", 6000);
+      await refreshStatus();
+    } catch (error) { toast(error.message, "error"); }
+  });
   $("#pause-sync").addEventListener("click", async () => {
+    if (!window.confirm("手动暂停不会自动恢复。临时维护可改用“维护暂停 15 分钟”。确定手动暂停吗？")) return;
     try {
       const data = await api("/api/sync/pause", { method: "POST", body: "{}" });
       toast(data.message, "info");
