@@ -178,10 +178,11 @@ class ManagerTests(unittest.TestCase):
             m.request_pause()
             m._worker = None
             self.one_tick(m).assert_not_called()
-            with self.assertRaises(PipelineError) as raised:
-                m.start(reason='auto')
-            self.assertEqual(raised.exception.code, 'SYNC_PAUSED')
-            self.assertEqual(m._pause_control().state['mode'], 'manual')
+            for reason in ['auto', 'query-backfill']:
+                with self.subTest(reason=reason), self.assertRaises(PipelineError) as raised:
+                    m.start(reason=reason)
+                self.assertEqual(raised.exception.code, 'SYNC_PAUSED')
+                self.assertEqual(m._pause_control().state['mode'], 'manual')
 
     def test_start_failure_without_a_job_is_reported_unhealthy(self):
         with tempfile.TemporaryDirectory() as root:

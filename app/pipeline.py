@@ -538,8 +538,8 @@ class SyncManager:
             if self._worker and self._worker.is_alive():
                 raise PipelineError("已有同步任务正在运行", "JOB_ALREADY_RUNNING")
             control = self._pause_control()
-            if reason == "auto" and (control.state["mode"] != "none" or self._pause_after_current.is_set()):
-                raise PipelineError("采集已暂停；自动任务不得清除操作暂停", "SYNC_PAUSED")
+            if reason != "manual" and (control.state["mode"] != "none" or self._pause_after_current.is_set()):
+                raise PipelineError("采集已暂停；自动任务或查询补采不得清除操作暂停", "SYNC_PAUSED")
             control.clear()
             self._pause_after_current.clear()
             LOGGER.info("SYNC_START instance=%s reason=%s autoSync=%s", settings.db_instance_id, reason, settings.auto_sync)
