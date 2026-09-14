@@ -128,7 +128,7 @@ class ManagerTests(unittest.TestCase):
         m._pause_after_current = threading.Event()
         m._pause_controls = {}
         m._worker = None
-        m._last_auto_start = 0
+        m._last_auto_start = float('-inf')
         m._last_health_log = ('', 0)
         m._last_auto_error = ''
         m.role = 'secondary'
@@ -137,7 +137,8 @@ class ManagerTests(unittest.TestCase):
 
     def one_tick(self, m):
         m._shutdown = SimpleNamespace(wait=Mock(side_effect=[False, True]))
-        with patch.object(m, 'start') as start:
+        # A freshly booted Linux runner may have uptime below pollMinutes.
+        with patch.object(m, 'start') as start, patch('app.pipeline.time.monotonic', return_value=1):
             m._scheduler_loop()
         return start
 
@@ -186,7 +187,7 @@ class ManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             m = self.manager(root)
             m._shutdown = SimpleNamespace(wait=Mock(side_effect=[False, True]))
-            with patch.object(m, 'start', side_effect=PipelineError('fixture', 'CREDENTIAL_REQUIRED')):
+            with patch.object(m, 'start', side_effect=PipelineError('fixture', 'CREDENTIAL_REQUIRED')), patch('app.pipeline.time.monotonic', return_value=1):
                 with self.assertLogs('app.pipeline', 'WARNING'):
                     m._scheduler_loop()
             self.assertEqual(m._collection_health(False, None)['state'], 'scheduler_error')

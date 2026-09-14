@@ -171,7 +171,7 @@ class SyncManager:
         self._shutdown = threading.Event()
         self._last_health_log = ("", 0.0)
         self._last_auto_error = ""
-        self._last_auto_start = 0.0
+        self._last_auto_start = float("-inf")
         # Monotonic clocks may be below one hour shortly after host boot.
         # A negative sentinel guarantees the first scheduled cleanup is due.
         self._last_retention_cleanup = float("-inf")
@@ -1950,7 +1950,7 @@ class SyncManager:
                 with self._state_lock:
                     if self._pause_control().expire():
                         self._pause_after_current.clear()
-                        self._last_auto_start = 0.0
+                        self._last_auto_start = float("-inf")
                         LOGGER.info("SYNC_MAINTENANCE_EXPIRED instance=%s autoSync=%s", self._job_scope(), settings.auto_sync)
                     running = bool(self._worker and self._worker.is_alive())
                     paused = self._pause_after_current.is_set()
