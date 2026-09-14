@@ -69,6 +69,9 @@ def _allowed_public_ip(value: str) -> bool:
     )
     return bool(
         address.is_private
+        # Alibaba's documented metadata endpoint is shared infrastructure, not
+        # a deployment identifier. Do not allow the rest of the CGNAT range.
+        or address == ipaddress.ip_address("100.100.100.200")
         or address.is_loopback
         or address.is_link_local
         or address.is_multicast

@@ -3,6 +3,16 @@ set -eu
 
 case "${RDS_BINLOG_CLICKHOUSE_OSS_ENABLED:-0}" in
     1|true|TRUE|yes|YES|on|ON)
+        case "${RDS_BINLOG_CLICKHOUSE_OSS_AUTH_MODE:-access_key}" in
+            ecs_ram_role)
+                exec python3 /opt/sql-insight/credential_entrypoint.py /entrypoint.sh "$@"
+                ;;
+            access_key) ;;
+            *)
+                echo "OSS_AUTH_MODE_INVALID refusing credential fallback" >&2
+                exit 1
+                ;;
+        esac
         credential_file="${RDS_BINLOG_OSS_CREDENTIAL_FILE:-/run/secrets/clickhouse_oss_credentials}"
         if [ ! -r "$credential_file" ]; then
             echo "ClickHouse OSS credential file is not readable" >&2

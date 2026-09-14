@@ -10,15 +10,16 @@ on:
         default: false
   push:
     tags:
-      - v1.28.13-rawoss
+      - v1.28.14-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.28.13-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.28.13-rawoss
+  VERSION: 1.28.14-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.28.14-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.14-rawoss
 
 jobs:
   build-test-package:
@@ -55,6 +56,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build credential-enabled ClickHouse in cloud CI
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: clickhouse/Dockerfile
+          load: true
+          push: false
+          tags: |
+            ${{ env.LOCAL_CLICKHOUSE_IMAGE }}
+            ${{ env.GHCR_IMAGE }}:clickhouse-${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=clickhouse
+          cache-to: type=gha,scope=clickhouse,mode=max
+
       - name: Run release regression suite
         shell: bash
         run: |
@@ -71,6 +88,7 @@ jobs:
             tests.test_core.MetadataSecurityTests \
             tests.test_core.PipelinePrefetchTests \
             tests.test_cloud_credentials \
+            tests.test_clickhouse_credentials \
             tests.test_core.CredentialBackendTests \
             tests.test_core.ConfigAndChecksumTests \
             tests.test_clickhouse_oss \
@@ -107,7 +125,7 @@ jobs:
           docker run -d --name mongo-ci-clickhouse -p 127.0.0.1:18123:8123 \
             -e CLICKHOUSE_DB=mongo_ci_fixture -e CLICKHOUSE_USER=fixture \
             -e CLICKHOUSE_PASSWORD=fixture-ci-only \
-            clickhouse/clickhouse-server@sha256:2ef11bbe2e44ab7022f37ff3019b3f2125ed09e919ea6194660be6130b7ca4b7
+            "$LOCAL_CLICKHOUSE_IMAGE"
           trap 'docker logs --tail 30 mongo-ci-clickhouse; docker rm -f mongo-ci-clickhouse' EXIT
           for n in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:18123/ping; then break; fi
@@ -120,6 +138,31 @@ jobs:
             -e CLICKHOUSE_USER=fixture -e CLICKHOUSE_PASSWORD=fixture-ci-only \
             "$LOCAL_IMAGE" -m unittest tests.test_mongo_clickhouse -v
 
+      - name: Verify native SDK rotation and graceful credential supervisor stop
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name credentials-ci-clickhouse -p 127.0.0.1:18123:8123 \
+            --entrypoint python3 --workdir /src --volume "$PWD:/src:ro" \
+            -e CLICKHOUSE_DB=default -e CLICKHOUSE_USER=fixture \
+            -e CLICKHOUSE_PASSWORD=fixture-ci-only \
+            "$LOCAL_CLICKHOUSE_IMAGE" -m tests.clickhouse_credential_fixture
+          trap 'docker logs --tail 40 credentials-ci-clickhouse; docker rm -f credentials-ci-clickhouse' EXIT
+          for n in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18123/ping; then break; fi
+            sleep 2
+          done
+          started=$(docker inspect --format '{{.State.StartedAt}}' credentials-ci-clickhouse)
+          query="SELECT sum(value) FROM s3('http://127.0.0.1:31812/bucket/file.csv', 'CSV', 'value UInt8') SETTINGS use_query_cache=0"
+          test "$(curl -fsS --user fixture:fixture-ci-only --data-binary "$query" http://127.0.0.1:18123/)" = 7
+          docker exec credentials-ci-clickhouse python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:31812/rotate').read()"
+          sleep 3
+          test "$(curl -fsS --user fixture:fixture-ci-only --data-binary "$query" http://127.0.0.1:18123/)" = 7
+          docker exec credentials-ci-clickhouse python3 -c "import urllib.request,json; d=json.load(urllib.request.urlopen('http://127.0.0.1:31812/evidence')); assert {1,2}.issubset(d['reads']) and d['failures']==0, d; print(d)"
+          test "$(docker inspect --format '{{.State.StartedAt}}' credentials-ci-clickhouse)" = "$started"
+          docker stop --time 60 credentials-ci-clickhouse
+          test "$(docker inspect --format '{{.State.ExitCode}}' credentials-ci-clickhouse)" = 0
+
       - name: Export immutable deployment artifact
         shell: bash
         run: |
@@ -130,6 +173,8 @@ jobs:
             > "dist/rds-binlog-insight-${VERSION}.tar.gz.sha256"
           docker image inspect --format '{{.Id}}' "$LOCAL_IMAGE" \
             > "dist/rds-binlog-insight-${VERSION}.image-id.txt"
+          docker image inspect --format '{{.Id}}' "$LOCAL_CLICKHOUSE_IMAGE" \
+            > "dist/rds-binlog-insight-clickhouse-${VERSION}.image-id.txt"
           cp compose.yaml "dist/compose-${VERSION}.yaml"
           cp docs/clickhouse-oss-v3-runbook.md \
             "dist/clickhouse-oss-v3-runbook-${VERSION}.md"
@@ -163,3 +208,4 @@ jobs:
         run: |
           set -euo pipefail
           docker push "$GHCR_IMAGE:$VERSION"
+          docker push "$GHCR_IMAGE:clickhouse-$VERSION"
