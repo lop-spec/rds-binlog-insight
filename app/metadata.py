@@ -17,6 +17,7 @@ from typing import Any, Iterator
 from .catalog_store import CatalogStore
 from .config import Settings, json_dumps, utc_now_text
 from .rds_api import RemoteBinlog
+from .query_cancellation import cancellable_sqlite
 
 
 # Tabularis 审计事件登记成伪 binlog 文件，文件名固定用这个前缀（见
@@ -2175,7 +2176,9 @@ class MetadataStore:
             # read-through retries the derived compressed copy.
             LOGGER.exception("Failed to mirror embedded part catalogs")
 
-    def part_catalogs(self, paths: list[str]) -> dict[str, dict[str, Any]]:
+    def part_catalogs(self, paths: list[str], *, control=None, backfill=True) -> dict[str, dict[str, Any]]:
+        if control is not None:
+            control.check_cancelled()
         if not paths:
             return {}
         current_parts: dict[str, tuple[str, int]] = {}
@@ -2245,7 +2248,7 @@ class MetadataStore:
                             "indexed_at": catalog["indexed_at"],
                         }
                     )
-        if backfill_entries:
+        if backfill_entries and backfill:
             try:
                 self.catalog_store.upsert_many(backfill_entries)
             except Exception:
@@ -2966,8 +2969,9 @@ class MetadataStore:
         *,
         start_epoch_us: int,
         end_epoch_us: int,
+        control=None,
     ) -> tuple[dict[str, int], list[dict[str, Any]] | None]:
-        with self.connection() as conn:
+        with self.connection() as conn, cancellable_sqlite(conn, control):
             conn.execute("BEGIN")
             try:
                 token = self._part_content_token(
@@ -3213,6 +3217,7 @@ class MetadataStore:
         limit: int = 1_000_000,
         source: str = "",
         instance: str = "",
+        control: Any | None = None,
     ) -> list[dict[str, Any]]:
         """按时间窗取候选分区。
 
@@ -3260,8 +3265,8 @@ class MetadataStore:
             clauses.append("b.instance_id = ?")
             params.append(instance_id)
         params.append(int(limit))
-        with self.connection() as conn:
-            rows = conn.execute(
+        with self.connection() as conn, cancellable_sqlite(conn, control):
+            cursor = conn.execute(
                 f"""
                 SELECT p.*, b.instance_id, b.log_file_name,
                        b.log_begin_utc, b.log_end_utc
@@ -3272,8 +3277,14 @@ class MetadataStore:
                 LIMIT ?
                 """,
                 params,
-            ).fetchall()
-        return [dict(row) for row in rows]
+            )
+            # Avoid retaining a second full list of sqlite Rows during conversion.
+            rows = []
+            while batch := cursor.fetchmany(128):
+                if control is not None:
+                    control.check_cancelled()
+                rows.extend(dict(row) for row in batch)
+        return rows
 
     def part_by_sha256(self, sha256: str) -> dict[str, Any] | None:
         with self.connection() as conn:

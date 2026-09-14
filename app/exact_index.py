@@ -14,6 +14,8 @@ from typing import Any, Iterable, Iterator
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
 
+from .query_cancellation import cancellable_sqlite
+
 
 EXACT_INDEX_FORMAT_VERSION = 1
 SCHEMA_REGISTRY_FORMAT_VERSION = 1
@@ -1064,6 +1066,8 @@ class ExactIndex:
         catalogs: dict[str, dict[str, Any]],
         database: str,
         table: str,
+        catalog_loader=None,
+        control=None,
     ) -> dict[str, Any]:
         database = str(database or "").strip().lower()
         table = str(table or "").strip().lower()
@@ -1080,43 +1084,51 @@ class ExactIndex:
         unknown: list[str] = []
         covered: list[str] = []
         segment_ids: set[str] = set()
-        with self.connection() as conn:
-            for part in parts:
-                path = str(part["path"])
-                identity = _identity(part)
-                segment = conn.execute(
-                    "SELECT p.segment_id, p.logical_part_id, s.registry_sha256 "
-                    "FROM segment_parts p JOIN segments s ON s.id = p.segment_id "
-                    "WHERE p.part_path = ?",
-                    (path,),
-                ).fetchone()
-                if (
-                    segment is None
-                    or str(segment["logical_part_id"]) != identity
-                    or str(segment["registry_sha256"]) != self.registry_sha256
+        with self.connection() as conn, cancellable_sqlite(conn, control):
+            for offset in range(0, len(parts), 128):
+                if control is not None:
+                    control.check_cancelled()
+                batch = parts[offset:offset + 128]
+                paths = [str(part['path']) for part in batch]
+                marks = ','.join('?' for _ in paths)
+                segments = {str(row['part_path']): row for row in conn.execute(
+                    "SELECT p.part_path,p.segment_id,p.logical_part_id,s.registry_sha256 "
+                    "FROM segment_parts p JOIN segments s ON s.id=p.segment_id "
+                    f"WHERE p.part_path IN ({marks})", paths
+                )}
+                states = {}
+                for row in conn.execute(
+                    "SELECT part_path,logical_part_id,coverage_state FROM part_tables "
+                    f"WHERE part_path IN ({marks}) AND database_name=? AND table_name=?",
+                    (*paths, database, table),
                 ):
-                    if _catalog_excludes(catalogs.get(path), part, database, table):
-                        covered.append(path)
+                    key = (str(row['part_path']), str(row['logical_part_id']))
+                    states[key] = states.get(key, True) and row['coverage_state'] == 'complete'
+                unresolved = [part for part in batch if (
+                    str(part['path']) not in segments
+                    or str(segments[str(part['path'])]['logical_part_id']) != _identity(part)
+                    or str(segments[str(part['path'])]['registry_sha256']) != self.registry_sha256
+                )]
+                # Current exact coverage needs no catalog at all. Decode only
+                # missing identities, one bounded batch at a time.
+                page_catalogs = catalog_loader([str(p['path']) for p in unresolved]) if catalog_loader and unresolved else catalogs
+                for part in batch:
+                    path = str(part['path'])
+                    segment = segments.get(path)
+                    if (segment is None or str(segment['logical_part_id']) != _identity(part)
+                            or str(segment['registry_sha256']) != self.registry_sha256):
+                        if _catalog_excludes(page_catalogs.get(path), part, database, table):
+                            covered.append(path)
+                        else:
+                            missing.append(path)
+                        continue
+                    covered_state = states.get((path, _identity(part)))
+                    if covered_state is False:
+                        unknown.append(path)
                     else:
-                        missing.append(path)
-                    continue
-                table_rows = conn.execute(
-                    """
-                    SELECT coverage_state
-                    FROM part_tables
-                    WHERE part_path = ? AND logical_part_id = ?
-                      AND database_name = ? AND table_name = ?
-                    """,
-                    (path, identity, database, table),
-                ).fetchall()
-                if not table_rows:
-                    covered.append(path)
-                    continue
-                if any(str(row["coverage_state"]) != "complete" for row in table_rows):
-                    unknown.append(path)
-                    continue
-                covered.append(path)
-                segment_ids.add(str(segment["segment_id"]))
+                        covered.append(path)
+                        if covered_state is True:
+                            segment_ids.add(str(segment['segment_id']))
         return {
             "complete": not missing and not unknown,
             "covered_parts": len(covered),
@@ -1138,6 +1150,8 @@ class ExactIndex:
         operations: Iterable[str],
         limit: int,
         offset: int,
+        catalog_loader=None,
+        control=None,
     ) -> dict[str, Any]:
         database = str(database or "").strip().lower()
         table = str(table or "").strip().lower()
@@ -1146,6 +1160,8 @@ class ExactIndex:
             catalogs=catalogs,
             database=database,
             table=table,
+            catalog_loader=catalog_loader,
+            control=control,
         )
         if not coverage["complete"]:
             return {
@@ -1160,17 +1176,24 @@ class ExactIndex:
         operation_set = {
             str(item).strip().upper() for item in operations if str(item).strip()
         }
-        with self.connection() as conn:
+        with self.connection() as conn, cancellable_sqlite(conn, control):
             segment_rows = []
-            if coverage["segment_ids"]:
-                placeholders = ",".join("?" for _ in coverage["segment_ids"])
-                segment_rows = conn.execute(
-                    f"SELECT id, file_name FROM segments WHERE id IN ({placeholders})",
-                    coverage["segment_ids"],
-                ).fetchall()
+            for offset_ids in range(0, len(coverage['segment_ids']), 128):
+                ids = coverage['segment_ids'][offset_ids:offset_ids + 128]
+                placeholders = ','.join('?' for _ in ids)
+                segment_rows.extend(conn.execute(
+                    f"SELECT id,file_name,max_event_epoch_us FROM segments WHERE id IN ({placeholders})", ids
+                ).fetchall())
+        segment_rows.sort(key=lambda row: (int(row['max_event_epoch_us']), str(row['id'])), reverse=True)
+        target = max(int(limit), 1) + max(int(offset), 0) + 1
         rows: list[dict[str, Any]] = []
+        segments_read = 0
+        # Validate all manifest files even when a newest-first page permits
+        # early-stop. Missing older files must not become complete coverage.
         for segment in segment_rows:
-            path = self.segments_dir / str(segment["file_name"])
+            if control is not None:
+                control.check_cancelled()
+            path = self.segments_dir / str(segment['file_name'])
             if not path.is_file():
                 return {
                     **coverage,
@@ -1184,8 +1207,17 @@ class ExactIndex:
                         set(coverage["unknown_parts"]) | {str(path)}
                     ),
                 }
+        for segment in segment_rows:
+            if control is not None:
+                control.check_cancelled()
+            if len(rows) >= target and int(segment['max_event_epoch_us']) < int(rows[-1]['event_epoch_us']):
+                break
+            path = self.segments_dir / str(segment['file_name'])
             segment_conn = self._segment_connection(path)
+            segments_read += 1
             try:
+                if control is not None:
+                    segment_conn.set_progress_handler(lambda: self._cancel_progress(control), 1000)
                 schemas = segment_conn.execute(
                     """
                     SELECT DISTINCT schema_version_id, column_ordinal, type_id
@@ -1221,21 +1253,35 @@ class ExactIndex:
                     doc_ids.update(int(item["doc_id"]) for item in matches)
                 if not doc_ids:
                     continue
-                placeholders = ",".join("?" for _ in doc_ids)
-                docs = segment_conn.execute(
-                    f"SELECT * FROM docs WHERE doc_id IN ({placeholders})",
-                    sorted(doc_ids),
-                ).fetchall()
-                for doc in docs:
-                    if str(doc["logical_part_id"]) not in current_identities:
-                        continue
-                    epoch = int(doc["event_epoch_us"])
-                    operation = str(doc["operation"])
-                    if epoch < int(start_epoch_us) or epoch > int(end_epoch_us):
-                        continue
-                    if operation_set and operation not in operation_set:
-                        continue
-                    rows.append(self._result_row(doc))
+                doc_ids = sorted(doc_ids)
+                for doc_offset in range(0, len(doc_ids), 128):
+                    if control is not None:
+                        control.check_cancelled()
+                    ids = doc_ids[doc_offset:doc_offset + 128]
+                    placeholders = ','.join('?' for _ in ids)
+                    docs = segment_conn.execute(
+                        f'SELECT * FROM docs WHERE doc_id IN ({placeholders})', ids
+                    )
+                    for doc in docs:
+                        if str(doc['logical_part_id']) not in current_identities:
+                            continue
+                        epoch = int(doc['event_epoch_us'])
+                        if epoch < int(start_epoch_us) or epoch > int(end_epoch_us):
+                            continue
+                        if operation_set and str(doc['operation']) not in operation_set:
+                            continue
+                        rows.append(self._result_row(doc))
+                    # Equal timestamps cannot trigger early-stop. Keep only
+                    # the exact top-(offset+limit+1), deduplicated by locator.
+                    unique_page = {(str(row['event_id']), str(row['locator'])): row for row in rows}
+                    rows = sorted(unique_page.values(), key=lambda row: (
+                        int(row['event_epoch_us']), str(row['source_file_name']),
+                        int(row['end_position']), int(row['row_index']),
+                    ), reverse=True)[:target]
+            except sqlite3.OperationalError:
+                if control is not None:
+                    control.check_cancelled()
+                raise
             finally:
                 segment_conn.close()
         unique: dict[tuple[str, str], dict[str, Any]] = {}
@@ -1258,10 +1304,18 @@ class ExactIndex:
             **coverage,
             "rows": page,
             "has_more": len(ordered) > offset + limit,
-            "segments": len(segment_rows),
+            "segments": segments_read,
             "oss_gets": 0,
             "oss_bytes": 0,
         }
+
+    @staticmethod
+    def _cancel_progress(control):
+        try:
+            control.check_cancelled()
+            return 0
+        except Exception:
+            return 1
 
     @staticmethod
     def _result_row(doc: sqlite3.Row) -> dict[str, Any]:

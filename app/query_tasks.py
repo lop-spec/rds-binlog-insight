@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import os
 import threading
 import time
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .metadata import MetadataStore
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class QueryCancelled(RuntimeError):
@@ -32,6 +36,11 @@ class QueryControl:
     def check_cancelled(self) -> None:
         if self._cancelled.is_set():
             raise QueryCancelled("查询已取消")
+
+    def set_stage(self, message: str) -> None:
+        self.check_cancelled()
+        self.metadata.update_query_task(self.task_id, message=message)
+        LOGGER.info("Query task %s planning: %s", self.task_id, message)
 
     def set_plan(
         self,
@@ -157,6 +166,7 @@ class QueryTaskManager:
         query: dict[str, Any],
         control: QueryControl,
     ) -> None:
+        started = time.monotonic()
         try:
             if not self.metadata.start_query_task(task_id):
                 return
@@ -196,6 +206,7 @@ class QueryTaskManager:
                 error_code=str(getattr(exc, "code", "QUERY_FAILED")),
             )
         finally:
+            LOGGER.info("Query task %s finished elapsed_seconds=%.3f", task_id, time.monotonic() - started)
             self._prune_history()
             with self._lock:
                 self._controls.pop(task_id, None)

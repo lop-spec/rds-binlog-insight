@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -14,6 +15,10 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
+from .query_cancellation import cancellable_sqlite
+
+
+LOGGER = logging.getLogger(__name__)
 
 INDEX_SCHEMA_VERSION = 2
 KEYWORD_COLUMNS = (
@@ -780,12 +785,13 @@ class SearchIndex:
         self,
         parts: list[dict[str, Any]],
         table: str,
+        control=None,
     ) -> tuple[set[str], set[str]]:
         if not parts:
             return set(), set()
         expected = {str(part["path"]): part for part in parts}
         covered: set[str] = set()
-        with self.connection() as conn:
+        with self.connection() as conn, cancellable_sqlite(conn, control):
             paths = list(expected)
             for offset in range(0, len(paths), 400):
                 chunk = paths[offset : offset + 400]
@@ -821,37 +827,41 @@ class SearchIndex:
     ) -> tuple[set[str], set[str]]:
         return self._coverage_table(parts, "structural_parts")
 
-    @staticmethod
-    def _fts_ids(
-        conn: sqlite3.Connection,
-        table: str,
-        value: str,
-    ) -> set[int] | None:
-        expression = _fts_expression(value)
-        if not expression:
-            return None
-        rows = conn.execute(
-            f"SELECT rowid FROM {table} WHERE {table} MATCH ?",
-            (expression,),
-        ).fetchall()
-        return {int(row[0]) for row in rows}
-
-    @staticmethod
-    def _token_ids(
-        conn: sqlite3.Connection,
-        value: str,
-    ) -> set[int] | None:
-        normalized = value.strip().lower()
-        if (
-            not 6 <= len(normalized) <= 128
-            or _TOKEN_PATTERN.fullmatch(normalized) is None
-        ):
-            return None
-        rows = conn.execute(
-            "SELECT rowid FROM token_fts WHERE token_fts MATCH ?",
-            (_token_key(normalized),),
-        ).fetchall()
-        return {int(row[0]) for row in rows}
+    def _planned_rows(self, covered, full_covered, conditions, params, control, structural_selects):
+        with self.connection() as conn, cancellable_sqlite(conn, control):
+            # Connection-local scope, no persistent index writes. SQLite may
+            # spill large posting sets to temporary storage, not Python heaps.
+            # Each FTS subquery executes once, not once per part batch.
+            conn.execute('CREATE TEMP TABLE query_scope(path TEXT PRIMARY KEY, full_index INTEGER) WITHOUT ROWID')
+            conn.executemany('INSERT INTO query_scope VALUES (?,?)',
+                             ((path, int(path in full_covered)) for path in covered))
+            join = 'query_scope q CROSS JOIN blocks b INDEXED BY idx_blocks_part ON b.part_path=q.path'
+            if structural_selects:
+                conn.execute('CREATE TEMP TABLE query_hits(id INTEGER PRIMARY KEY)')
+                count = conn.execute('INSERT INTO query_hits ' + ' INTERSECT '.join(structural_selects),
+                                     params[2:2 + len(structural_selects)]).rowcount
+                params = params[:2] + params[2 + len(structural_selects):]
+                scoped_blocks = int(conn.execute(
+                    'SELECT coalesce(sum(coalesce(s.row_group_count,1)),0) FROM query_scope q '
+                    'LEFT JOIN structural_parts s ON s.path=q.path'
+                ).fetchone()[0])
+                # Use measured cardinalities, not FTS's fixed planner estimate.
+                # This avoids either a global block scan or repeated probes of
+                # broad database hits when the table/time scope is selective.
+                indexed_driver = count < scoped_blocks
+                if indexed_driver:
+                    join = ('query_hits h CROSS JOIN blocks b ON b.id=h.id '
+                            'JOIN query_scope q ON q.path=b.part_path')
+                else:
+                    conditions += ' AND b.id IN (SELECT id FROM query_hits)'
+                LOGGER.info('Query index plan: parts=%s scoped_blocks=%s posting_hits=%s driver=%s',
+                            len(covered), scoped_blocks, count, 'postings' if indexed_driver else 'parts')
+            else:
+                LOGGER.info('Query index plan: parts=%s driver=parts reason=no-structural-fts-filter', len(covered))
+            yield from conn.execute(
+                'SELECT b.* FROM ' + join + ' WHERE b.max_event_epoch_us>=? AND b.min_event_epoch_us<=?' + conditions,
+                params,
+            )
 
     def candidate_blocks(
         self,
@@ -860,10 +870,11 @@ class SearchIndex:
         *,
         start_epoch_us: int,
         end_epoch_us: int,
+        control: Any | None = None,
     ) -> dict[str, Any]:
         part_map = self._part_map(parts)
-        full_covered, _full_unknown = self._coverage(parts)
-        structural_covered, _structural_unknown = self._structural_coverage(parts)
+        full_covered, _full_unknown = self._coverage_table(parts, 'indexed_parts', control)
+        structural_covered, _structural_unknown = self._coverage_table(parts, 'structural_parts', control)
         covered = full_covered | structural_covered
         unknown = set(part_map) - covered
         if not covered:
@@ -890,76 +901,40 @@ class SearchIndex:
         mode_or = bool(
             terms and str(query.get("keyword_mode") or "").upper() == "OR"
         )
-        with self.connection() as conn:
-            structural_ids: set[int] | None = None
+        predicates = []
+        params = [int(start_epoch_us), int(end_epoch_us)]
 
-            def intersect_structural(value: set[int] | None) -> None:
-                nonlocal structural_ids
-                if value is None:
-                    return
-                structural_ids = (
-                    value
-                    if structural_ids is None
-                    else structural_ids & value
-                )
+        def fts_predicate(fts_table, expression):
+            params.append(expression)
+            return f'b.id IN (SELECT rowid FROM {fts_table} WHERE {fts_table} MATCH ?)'
 
-            intersect_structural(
-                self._fts_ids(conn, "database_fts", database)
-                if database
-                else None
-            )
-            intersect_structural(
-                self._fts_ids(conn, "table_fts", table) if table else None
-            )
-            full_ids = (
-                set(structural_ids) if structural_ids is not None else None
-            )
-
-            def intersect_full(value: set[int] | None) -> None:
-                nonlocal full_ids
-                if value is None:
-                    return
-                full_ids = value if full_ids is None else full_ids & value
-
-            if terms:
-                term_sets: list[set[int] | None] = []
-                for term in terms:
-                    token_ids = self._token_ids(conn, term)
-                    trigram_ids = self._fts_ids(conn, "keyword_fts", term)
-                    if token_ids is None:
-                        term_sets.append(trigram_ids)
-                    elif trigram_ids is None:
-                        term_sets.append(token_ids)
-                    else:
-                        # Token lookup is an accelerator, not a semantic
-                        # substitute: the public query contract is arbitrary
-                        # substring matching, including a term embedded inside
-                        # a longer token.
-                        term_sets.append(token_ids | trigram_ids)
-                if mode_or:
-                    if all(value is not None for value in term_sets):
-                        combined: set[int] = set()
-                        for value in term_sets:
-                            combined.update(value or set())
-                        intersect_full(combined)
-                else:
-                    for value in term_sets:
-                        intersect_full(value)
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM blocks
-                WHERE max_event_epoch_us >= ?
-                  AND min_event_epoch_us <= ?
-                ORDER BY max_event_epoch_us DESC,
-                         min_event_epoch_us DESC,
-                         id DESC
-                """,
-                (int(start_epoch_us), int(end_epoch_us)),
-            ).fetchall()
+        structural_selects = []
+        for fts_table, value in [('database_fts', database), ('table_fts', table)]:
+            expression = _fts_expression(value)
+            if expression:
+                params.append(expression)
+                structural_selects.append(f'SELECT rowid FROM {fts_table} WHERE {fts_table} MATCH ?')
+        expressions = [_fts_expression(term) for term in terms]
+        if expressions and (not mode_or or all(expressions)):
+            term_predicates = []
+            for term, expression in zip(terms, expressions):
+                if not expression:
+                    continue
+                predicate = fts_predicate('keyword_fts', expression)
+                # Token hits supplement rather than replace substring hits.
+                if 6 <= len(term) <= 128 and _TOKEN_PATTERN.fullmatch(term):
+                    predicate = '(' + predicate + ' OR ' + fts_predicate('token_fts', _token_key(term)) + ')'
+                term_predicates.append(predicate)
+            if term_predicates:
+                joiner = ' OR ' if mode_or else ' AND '
+                predicates.append('(q.full_index=0 OR (' + joiner.join(term_predicates) + '))')
+        conditions = ''.join(' AND (' + value + ')' for value in predicates)
+        rows = self._planned_rows(covered, full_covered, conditions, params, control, structural_selects)
         entries: list[dict[str, Any]] = []
         candidate_paths: set[str] = set()
         for row in rows:
+            if control is not None:
+                control.check_cancelled()
             block_id = int(row["id"])
             path = str(row["part_path"])
             part = part_map.get(path)
@@ -974,9 +949,6 @@ class SearchIndex:
             ):
                 continue
             complete = path in full_covered
-            allowed_ids = full_ids if complete else structural_ids
-            if allowed_ids is not None and block_id not in allowed_ids:
-                continue
             databases = json.loads(str(row["databases_json"]))
             tables = json.loads(str(row["tables_json"]))
             row_operations = set(json.loads(str(row["operations_json"])))
@@ -992,11 +964,15 @@ class SearchIndex:
                     "path": path,
                     "part": part,
                     "row_group_id": int(row["row_group_id"]),
+                    "_block_id": block_id,
                     "min_event_epoch_us": int(row["min_event_epoch_us"]),
                     "max_event_epoch_us": int(row["max_event_epoch_us"]),
                     "complete": complete,
                 }
             )
+        entries.sort(key=lambda row: (row['max_event_epoch_us'], row['min_event_epoch_us'], row['_block_id']), reverse=True)
+        for entry in entries:
+            entry.pop('_block_id')
         return {
             "entries": entries,
             "covered_paths": covered,

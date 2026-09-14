@@ -3146,6 +3146,7 @@ class EventStorage:
         end_us: int,
         limit: int,
         offset: int,
+        control: Any | None = None,
     ) -> dict[str, Any] | None:
         exact = query.get("exact")
         if not isinstance(exact, dict):
@@ -3161,8 +3162,12 @@ class EventStorage:
             operations=query.get("operations") or [],
             limit=limit,
             offset=offset,
+            catalog_loader=lambda paths: self.metadata.part_catalogs(paths, control=control, backfill=False),
+            control=control,
         )
         if not bool(result.get("complete")):
+            LOGGER.info("Exact query falling back: missing_parts=%s unknown_parts=%s",
+                        len(result.get("missing_parts") or []), len(result.get("unknown_parts") or []))
             if str(exact.get("fallback") or "error").lower() == "error":
                 missing = len(result.get("missing_parts") or [])
                 unknown = len(result.get("unknown_parts") or [])
@@ -3220,6 +3225,16 @@ class EventStorage:
             "exact_index_oss_gets": int(result.get("oss_gets") or 0),
             "exact_index_oss_bytes": int(result.get("oss_bytes") or 0),
         }
+
+    def _iter_query_catalogs(self, paths, control=None):
+        # Catalog strings can expand to gigabytes. Keep only one small page.
+        for offset in range(0, len(paths), 128):
+            if control is not None:
+                control.check_cancelled()
+            batch = paths[offset:offset + 128]
+            catalogs = self.metadata.part_catalogs(batch, control=control, backfill=False)
+            for path in batch:
+                yield path, catalogs.get(path)
 
     def _query_events_tiered_impl(
         self,
@@ -3286,11 +3301,14 @@ class EventStorage:
             end_us,
             settings.db_instance_id,
         )
+        if control is not None:
+            control.set_stage("正在核对数据范围和查询证书")
         certificate_token, certificate_rows = (
             self.metadata.complete_query_certificate(
                 certificate_fingerprint,
                 start_epoch_us=start_us,
                 end_epoch_us=end_us,
+                control=control,
             )
         )
         if certificate_rows is not None:
@@ -3344,28 +3362,30 @@ class EventStorage:
                     hot_result["available_start_epoch_us"] = oldest_us
                     hot_result["available_end_epoch_us"] = latest_us
                     return hot_result
+        if control is not None:
+            control.set_stage("正在按实例和时间定位分区")
         parts = self.metadata.parts_in_range(
             start_epoch_us=start_us,
             end_epoch_us=end_us,
             source=str(query.get("source") or ""),
             instance=str(query.get("instance") or ""),
+            control=control,
         )
         if control is not None:
             control.check_cancelled()
+            control.set_stage(f"已定位 {len(parts)} 个分区，正在核对索引")
         exact = query.get("exact")
         exact_fallback: dict[str, Any] = {}
         if isinstance(exact, dict):
-            exact_catalogs = self.metadata.part_catalogs(
-                [str(part["path"]) for part in parts]
-            )
             exact_result = self._exact_index_result(
                 parts,
-                exact_catalogs,
+                {},
                 query,
                 start_us,
                 end_us,
                 limit,
                 offset,
+                control=control,
             )
             if exact_result is not None:
                 if exact_result.get("fallback_scan"):
@@ -3382,12 +3402,17 @@ class EventStorage:
                     exact_result["available_start_epoch_us"] = oldest_us
                     exact_result["available_end_epoch_us"] = latest_us
                     return exact_result
+        if control is not None:
+            control.set_stage("正在筛选分区索引" + ("；主键索引不完整，按原条件回退扫描" if exact_fallback else ""))
         index_plan = self.search_index.candidate_blocks(
             parts,
             query,
             start_epoch_us=start_us,
             end_epoch_us=end_us,
+            control=control,
         )
+        if control is not None:
+            control.set_stage(f"索引候选 {len(index_plan['entries'])} 个行组，核对 {len(index_plan['unknown_paths'])} 个未索引分区")
         # Public queries must remain read-only against the shared search
         # index. Building even a handful of structural entries here can wait
         # behind the external indexer's SQLite writer and make the service
@@ -3444,13 +3469,11 @@ class EventStorage:
                 int(entry["max_event_epoch_us"]),
             )
         unknown_paths = list(index_plan["unknown_paths"])
-        catalogs = self.metadata.part_catalogs(unknown_paths)
         unknown_candidates: list[tuple[str, str, str]] = []
         unknown_fingerprints: dict[str, str] = {}
         catalog_skipped_parts = 0
-        for path_text in unknown_paths:
+        for path_text, catalog in self._iter_query_catalogs(unknown_paths, control):
             part = part_map[path_text]
-            catalog = catalogs.get(path_text)
             if (
                 catalog
                 and str(catalog.get("sha256") or "") == str(part["sha256"])
