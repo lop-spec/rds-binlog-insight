@@ -698,12 +698,25 @@ class MetadataSecurityTests(unittest.TestCase):
                 conn.execute("DROP INDEX idx_binlog_visibility")
                 conn.execute("DROP INDEX idx_binlog_slowlog_source")
                 conn.execute("DROP INDEX idx_binlog_visibility_id")
+                # Emulate the old schema, before visibility-aware queue triggers
+                # existed. SQLite correctly rejects dropping a referenced column.
+                visibility_triggers = [row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND sql LIKE '%query_visible%'"
+                )]
+                for trigger in visibility_triggers:
+                    conn.execute('DROP TRIGGER "' + trigger.replace('"', '""') + '"')
                 conn.execute(
                     "ALTER TABLE binlog_files DROP COLUMN query_visible"
                 )
                 conn.execute("PRAGMA user_version = 0")
 
             migrated = MetadataStore(path)
+            with migrated.connection() as conn:
+                restored = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                )}
+            self.assertTrue(set(visibility_triggers).issubset(restored))
             self.assertEqual(migrated.file_record(done_id)["query_visible"], 1)
             self.assertEqual(
                 migrated.file_record(interrupted_id)["query_visible"],
