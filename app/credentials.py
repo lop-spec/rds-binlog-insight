@@ -3,17 +3,45 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import logging
 import os
 import stat
 import tempfile
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 FILE_SCHEMA_VERSION = 1
 MAX_CREDENTIAL_FILE_BYTES = 16 * 1024
+LOGGER = logging.getLogger(__name__)
+
+
+def _cloud_auth_mode() -> str:
+    mode = os.environ.get("RDS_BINLOG_CLOUD_AUTH_MODE", "access_key").strip() or "access_key"
+    if mode not in {"access_key", "ecs_ram_role"}:
+        LOGGER.error("Unsupported RDS_BINLOG_CLOUD_AUTH_MODE; refusing credential fallback")
+        raise ValueError("RDS_BINLOG_CLOUD_AUTH_MODE must be access_key or ecs_ram_role")
+    return mode
+
+
+@lru_cache(maxsize=8)
+def ecs_role_client(role_name: str = "") -> Any:
+    """One SDK-managed, IMDSv2-only credential provider per role/process."""
+    from alibabacloud_credentials.client import Client
+    from alibabacloud_credentials.models import Config
+
+    options: dict[str, Any] = {
+        "type": "ecs_ram_role", "disable_imds_v1": True,
+        "metadata_token_duration": 21600, "connect_timeout": 3000, "timeout": 3000,
+    }
+    if role_name:
+        options["role_name"] = role_name
+    LOGGER.info("Using SDK-managed ECS role credentials (IMDSv2 only)")
+    return Client(Config(**options))
 
 
 @dataclass(slots=True)
@@ -21,11 +49,28 @@ class CloudCredential:
     access_key_id: str
     access_key_secret: str
     security_token: str = ""
+    _provider: Any = field(default=None, repr=False, compare=False)
+
+    def current(self) -> CloudCredential:
+        """Take one consistent snapshot per signature; never persist STS values."""
+        if self._provider is None:
+            return self
+        try:
+            value = self._provider.get_credential()
+            credential = CloudCredential(value.access_key_id, value.access_key_secret, value.security_token)
+            credential.validate()
+            if not credential.security_token:
+                raise ValueError("ECS role credential has no security token")
+            return credential
+        except Exception as exc:
+            LOGGER.error("ECS role credential refresh failed (%s); refusing static-key fallback", type(exc).__name__)
+            raise
 
     def validate(self) -> None:
-        if not self.access_key_id or not self.access_key_secret:
+        credential = self.current()
+        if not credential.access_key_id or not credential.access_key_secret:
             raise ValueError("AccessKey ID 和 AccessKey Secret 均不能为空")
-        if len(self.access_key_id) > 256 or len(self.access_key_secret) > 1024:
+        if len(credential.access_key_id) > 256 or len(credential.access_key_secret) > 1024:
             raise ValueError("凭据字段长度异常")
 
 
@@ -180,6 +225,8 @@ def _advapi32():
 
 
 def save_credential(target: str, credential: CloudCredential) -> None:
+    if credential._provider is not None:
+        raise ValueError("SDK-managed credentials must not be persisted")
     credential.validate()
     if not _uses_windows_credential_manager():
         _save_file_credential(target, credential)
@@ -205,6 +252,9 @@ def save_credential(target: str, credential: CloudCredential) -> None:
 
 
 def load_credential(target: str) -> CloudCredential | None:
+    if _cloud_auth_mode() == "ecs_ram_role":
+        role = os.environ.get("ALIBABA_CLOUD_ECS_METADATA", "").strip()
+        return CloudCredential("", "", _provider=ecs_role_client(role))
     environment = _environment_credential()
     if environment:
         return environment
@@ -246,6 +296,9 @@ def credential_status(target: str) -> dict[str, str | bool]:
     credential = load_credential(target)
     if not credential:
         return {"present": False, "source": "none", "maskedAccessKeyId": ""}
+    if credential._provider is not None:
+        credential.current()  # Verify availability without disclosing temporary keys.
+        return {"present": True, "source": "ecs-ram-role", "maskedAccessKeyId": ""}
     source = (
         "environment"
         if _environment_credential()

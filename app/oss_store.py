@@ -12,13 +12,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 import oss2
-from alibabacloud_credentials.client import Client as CredentialClient
-from alibabacloud_credentials.models import Config as CredentialConfig
 from oss2.credentials import Credentials
 from oss2.models import BucketLifecycle, LifecycleExpiration, LifecycleRule
 
 from .config import Settings
-from .credentials import CloudCredential
+from .credentials import CloudCredential, ecs_role_client
 
 LOGGER = logging.getLogger(__name__)
 
@@ -183,16 +181,7 @@ class OssRangeReader(io.RawIOBase):
 
 class _EcsRamRoleCredentialsProvider(oss2.CredentialsProvider):
     def __init__(self, role_name: str = ""):
-        options: dict[str, Any] = {
-            "type": "ecs_ram_role",
-            "disable_imds_v1": True,
-            "metadata_token_duration": 21600,
-            "connect_timeout": 3000,
-            "timeout": 3000,
-        }
-        if role_name:
-            options["role_name"] = role_name
-        self.client = CredentialClient(CredentialConfig(**options))
+        self.client = ecs_role_client(role_name)
 
     def get_credentials(self) -> Credentials:
         credential = self.client.get_credential()
@@ -209,10 +198,11 @@ class _AccessKeyCredentialsProvider(oss2.CredentialsProvider):
         self.credential = credential
 
     def get_credentials(self) -> Credentials:
+        credential = self.credential.current()
         return Credentials(
-            self.credential.access_key_id,
-            self.credential.access_key_secret,
-            self.credential.security_token,
+            credential.access_key_id,
+            credential.access_key_secret,
+            credential.security_token,
         )
 
 

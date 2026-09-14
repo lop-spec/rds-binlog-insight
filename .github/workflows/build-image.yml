@@ -10,15 +10,15 @@ on:
         default: false
   push:
     tags:
-      - v1.28.6-rawoss
+      - v1.28.8-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.28.6-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.28.6-rawoss
+  VERSION: 1.28.8-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.28.8-rawoss
 
 jobs:
   build-test-package:
@@ -65,6 +65,9 @@ jobs:
             --volume "$PWD:/src:ro" \
             "$LOCAL_IMAGE" \
             -m unittest \
+            tests.test_cloud_credentials \
+            tests.test_core.CredentialBackendTests \
+            tests.test_core.ConfigAndChecksumTests \
             tests.test_clickhouse_oss \
             tests.test_clickhouse_hot \
             tests.test_clickhouse_raw_worker \

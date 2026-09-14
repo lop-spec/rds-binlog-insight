@@ -81,8 +81,9 @@ class RdsRpcClient:
         return endpoint
 
     def _signed_params(self, action: str, params: dict[str, Any]) -> dict[str, str]:
+        credential = self.credential.current()
         values = {
-            "AccessKeyId": self.credential.access_key_id,
+            "AccessKeyId": credential.access_key_id,
             "Action": action,
             "Format": "JSON",
             "RegionId": self.settings.region_id,
@@ -92,15 +93,15 @@ class RdsRpcClient:
             "Timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "Version": self.VERSION,
         }
-        if self.credential.security_token:
-            values["SecurityToken"] = self.credential.security_token
+        if credential.security_token:
+            values["SecurityToken"] = credential.security_token
         values.update({key: str(value) for key, value in params.items() if value is not None})
         canonical = "&".join(
             f"{_percent(key)}={_percent(values[key])}" for key in sorted(values)
         )
         string_to_sign = "GET&%2F&" + _percent(canonical)
         digest = hmac.new(
-            (self.credential.access_key_secret + "&").encode("utf-8"),
+            (credential.access_key_secret + "&").encode("utf-8"),
             string_to_sign.encode("utf-8"),
             hashlib.sha1,
         ).digest()
