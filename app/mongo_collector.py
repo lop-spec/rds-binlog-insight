@@ -64,11 +64,18 @@ def load_instances(root: Path):
 
 
 class MongoCollector:
+    SLOWLOG_PAGE_TIMEOUT = 12
+    # DDS documents 30 DescribeSlowLogRecords requests/minute. Share this gate
+    # between realtime and history lanes; do not speed up by adding readers.
+    SLOWLOG_REQUEST_INTERVAL = 2.1
+    SLOWLOG_MAX_PAGES = 500
+
     def __init__(self, store, entry, settings_loader, archive_loader=None):
         self.store=store;self.entry=entry;self.instance=entry['instanceId']
         self.settings_loader=settings_loader;self.archive_loader=archive_loader
         self.stop_event=threading.Event();self.threads=[];self.clients={};self.before={};self.unsupported_metrics={}
         self.history_retry={}
+        self.slow_request_lock=threading.Lock();self.slow_next_request=0.0
         self.state={'instanceId':self.instance,'label':entry.get('label',self.instance),'enabled':entry.get('enabled',False),
                     'slowlog':'not_started','metrics':'not_started','counters':'not_started','client_aggregates':'not_connected'}
 
@@ -77,21 +84,41 @@ class MongoCollector:
         credential=load_credential(settings.credential_target)
         if credential is None:raise RuntimeError('cloud_credential_unavailable')
         endpoint='https://metrics.'+self.entry['region']+'.aliyuncs.com' if cms else 'https://mongodb.aliyuncs.com'
-        return (CmsClient if cms else DdsClient)(replace(settings,db_instance_id=self.instance,region_id=self.entry['region'],endpoint=endpoint),credential,timeout=12)
+        return (CmsClient if cms else DdsClient)(replace(settings,db_instance_id=self.instance,region_id=self.entry['region'],endpoint=endpoint),credential,timeout=self.SLOWLOG_PAGE_TIMEOUT)
+
+    def _slow_page(self,client,params):
+        with self.slow_request_lock:
+            delay=max(0.0,self.slow_next_request-time.monotonic())
+            if self.stop_event.wait(delay):raise RuntimeError('collector_stopping')
+            self.slow_next_request=time.monotonic()+self.SLOWLOG_REQUEST_INTERVAL
+            return client.call('DescribeSlowLogRecords',params)
 
     def slow_window(self,start,end):
-        client=self.rpc();records=[];total=None;deadline=time.monotonic()+240
-        for page in range(1,501):
+        client=self.rpc();records=[];total=None;begin=time.monotonic();deadline=begin+240
+        for page in range(1,self.SLOWLOG_MAX_PAGES+1):
             if self.stop_event.is_set():raise RuntimeError('collector_stopping')
             if time.monotonic()>deadline:raise RuntimeError('slowlog_window_deadline')
-            r=client.call('DescribeSlowLogRecords',{'DBInstanceId':self.instance,'StartTime':iso(start),'EndTime':iso(end),
+            r=self._slow_page(client,{'DBInstanceId':self.instance,'StartTime':iso(start),'EndTime':iso(end),
                           'PageSize':100,'PageNumber':page,'OrderType':'asc'})
             count=int(r.get('TotalRecordCount',-1))
             if count<0 or (total is not None and count!=total):raise RuntimeError('source_changed_during_pagination')
+            if total is None:
+                pages=max(1,(count+99)//100)
+                if pages>self.SLOWLOG_MAX_PAGES:raise RuntimeError('slowlog_page_limit_or_count_mismatch')
+                # A dense window cannot fit the old fixed 240s budget even when
+                # every request succeeds. Budget all pages plus API pacing;
+                # retain per-request timeout, finite page cap and stop checks.
+                deadline=begin+max(240,pages*(self.SLOWLOG_PAGE_TIMEOUT+self.SLOWLOG_REQUEST_INTERVAL)+30)
             total=count
             batch=r.get('Items',{}).get('LogRecords',[])
             if not isinstance(batch,list):raise RuntimeError('invalid_slowlog_page')
             records.extend(batch)
+            progress=dict(start_us=start,end_us=end,page=page,records=len(records),total=total,
+                          elapsed_seconds=round(time.monotonic()-begin,2))
+            self.state['slowlog_fetch_progress']=progress
+            if page==1 or page%10==0 or len(records)>=total:
+                LOGGER.info('mongo_slowlog pagination: instance=%s window=%s page=%s records=%s total=%s elapsed=%s',
+                            self.instance,start,page,len(records),total,progress['elapsed_seconds'])
             if len(records)>=total:break
             if not batch:raise RuntimeError('incomplete_slowlog_pagination')
         if len(records)!=total:raise RuntimeError('slowlog_page_limit_or_count_mismatch')

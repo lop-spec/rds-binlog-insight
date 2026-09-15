@@ -43,6 +43,68 @@ class CollectorGates(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'source_changed'):c.slow_window(T,T+5*MINUTE)
         c.store.publish.assert_not_called()
 
+    def test_dense_window_finishes_after_old_deadline_without_partial_publish(self):
+        # 28,449 records require 285 requests; even 1.2s/request exceeds 240s.
+        total=28449;clock=[0.0];starts=[]
+        c=self.collector([])
+        client=Mock()
+        def response(action,params):
+            self.assertEqual(action,'DescribeSlowLogRecords')
+            self.assertEqual(params['PageNumber'],len(starts)+1)
+            c.store.publish.assert_not_called()
+            starts.append(clock[0]);clock[0]+=1.2
+            n=min(100,total-(params['PageNumber']-1)*100)
+            return {'TotalRecordCount':total,'Items':{'LogRecords':[record() for _ in range(n)]}}
+        client.call.side_effect=response;c.rpc=lambda cms=False:client
+        def wait(delay):clock[0]+=delay;return False
+        with patch('app.mongo_collector.time.monotonic',side_effect=lambda:clock[0]),patch.object(c.stop_event,'wait',side_effect=wait):
+            c.slow_window(T,T+5*MINUTE)
+        self.assertGreater(clock[0],240)
+        self.assertEqual(len(starts),285)
+        self.assertTrue(all(b-a>=2.1-1e-8 for a,b in zip(starts,starts[1:])))
+        c.store.publish.assert_called_once()
+        self.assertEqual(len(c.store.publish.call_args.args[3]),total)
+        self.assertEqual(c.state['slowlog_fetch_progress']['records'],total)
+
+    def test_pacing_shared_between_realtime_and_history_calls(self):
+        from concurrent.futures import ThreadPoolExecutor
+        c=self.collector([]);clock=[0.0];starts=[];client=Mock()
+        def response(*args):starts.append(clock[0]);return {}
+        def wait(delay):clock[0]+=delay;return False
+        client.call.side_effect=response
+        with patch('app.mongo_collector.time.monotonic',side_effect=lambda:clock[0]),patch.object(c.stop_event,'wait',side_effect=wait):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(lambda _:c._slow_page(client,{}),range(32)))
+        self.assertEqual(len(starts),32)
+        self.assertGreaterEqual(starts[30]-starts[0],60)
+        self.assertTrue(all(b-a>=2.1-1e-8 for a,b in zip(starts,starts[1:])))
+
+    def test_cancelled_rate_wait_never_calls_provider_or_publishes(self):
+        c=self.collector([]);client=Mock();c.rpc=lambda cms=False:client
+        with patch.object(c.stop_event,'wait',return_value=True):
+            with self.assertRaisesRegex(RuntimeError,'collector_stopping'):c.slow_window(T,T+5*MINUTE)
+        client.call.assert_not_called();c.store.publish.assert_not_called()
+
+    def test_oversized_window_fails_explicitly_without_publishing(self):
+        c=self.collector([{'TotalRecordCount':50001,'Items':{'LogRecords':[record()]}}])
+        with self.assertRaisesRegex(RuntimeError,'page_limit'):c.slow_window(T,T+5*MINUTE)
+        c.store.publish.assert_not_called()
+
+    def test_failed_dense_window_does_not_advance_checkpoint_and_can_retry(self):
+        from app.mongo_store import MongoStore,atomic_json
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            c=MongoCollector(store,dict(instanceId='dds-example'),lambda:None)
+            checkpoint=store.base(c.instance)/'slow-checkpoint.json';atomic_json(checkpoint,{'next':T})
+            before=checkpoint.read_bytes();c.slow_window=Mock(side_effect=TimeoutError('provider'))
+            with patch('app.mongo_collector.time.time',return_value=T/1e6+1000):
+                with self.assertRaises(TimeoutError):c.slow_tick()
+                self.assertEqual(checkpoint.read_bytes(),before)
+                c.slow_window=Mock(return_value=dict(end=T+5*MINUTE,records=28449))
+                self.assertEqual(c.slow_tick(),28449)
+            c.slow_window.assert_called_once_with(T,T+5*MINUTE)
+            self.assertEqual(json.loads(checkpoint.read_text())['next'],T+5*MINUTE)
+
     def test_empty_is_a_complete_source_window(self):
         c=self.collector([{'TotalRecordCount':0,'Items':{'LogRecords':[]}}])
         c.slow_window(T,T+5*MINUTE)
