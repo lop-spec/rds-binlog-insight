@@ -10,16 +10,16 @@ on:
         default: false
   push:
     tags:
-      - v1.28.15-rawoss
+      - v1.28.16-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.28.15-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.28.15-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.15-rawoss
+  VERSION: 1.28.16-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.28.16-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.16-rawoss
 
 jobs:
   build-test-package:
