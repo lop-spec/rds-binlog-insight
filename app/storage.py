@@ -33,7 +33,7 @@ except ImportError:
     msvcrt = None
 
 from .analytics_index import AnalyticsIndex
-from .clickhouse_query import ClickHouseQueryBackend
+from .clickhouse_query import ClickHouseQueryBackend, ClickHouseRawOssUnavailable
 from .clickhouse_slowlog import ClickHouseSlowLogQueryBackend
 from .rollup_index import DAY_US, HOUR_US, RollupIndex
 from .config import Settings, ensure_data_dirs
@@ -3395,7 +3395,15 @@ class EventStorage:
             except Exception as exc:
                 if control is not None:
                     control.check_cancelled()
-                if bool(getattr(self.clickhouse_backend, "raw_serving", False)):
+                # The optional all-source route must not make a formerly
+                # supported query unavailable merely because its CH manifest
+                # is catching up. Only this pre-query coverage refusal retains
+                # the existing path; actual raw-query failures stay fail-closed.
+                coverage_only_decline = merge_audit and isinstance(
+                    exc, ClickHouseRawOssUnavailable
+                )
+                if (bool(getattr(self.clickhouse_backend, "raw_serving", False))
+                        and not coverage_only_decline):
                     LOGGER.exception(
                         "ClickHouse raw OSS query failed; refusing unbounded "
                         "Parquet fallback"

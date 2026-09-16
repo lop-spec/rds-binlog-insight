@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from app.clickhouse_query import ClickHouseRawOssUnavailable
 from app.config import Settings
 from app.metadata import MetadataStore
 from app.storage import EventStorage, StorageError
@@ -96,6 +97,22 @@ class AllSourceRoutingTests(unittest.TestCase):
         self.assertEqual(result['rows'], [])
         self.assertNotIn('source_merge', result)
         self.assertEqual(backend.query_events.call_args.args[0]['source'], '')
+
+    def test_manifest_catchup_keeps_previous_all_source_path(self):
+        backend = self.install_backend()
+        backend.query_events.side_effect = ClickHouseRawOssUnavailable('fixture incomplete')
+        with self.assertLogs('app.storage', level='ERROR'):
+            result = self.storage._query_events_tiered_impl(self.query, self.settings, None)
+        self.assertEqual([r['event_id'] for r in result['rows']],
+                         ['event-9', 'event-8', 'event-7'])
+        self.assertNotIn('source_merge', result)
+
+    def test_raw_query_failure_still_refuses_unbounded_fallback(self):
+        backend = self.install_backend()
+        backend.query_events.side_effect = RuntimeError('fixture query resource failure')
+        with self.assertLogs('app.storage', level='ERROR'), self.assertRaises(StorageError) as raised:
+            self.storage._query_events_tiered_impl(self.query, self.settings, None)
+        self.assertEqual(raised.exception.code, 'CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE')
 
     def test_equal_timestamps_use_full_stable_order_key(self):
         rows = [{'event_id': str(i), 'event_epoch_us': 10, 'source_file_name': str(i % 2),
