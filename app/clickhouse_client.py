@@ -13,6 +13,11 @@ from .io_pressure import io_recovery_ratio_from_env
 
 
 MAX_PART_STATE_IDENTITIES = 256
+# HTTP param_* values use ClickHouse's Escaped format, then URL encoding.
+# URL encoding alone lets literal backslashes change a String parameter.
+_HTTP_PARAMETER_ESCAPES = str.maketrans({
+    "\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r", "\0": "\\0",
+})
 
 
 def validate_part_state_batch_size(value: int) -> int:
@@ -334,7 +339,10 @@ class ClickHouseClient:
         }
         values.update(settings or {})
         values.update(
-            {f"param_{key}": value for key, value in (parameters or {}).items()}
+            {f"param_{key}": (
+                value.translate(_HTTP_PARAMETER_ESCAPES)
+                if isinstance(value, str) else value
+            ) for key, value in (parameters or {}).items()}
         )
         connection = http.client.HTTPConnection(
             self.config.host,

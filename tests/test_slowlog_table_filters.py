@@ -5,6 +5,8 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlsplit
 
 from app.clickhouse_client import ClickHouseClient, ClickHouseConfig
 from app.clickhouse_slowlog import ClickHouseSlowLogQueryBackend
@@ -65,12 +67,28 @@ class SlowLogTableFilters(unittest.TestCase):
                     self.assertEqual(summary['sql']['totals']['scan_rows'],
                         sum(100 + number for number, key in enumerate(TABLES) if key in expected))
 
+    def test_http_parameters_escape_before_url_encoding(self):
+        response = Mock(status=200)
+        response.read.return_value = b'1\n'
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.dict(os.environ, {'CLICKHOUSE_USER': 'fixture',
+                                     'CLICKHOUSE_PASSWORD': 'fixture-ci-only'}, clear=True), \
+                patch('app.clickhouse_client.http.client.HTTPConnection', return_value=connection):
+            client = ClickHouseClient(ClickHouseConfig.from_env())
+            client.query('SELECT {text:String}, {number:Int64}',
+                         parameters={'text': "a\\r\t\n\r\0'\"", 'number': 7})
+        url = connection.request.call_args.args[1]
+        values = parse_qs(urlsplit(url).query)
+        self.assertEqual(values['param_text'], ["a\\\\r\\t\\n\\r\\0'\""])
+        self.assertEqual(values['param_number'], ['7'])
+
     def test_clickhouse_scope_uses_parameterized_member_match_and_exact_combination(self):
         backend = object.__new__(ClickHouseSlowLogQueryBackend)
         backend.table = 'fixture.events'
         sql, parameters = backend._scope_sql({'table': "orders' OR 1=1 --"}, T-1, T+100)
         self.assertIn("splitByChar(',', table_name)", sql)
-        self.assertIn('trimBoth(lowerUTF8(name))', sql)
+        self.assertIn('trimBoth(lowerUTF8(name), char(32,9,10,11,12,13))', sql)
         self.assertNotIn("orders' OR 1=1", sql)
         self.assertIn("orders' OR 1=1 --", parameters.values())
         sql, _ = backend._scope_sql({'table': 'orders,customers'}, T-1, T+100)
@@ -86,6 +104,11 @@ class SlowLogTableFiltersClickHouse(unittest.TestCase):
         self.assertEqual(config.host, '127.0.0.1')
         self.assertEqual(config.port, 18123)
         client = ClickHouseClient(config)
+        # Prove actual HTTP transport, not only mocked URLs or generated SQL.
+        for value in ['o\\rders', '\\N', '\\t', 'tab\tline\nreturn\rnull\0', '\b\f\v', "quote'\"\\"]:
+            with self.subTest(parameter=repr(value)):
+                result = client.json_rows('SELECT {value:String} AS value', parameters={'value': value})
+                self.assertEqual(result, [{'value': value}])
         table = 'mongo_ci_fixture.slowlog_table_filter_fixture'
         client.query(f'''CREATE TABLE {table} (
             instance_id String, event_epoch_us Int64, event_id String,

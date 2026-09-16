@@ -766,7 +766,8 @@ class ClickHouseSlowLogQueryBackend:
                 # A slow-log row can reference several JOIN participants. Keep
                 # the legacy exact combination filter when the query has commas.
                 clauses.append(
-                    f"has(arrayMap(name -> trimBoth(lowerUTF8(name)), "
+                    f"has(arrayMap(name -> trimBoth(lowerUTF8(name), "
+                    f"char(32,9,10,11,12,13)), "
                     f"splitByChar(',', {column})), lowerUTF8({parameter}))"
                 )
             elif key in {"database", "table"}:
