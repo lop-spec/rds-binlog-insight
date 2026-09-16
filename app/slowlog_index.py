@@ -1466,6 +1466,18 @@ class SlowLogIndex:
     # --------------------------------------------------------------------- query
 
     @staticmethod
+    def _table_member_filter(column: str, parameter: str) -> str:
+        # DAS TableName is a comma-separated list, not one physical table.
+        # json_quote preserves quotes/backslashes in names; json_each + trim
+        # handles spacing without LIKE wildcards or substring false positives.
+        return (
+            "EXISTS (SELECT 1 FROM json_each('[' || "
+            f"replace(json_quote({column}), ',', '\",\"') || ']') AS table_member "
+            "WHERE trim(table_member.value, ' ' || char(9) || char(10) || "
+            f"char(11) || char(12) || char(13)) = {parameter} COLLATE NOCASE)"
+        )
+
+    @staticmethod
     def _event_where(
         query: dict[str, Any], start_epoch_us: int, end_epoch_us: int
     ) -> tuple[str, list[Any]]:
@@ -1487,8 +1499,12 @@ class SlowLogIndex:
         for key, column in (("database", "database_name"), ("table", "table_name")):
             value = str(query.get(key) or "").strip().lower()
             if value:
-                clauses.append(f"{column} = ? COLLATE NOCASE")
-                params.append(value)
+                if key == "table" and "," not in value:
+                    clauses.append(SlowLogIndex._table_member_filter(column, "?"))
+                    params.append(value)
+                else:
+                    clauses.append(f"{column} = ? COLLATE NOCASE")
+                    params.append(value)
         for key, column in (("account", "database_account"), ("connection", "client_ip")):
             value = str(query.get(key) or "").strip().lower()
             if value:
@@ -1757,11 +1773,17 @@ class SlowLogIndex:
             (operation.upper() if operation else "", "e.operation", "operation"),
         ):
             if value:
-                if name in {"database", "table_name"}:
-                    clauses.append(f"{column} = :{name} COLLATE NOCASE")
+                if name == "table_name" and "," not in str(value):
+                    clauses.append(
+                        SlowLogIndex._table_member_filter(column, f":{name}")
+                    )
+                    params[name] = str(value).strip()
                 else:
-                    clauses.append(f"{column} = :{name}")
-                params[name] = str(value)
+                    if name in {"database", "table_name"}:
+                        clauses.append(f"{column} = :{name} COLLATE NOCASE")
+                    else:
+                        clauses.append(f"{column} = :{name}")
+                    params[name] = str(value)
         return " AND ".join(clauses), params
 
     @staticmethod

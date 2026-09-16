@@ -762,7 +762,14 @@ class ClickHouseSlowLogQueryBackend:
             if key == "operation":
                 value = value.upper()
             parameter = parameters.add(value, "String")
-            if key in {"database", "table"}:
+            if key == "table" and "," not in value:
+                # A slow-log row can reference several JOIN participants. Keep
+                # the legacy exact combination filter when the query has commas.
+                clauses.append(
+                    f"has(arrayMap(name -> trimBoth(lowerUTF8(name)), "
+                    f"splitByChar(',', {column})), lowerUTF8({parameter}))"
+                )
+            elif key in {"database", "table"}:
                 clauses.append(f"lowerUTF8({column}) = lowerUTF8({parameter})")
             else:
                 clauses.append(f"{column} = {parameter}")
