@@ -1206,25 +1206,26 @@ class SyncManager:
                     )
                     submit_archive_buffer(force=False)
                 metadata_started = time.monotonic()
-                self.metadata.set_file_state(
-                    file_id,
-                    "parsing",
-                    event_count=count,
+                progress_visible = visible_event.is_set()
+                event_message = (
+                    f"{item.log_file_name} 第 {chunk_index + 1} 批："
+                    f"{chunk_count} 条事件已原子发布"
                 )
-                if visible_event.is_set():
-                    self.metadata.update_job(
-                        job_id,
-                        message=(
-                            f"{item.log_file_name} 已发布 {count} 条事件；"
-                            "这些事件现在即可查询"
-                        ),
-                    )
-                    self._event(
-                        job_id,
-                        "info",
-                        "FILE_CHUNK_PUBLISHED",
-                        f"{item.log_file_name} 第 {chunk_index + 1} 批："
-                        f"{chunk_count} 条事件已原子发布",
+                self.metadata.record_file_chunk_progress(
+                    file_id,
+                    count,
+                    job_id=job_id if progress_visible else "",
+                    message=(
+                        f"{item.log_file_name} 已发布 {count} 条事件；"
+                        "这些事件现在即可查询"
+                    ),
+                    event_message=event_message,
+                )
+                if progress_visible:
+                    # The event is already durable in the same transaction as
+                    # the count and job message; do not insert it a second time.
+                    LOGGER.info(
+                        "%s %s %s", job_id, "FILE_CHUNK_PUBLISHED", event_message
                     )
                 timings["metadata_seconds"] += time.monotonic() - metadata_started
                 native_wait_since = time.monotonic()

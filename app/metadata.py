@@ -1884,6 +1884,47 @@ class MetadataStore:
                 f"UPDATE binlog_files SET {', '.join(updates)} WHERE id = ?", values
             )
 
+    def record_file_chunk_progress(
+        self,
+        file_id: str,
+        event_count: int,
+        *,
+        job_id: str = "",
+        message: str = "",
+        event_message: str = "",
+    ) -> None:
+        """Commit chunk progress once, without weakening FULL durability.
+
+        Parts are published before this call; final storage/visibility and raw
+        deletion still belong to the existing file commit boundary. An empty
+        job_id records a background chunk without changing the visible job.
+        """
+        now_text = utc_now_text()
+        with self._write_lock, self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE binlog_files SET state = 'parsing', updated_at = ?, "
+                    "error_code = '', error_message = '', event_count = ? "
+                    "WHERE id = ?",
+                    (now_text, int(event_count), file_id),
+                )
+                if job_id:
+                    conn.execute(
+                        "UPDATE jobs SET message = ? WHERE id = ?",
+                        (message, job_id),
+                    )
+                    conn.execute(
+                        "INSERT INTO job_events "
+                        "(job_id, level, code, message, created_at) "
+                        "VALUES (?, 'info', 'FILE_CHUNK_PUBLISHED', ?, ?)",
+                        (job_id, event_message, now_text),
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
     def set_file_visibility(self, file_id: str, visible: bool) -> None:
         with self._write_lock, self.connection() as conn:
             cursor = conn.execute(
