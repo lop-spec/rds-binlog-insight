@@ -3260,13 +3260,47 @@ class MetadataStore:
             clauses.append("b.instance_id = ?")
             params.append(instance_id)
         params.append(int(limit))
+        # The existing cold-compression index has max_event_epoch_us second.
+        # Enumerate its leading keys with MIN seeks (not a full DISTINCT scan),
+        # then seek max >= start for every level. Levels are discovered, never
+        # hardcoded: imported parts with any compression level remain included.
+        # Keep min <= end unchanged, including arbitrarily long overlaps.
+        levels = ""
+        part_join = "parquet_parts p JOIN binlog_files b"
         with self.connection() as conn:
+            # A wide/all-history query gains little from the lower-end seek;
+            # keep the planner's source-first path there (and for sparse audit).
+            # This indexed MIN is only a plan heuristic, never a row filter.
+            oldest = None
+            if normalized != "audit":
+                oldest = conn.execute(
+                    "SELECT MIN(min_event_epoch_us) FROM parquet_parts"
+                ).fetchone()[0]
+            if (
+                oldest is not None
+                and int(start_epoch_us) - int(oldest)
+                > max(int(end_epoch_us) - int(start_epoch_us), 0)
+            ):
+                levels = """
+                    WITH RECURSIVE levels(level) AS (
+                        SELECT MIN(compression_level) FROM parquet_parts
+                        UNION ALL
+                        SELECT (SELECT MIN(compression_level) FROM parquet_parts
+                                WHERE compression_level > levels.level)
+                        FROM levels WHERE level IS NOT NULL
+                    )
+                """
+                part_join = (
+                    "levels CROSS JOIN parquet_parts p "
+                    "INDEXED BY idx_part_cold_compression "
+                    "ON p.compression_level = levels.level CROSS JOIN binlog_files b"
+                )
             rows = conn.execute(
                 f"""
+                {levels}
                 SELECT p.*, b.instance_id, b.log_file_name,
                        b.log_begin_utc, b.log_end_utc
-                FROM parquet_parts p
-                JOIN binlog_files b ON b.id = p.binlog_id
+                FROM {part_join} ON b.id = p.binlog_id
                 WHERE {" AND ".join(clauses)}
                 ORDER BY p.min_event_epoch_us, p.max_event_epoch_us, p.path
                 LIMIT ?

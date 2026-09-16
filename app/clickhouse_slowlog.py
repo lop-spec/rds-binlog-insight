@@ -924,6 +924,12 @@ class ClickHouseSlowLogQueryBackend:
             )
         coverage = self._manifest_coverage(parts)
         if not bool(coverage.get("complete")):
+            LOGGER.warning(
+                "ClickHouse slow-log coverage incomplete: requested_parts=%d "
+                "covered_parts=%s missing_parts=%s; using exact SQLite fallback",
+                len(parts), coverage.get("covered_parts"),
+                coverage.get("missing_parts_total", len(coverage.get("missing_parts") or [])),
+            )
             return None
         if control is not None:
             control.check_cancelled()

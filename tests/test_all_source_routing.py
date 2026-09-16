@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from app.config import Settings
+from app.metadata import MetadataStore
+from app.storage import EventStorage, StorageError
+from tests.test_core import remote
+
+
+class AllSourceRoutingTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        self.metadata = MetadataStore(root / 'metadata.sqlite3')
+        self.storage = EventStorage(self.metadata, root)
+        self.addCleanup(self.storage.slowlog_index.close)
+        self.settings = Settings(db_instance_id='rm-fixture', retention_days=60)
+        self.epoch = int(time.time() * 1_000_000) - 60_000_000
+        for name, kind, indices in [
+            ('binlog', 'WriteRowsEventV2', [0, 3, 6, 9]),
+            ('slow-log/fixture', 'SLOW_LOG', [2, 5, 8]),
+            ('tabularis-audit-fixture', 'TABULARIS_AUDIT', [1, 4, 7]),
+        ]:
+            file_id, _ = self.metadata.upsert_remote(
+                self.settings, remote(name, '2026-07-29T01:00:00Z'))
+            ndjson = root / 'fixture.ndjson'
+            ndjson.write_text(''.join(json.dumps({
+                'event_id': f'event-{i}', 'event_epoch_us': self.epoch + i,
+                'raw_event_type': kind, 'operation': 'INSERT',
+                'database_name': 'fixture', 'table_name': 'orders',
+                'after_json': json.dumps({'order_id': i}),
+            }) + '\n' for i in indices))
+            self.storage.ingest_ndjson_file(
+                file_id=file_id, instance_id='rm-fixture', host_instance_id='host-a',
+                source_file_name=name, ndjson_path=ndjson)
+        self.query = {'source': '', 'start_epoch_us': self.epoch,
+                      'end_epoch_us': self.epoch + 9, 'limit': 3}
+        self.database = self.storage.query_events_tiered(
+            {**self.query, 'source': 'database', 'limit': 100}, self.settings, None)
+
+    def install_backend(self):
+        def query(query, **_kwargs):
+            if query['source'] != 'database':
+                return None
+            self.assertEqual(query['offset'], 0)
+            limit = query['limit']
+            return {**self.database, 'rows': self.database['rows'][:limit],
+                    'has_more': len(self.database['rows']) > limit,
+                    'limit': limit, 'offset': 0, 'tiers_used': ['clickhouse-raw-oss']}
+        backend = SimpleNamespace(query_events=Mock(side_effect=query), raw_serving=True)
+        self.storage.clickhouse_backend = backend
+        return backend
+
+    def test_union_matches_legacy_rows_order_and_pagination(self):
+        # Do not prime the all-source certificate while computing the reference;
+        # a valid certificate rightly bypasses every backend, including CH.
+        with patch.object(self.metadata, 'record_complete_query_certificate', return_value=False):
+            expected = [self.storage._query_events_tiered_impl(
+                {**self.query, 'offset': offset}, self.settings, None)
+                        for offset in (0, 3, 6, 9)]
+        backend = self.install_backend()
+        actual = [self.storage._query_events_tiered_impl(
+            {**self.query, 'offset': offset}, self.settings, None)
+                  for offset in (0, 3, 6, 9)]
+        for before, after in zip(expected, actual, strict=True):
+            self.assertEqual([r['event_id'] for r in before['rows']],
+                             [r['event_id'] for r in after['rows']])
+            self.assertEqual(before['has_more'], after['has_more'])
+            self.assertEqual(after['source_merge'], 'clickhouse-database+exact-audit')
+            self.assertIn('clickhouse-raw-oss', after['tiers_used'])
+        self.assertTrue(backend.query_events.called)
+        self.assertEqual(sum(len(page['rows']) for page in actual), 10)
+
+    def test_audit_failure_is_not_reported_as_complete(self):
+        self.install_backend()
+        original = self.storage._query_events_tiered_impl
+        with patch.object(self.storage, '_query_events_tiered_impl',
+                          return_value={'unavailable_parts': 1}):
+            with self.assertRaises(StorageError) as raised:
+                original(self.query, self.settings, None)
+        self.assertEqual(raised.exception.code, 'ALL_SOURCES_AUDIT_INCOMPLETE')
+
+    def test_deep_offset_does_not_silently_truncate_union(self):
+        backend = self.install_backend()
+        with self.assertLogs('app.storage', level='WARNING'):
+            result = self.storage.query_events_tiered(
+                {**self.query, 'offset': 1001}, self.settings, None)
+        self.assertEqual(result['rows'], [])
+        self.assertNotIn('source_merge', result)
+        self.assertEqual(backend.query_events.call_args.args[0]['source'], '')
+
+    def test_equal_timestamps_use_full_stable_order_key(self):
+        rows = [{'event_id': str(i), 'event_epoch_us': 10, 'source_file_name': str(i % 2),
+                 'end_position': i // 2, 'row_index': i % 3} for i in range(12)]
+        ordered = sorted(rows, key=EventStorage._row_sort_key, reverse=True)
+        for offset in range(0, 12, 3):
+            top = offset + 3
+            database = sorted(rows[::2], key=EventStorage._row_sort_key, reverse=True)
+            audit = sorted(rows[1::2], key=EventStorage._row_sort_key, reverse=True)
+            result = EventStorage._merge_source_pages(
+                {'rows': database[:top], 'has_more': len(database) > top},
+                {'rows': audit[:top], 'has_more': len(audit) > top}, limit=3, offset=offset)
+            self.assertEqual(result['rows'], ordered[offset:offset + 3])
+            self.assertEqual(result['has_more'], offset + 3 < 12)
+
+
+if __name__ == '__main__':
+    unittest.main()

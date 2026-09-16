@@ -377,6 +377,7 @@ class Application:
                         )
                     ),
                     role="secondary",
+                    retention_owner=self.sync,
                     scope_instance_id=item.instance_id,
                     display_name=item.display_name(),
                 )
@@ -824,17 +825,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                 settings = self.app.metadata.load_settings()
                 event_query = _event_query(query)
                 archive = None
-                if not (
-                    str(event_query.get("source") or "").lower() == "slowlog"
-                    and self.app.storage.slowlog_query_coverage(
-                        event_query, settings
-                    ).get("complete")
-                ):
+                archive_options = {}
+                if str(event_query.get("source") or "").lower() == "slowlog":
+                    archive_options["archive_factory"] = (
+                        lambda: self.app.sync.archive_for_settings(settings)
+                    )
+                else:
                     archive = self.app.sync.archive_for_settings(settings)
                 result = self.app.storage.query_events_tiered(
                     event_query,
                     settings,
                     archive,
+                    **archive_options,
                 )
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/event":
@@ -876,19 +878,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                 settings = self.app.metadata.load_settings()
                 analytics_query = _analytics_query(query)
                 archive = None
-                if not (
-                    str(analytics_query.get("source") or "").lower()
-                    == "slowlog"
-                    and self.app.storage.slowlog_query_coverage(
-                        analytics_query, settings
-                    ).get("complete")
-                ):
+                archive_options = {}
+                if str(analytics_query.get("source") or "").lower() == "slowlog":
+                    archive_options["archive_factory"] = (
+                        lambda: self.app.sync.archive_for_settings(settings)
+                    )
+                else:
                     archive = self.app.sync.archive_for_settings(settings)
                 result = self.app.storage.analytics_summary(
                     analytics_query,
                     settings,
                     archive,
                     scan_limit=int(analytics_query.pop("scan_limit")),
+                    **archive_options,
                 )
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/storage":

@@ -15,17 +15,23 @@ from .config import app_root
 
 
 NATIVE_CHUNK_MAX_LINES = 200_000
-NATIVE_CHUNK_MAX_BYTES = 384 * 1024 * 1024
+NATIVE_CHUNK_MAX_BYTES = 128 * 1024 * 1024
 NATIVE_CHUNK_PREFETCH = 1
 NATIVE_CHUNK_MAX_OUTSTANDING = NATIVE_CHUNK_PREFETCH + 1
-_NATIVE_STAGING_LOCK = threading.Lock()
+# Shared by primary/secondary managers in the collector process. Leave headroom
+# in the 1 GiB tmpfs for an oversized final record and parser manifests.
+NATIVE_STAGING_BUDGET_BYTES = 768 * 1024 * 1024
+_NATIVE_STAGING_LOCK = threading.Condition()
+_NATIVE_STAGING_ACTIVE: dict[Path, dict[str, int]] = {}
 
 
 def _cleanup_native_chunk_artifacts(
     staging_root: Path,
     source_file_id: str | None = None,
+    *,
+    keep_source_ids: set[str] | None = None,
 ) -> None:
-    """Remove only parser-owned atomic chunk files from dedicated staging."""
+    """Remove parser-owned orphans, never another admitted lane's chunks."""
 
     for candidate in staging_root.iterdir():
         name = candidate.name
@@ -48,6 +54,7 @@ def _cleanup_native_chunk_artifacts(
             or not index.isascii()
             or not index.isdecimal()
             or (source_file_id is not None and prefix != source_file_id)
+            or (keep_source_ids is not None and prefix in keep_source_ids)
         ):
             continue
         if candidate.is_file() or candidate.is_symlink():
@@ -774,27 +781,41 @@ def parse_ndjson_chunks_buffered(
 ) -> Iterator[Path]:
     staging_dir.mkdir(parents=True, exist_ok=True)
     staging_root = staging_dir.resolve(strict=True)
+    reservation = max_bytes * (max(1, int(max_prefetch)) + 1)
+    if max_bytes <= 0 or reservation > NATIVE_STAGING_BUDGET_BYTES:
+        raise ParserError("解析分块预取超出暂存预算", "PARSER_STAGING_BUDGET")
     with _NATIVE_STAGING_LOCK:
-        # This directory is a dedicated tmpfs and the production pipeline has
-        # one parser lane. Clear chunks left by any interrupted source before
-        # admitting the next file so retries start with the full capacity.
-        _cleanup_native_chunk_artifacts(staging_root)
-        completed = False
-        try:
-            yield from _parse_ndjson_chunks_buffered(
-                path,
-                source_file_id,
-                staging_root,
-                flavor,
-                max_lines=max_lines,
-                max_bytes=max_bytes,
-                max_prefetch=max_prefetch,
-                no_progress_seconds=no_progress_seconds,
-            )
-            completed = True
-        finally:
-            if not completed:
-                _cleanup_native_chunk_artifacts(staging_root, source_file_id)
+        active = _NATIVE_STAGING_ACTIVE.setdefault(staging_root, {})
+        # Two lanes total, including secondary instances. This lock is held only
+        # for admission/cleanup, never while parsing or consuming a yielded chunk.
+        _NATIVE_STAGING_LOCK.wait_for(
+            lambda: source_file_id not in active
+            and len(active) < 2
+            and sum(active.values()) + reservation <= NATIVE_STAGING_BUDGET_BYTES
+        )
+        _cleanup_native_chunk_artifacts(staging_root, keep_source_ids=set(active))
+        active[source_file_id] = reservation
+    completed = False
+    try:
+        yield from _parse_ndjson_chunks_buffered(
+            path,
+            source_file_id,
+            staging_root,
+            flavor,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
+            max_prefetch=max_prefetch,
+            no_progress_seconds=no_progress_seconds,
+        )
+        completed = True
+    finally:
+        with _NATIVE_STAGING_LOCK:
+            try:
+                if not completed:
+                    _cleanup_native_chunk_artifacts(staging_root, source_file_id)
+            finally:
+                del active[source_file_id]
+                _NATIVE_STAGING_LOCK.notify_all()
 
 
 def parse_events(

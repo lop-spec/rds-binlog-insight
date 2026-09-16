@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import os
 import threading
 import time
 from collections import deque
@@ -25,9 +26,22 @@ from .storage import EventStorage, StorageError, ingest_ndjson_file_detached
 
 LOGGER = logging.getLogger(__name__)
 
-FILE_PIPELINE_WORKERS = 1
+def _pipeline_limit(name: str, default: int, maximum: int) -> int:
+    value = int(os.environ.get(name, str(default)))
+    if not 1 <= value <= maximum:
+        raise ValueError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
+FILE_PIPELINE_WORKERS = _pipeline_limit("RDS_BINLOG_FILE_WORKERS", 2, 2)
 DOWNLOAD_PIPELINE_WORKERS = 3
-TRANSFORM_PIPELINE_WORKERS = 1
+TRANSFORM_PIPELINE_WORKERS = _pipeline_limit("RDS_BINLOG_TRANSFORM_WORKERS", 2, 2)
+DOWNLOAD_PREFETCH_FILES = _pipeline_limit(
+    "RDS_BINLOG_DOWNLOAD_PREFETCH_FILES", FILE_PIPELINE_WORKERS + 2, 8
+)
+DOWNLOAD_PREFETCH_BYTES = 2 * 1024**3
+if DOWNLOAD_PREFETCH_FILES < FILE_PIPELINE_WORKERS:
+    raise ValueError("download prefetch must admit every active file lane")
 OSS_ARCHIVE_WORKERS = 4
 OSS_ARCHIVE_BACKLOG_PER_FILE = OSS_ARCHIVE_WORKERS + 1
 OSS_FRESH_UPLOAD_TARGET_BYTES = 1
@@ -137,6 +151,7 @@ class SyncManager:
         start_scheduler: bool = True,
         settings_loader: Callable[[], Settings] | None = None,
         role: str = "primary",
+        retention_owner: SyncManager | None = None,
         scope_instance_id: str = "",
         display_name: str = "",
     ):
@@ -148,6 +163,7 @@ class SyncManager:
         # binlog 同步进来，否则同一份 storage 会被清理逻辑重复执行。
         self._settings_loader = settings_loader or metadata.load_settings
         self.role = "secondary" if role == "secondary" else "primary"
+        self._retention_owner = self if self.role == "primary" else retention_owner
         self.scope_instance_id = str(scope_instance_id or "").strip()
         self.display_name = display_name or self.scope_instance_id
         self.client_factory = client_factory or (
@@ -1316,27 +1332,41 @@ class SyncManager:
                 fresh=True,
             )
 
+        prefetched: dict[str, Future[tuple[Path, str]] | None] = {}
+
+        def window(start: int, limit: int) -> list[tuple[str, RemoteBinlog, str]]:
+            entries: list[tuple[str, RemoteBinlog, str]] = []
+            size = 0
+            for entry in pending[start : start + limit]:
+                cost = max(entry[1].file_size, 0)
+                if entries and size + cost > DOWNLOAD_PREFETCH_BYTES:
+                    break
+                entries.append(entry)
+                size += cost
+            if size > DOWNLOAD_PREFETCH_BYTES:
+                LOGGER.warning(
+                    "Oversized binlog admitted alone: bytes=%d prefetch_budget=%d",
+                    size, DOWNLOAD_PREFETCH_BYTES,
+                )
+            return entries
+
         def schedule_downloads(
             executor: ThreadPoolExecutor,
+            start: int,
             batch: list[tuple[str, RemoteBinlog, str]],
         ) -> list[Future[tuple[Path, str]] | None]:
-            futures: list[Future[tuple[Path, str]] | None] = []
-            for file_id, item, prior_state in batch:
-                self.metadata.set_file_visibility(file_id, False)
-                if prior_state == "stored":
-                    futures.append(None)
+            # Download admission is independent of parser lanes. Retire a batch
+            # before refilling so parsed + downloaded + downloading stay bounded.
+            for file_id, item, prior_state in window(start, DOWNLOAD_PREFETCH_FILES):
+                if file_id in prefetched:
                     continue
-                futures.append(
-                    executor.submit(
-                        self._download,
-                        job_id,
-                        client,
-                        settings,
-                        file_id,
-                        item,
+                self.metadata.set_file_visibility(file_id, False)
+                prefetched[file_id] = (
+                    None if prior_state == "stored" else executor.submit(
+                        self._download, job_id, client, settings, file_id, item,
                     )
                 )
-            return futures
+            return [prefetched[entry[0]] for entry in batch]
 
         self._update_pipeline_status(active=True)
         try:
@@ -1359,8 +1389,8 @@ class SyncManager:
                 ) as archive_executor,
             ):
                 batch_start = 0
-                batch = pending[:FILE_PIPELINE_WORKERS]
-                downloads = schedule_downloads(download_executor, batch)
+                batch = window(0, FILE_PIPELINE_WORKERS)
+                downloads = schedule_downloads(download_executor, 0, batch)
                 while batch:
                     visibility_events = [
                         threading.Event() for _entry in batch
@@ -1442,14 +1472,7 @@ class SyncManager:
                         )
 
                     next_start = batch_start + len(batch)
-                    next_batch = pending[
-                        next_start : next_start + FILE_PIPELINE_WORKERS
-                    ]
-                    next_downloads = (
-                        schedule_downloads(download_executor, next_batch)
-                        if next_batch
-                        else []
-                    )
+                    next_batch = window(next_start, FILE_PIPELINE_WORKERS)
 
                     for position, (
                         entry,
@@ -1512,9 +1535,10 @@ class SyncManager:
                             completed_files=completed,
                         )
 
+                    for file_id, _item, _state in batch:
+                        prefetched.pop(file_id, None)
                     batch_start = next_start
                     batch = next_batch
-                    downloads = next_downloads
                     self._update_pipeline_status(
                         inFlightFiles=[],
                         visibleFile="",
@@ -1528,7 +1552,14 @@ class SyncManager:
                             "paused",
                             "已在并行文件批次边界暂停；下次从断点继续",
                         )
+                        for future in prefetched.values():
+                            if future is not None:
+                                future.cancel()
                         return completed, unavailable, True
+                    downloads = (
+                        schedule_downloads(download_executor, batch_start, batch)
+                        if batch else []
+                    )
         finally:
             self._update_pipeline_status(
                 active=False,
@@ -1665,14 +1696,7 @@ class SyncManager:
                     "当前清单已处理完，正在确认是否有新的 Completed Binlog"
                 ),
             )
-        cleanup = self.storage.cleanup(
-            settings.retention_days,
-            archive_enabled=settings.oss_enabled,
-        )
-        cache = self.storage.enforce_local_cache_limit(0)
-        query_cache = self.storage.enforce_query_cache_limit(0)
-        cleanup["errors"].extend(cache["errors"])
-        cleanup["errors"].extend(query_cache["errors"])
+        cleanup = self._cleanup_after_sync(settings)
         if unavailable:
             completed_message = (
                 "指定时间范围内其余可用 Completed Binlog 已全部解析；"
@@ -1717,6 +1741,65 @@ class SyncManager:
                 "success",
                 completed_message,
             )
+
+    def _cleanup_after_sync(self, settings: Settings) -> dict[str, Any]:
+        # The live Application always has a primary scheduler over this shared
+        # storage. It runs retention and both cache sweeps even with auto_sync
+        # disabled. Standalone managers and per-instance overrides are NOT an
+        # equivalent handoff, so retain their existing cleanup/error behavior.
+        owner = self._retention_owner
+        shared_owner = (
+            owner is not None
+            and owner.role == "primary"
+            and owner.storage is self.storage
+        )
+        global_settings = owner._settings() if shared_owner else None
+        owner_busy = False
+        if shared_owner:
+            # The hourly sweep skips a running primary worker. A secondary
+            # cannot hand off to it during a potentially long catch-up run.
+            # The primary itself is at its final step and about to go idle.
+            with owner._state_lock:
+                owner_busy = (
+                    owner is not self
+                    and owner._worker is not None
+                    and owner._worker.is_alive()
+                )
+        equivalent = (
+            global_settings is not None
+            and settings.retention_days == global_settings.retention_days
+            and settings.oss_enabled == global_settings.oss_enabled
+        )
+        if (
+            equivalent
+            and owner is not None
+            and owner._scheduler is not None
+            and owner._scheduler.is_alive()
+            and not owner._shutdown.is_set()
+            and not owner_busy
+        ):
+            LOGGER.info(
+                "Sync cleanup delegated to the primary hourly retention scheduler"
+            )
+            return {"errors": []}
+        if not shared_owner:
+            reason = "no-shared-primary-owner"
+        elif not equivalent:
+            reason = "retention-settings-differ"
+        elif owner_busy:
+            reason = "primary-worker-active"
+        else:
+            reason = "scheduler-stopped-or-stopping"
+        LOGGER.info("Sync cleanup retained: %s", reason)
+        result = self.storage.cleanup(
+            settings.retention_days,
+            archive_enabled=settings.oss_enabled,
+        )
+        cache = self.storage.enforce_local_cache_limit(0)
+        query_cache = self.storage.enforce_query_cache_limit(0)
+        result["errors"].extend(cache["errors"])
+        result["errors"].extend(query_cache["errors"])
+        return result
 
     def _run_retention_cleanup_if_due(self, settings: Settings) -> None:
         now = time.monotonic()

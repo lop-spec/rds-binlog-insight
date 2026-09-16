@@ -4794,7 +4794,7 @@ class QueryIsolationTests(unittest.TestCase):
                 return {"complete": True}
 
             @staticmethod
-            def query_events_tiered(_query, _settings, archive):
+            def query_events_tiered(_query, _settings, archive, **_kwargs):
                 if archive is not None:
                     raise AssertionError("complete slow-log query must stay local")
                 return {"rows": [], "tiers_used": ["slowlog-index"]}
@@ -4951,10 +4951,10 @@ class ArchiveMetadataBatchTests(unittest.TestCase):
 
 
 class PipelinePrefetchTests(unittest.TestCase):
-    def test_pipeline_keeps_cpu_heavy_work_to_one_lane(self) -> None:
-        self.assertEqual(FILE_PIPELINE_WORKERS, 1)
+    def test_pipeline_bounds_cpu_heavy_work_to_two_lanes(self) -> None:
+        self.assertEqual(FILE_PIPELINE_WORKERS, 2)
         self.assertEqual(DOWNLOAD_PIPELINE_WORKERS, 3)
-        self.assertEqual(TRANSFORM_PIPELINE_WORKERS, 1)
+        self.assertEqual(TRANSFORM_PIPELINE_WORKERS, 2)
 
     def test_archive_pool_and_per_file_backlog_are_bounded(self) -> None:
         self.assertEqual(OSS_ARCHIVE_WORKERS, 4)
@@ -5215,7 +5215,7 @@ class PipelinePrefetchTests(unittest.TestCase):
                     first_archive.set_result(1)
                 manager.shutdown()
 
-    def test_single_cpu_files_commit_in_source_order(self) -> None:
+    def test_parallel_files_commit_in_source_order(self) -> None:
         class Client:
             @staticmethod
             def verify_instance():

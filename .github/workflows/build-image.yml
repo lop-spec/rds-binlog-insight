@@ -10,16 +10,16 @@ on:
         default: false
   push:
     tags:
-      - v1.28.16-rawoss
+      - v1.28.17-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.28.16-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.28.16-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.16-rawoss
+  VERSION: 1.28.17-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.28.17-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.17-rawoss
 
 jobs:
   build-test-package:
@@ -32,8 +32,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Reject credentials and deployment identifiers
-        run: python tools/public_sanitization_check.py --history
+      - name: Reject credentials and deployment identifiers in source
+        run: python tools/public_sanitization_check.py
 
       - name: Set image coordinates
         shell: bash
@@ -84,13 +84,12 @@ jobs:
             -m unittest \
             tests.test_sync_lifecycle \
             tests.test_rds_download \
-            tests.test_core.RdsClientTests \
-            tests.test_core.MetadataSecurityTests \
-            tests.test_core.PipelinePrefetchTests \
+            tests.test_core \
+            tests.test_parser_buffering \
+            tests.test_pipeline_capacity \
+            tests.test_all_source_routing \
             tests.test_cloud_credentials \
             tests.test_clickhouse_credentials \
-            tests.test_core.CredentialBackendTests \
-            tests.test_core.ConfigAndChecksumTests \
             tests.test_clickhouse_oss \
             tests.test_clickhouse_hot \
             tests.test_clickhouse_raw_worker \
@@ -98,6 +97,8 @@ jobs:
             tests.test_clickhouse_slowlog_verify \
             tests.test_slowlog_collector \
             tests.test_slowlog_index \
+            tests.test_serving_handoff \
+            tests.test_sqlite_serving_performance \
             tests.test_slowlog_correlation \
             tests.test_slowlog_correlation_engines \
             tests.test_slowlog_impact \
@@ -162,6 +163,11 @@ jobs:
           test "$(docker inspect --format '{{.State.StartedAt}}' credentials-ci-clickhouse)" = "$started"
           docker stop --time 60 credentials-ci-clickhouse
           test "$(docker inspect --format '{{.State.ExitCode}}' credentials-ci-clickhouse)" = 0
+
+      # Keep the full-history publication gate unconditional, while allowing
+      # isolated cloud regression tests to diagnose unrelated historical debt.
+      - name: Reject sensitive Git history before any artifact export
+        run: python tools/public_sanitization_check.py --history
 
       - name: Export immutable deployment artifact
         shell: bash

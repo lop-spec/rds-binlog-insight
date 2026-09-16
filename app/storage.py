@@ -10,6 +10,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
@@ -2349,6 +2350,7 @@ class EventStorage:
         *,
         control: Any | None = None,
         scan_limit: int = 8,
+        archive_factory: Callable[[], OssArchive | None] | None = None,
     ) -> dict[str, Any]:
         """按时间窗返回三类分析结果，并如实报告覆盖度。
 
@@ -2367,7 +2369,6 @@ class EventStorage:
             instance=instance,
         )
         if source == "slowlog":
-            slowlog_coverage = self._slowlog_coverage_with_repair(parts)
             if self.clickhouse_slowlog_backend is not None:
                 try:
                     clickhouse_summary = (
@@ -2421,6 +2422,7 @@ class EventStorage:
                             ],
                         }
                         return clickhouse_summary
+            slowlog_coverage = self._slowlog_coverage_with_repair(parts)
             if slowlog_coverage["complete"]:
                 if control is not None:
                     control.check_cancelled()
@@ -2459,6 +2461,14 @@ class EventStorage:
                     ],
                 }
                 return summary
+            LOGGER.warning(
+                "Slow-log analytics index coverage incomplete; using legacy fallback"
+            )
+        # HTTP supplies a request-local factory, not an early coverage probe.
+        # This keeps both the part scan and repair enqueue single-pass and avoids
+        # constructing OSS clients on a complete SQLite/ClickHouse serving path.
+        if archive is None and archive_factory is not None:
+            archive = archive_factory()
         coverage = self.analytics_index.coverage(parts)
         scanned: list[str] = []
         scan_errors: list[str] = []
@@ -3012,6 +3022,49 @@ class EventStorage:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @classmethod
+    def _merge_source_pages(
+        cls, database: dict[str, Any], audit: dict[str, Any], *, limit: int, offset: int,
+    ) -> dict[str, Any]:
+        # Both sources supply their first offset+limit rows. Every global top-N
+        # row must belong to a source's top-N, including equal-timestamp ties.
+        unique: dict[str, dict[str, Any]] = {}
+        for row in [*database.get("rows", []), *audit.get("rows", [])]:
+            unique.setdefault(str(row["event_id"]), row)
+        ordered = sorted(unique.values(), key=cls._row_sort_key, reverse=True)
+        result = {
+            **database,
+            "rows": ordered[offset : offset + limit],
+            "limit": limit,
+            "offset": offset,
+            "has_more": bool(len(ordered) > offset + limit
+                             or database.get("has_more") or audit.get("has_more")),
+            "coverage_found": bool(database.get("coverage_found") or audit.get("coverage_found")),
+            "tiers_used": list(dict.fromkeys([
+                *database.get("tiers_used", []), *audit.get("tiers_used", []),
+            ])),
+            "source_merge": "clickhouse-database+exact-audit",
+        }
+        for key in (
+            "local_parts_read", "oss_parts_read", "range_requests", "range_bytes",
+            "oss_range_parts_read", "oss_temporary_parts_read", "oss_downloaded_parts",
+            "full_object_fallback_bytes", "predicate_row_groups_scanned",
+            "predicate_row_groups_selected", "unavailable_parts", "indexed_parts",
+            "structural_indexed_parts", "structural_prime_parts", "index_unknown_parts",
+            "index_skipped_parts", "candidate_blocks", "catalog_skipped_parts",
+            "negative_probe_skipped_parts", "positive_probe_cached_parts",
+            "query_cache_parts_read",
+        ):
+            result[key] = int(database.get(key) or 0) + int(audit.get(key) or 0)
+        indexed = result["indexed_parts"]
+        considered = indexed + result["index_unknown_parts"]
+        result["index_coverage"] = indexed / considered if considered else 1.0
+        result["query_scan_workers"] = max(
+            int(database.get("query_scan_workers") or 0),
+            int(audit.get("query_scan_workers") or 0),
+        )
+        return result
+
     def query_events_tiered(
         self,
         query: dict[str, Any],
@@ -3020,6 +3073,7 @@ class EventStorage:
         *,
         limit_cap: int = 1000,
         control: Any | None = None,
+        archive_factory: Callable[[], OssArchive | None] | None = None,
     ) -> dict[str, Any]:
         source = str(query.get("source") or "").strip().lower()
         if source == "audit":
@@ -3081,6 +3135,11 @@ class EventStorage:
                 result["available_start_epoch_us"] = available.get("oldest_epoch_us")
                 result["available_end_epoch_us"] = latest_us
                 return result
+            LOGGER.warning(
+                "Slow-log event index coverage incomplete; using legacy fallback"
+            )
+        if archive is None and archive_factory is not None:
+            archive = archive_factory()
         with self.query_activity():
             if control is not None:
                 result = self._query_events_tiered_impl(
@@ -3316,6 +3375,16 @@ class EventStorage:
             hot_query = dict(query)
             hot_query["start_epoch_us"] = start_us
             hot_query["end_epoch_us"] = end_us
+            # CH's change manifest deliberately excludes Tabularis. All-source
+            # pages therefore require an exact union, not merely a route alias.
+            merge_audit = (
+                str(query.get("source") or "").strip().lower() in {"", "all"}
+                and not query.get("exact")
+                and not query.get("fingerprint")
+                and offset + limit <= limit_cap
+            )
+            if merge_audit:
+                hot_query.update(source="database", offset=0, limit=offset + limit)
             try:
                 hot_result = self.clickhouse_backend.query_events(
                     hot_query,
@@ -3341,9 +3410,28 @@ class EventStorage:
                 )
             else:
                 if hot_result is not None:
+                    if merge_audit:
+                        audit_result = self._query_events_tiered_impl(
+                            {**hot_query, "source": "audit"}, settings, archive,
+                            limit_cap=limit_cap, control=control,
+                        )
+                        if audit_result.get("unavailable_parts"):
+                            raise StorageError(
+                                "全部来源查询的审计分区不完整，未返回不完整结果",
+                                "ALL_SOURCES_AUDIT_INCOMPLETE",
+                            )
+                        hot_result = self._merge_source_pages(
+                            hot_result, audit_result, limit=limit, offset=offset,
+                        )
                     hot_result["available_start_epoch_us"] = oldest_us
                     hot_result["available_end_epoch_us"] = latest_us
                     return hot_result
+                LOGGER.warning(
+                    "ClickHouse route declined: source=%s exact=%s fingerprint=%s "
+                    "offset=%d; using indexed Parquet path",
+                    query.get("source") or "all", bool(query.get("exact")),
+                    bool(query.get("fingerprint")), offset,
+                )
         parts = self.metadata.parts_in_range(
             start_epoch_us=start_us,
             end_epoch_us=end_us,
