@@ -3022,6 +3022,29 @@ class EventStorage:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @staticmethod
+    def _audit_union_query(
+        database_query: dict[str, Any], database_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        audit_query = {**database_query, "source": "audit"}
+        rows = database_result.get("rows") or []
+        required = int(database_query["limit"])
+        # The database side has already supplied its unique top-N and proved
+        # that another row exists. An audit row strictly older than every one
+        # of those N rows cannot enter the union's top-N. Keep timestamp ties;
+        # the merge still applies the complete stable ordering key.
+        # Without has_more, older audit rows can change global has_more even
+        # when they cannot enter the page, so retain the original window.
+        if (
+            database_result.get("has_more")
+            and len({str(row["event_id"]) for row in rows}) >= required
+        ):
+            audit_query["start_epoch_us"] = max(
+                int(database_query["start_epoch_us"]),
+                min(int(row["event_epoch_us"]) for row in rows),
+            )
+        return audit_query
+
     @classmethod
     def _merge_source_pages(
         cls, database: dict[str, Any], audit: dict[str, Any], *, limit: int, offset: int,
@@ -3433,8 +3456,9 @@ class EventStorage:
             else:
                 if hot_result is not None:
                     if merge_audit:
+                        audit_query = self._audit_union_query(hot_query, hot_result)
                         audit_result = self._query_events_tiered_impl(
-                            {**hot_query, "source": "audit"}, settings, archive,
+                            audit_query, settings, archive,
                             limit_cap=limit_cap, control=control,
                         )
                         if audit_result.get("unavailable_parts"):
@@ -3445,6 +3469,9 @@ class EventStorage:
                         hot_result = self._merge_source_pages(
                             hot_result, audit_result, limit=limit, offset=offset,
                         )
+                        hot_result["audit_search_start_epoch_us"] = audit_query[
+                            "start_epoch_us"
+                        ]
                     hot_result["available_start_epoch_us"] = oldest_us
                     hot_result["available_end_epoch_us"] = latest_us
                     return hot_result

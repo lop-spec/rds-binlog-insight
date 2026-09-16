@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import tempfile
 import time
 import unittest
@@ -79,6 +80,73 @@ class AllSourceRoutingTests(unittest.TestCase):
             self.assertIn('clickhouse-raw-oss', after['tiers_used'])
         self.assertTrue(backend.query_events.called)
         self.assertEqual(sum(len(page['rows']) for page in actual), 10)
+
+    def test_audit_rank_bound_is_used_by_real_parquet_route(self):
+        self.install_backend()
+        with patch.object(self.metadata, 'parts_in_range',
+                          wraps=self.metadata.parts_in_range) as parts:
+            result = self.storage._query_events_tiered_impl(
+                self.query, self.settings, None)
+        audit_calls = [c.kwargs for c in parts.call_args_list
+                       if c.kwargs.get('source') == 'audit']
+        self.assertEqual(len(audit_calls), 1)
+        self.assertEqual(audit_calls[0]['start_epoch_us'], self.epoch + 6)
+        self.assertEqual(audit_calls[0]['end_epoch_us'], self.epoch + 9)
+        self.assertEqual(result['audit_search_start_epoch_us'], self.epoch + 6)
+        self.assertEqual([r['event_id'] for r in result['rows']],
+                         ['event-9', 'event-8', 'event-7'])
+        self.assertTrue(result['has_more'])
+
+    def test_audit_bound_needs_unique_full_page_and_proven_more(self):
+        query = {**self.query, 'source': 'database', 'offset': 0}
+        rows = self.database['rows'][:3]
+        for result in [
+            {'rows': rows, 'has_more': False},
+            {'rows': rows[:2], 'has_more': True},
+            {'rows': [rows[0]] * 3, 'has_more': True},
+            {'rows': [], 'has_more': True},
+        ]:
+            with self.subTest(result=result):
+                audit = EventStorage._audit_union_query(query, result)
+                self.assertEqual(audit['start_epoch_us'], self.epoch)
+                self.assertEqual(audit['source'], 'audit')
+        self.assertEqual(query['source'], 'database')
+        self.assertEqual(query['start_epoch_us'], self.epoch)
+
+    def test_rank_pruning_matches_independent_union_oracle(self):
+        # Vary interleaving, timestamp ties, empty/exhausted sources and offset.
+        # Oracle never uses the pruning helper or the production sort function.
+        def key(row):
+            return (row['event_epoch_us'], row['source_file_name'],
+                    row['end_position'], row['row_index'], row['event_id'])
+
+        for seed in range(16):
+            rng = random.Random(seed)
+            rows = [{'event_id': f'event-{i:03}',
+                     'event_epoch_us': 100 + rng.randrange(8),
+                     'source_file_name': f'file-{rng.randrange(3)}',
+                     'end_position': rng.randrange(4),
+                     'row_index': rng.randrange(3)} for i in range(64)]
+            database = sorted(rows[:seed * 4], key=key, reverse=True)
+            audit = sorted(rows[seed * 4:], key=key, reverse=True)
+            oracle = sorted(rows, key=key, reverse=True)
+            for offset in (0, 1, 9, 60, 64):
+                for limit in (1, 3, 7):
+                    with self.subTest(seed=seed, offset=offset, limit=limit):
+                        top = offset + limit
+                        db_result = {'rows': database[:top],
+                                     'has_more': len(database) > top}
+                        query = {'source': 'database', 'start_epoch_us': 100,
+                                 'end_epoch_us': 107, 'limit': top, 'offset': 0}
+                        bounded = EventStorage._audit_union_query(query, db_result)
+                        selected = [r for r in audit if r['event_epoch_us'] >=
+                                    bounded['start_epoch_us']]
+                        actual = EventStorage._merge_source_pages(
+                            db_result, {'rows': selected[:top],
+                                        'has_more': len(selected) > top},
+                            limit=limit, offset=offset)
+                        self.assertEqual(actual['rows'], oracle[offset:offset + limit])
+                        self.assertEqual(actual['has_more'], offset + limit < len(oracle))
 
     def test_audit_failure_is_not_reported_as_complete(self):
         self.install_backend()
