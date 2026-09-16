@@ -122,20 +122,32 @@ def query_rows_with_cancel(
     control.check_cancelled()
     query_id = f"{query_id_prefix}-{uuid.uuid4().hex}"
     stopped = threading.Event()
+    cancel_lock = threading.Lock()
+    cancel_attempted = False
+
+    def cancel_owned_query() -> None:
+        nonlocal cancel_attempted
+        # Keep the lock through the acknowledgement: an HTTP failure must not
+        # race past the watcher's in-flight cleanup and start another query.
+        with cancel_lock:
+            if cancel_attempted:
+                return
+            cancel_attempted = True
+            try:
+                client.query(
+                    "KILL QUERY WHERE query_id = {query_id:String} SYNC",
+                    parameters={"query_id": query_id},
+                    timeout=10,
+                )
+            except Exception:
+                LOGGER.exception("Failed to cancel ClickHouse query %s", query_id)
 
     def cancel_watch() -> None:
         while not stopped.wait(0.1):
             try:
                 control.check_cancelled()
             except BaseException:
-                try:
-                    client.query(
-                        "KILL QUERY WHERE query_id = {query_id:String} SYNC",
-                        parameters={"query_id": query_id},
-                        timeout=10,
-                    )
-                except Exception:
-                    LOGGER.exception("Failed to cancel ClickHouse query")
+                cancel_owned_query()
                 return
 
     watcher = threading.Thread(
@@ -148,11 +160,20 @@ def query_rows_with_cancel(
         rows = client.json_rows(
             sql,
             parameters=parameters,
-            settings={**(settings or {}), "query_id": query_id},
+            settings={
+                **(settings or {}),
+                "query_id": query_id,
+                "cancel_http_readonly_queries_on_client_close": 1,
+            },
             timeout=timeout,
         )
         control.check_cancelled()
         return rows
+    except BaseException as exc:
+        stopped.set()
+        LOGGER.info("Cancelling owned ClickHouse query %s after %s", query_id, type(exc).__name__)
+        cancel_owned_query()
+        raise
     finally:
         stopped.set()
         watcher.join(timeout=1)
