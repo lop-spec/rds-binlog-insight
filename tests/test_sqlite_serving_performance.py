@@ -156,7 +156,10 @@ class SQLiteServingPerformanceTests(unittest.TestCase):
                 conn.commit()
 
                 @contextmanager
-                def connection():
+                def connection(*, control=None):
+                    # This fixture owns the connection/progress instrumentation;
+                    # cancellation behavior is exercised with real connections.
+                    self.assertIsNone(control)
                     yield conn
 
                 windows = [(BASE + 59 * DAY, BASE + 60 * DAY),
