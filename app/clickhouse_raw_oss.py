@@ -312,6 +312,7 @@ def _manifest_filter_sql(
     root: str,
     direct: bool,
     parameters: dict[str, str | int],
+    include_catalog: bool = True,
 ) -> str:
     clauses = [
         "is_deleted = 0",
@@ -326,6 +327,8 @@ def _manifest_filter_sql(
         clauses.append(
             "lowerUTF8(instance_id) = lowerUTF8({raw_instance:String})"
         )
+    if not include_catalog:
+        return " AND ".join(clauses)
     for key, column in (
         ("database", "database_names"),
         ("table", "table_names"),
@@ -378,6 +381,13 @@ def build_raw_oss_candidate_sql(
     On a bucket with hundreds of thousands of objects that turns a tiny query
     into a full prefix listing.  This first-stage query reads only the local
     manifest and returns exact keys; the data-stage query never uses a glob.
+
+    First collect a superset of matching identities using narrow columns from
+    ALL versions. PREWHERE then filters only the ORDER BY key (part_path), so
+    FINAL still sees every version and tombstone of each selected identity.
+    Mutable predicates and catalogs are evaluated after FINAL; pushing them
+    directly into PREWHERE could resurrect stale or deleted objects. The key
+    subquery must not use LIMIT: the page limit belongs after deduplication.
     """
 
     database = _identifier(database)
@@ -392,6 +402,7 @@ def build_raw_oss_candidate_sql(
     }
     manifest = f"{database}.{_identifier(config.manifest_table)}"
     filters: list[str] = []
+    key_filters: list[str] = []
     for root in roots:
         for direct in (True, False):
             filters.append(
@@ -401,6 +412,17 @@ def build_raw_oss_candidate_sql(
                     root=root,
                     direct=direct,
                     parameters=parameters,
+                )
+                + ")"
+            )
+            key_filters.append(
+                "("
+                + _manifest_filter_sql(
+                    query,
+                    root=root,
+                    direct=direct,
+                    parameters=parameters,
+                    include_catalog=False,
                 )
                 + ")"
             )
@@ -422,6 +444,10 @@ SELECT part_path, logical_part_id, sha256, content_revision,
        min_event_epoch_us, max_event_epoch_us, row_count, size_bytes,
        oss_path, oss_key, oss_offset, oss_length
 FROM {manifest} FINAL
+PREWHERE part_path IN (
+    SELECT part_path FROM {manifest}
+    WHERE ({' OR '.join(key_filters)})
+)
 WHERE ({' OR '.join(filters)})
 {cursor}
 ORDER BY max_event_epoch_us DESC, part_path DESC

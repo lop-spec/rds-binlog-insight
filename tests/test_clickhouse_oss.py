@@ -165,6 +165,49 @@ class ClickHouseOssConfigTests(unittest.TestCase):
             exact_parameters["raw_pack_identity_0"], "part-packed"
         )
 
+    def test_raw_candidate_prefilter_keeps_all_versions_until_final(self):
+        config = ClickHouseRawOssConfig.from_env()
+        for source in ("binlog", "database"):
+            with self.subTest(source=source):
+                sql, parameters = build_raw_oss_candidate_sql(
+                    config,
+                    database="insight",
+                    query={
+                        "source": source,
+                        "instance": "rm-test",
+                        "database": "orders",
+                        "table": "items",
+                        "operations": ["insert", "UPDATE"],
+                    },
+                    start_epoch_us=10,
+                    end_epoch_us=100,
+                    limit=2,
+                    cursor_max_event_epoch_us=70,
+                    cursor_part_path="/data/page-end.parquet",
+                )
+                prewhere, after_final = sql.split("\n)\nWHERE ", 1)
+                prewhere = prewhere.split("PREWHERE part_path IN (", 1)[1]
+                for unsafe in (
+                    "FINAL", "LIMIT", "ORDER BY", "catalog_ready",
+                    "database_names", "table_names", "operations", "raw_cursor",
+                ):
+                    self.assertNotIn(unsafe, prewhere)
+                for clause in (
+                    "source_kind", "is_deleted = 0", "instance_id",
+                    "max_event_epoch_us", "min_event_epoch_us",
+                    "oss_length = 0", "oss_length > 0",
+                ):
+                    self.assertIn(clause, prewhere)
+                    self.assertIn(clause, after_final)
+                self.assertIn("catalog_ready = 0 OR", after_final)
+                self.assertIn("raw_cursor_max", after_final)
+                self.assertEqual(sql.count(" FINAL"), 1)
+                self.assertEqual(sql.count("LIMIT "), 1)
+                self.assertEqual(parameters["raw_candidate_limit"], 2)
+                self.assertEqual(parameters["raw_cursor_path"], "/data/page-end.parquet")
+                self.assertEqual(parameters["raw_operation_0"], "INSERT")
+                self.assertEqual(parameters["raw_operation_1"], "UPDATE")
+
     def test_raw_oss_day_windows_are_newest_first_and_utc_bounded(self):
         start_us = int(datetime(2026, 8, 24, 23, 30, tzinfo=UTC).timestamp() * 1_000_000)
         end_us = int(datetime(2026, 8, 26, 0, 30, tzinfo=UTC).timestamp() * 1_000_000)
