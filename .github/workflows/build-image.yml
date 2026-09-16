@@ -8,6 +8,11 @@ on:
         required: true
         type: boolean
         default: false
+      memory_isolation:
+        description: Run only the credential-free v33 memory ABBA experiment; never publish
+        required: true
+        type: boolean
+        default: false
   push:
     tags:
       - v1.28.33-rawoss
@@ -22,7 +27,29 @@ env:
   LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.33-rawoss
 
 jobs:
+  memory-isolation:
+    if: github.event_name == 'workflow_dispatch' && inputs.memory_isolation
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - name: Verify fixture safety contracts
+        run: python -m unittest tests.test_memory_isolation33 -v
+      - name: Run isolated same-version ABBA without production credentials
+        run: python -u tools/memory_isolation33.py
+      - name: Preserve measurements even when a gate fails
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: memory-isolated33
+          path: memory-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
   build-test-package:
+    if: github.event_name != 'workflow_dispatch' || !inputs.memory_isolation
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
