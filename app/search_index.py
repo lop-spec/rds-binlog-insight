@@ -214,13 +214,36 @@ class SearchIndex:
             )
 
     @contextmanager
-    def connection(self) -> Iterable[sqlite3.Connection]:
+    def connection(
+        self, *, control: Any | None = None,
+    ) -> Iterable[sqlite3.Connection]:
+        if control is not None:
+            control.check_cancelled()
         conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
+        cancelled: list[BaseException] = []
+        if control is not None:
+            def check_cancelled() -> int:
+                try:
+                    control.check_cancelled()
+                except BaseException as exc:
+                    cancelled.append(exc)
+                    return 1
+                return 0
+
+            conn.set_progress_handler(check_cancelled, 2000)
         try:
             yield conn
+            if control is not None:
+                control.check_cancelled()
+        except sqlite3.OperationalError:
+            if cancelled:
+                raise cancelled[0]
+            raise
         finally:
+            if control is not None:
+                conn.set_progress_handler(None, 0)
             conn.close()
 
     @staticmethod
@@ -780,14 +803,20 @@ class SearchIndex:
         self,
         parts: list[dict[str, Any]],
         table: str,
+        *,
+        control: Any | None = None,
     ) -> tuple[set[str], set[str]]:
+        if control is not None:
+            control.check_cancelled()
         if not parts:
             return set(), set()
         expected = {str(part["path"]): part for part in parts}
         covered: set[str] = set()
-        with self.connection() as conn:
+        with self.connection(control=control) as conn:
             paths = list(expected)
             for offset in range(0, len(paths), 400):
+                if control is not None:
+                    control.check_cancelled()
                 chunk = paths[offset : offset + 400]
                 placeholders = ",".join("?" for _ in chunk)
                 rows = conn.execute(
@@ -812,14 +841,18 @@ class SearchIndex:
     def _coverage(
         self,
         parts: list[dict[str, Any]],
+        *,
+        control: Any | None = None,
     ) -> tuple[set[str], set[str]]:
-        return self._coverage_table(parts, "indexed_parts")
+        return self._coverage_table(parts, "indexed_parts", control=control)
 
     def _structural_coverage(
         self,
         parts: list[dict[str, Any]],
+        *,
+        control: Any | None = None,
     ) -> tuple[set[str], set[str]]:
-        return self._coverage_table(parts, "structural_parts")
+        return self._coverage_table(parts, "structural_parts", control=control)
 
     @staticmethod
     def _fts_ids(
@@ -860,10 +893,15 @@ class SearchIndex:
         *,
         start_epoch_us: int,
         end_epoch_us: int,
+        control: Any | None = None,
     ) -> dict[str, Any]:
+        if control is not None:
+            control.check_cancelled()
         part_map = self._part_map(parts)
-        full_covered, _full_unknown = self._coverage(parts)
-        structural_covered, _structural_unknown = self._structural_coverage(parts)
+        full_covered, _full_unknown = self._coverage(parts, control=control)
+        structural_covered, _structural_unknown = self._structural_coverage(
+            parts, control=control,
+        )
         covered = full_covered | structural_covered
         unknown = set(part_map) - covered
         if not covered:
@@ -890,7 +928,7 @@ class SearchIndex:
         mode_or = bool(
             terms and str(query.get("keyword_mode") or "").upper() == "OR"
         )
-        with self.connection() as conn:
+        with self.connection(control=control) as conn:
             structural_ids: set[int] | None = None
 
             def intersect_structural(value: set[int] | None) -> None:
@@ -960,6 +998,8 @@ class SearchIndex:
         entries: list[dict[str, Any]] = []
         candidate_paths: set[str] = set()
         for row in rows:
+            if control is not None:
+                control.check_cancelled()
             block_id = int(row["id"])
             path = str(row["part_path"])
             part = part_map.get(path)
@@ -997,6 +1037,8 @@ class SearchIndex:
                     "complete": complete,
                 }
             )
+        if control is not None:
+            control.check_cancelled()
         return {
             "entries": entries,
             "covered_paths": covered,

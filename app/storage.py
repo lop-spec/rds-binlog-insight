@@ -3484,6 +3484,7 @@ class EventStorage:
             query,
             start_epoch_us=start_us,
             end_epoch_us=end_us,
+            control=control,
         )
         # Public queries must remain read-only against the shared search
         # index. Building even a handful of structural entries here can wait
