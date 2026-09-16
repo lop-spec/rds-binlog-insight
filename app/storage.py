@@ -3129,6 +3129,7 @@ class EventStorage:
                         query,
                         start_epoch_us=start_us,
                         end_epoch_us=end_us,
+                        control=control,
                     )
                 result["coverage_found"] = bool(parts)
                 result["slowlog_index_coverage"] = slowlog_coverage

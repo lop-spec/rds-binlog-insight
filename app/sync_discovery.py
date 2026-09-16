@@ -25,12 +25,19 @@ def source_order(entry):
     return (item.log_begin_utc, item.log_end_utc, item.log_file_name, item.host_instance_id)
 
 
-def fair_pending(entries, now):
-    """Alternate oldest cold/live files; neither cohort can starve the other."""
+def fair_pending(entries, now, *, confirmed_ids=None):
+    """Alternate cold/live; prefer revalidated or local files within each cohort.
+
+    Unconfirmed cached records remain pending, never archived or dropped. The
+    retained scan continues independently and promotes them as pages arrive.
+    """
     boundary = (now - LIVE_LOOKBACK).strftime('%Y-%m-%dT%H:%M:%SZ')
     cold, live = [], []
     unique = {entry[0]: entry for entry in entries}
-    for entry in sorted(unique.values(), key=source_order):
+    def order(entry):
+        deferred = confirmed_ids is not None and entry[0] not in confirmed_ids
+        return (deferred, source_order(entry))
+    for entry in sorted(unique.values(), key=order):
         (live if entry[1].log_end_utc >= boundary else cold).append(entry)
     result = []
     for index in range(max(len(cold), len(live))):
@@ -48,6 +55,8 @@ class RetainedDiscovery:
         self.stop = threading.Event()
         self.last_recent = float('-inf')
         self.primary_windows = set()
+        self.confirmed_ids = set()
+        self.observed_lock = threading.Lock()
         self.pool = None
         self.future = None
 
@@ -78,10 +87,13 @@ class RetainedDiscovery:
 
     def _ingest(self, batch, *, retained=False):
         items = [item for item in batch if not self.primary or item.host_instance_id == self.primary]
-        self.manager.metadata.upsert_remotes(self.settings, items)
-        if retained:
-            self.primary_windows.update((item.log_begin_utc, item.log_end_utc)
-                                        for item in items if item.remote_status.lower() == 'completed')
+        records = self.manager.metadata.upsert_remotes(self.settings, items)
+        with self.observed_lock:
+            self.confirmed_ids.update(file_id for (file_id, _state), item in zip(records, items)
+                                      if item.remote_status.lower() == 'completed')
+            if retained:
+                self.primary_windows.update((item.log_begin_utc, item.log_end_utc)
+                                            for item in items if item.remote_status.lower() == 'completed')
 
     def _reconcile(self):
         fmt = lambda dt: dt.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -118,6 +130,9 @@ class RetainedDiscovery:
             self.last_recent = time.monotonic()
         result = []
         finished = self.finished
+        with self.observed_lock:
+            confirmed_ids = self.confirmed_ids.copy()
+            primary_windows = self.primary_windows.copy()
         records = self.manager.metadata.recoverable_files(
             self.settings.db_instance_id, include_discovered=True)
         for record in records:
@@ -131,7 +146,9 @@ class RetainedDiscovery:
                 # Preserve the original interrupted-file fallback only after the
                 # complete primary-window set is known. Never mix duplicate hosts.
                 if not finished or not local_resume: continue
-                if (str(record['log_begin_utc']), str(record['log_end_utc'])) in self.primary_windows: continue
+                if (str(record['log_begin_utc']), str(record['log_end_utc'])) in primary_windows: continue
+            if local_resume:
+                confirmed_ids.add(file_id)
             if not local_resume:
                 if str(record['remote_status']).lower() != 'completed': continue
                 if str(record['log_end_utc']) < self.scan_start.strftime('%Y-%m-%dT%H:%M:%SZ'): continue
@@ -140,4 +157,8 @@ class RetainedDiscovery:
                 'checksum_crc64', 'download_link', 'intranet_download_link',
                 'link_expired_utc', 'remote_status', 'host_instance_id')})
             result.append((file_id, item, state))
-        return fair_pending(result, now)
+        deferred = sum(file_id not in confirmed_ids for file_id, _item, _state in result)
+        if deferred:
+            LOGGER.warning('Cached binlog availability not revalidated: %d pending records; '
+                           'prefer API-confirmed/local files without discarding history', deferred)
+        return fair_pending(result, now, confirmed_ids=confirmed_ids)

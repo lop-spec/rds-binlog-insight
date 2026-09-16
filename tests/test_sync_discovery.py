@@ -44,6 +44,48 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual([e[0] for e in result[:6]],['old-0','new-0','old-1','new-1','old-2','new-2'])
         self.assertEqual(len(result),13)
 
+    def test_confirmed_cold_files_beat_unverified_cache_without_dropping_history(self):
+        cached, available, fresh = item('bin.cached',24), item('bin.available',3), item('bin.live')
+        cached_id = self.manager.metadata.upsert_remote(self.settings,cached)[0]
+        client = SimpleNamespace(iter_binlog_batches=lambda *_:iter([[available,fresh]]))
+        with RetainedDiscovery(self.manager,self.job,client,self.settings,'host-a') as discovery:
+            discovery.future.result(timeout=2)
+            with self.assertLogs('app.sync_discovery',level='WARNING'):
+                pending = discovery.pending()
+            self.assertEqual([entry[1].log_file_name for entry in pending],
+                             ['bin.available','bin.live','bin.cached'])
+            self.assertEqual(self.manager.metadata.file_record(cached_id)['state'],'discovered')
+
+    def test_local_interrupted_file_keeps_priority_without_api_revalidation(self):
+        cached, available = item('bin.cached',24), item('bin.available',3)
+        cached_id = self.manager.metadata.upsert_remote(self.settings,cached)[0]
+        (self.root/(cached_id+'.binlog')).write_bytes(b'fixture')
+        client = SimpleNamespace(iter_binlog_batches=lambda *_:iter([[available]]))
+        with RetainedDiscovery(self.manager,self.job,client,self.settings,'host-a') as discovery:
+            discovery.future.result(timeout=2)
+            self.assertEqual([entry[1].log_file_name for entry in discovery.pending()],
+                             ['bin.cached','bin.available'])
+
+    def test_new_page_promotes_cached_file_before_scan_finishes(self):
+        cached, available = item('bin.cached',24), item('bin.available',3)
+        cached_id = self.manager.metadata.upsert_remote(self.settings,cached)[0]
+        entered, release = threading.Event(), threading.Event()
+        def pages(begin,end):
+            if datetime.fromisoformat(begin.replace('Z','+00:00')) < datetime.now(UTC)-timedelta(hours=2):
+                yield [available]
+                entered.set()
+                if not release.wait(3): raise AssertionError('scan not released')
+                yield [cached]
+            else: yield []
+        with RetainedDiscovery(self.manager,self.job,SimpleNamespace(iter_binlog_batches=pages),self.settings,'host-a') as discovery:
+            try:
+                self.assertTrue(entered.wait(2))
+                with self.assertLogs('app.sync_discovery',level='WARNING'):
+                    self.assertNotEqual(discovery.pending()[0][0],cached_id)
+            finally: release.set()
+            discovery.future.result(timeout=2)
+            self.assertEqual(discovery.pending()[0][0],cached_id)
+
     def test_cached_restart_and_fresh_frontier_do_not_wait_for_full_scan(self):
         old = item('bin.000001',4)
         old_id = self.manager.metadata.upsert_remote(self.settings,old)[0]

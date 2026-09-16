@@ -1544,7 +1544,12 @@ class SlowLogIndex:
             return " INDEXED BY idx_slowlog_event_fingerprint_time"
         if instance and node_id:
             return " INDEXED BY idx_slowlog_event_instance_node_time"
-        if instance and str(query.get("database") or "").strip():
+        # The object index orders by table before time. It can stream a bounded
+        # page only when both database AND the exact table combination are fixed.
+        # Single-table membership (including JOIN participants) is not equality;
+        # forcing that index scans/sorts the entire database before LIMIT applies.
+        table = str(query.get("table") or "").strip()
+        if instance and str(query.get("database") or "").strip() and "," in table:
             return " INDEXED BY idx_slowlog_event_object_nocase_time"
         if instance:
             return " INDEXED BY idx_slowlog_event_instance_time"
@@ -1624,12 +1629,15 @@ class SlowLogIndex:
         *,
         start_epoch_us: int,
         end_epoch_us: int,
+        control: Any | None = None,
     ) -> dict[str, Any]:
         limit = min(max(_integer(query.get("limit") or 100), 1), 1000)
         offset = min(max(_integer(query.get("offset")), 0), 100_000)
         where, params = self._event_where(query, start_epoch_us, end_epoch_us)
         index_hint = self._event_index_hint(query)
-        with self.connection() as conn:
+        if control is not None:
+            control.check_cancelled()
+        with self.connection(control=control) as conn:
             rows = conn.execute(
                 f"SELECT e.*, d.sql_text_z FROM slowlog_events e{index_hint} "
                 "JOIN slowlog_event_details d "

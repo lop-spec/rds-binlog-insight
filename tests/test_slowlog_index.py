@@ -545,7 +545,7 @@ class SlowLogIndexTests(unittest.TestCase):
                     params,
                 ).fetchall()
             self.assertIn(
-                "idx_slowlog_event_object_nocase_time",
+                "idx_slowlog_event_instance_time",
                 " ".join(str(row[3]) for row in plan),
             )
 
