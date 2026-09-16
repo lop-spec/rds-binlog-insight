@@ -708,11 +708,32 @@ function renderSyncPerformance(performance, running = false) {
   }
 }
 
+function renderPrimarySync(status) {
+  // The global 50-job history can contain only newer secondary-instance jobs.
+  // All primary-card fields must come from the same authoritative status snapshot.
+  const sync = status?.sync || {};
+  const job = sync.latestJob;
+  $("#active-job").hidden = !job;
+  if (!job) return;
+  const id = status.primaryInstance?.instanceId || job.instance_id;
+  const label = instanceLabels(status).get(id) || id || "主实例";
+  $("#active-job .status-chip").outerHTML = renderJobStatus(job);
+  $("#active-job-file").textContent = `${label} · ${job.current_file || "核验 RDS 最新 Completed Binlog"}`;
+  $("#active-job-count").textContent = `${job.completed_files} / ${job.total_files}`;
+  const percent = job.total_files ? Math.min(100, (job.completed_files / job.total_files) * 100) : 8;
+  $("#active-job-progress").style.width = `${percent}%`;
+  $("#active-job-message").textContent = job.message || "—";
+  renderSyncPerformance(job.performance, Boolean(sync.running));
+}
+
 function renderJobs(jobs) {
+  const latest = state.status?.sync?.latestJob;
+  const history = latest && !jobs.some((job) => job.id === latest.id) ? [latest, ...jobs] : jobs;
+  const labels = instanceLabels(state.status || {});
   const list = $("#job-list");
   list.innerHTML = "";
-  $("#job-empty").hidden = jobs.length > 0;
-  for (const job of jobs) {
+  $("#job-empty").hidden = history.length > 0;
+  for (const job of history) {
     const item = document.createElement("article");
     item.className = "job-item";
     const events = (job.events || []).map((event) => `<li><span>${escapeHtml(formatTime(event.created_at, true))}</span> ${escapeHtml(event.message)}</li>`).join("");
@@ -720,21 +741,11 @@ function renderJobs(jobs) {
       ? ` · ${formatTime(job.requested_start_utc, true)} → ${formatTime(job.requested_end_utc, true)}`
       : "";
     item.innerHTML = `
-      <div class="job-main">${renderJobStatus(job)}<span>${escapeHtml(job.kind)} · ${escapeHtml(job.id.slice(0, 8))}${escapeHtml(requestedRange)}</span></div>
+      <div class="job-main">${renderJobStatus(job)}<span>${escapeHtml(labels.get(job.instance_id) || job.instance_id || "未知实例")} · ${escapeHtml(job.kind)} · ${escapeHtml(job.id.slice(0, 8))}${escapeHtml(requestedRange)}</span></div>
       <div class="job-time"><strong>${escapeHtml(formatTime(job.started_at))}</strong><br>${job.finished_at ? escapeHtml(formatTime(job.finished_at)) : "尚未结束"}</div>
       <details class="job-message"><summary>${escapeHtml(job.message || "—")}</summary>${events ? `<ul class="job-events">${events}</ul>` : ""}</details>
       <div class="job-count">${humanCount(job.completed_files)} / ${humanCount(job.total_files)} 文件${job.failed_files ? `<br><span class="danger-text">${job.failed_files} 失败</span>` : ""}</div>`;
     list.append(item);
-  }
-  const active = jobs.find((job) => job.status === "running");
-  $("#active-job").hidden = !active;
-  if (active) {
-    $("#active-job-file").textContent = active.current_file || "核验 RDS 最新 Completed Binlog";
-    $("#active-job-count").textContent = `${active.completed_files} / ${active.total_files}`;
-    const percent = active.total_files ? Math.min(100, (active.completed_files / active.total_files) * 100) : 8;
-    $("#active-job-progress").style.width = `${percent}%`;
-    $("#active-job-message").textContent = active.message || "正在运行";
-    renderSyncPerformance(state.status?.sync?.latestJob?.performance, true);
   }
 }
 
@@ -1017,7 +1028,7 @@ async function refreshStatus() {
     const caughtUp = performanceState === "caught_up";
     const checkingLatest = performanceState === "checking_latest";
     const liveFollowing = performanceState === "live_following";
-    renderSyncPerformance(latest?.performance, running);
+    renderPrimarySync(data);
     const syncHealth = data.sync?.health;
     const syncWarning = syncHealth?.ok === false;
     const warningLabels = { disabled: "自动同步已关闭", paused: "手动暂停未恢复", maintenance: "维护暂停中", stalled: "同步停滞", failed: "采集失败", scheduler_error: "自动采集启动失败", unconfigured: "待配置" };

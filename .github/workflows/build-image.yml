@@ -116,7 +116,7 @@ jobs:
             "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"
 
       - name: Verify workspace rendering and disclosure contracts
-        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs tests/test_sync_lifecycle.cjs
+        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs tests/test_sync_lifecycle.cjs tests/test_sync_status.cjs
 
       - name: Verify Mongo serving against isolated ClickHouse
         shell: bash
