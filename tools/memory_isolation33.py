@@ -56,7 +56,10 @@ def client(index):
     from tests.test_clickhouse_query_lifecycle import Control
     config=ClickHouseConfig.from_env()
     assert (config.host,config.port,config.database)==('127.0.0.1',18123,'mongo_ci_fixture')
-    timeout_case=index==-1;case={'name':'forced-http-timeout','sql':'SELECT sleep(3)'} if timeout_case else cases()[index]
+    timeout_case=index==-1;pressure_case=index==-2
+    case=({'name':'forced-http-timeout','sql':'SELECT sleep(3)'} if timeout_case else
+          {'name':'server-budget-pressure','sql':'SELECT cityHash64(groupArray(repeat(toString(number),144))) AS digest FROM numbers(4000000)'} if pressure_case else cases()[index])
+    query_cap=3000000000 if pressure_case else CAP
     class OwnedClient(ClickHouseClient):
         owned=''
         acknowledgements=0
@@ -71,10 +74,10 @@ def client(index):
             if sql.startswith('KILL QUERY'):self.acknowledgements+=1
             return answer
     c=OwnedClient(config);start=time.monotonic()
-    result={'name':case['name'],'maxMemoryUsage':CAP,'rows':None,'error':None,'cleanupRemaining':None}
+    result={'name':case['name'],'maxMemoryUsage':query_cap,'rows':None,'error':None,'cleanupRemaining':None}
     try:
         result['rows']=query_rows_with_cancel(c,case['sql'],{},Control(),timeout=1 if timeout_case else 50,
-            settings={'max_memory_usage':CAP,'max_execution_time':45,'max_threads':1,'input_format_parquet_use_native_reader_v3':0,
+            settings={'max_memory_usage':query_cap,'max_execution_time':45,'max_threads':1,'max_block_size':8192,'input_format_parquet_use_native_reader_v3':0,
                       'input_format_parquet_max_block_size':1024,'input_format_parquet_prefer_block_bytes':8388608,
                       'input_format_max_block_size_bytes':33554432,'input_format_parquet_enable_row_group_prefetch':0})
     except Exception as exc:result['error']={'type':type(exc).__name__,'message':str(exc)[:1200]}
@@ -86,7 +89,8 @@ def client(index):
         except Exception as exc:result['cleanupCheckError']=type(exc).__name__
         if result['cleanupRemaining']:
             c.query('KILL QUERY WHERE query_id={id:String} SYNC',parameters={'id':c.owned},timeout=10)
-    result['oracle']=normalized(result['rows'] or [])==case.get('expected') if not timeout_case else None
+    result['oracle']=normalized(result['rows'] or [])==case.get('expected') if not (timeout_case or pressure_case) else None
+    result['pressureRejectedCleanly']=bool(result['error'] and ('MEMORY_LIMIT_EXCEEDED' in result['error']['message'] or 'Memory limit' in result['error']['message']) and result['cleanupRemaining']==0) if pressure_case else None
     result['timeoutCleanupPassed']=bool(result['error'] and 'timed out' in result['error']['message'] and result['cleanupRemaining']==0 and c.acknowledgements==1) if timeout_case else None
     print(json.dumps(result),flush=True)
 
@@ -114,7 +118,7 @@ def monitor(name,stop,samples):
                 c=inspect(name);pid=c['State']['Pid']
                 group=Path('/sys/fs/cgroup')/Path(f'/proc/{pid}/cgroup').read_text().split('0::')[1].strip().lstrip('/')
             stat=counters(group/'memory.stat')
-            item.update(current=int((group/'memory.current').read_text()),events=counters(group/'memory.events'),
+            item.update(current=int((group/'memory.current').read_text()),kernelPeak=int((group/'memory.peak').read_text()) if (group/'memory.peak').exists() else None,events=counters(group/'memory.events'),
                         stat={k:stat.get(k,0) for k in ('anon','file','sock','kernel','slab_reclaimable')})
             if time.monotonic()>=next_metrics:
                 try:item['metrics']=rows("SELECT metric,toFloat64(value) value FROM system.metrics WHERE metric='MemoryTracking' UNION ALL SELECT metric,value FROM system.asynchronous_metrics WHERE metric IN ('MemoryResident','CGroupMemoryUsed','jemalloc.allocated','jemalloc.resident')",timeout=1)
@@ -130,7 +134,8 @@ def summarize(phase):
         if 'MemoryTracking' in metrics:gaps.append(s['current']-metrics['MemoryTracking'])
         stat=s['stat'];accounting.append(s['current']-sum(stat.get(k,0) for k in ('anon','file','kernel','sock')))
     results=phase.get('queries',[])
-    return {'peakCgroupBytes':max((s['current'] for s in samples),default=None),
+    return {'sampledPeakCgroupBytes':max((s['current'] for s in samples),default=None),
+            'kernelPeakCgroupBytes':max((s['kernelPeak'] for s in samples if s.get('kernelPeak') is not None),default=None),
             'medianCgroupMinusTracking':statistics.median(gaps) if gaps else None,
             'medianCgroupMinusCategories':statistics.median(accounting) if accounting else None,
             'oomEvents':max((s['events'].get('oom_kill',0) for s in samples),default=0),
@@ -186,6 +191,10 @@ def main():
                 sql(f"INSERT INTO mongo_ci_fixture.slowlog SELECT number,{EPOCH}+number*{STEP},concat('SELECT * FROM fixture.orders WHERE customer_id=',toString(number%97),' AND order_id=',toString(number)) FROM numbers({ROWS})",timeout=30,max_execution_time=25,max_memory_usage=CAP)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     for pair in [(0,2),(1,3),(4,4)]:phase['queries'].extend(pool.map(execute,pair))
+                # A separate negative test, not counted as a successful business query.
+                # The explicit 3 GB query cap models the existing ingester budget;
+                # server 2.5/1.8 GB must reject this ~3.8 GB aggregate without OOM.
+                phase['pressure']=execute(-2)
                 phase['timeoutAfter']=execute(-1)
                 phase['remainingOwned']=rows("SELECT query_id FROM system.processes WHERE startsWith(query_id,'rds-insight-')")
             except Exception as e:phase['failure']=str(e)
@@ -211,7 +220,8 @@ def main():
                           'candidateNoOom':complete and all(p['samples'] and not p.get('containerState',{}).get('OOMKilled',True) and p['summary']['oomEvents']==0 for p in evidence['phases'] if p['variant']=='candidate'),
                           'allOraclesAndCleanup':complete and all(p['summary']['oracleFailures']==0 and p['summary']['cleanupFailures']==0 and len(p['queries'])==6 and not p.get('remainingOwned') and p.get('timeoutBefore',{}).get('timeoutCleanupPassed') and p.get('timeoutAfter',{}).get('timeoutCleanupPassed') for p in evidence['phases'])}
         a=[p for p in evidence['phases'] if p['variant']=='baseline'];b=[p for p in evidence['phases'] if p['variant']=='candidate']
-        evidence['gate']['candidateDoesNotIncreaseFailures']=sum(p['summary']['failedQueries'] for p in b)<=sum(p['summary']['failedQueries'] for p in a)
+        evidence['gate']['candidateDoesNotIncreaseFailures']=complete and sum(p['summary']['failedQueries'] for p in b)<=sum(p['summary']['failedQueries'] for p in a)
+        evidence['gate']['pressureRejectedWithoutOom']=complete and all(p.get('pressure',{}).get('pressureRejectedCleanly') and p['summary']['oomEvents']==0 and not p.get('containerState',{}).get('OOMKilled',True) and p['summary']['kernelPeakCgroupBytes'] is not None for p in evidence['phases'])
         evidence['productionOomReproduced']=False
         evidence['limitations']=['Synthetic data only; cannot attribute incident 31 from this experiment.','Cgroup categories and MemoryTracking are different measurements; correction does not fix kernel accounting.','No production settings, containers or data changed.']
         save()
