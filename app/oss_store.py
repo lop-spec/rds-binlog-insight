@@ -17,6 +17,7 @@ from oss2.models import BucketLifecycle, LifecycleExpiration, LifecycleRule
 
 from .config import Settings
 from .credentials import CloudCredential, ecs_role_client
+from .oss_crc import report_crc_backend
 
 LOGGER = logging.getLogger(__name__)
 
@@ -248,6 +249,7 @@ class OssArchive:
         if bucket is not None:
             self.bucket = bucket
             return
+        report_crc_backend()
         try:
             if settings.oss_auth_mode == "access_key":
                 if credential is None:

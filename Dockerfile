@@ -27,10 +27,15 @@ RUN curl --fail --show-error --silent --location \
     && make -j2 \
     && make install
 
+# Reuse the existing compiler stage; never compile/fall back silently at runtime.
+RUN python -m pip wheel --no-cache-dir --disable-pip-version-check --no-deps \
+        --no-binary=crcmod --wheel-dir=/opt/crcmod-wheels \
+        "https://files.pythonhosted.org/packages/6b/b0/e595ce2a2527e169c3bcd6c33d2473c1918e0b7f6826a043ca1245dd4e5b/crcmod-1.7.tar.gz#sha256=dc7051a0db5f2bd48665a990d3ec1cc305a466a77358ca4492826f41f283601e"
+
 FROM python:3.12-slim-bookworm@sha256:b64e9d3a71eddaa1b3f80c04abf292b3139e3b7c4dd272d19c31dc1f91194d1b
 
 LABEL org.opencontainers.image.title="RDS Binlog Insight" \
-      org.opencontainers.image.version="1.28.26-rawoss" \
+      org.opencontainers.image.version="1.28.27-rawoss" \
       org.opencontainers.image.sqlite.version="3.53.4"
 
 COPY --from=sqlite-builder /usr/local/lib/ /usr/local/lib/
@@ -46,10 +51,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --no-cache-dir --disable-pip-version-check -r /app/requirements.txt
+COPY --from=sqlite-builder /opt/crcmod-wheels/ /opt/crcmod-wheels/
+RUN python -m pip install --no-cache-dir --disable-pip-version-check \
+        -r /app/requirements.txt /opt/crcmod-wheels/*.whl
 
 COPY requirements-migrate.txt /app/requirements-migrate.txt
 RUN python -m pip install --no-cache-dir --disable-pip-version-check -r /app/requirements-migrate.txt
+
+COPY app/oss_crc.py /app/app/oss_crc.py
+RUN python /app/app/oss_crc.py --require-native
 
 COPY app /app/app
 COPY clickhouse /app/clickhouse
