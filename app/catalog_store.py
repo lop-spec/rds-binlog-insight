@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import zlib
@@ -8,6 +9,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+
+LOGGER = logging.getLogger(__name__)
 
 CATALOG_STORE_SCHEMA_VERSION = 1
 REQUIRED_RUNTIME_TABLES = frozenset({"backfill_state", "catalogs"})
@@ -42,6 +45,15 @@ class CatalogStore:
     def __init__(self, path: Path, *, run_migrations: bool = True):
         self.path = path
         self._write_lock = threading.RLock()
+        self._anchor_lock = threading.Lock()
+        self._wal_anchor: sqlite3.Connection | None = None
+        self._initialize_schema(run_migrations=run_migrations)
+        if not run_migrations:
+            # Match MetadataStore: migration owners remain short-lived;
+            # only the long-lived runtime owns a WAL anchor.
+            self._open_wal_anchor()
+
+    def _initialize_schema(self, *, run_migrations: bool) -> None:
         if not run_migrations:
             self._require_schema_version()
             return
@@ -61,6 +73,46 @@ class CatalogStore:
             conn.execute(
                 f"PRAGMA user_version = {CATALOG_STORE_SCHEMA_VERSION}"
             )
+
+    def _open_wal_anchor(self) -> None:
+        """Avoid last-connection checkpoints on every short catalog operation.
+
+        This autocommit, query-only connection holds no read transaction.
+        Writer durability and SQLite's automatic checkpoints stay unchanged.
+        """
+        with self._anchor_lock:
+            if self._wal_anchor is not None:
+                return
+            conn = sqlite3.connect(
+                self.path, timeout=5, isolation_level=None,
+                check_same_thread=False,
+            )
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA query_only=ON")
+                mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                if mode != "wal":
+                    raise RuntimeError(
+                        f"Catalog WAL anchor requires journal_mode=wal, got {mode}"
+                    )
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            except Exception:
+                conn.close()
+                raise
+            self._wal_anchor = conn
+
+    def close(self) -> None:
+        with self._anchor_lock:
+            conn = self._wal_anchor
+            self._wal_anchor = None
+        if conn is not None:
+            conn.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            LOGGER.exception("Failed to close catalog WAL anchor")
 
     def _require_schema_version(self) -> None:
         if not self.path.is_file():

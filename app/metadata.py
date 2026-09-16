@@ -1047,8 +1047,13 @@ class MetadataStore:
         with self._anchor_lock:
             connection = self._wal_anchor
             self._wal_anchor = None
-        if connection is not None:
-            connection.close()
+        try:
+            if connection is not None:
+                connection.close()
+        finally:
+            catalog_store = getattr(self, "catalog_store", None)
+            if catalog_store is not None:
+                catalog_store.close()
 
     def __del__(self) -> None:
         try:
