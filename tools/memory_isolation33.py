@@ -171,7 +171,10 @@ def main():
                         version=sql('SELECT version()').strip()
                         if version!=VERSION:raise AssertionError('wrong ClickHouse version: '+version)
                         break
-                    except (OSError,TimeoutError):time.sleep(1)
+                    except (OSError,TimeoutError) as error:
+                        state=inspect(name)['State']
+                        if not state['Running']:raise RuntimeError(f"fixture exited before readiness: {state}; HTTP: {error}") from error
+                        time.sleep(1)
                 else:raise RuntimeError('fixture readiness deadline')
                 c=inspect(name);assert c['HostConfig']['Memory']==LIMIT and c['HostConfig']['MemorySwap']==LIMIT
                 phase['settings']=rows("SELECT name,value FROM system.server_settings WHERE name IN ('max_server_memory_usage','memory_worker_correct_memory_tracker','memory_worker_use_cgroup')")
@@ -191,14 +194,18 @@ def main():
                 if thread:thread.join(8)
                 try:
                     c=inspect(name);phase['containerState']=c['State'];assert c['Config']['Labels'].get('scope')=='memory-isolation-ci'
-                    (root/f'{ordinal}-container.log').write_text(run(['docker','logs','--tail','100',name],10))
+                    logs=subprocess.run(['docker','logs','--tail','100',name],capture_output=True,text=True,timeout=10)
+                    (root/f'{ordinal}-container.log').write_text(logs.stdout+'\nSTDERR:\n'+logs.stderr)
+                    assert logs.returncode==0,'fixture logs unavailable'
                     run(['docker','stop','--time','30',name],40)
                     run(['docker','rm',name],10)
                 except Exception as e:phase['cleanupError']=str(e)
                 phase['summary']=summarize(phase);save();print(json.dumps({'phase':ordinal,'variant':variant,**phase['summary'],'failure':phase.get('failure')}),flush=True)
-        evidence['gate']={'allFixturesRan':all(not p.get('failure') and not p.get('cleanupError') for p in evidence['phases']),
-                          'candidateNoOom':all(not p.get('containerState',{}).get('OOMKilled',True) and p['summary']['oomEvents']==0 for p in evidence['phases'] if p['variant']=='candidate'),
-                          'allOraclesAndCleanup':all(p['summary']['oracleFailures']==0 and p['summary']['cleanupFailures']==0 and len(p['queries'])==6 and not p.get('remainingOwned') and p.get('timeoutBefore',{}).get('timeoutCleanupPassed') and p.get('timeoutAfter',{}).get('timeoutCleanupPassed') for p in evidence['phases'])}
+            if phase.get('failure') or phase.get('cleanupError'):break
+        complete=len(evidence['phases'])==4
+        evidence['gate']={'allFixturesRan':complete and all(not p.get('failure') and not p.get('cleanupError') for p in evidence['phases']),
+                          'candidateNoOom':complete and all(p['samples'] and not p.get('containerState',{}).get('OOMKilled',True) and p['summary']['oomEvents']==0 for p in evidence['phases'] if p['variant']=='candidate'),
+                          'allOraclesAndCleanup':complete and all(p['summary']['oracleFailures']==0 and p['summary']['cleanupFailures']==0 and len(p['queries'])==6 and not p.get('remainingOwned') and p.get('timeoutBefore',{}).get('timeoutCleanupPassed') and p.get('timeoutAfter',{}).get('timeoutCleanupPassed') for p in evidence['phases'])}
         a=[p for p in evidence['phases'] if p['variant']=='baseline'];b=[p for p in evidence['phases'] if p['variant']=='candidate']
         evidence['gate']['candidateDoesNotIncreaseFailures']=sum(p['summary']['failedQueries'] for p in b)<=sum(p['summary']['failedQueries'] for p in a)
         evidence['productionOomReproduced']=False
