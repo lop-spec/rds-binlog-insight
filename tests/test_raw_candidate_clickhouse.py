@@ -88,6 +88,28 @@ def oracle(rows, query, start=100, end=200):
     return sorted(result, key=lambda row: (row["max_event_epoch_us"], row["part_path"]), reverse=True)
 
 
+def fixture_manifest_ddl(raw, database):
+    schema = build_raw_oss_schema(
+        Settings(oss_enabled=True, oss_bucket="fixture-only",
+                 oss_endpoint="oss-cn-hangzhou-internal.aliyuncs.com",
+                 oss_region_id="cn-hangzhou"), raw, database=database,
+    )
+    table = f"{database}.{raw.manifest_table}"
+    return next(s for s in schema.split(";")
+                if f"CREATE TABLE IF NOT EXISTS {table}\n" in s)
+
+
+class RawCandidateFixtureSetup(unittest.TestCase):
+    def test_manifest_setup_needs_no_cloud_service_or_credential(self):
+        raw = replace(ClickHouseRawOssConfig.from_env(),
+                      manifest_table="raw_candidate_ci_fixture")
+        ddl = fixture_manifest_ddl(raw, "mongo_ci_fixture")
+        self.assertIn("ReplacingMergeTree(change_version, is_deleted)", ddl)
+        self.assertIn("ORDER BY part_path", ddl)
+        self.assertNotIn("packed-events", ddl)
+        self.assertNotIn("disk =", ddl)
+
+
 @unittest.skipUnless(os.environ.get("RAW_CANDIDATE_CI_FIXTURE") == "1",
                      "isolated CI ClickHouse fixture only")
 class RawCandidateClickHouse(unittest.TestCase):
@@ -99,13 +121,8 @@ class RawCandidateClickHouse(unittest.TestCase):
         client = ClickHouseClient(config)
         raw = replace(ClickHouseRawOssConfig.from_env(), manifest_table="raw_candidate_ci_fixture")
         table = f"{config.database}.{raw.manifest_table}"
-        schema = build_raw_oss_schema(
-            Settings(oss_bucket="fixture-only", oss_endpoint="oss-cn-hangzhou.aliyuncs.com",
-                     oss_region_id="cn-hangzhou"), raw, database=config.database,
-        )
         # Only the production manifest DDL; no S3 table, credentials or OSS writes.
-        ddl = next(s for s in schema.split(";") if f"CREATE TABLE IF NOT EXISTS {table}\n" in s)
-        client.query(ddl)
+        client.query(fixture_manifest_ddl(raw, config.database))
         try:
             # Keep versions physically separate so accidental pre-FINAL filtering
             # cannot be masked by an opportunistic background merge.
