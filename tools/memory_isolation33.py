@@ -165,7 +165,7 @@ def main():
             phase={'ordinal':ordinal,'variant':variant,'cap':cap,'correct':correct,'samples':[],'queries':[]};evidence['phases'].append(phase)
             stop=threading.Event();thread=None
             try:
-                run(['docker','run','-d','--name',name,'--label','scope=memory-isolation-ci','--memory','3g','--memory-swap','3g','--cpus','2','--restart','no','-p','127.0.0.1:18123:8123','-v',f'{conf}:/etc/clickhouse-server/config.d/memory-fixture.xml:ro','-v',f'{data}:/var/lib/clickhouse/user_files:ro','-e','CLICKHOUSE_DB=mongo_ci_fixture','-e','CLICKHOUSE_USER=fixture','-e','CLICKHOUSE_PASSWORD=fixture-ci-only',CH],30)
+                run(['docker','run','-d','--name',name,'--label','scope=memory-isolation-ci','--memory','3g','--memory-swap','3g','--cpus','2','--restart','no','-p','127.0.0.1:18123:8123','-v',f'{conf}:/etc/clickhouse-server/config.d/memory-fixture.xml:ro','-v',f'{data}:/var/lib/clickhouse/user_files','-e','CLICKHOUSE_DB=mongo_ci_fixture','-e','CLICKHOUSE_USER=fixture','-e','CLICKHOUSE_PASSWORD=fixture-ci-only',CH],30)
                 for attempt in range(40):
                     try:
                         version=sql('SELECT version()').strip()
@@ -193,6 +193,10 @@ def main():
                 stop.set()
                 if thread:thread.join(8)
                 try:
+                    # The official entrypoint chowns user_files. Only this generated
+                    # CI fixture is writable; check content identity after each run.
+                    phase['fixtureSha256']=hashlib.sha256((data/'wide.parquet').read_bytes()).hexdigest()
+                    assert phase['fixtureSha256']==evidence['fixture']['sha256'],'fixture input changed'
                     c=inspect(name);phase['containerState']=c['State'];assert c['Config']['Labels'].get('scope')=='memory-isolation-ci'
                     logs=subprocess.run(['docker','logs','--tail','100',name],capture_output=True,text=True,timeout=10)
                     (root/f'{ordinal}-container.log').write_text(logs.stdout+'\nSTDERR:\n'+logs.stderr)
