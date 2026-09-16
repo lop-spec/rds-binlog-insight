@@ -3089,7 +3089,7 @@ class EventStorage:
             }
         slowlog_coverage: dict[str, Any] | None = None
         if source == "slowlog":
-            available = self.metadata.storage_metadata_stats()
+            available = self.metadata.storage_metadata_stats(control=control)
             latest_us = available.get("latest_epoch_us")
             requested_end_us = query.get("end_epoch_us")
             if (
@@ -3112,6 +3112,7 @@ class EventStorage:
                 end_epoch_us=end_us,
                 source="slowlog",
                 instance=instance,
+                control=control,
             )
             slowlog_coverage = self._slowlog_coverage_with_repair(parts)
             if slowlog_coverage["complete"]:
@@ -3297,7 +3298,7 @@ class EventStorage:
             min(max(int(limit_cap), 1), 100_000),
         )
         offset = min(max(int(query.get("offset") or 0), 0), 100_000)
-        available = self.metadata.storage_metadata_stats()
+        available = self.metadata.storage_metadata_stats(control=control)
         oldest_us = available.get("oldest_epoch_us")
         latest_us = available.get("latest_epoch_us")
         requested_end_us = query.get("end_epoch_us")
@@ -3346,13 +3347,25 @@ class EventStorage:
             end_us,
             settings.db_instance_id,
         )
-        certificate_token, certificate_rows = (
-            self.metadata.complete_query_certificate(
+        certificate_token = None
+        certificate_rows = None
+        if (
+            self.clickhouse_backend is None
+            or self.metadata.has_complete_query_certificate(
                 certificate_fingerprint,
                 start_epoch_us=start_us,
                 end_epoch_us=end_us,
+                control=control,
             )
-        )
+        ):
+            certificate_token, certificate_rows = (
+                self.metadata.complete_query_certificate(
+                    certificate_fingerprint,
+                    start_epoch_us=start_us,
+                    end_epoch_us=end_us,
+                    control=control,
+                )
+            )
         if certificate_rows is not None:
             if control is not None:
                 control.set_plan(
@@ -3441,11 +3454,22 @@ class EventStorage:
                     query.get("source") or "all", bool(query.get("exact")),
                     bool(query.get("fingerprint")), offset,
                 )
+        # The Parquet path still needs its pre-read token to validate any
+        # complete result it later caches. Never manufacture or freeze a token
+        # merely to bypass ClickHouse coverage or a concurrent source mutation.
+        if certificate_token is None:
+            certificate_token, _ = self.metadata.complete_query_certificate(
+                certificate_fingerprint,
+                start_epoch_us=start_us,
+                end_epoch_us=end_us,
+                control=control,
+            )
         parts = self.metadata.parts_in_range(
             start_epoch_us=start_us,
             end_epoch_us=end_us,
             source=str(query.get("source") or ""),
             instance=str(query.get("instance") or ""),
+            control=control,
         )
         if control is not None:
             control.check_cancelled()

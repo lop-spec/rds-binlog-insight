@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import multiprocessing
 import os
@@ -1104,6 +1105,14 @@ class SyncManager:
         archive_futures: deque[Future[int]] = deque()
         archive_buffer: list[dict[str, Any]] = []
         archive_buffer_bytes = 0
+        # Disjoint caller wall-clock phases, not summed worker CPU or upload
+        # durations. In particular, native wait includes upstream backpressure.
+        timings = dict.fromkeys((
+            "native_wait_seconds", "transform_wait_seconds", "publish_seconds",
+            "archive_wait_seconds", "metadata_seconds",
+        ), 0.0)
+        chunks = 0
+        ndjson_bytes = 0
 
         def submit_archive_buffer(*, force: bool) -> None:
             nonlocal archive_buffer, archive_buffer_bytes
@@ -1117,21 +1126,26 @@ class SyncManager:
             batch = archive_buffer
             archive_buffer = []
             archive_buffer_bytes = 0
-            if archive_submitter is not None:
-                archive_futures.append(archive_submitter(batch))
-                if len(archive_futures) >= OSS_ARCHIVE_BACKLOG_PER_FILE:
-                    archive_futures.popleft().result()
-            else:
-                self._archive_parts(
-                    job_id,
-                    settings,
-                    archive,
-                    batch,
-                    event_code="OSS_CHUNK_ARCHIVED",
-                    fresh=True,
-                )
+            started = time.monotonic()
+            try:
+                if archive_submitter is not None:
+                    archive_futures.append(archive_submitter(batch))
+                    if len(archive_futures) >= OSS_ARCHIVE_BACKLOG_PER_FILE:
+                        archive_futures.popleft().result()
+                else:
+                    self._archive_parts(
+                        job_id,
+                        settings,
+                        archive,
+                        batch,
+                        event_code="OSS_CHUNK_ARCHIVED",
+                        fresh=True,
+                    )
+            finally:
+                timings["archive_wait_seconds"] += time.monotonic() - started
 
         try:
+            native_wait_since = time.monotonic()
             for chunk_index, ndjson_path in enumerate(
                 parse_ndjson_chunks_buffered(
                     path,
@@ -1140,7 +1154,11 @@ class SyncManager:
                     flavor,
                 )
             ):
+                timings["native_wait_seconds"] += time.monotonic() - native_wait_since
+                chunks += 1
+                ndjson_bytes += ndjson_path.stat().st_size
                 try:
+                    transform_started = time.monotonic()
                     if transform_submitter is None:
                         chunk_count, parts = self.storage.ingest_ndjson_file(
                             file_id=file_id,
@@ -1151,6 +1169,7 @@ class SyncManager:
                             part_key=f"{chunk_index:06d}",
                             append=True,
                         )
+                        timings["transform_wait_seconds"] += time.monotonic() - transform_started
                     else:
                         chunk_count, parts = transform_submitter(
                             {
@@ -1163,11 +1182,14 @@ class SyncManager:
                                 "part_key": f"{chunk_index:06d}",
                             }
                         ).result()
+                        timings["transform_wait_seconds"] += time.monotonic() - transform_started
+                        publish_started = time.monotonic()
                         self.storage.publish_ingested_parts(
                             file_id,
                             parts,
                             append=True,
                         )
+                        timings["publish_seconds"] += time.monotonic() - publish_started
                 finally:
                     if ndjson_path.exists():
                         try:
@@ -1183,6 +1205,7 @@ class SyncManager:
                         for part in parts
                     )
                     submit_archive_buffer(force=False)
+                metadata_started = time.monotonic()
                 self.metadata.set_file_state(
                     file_id,
                     "parsing",
@@ -1203,9 +1226,14 @@ class SyncManager:
                         f"{item.log_file_name} 第 {chunk_index + 1} 批："
                         f"{chunk_count} 条事件已原子发布",
                     )
+                timings["metadata_seconds"] += time.monotonic() - metadata_started
+                native_wait_since = time.monotonic()
+            timings["native_wait_seconds"] += time.monotonic() - native_wait_since
             submit_archive_buffer(force=True)
+            archive_wait_since = time.monotonic()
             while archive_futures:
                 archive_futures.popleft().result()
+            timings["archive_wait_seconds"] += time.monotonic() - archive_wait_since
         except Exception:
             archive_buffer.clear()
             for future in archive_futures:
@@ -1219,14 +1247,25 @@ class SyncManager:
                 except Exception:
                     pass
             raise
+        metadata_started = time.monotonic()
         self.storage.finalize_file_parts(file_id, keep_paths)
         self.metadata.set_file_state(file_id, "stored", event_count=count)
+        timings["metadata_seconds"] += time.monotonic() - metadata_started
+        parse_seconds = time.monotonic() - parse_started
+        timings["other_seconds"] = max(parse_seconds - sum(timings.values()), 0.0)
+        LOGGER.info("FILE_STAGE_TIMINGS %s", json.dumps({
+            "file": item.log_file_name, "chunks": chunks,
+            "ndjson_bytes": ndjson_bytes, "events": count,
+            "prepared_seconds": round(parse_seconds, 6),
+            "transform_mode": "detached" if transform_submitter else "inline-with-publish",
+            **{key: round(value, 6) for key, value in timings.items()},
+        }, ensure_ascii=False))
         prepared = PreparedBinlog(
             file_id=file_id,
             item=item,
             raw_path=path,
             event_count=count,
-            parse_seconds=time.monotonic() - parse_started,
+            parse_seconds=parse_seconds,
         )
         if defer_commit:
             return prepared

@@ -1130,14 +1130,37 @@ class MetadataStore:
             )
 
     @contextmanager
-    def connection(self) -> Iterator[sqlite3.Connection]:
+    def connection(
+        self, *, control: Any | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        if control is not None:
+            control.check_cancelled()
         conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
+        cancelled: list[BaseException] = []
         try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=5000")
+            if control is not None:
+                def check_cancelled() -> int:
+                    try:
+                        control.check_cancelled()
+                    except BaseException as exc:
+                        cancelled.append(exc)
+                        return 1
+                    return 0
+
+                conn.set_progress_handler(check_cancelled, 2000)
             yield conn
+            if control is not None:
+                control.check_cancelled()
+        except sqlite3.OperationalError:
+            if cancelled:
+                raise cancelled[0]
+            raise
         finally:
+            if control is not None:
+                conn.set_progress_handler(None, 0)
             conn.close()
 
     @staticmethod
@@ -2967,14 +2990,37 @@ class MetadataStore:
             )
         return len(valid)
 
+    def has_complete_query_certificate(
+        self,
+        fingerprint: str,
+        *,
+        start_epoch_us: int,
+        end_epoch_us: int,
+        control: Any | None = None,
+    ) -> bool:
+        """Cheap existence check, never a validity or coverage certificate.
+
+        A hit must still pass complete_query_certificate's content-token check.
+        A miss lets the authoritative ClickHouse route avoid a history-wide
+        token aggregation for a cache entry that does not exist.
+        """
+        with self.connection(control=control) as conn:
+            return conn.execute(
+                "SELECT 1 FROM query_complete_certificates "
+                "WHERE fingerprint = ? AND start_epoch_us = ? "
+                "AND end_epoch_us = ?",
+                (str(fingerprint), int(start_epoch_us), int(end_epoch_us)),
+            ).fetchone() is not None
+
     def complete_query_certificate(
         self,
         fingerprint: str,
         *,
         start_epoch_us: int,
         end_epoch_us: int,
+        control: Any | None = None,
     ) -> tuple[dict[str, int], list[dict[str, Any]] | None]:
-        with self.connection() as conn:
+        with self.connection(control=control) as conn:
             conn.execute("BEGIN")
             try:
                 token = self._part_content_token(
@@ -3220,6 +3266,7 @@ class MetadataStore:
         limit: int = 1_000_000,
         source: str = "",
         instance: str = "",
+        control: Any | None = None,
     ) -> list[dict[str, Any]]:
         """按时间窗取候选分区。
 
@@ -3274,7 +3321,7 @@ class MetadataStore:
         # Keep min <= end unchanged, including arbitrarily long overlaps.
         levels = ""
         part_join = "parquet_parts p JOIN binlog_files b"
-        with self.connection() as conn:
+        with self.connection(control=control) as conn:
             # A wide/all-history query gains little from the lower-end seek;
             # keep the planner's source-first path there (and for sparse audit).
             # This indexed MIN is only a plan heuristic, never a row filter.
@@ -4406,8 +4453,10 @@ class MetadataStore:
                 raise
         return {"complete": True, "files": files}
 
-    def storage_metadata_stats(self) -> dict[str, Any]:
-        with self.connection() as conn:
+    def storage_metadata_stats(
+        self, *, control: Any | None = None,
+    ) -> dict[str, Any]:
+        with self.connection(control=control) as conn:
             state = conn.execute(
                 "SELECT complete FROM parquet_file_stats_state "
                 "WHERE singleton = 1"

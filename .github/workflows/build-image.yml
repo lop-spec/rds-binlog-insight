@@ -10,16 +10,16 @@ on:
         default: false
   push:
     tags:
-      - v1.28.23-rawoss
+      - v1.28.24-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.28.23-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.28.23-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.23-rawoss
+  VERSION: 1.28.24-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.28.24-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.24-rawoss
 
 jobs:
   build-test-package:
@@ -87,8 +87,11 @@ jobs:
             tests.test_core \
             tests.test_parser_buffering \
             tests.test_pipeline_capacity \
+            tests.test_pipeline_stage_timing \
             tests.test_sync_discovery \
             tests.test_all_source_routing \
+            tests.test_query_preflight \
+            tests.test_search_index_cancellation \
             tests.test_cloud_credentials \
             tests.test_clickhouse_credentials \
             tests.test_clickhouse_oss \
