@@ -267,10 +267,12 @@ class RdsRpcClient:
             )
         return masters[0]
 
-    def list_binlogs(self, start_utc: str, end_utc: str) -> list[RemoteBinlog]:
+    def iter_binlog_batches(self, start_utc: str, end_utc: str):
+        """Yield one API page at a time; callers may stop between bounded RPCs."""
         page = 1
-        results: list[RemoteBinlog] = []
+        received = 0
         while True:
+            results: list[RemoteBinlog] = []
             payload = self.call(
                 "DescribeBinlogFiles",
                 {
@@ -302,14 +304,20 @@ class RdsRpcClient:
                         request_id=str(payload.get("RequestId") or ""),
                     )
                 )
-            total = int(payload.get("TotalRecordCount") or len(results))
-            if len(results) >= total or not raw_items:
+            received += len(results)
+            total = int(payload.get("TotalRecordCount") or received)
+            if not raw_items and received < total:
+                raise RdsApiError("RDS Binlog 分页提前结束", code="INCOMPLETE_PAGINATION")
+            yield results
+            if received >= total:
                 break
             page += 1
             if page > 100000:
                 raise RdsApiError("RDS Binlog 分页异常，已停止", code="PAGINATION_GUARD")
+
+    def list_binlogs(self, start_utc: str, end_utc: str) -> list[RemoteBinlog]:
         return sorted(
-            results,
+            (item for batch in self.iter_binlog_batches(start_utc, end_utc) for item in batch),
             key=lambda item: (
                 item.log_begin_utc,
                 item.log_end_utc,

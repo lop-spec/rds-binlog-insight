@@ -1624,16 +1624,20 @@ class MetadataStore:
             (self.file_id(settings.db_instance_id, item), item)
             for item in items
         ]
+        rows = []
         with self.connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, state, download_link, intranet_download_link,
-                       link_expired_utc, remote_status
-                FROM binlog_files
-                WHERE instance_id = ?
-                """,
-                (settings.db_instance_id,),
-            ).fetchall()
+            # A page-sized reconciliation must not reread the entire retained
+            # inventory for every API page. Stay below SQLite parameter limits.
+            ids = list(dict.fromkeys(file_id for file_id, _item in prepared))
+            for offset in range(0, len(ids), 400):
+                batch_ids = ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch_ids)
+                rows.extend(conn.execute(
+                    "SELECT id, state, download_link, intranet_download_link, "
+                    "link_expired_utc, remote_status FROM binlog_files "
+                    f"WHERE instance_id = ? AND id IN ({placeholders})",
+                    (settings.db_instance_id, *batch_ids),
+                ).fetchall())
         existing = {str(row["id"]): row for row in rows}
         now = utc_now_text()
         updates: dict[str, tuple[Any, ...]] = {}
@@ -1719,17 +1723,20 @@ class MetadataStore:
             ).fetchone()
         return dict(row) if row else None
 
-    def recoverable_files(self, instance_id: str) -> list[dict[str, Any]]:
+    def recoverable_files(
+        self, instance_id: str, *, include_discovered: bool = False,
+    ) -> list[dict[str, Any]]:
         with self.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT *
                 FROM binlog_files
                 WHERE instance_id = ?
-                  AND state IN ('failed', 'downloading', 'downloaded', 'parsing', 'stored')
+                  AND (state IN ('failed', 'downloading', 'downloaded', 'parsing', 'stored')
+                       OR (? AND state = 'discovered'))
                 ORDER BY log_begin_utc, log_end_utc, log_file_name, host_instance_id
                 """,
-                (instance_id,),
+                (instance_id, int(include_discovered)),
             ).fetchall()
         return [dict(row) for row in rows]
 

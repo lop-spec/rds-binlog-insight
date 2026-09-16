@@ -7,11 +7,14 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from contextlib import nullcontext
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
+
+from .sync_discovery import RetainedDiscovery, source_order
 
 from .config import Settings, utc_now_text
 from .credentials import CloudCredential, load_credential
@@ -1310,6 +1313,7 @@ class SyncManager:
         *,
         completed: int,
         unavailable: int,
+        refresh_pending: Callable[[], list[tuple[str, RemoteBinlog, str]]] | None = None,
     ) -> tuple[int, int, bool]:
         archive_thread_local = threading.local()
 
@@ -1348,7 +1352,7 @@ class SyncManager:
                     "Oversized binlog admitted alone: bytes=%d prefetch_budget=%d",
                     size, DOWNLOAD_PREFETCH_BYTES,
                 )
-            return entries
+            return sorted(entries, key=source_order) if refresh_pending is not None else entries
 
         def schedule_downloads(
             executor: ThreadPoolExecutor,
@@ -1472,7 +1476,6 @@ class SyncManager:
                         )
 
                     next_start = batch_start + len(batch)
-                    next_batch = window(next_start, FILE_PIPELINE_WORKERS)
 
                     for position, (
                         entry,
@@ -1538,7 +1541,6 @@ class SyncManager:
                     for file_id, _item, _state in batch:
                         prefetched.pop(file_id, None)
                     batch_start = next_start
-                    batch = next_batch
                     self._update_pipeline_status(
                         inFlightFiles=[],
                         visibleFile="",
@@ -1556,6 +1558,17 @@ class SyncManager:
                             if future is not None:
                                 future.cancel()
                         return completed, unavailable, True
+                    if refresh_pending is not None:
+                        refreshed = refresh_pending()
+                        # Already admitted downloads keep their bounded places.
+                        # Reordering/discarding them would duplicate work or leave
+                        # invisible files and futures outside the admission budget.
+                        admitted = [entry for entry in pending[next_start:]
+                                    if entry[0] in prefetched]
+                        pending = admitted + [entry for entry in refreshed
+                                              if entry[0] not in prefetched]
+                        batch_start = 0
+                    batch = window(batch_start, FILE_PIPELINE_WORKERS)
                     downloads = (
                         schedule_downloads(download_executor, batch_start, batch)
                         if batch else []
@@ -1640,62 +1653,12 @@ class SyncManager:
                 else ""
             ),
         )
-        completed = 0
-        unavailable = 0
-        discovered_ids: set[str] = set()
-        while not self._shutdown.is_set():
-            pending = self._discover(
-                client,
-                settings,
-                primary_host_instance_id=primary_host_instance_id,
-                start_utc=start_utc,
-                end_utc=end_utc,
-            )
-            for file_id, _item, _state in pending:
-                discovered_ids.add(file_id)
-            pending = [
-                entry
-                for entry in pending
-                if (self.metadata.file_record(entry[0]) or {}).get("state") != "done"
-            ]
-            self.metadata.update_job(
-                job_id,
-                total_files=len(discovered_ids),
-                discovered_files=len(discovered_ids),
-                completed_files=completed,
-                current_file="" if not pending else pending[0][1].log_file_name,
-                message=(
-                    f"发现 {len(discovered_ids)} 个待处理文件"
-                    if pending
-                    else "正在确认是否已到 API 最新文件"
-                ),
-            )
-            if not pending:
-                break
-            if self._pause_after_current.is_set() or self._shutdown.is_set():
-                self.metadata.finish_job(
-                    job_id, "paused", "已在文件边界暂停；下次从断点继续"
-                )
-                return
-            completed, unavailable, paused = self._run_pending_parallel(
-                job_id,
-                client,
-                settings,
-                pending,
-                flavor,
-                archive,
-                completed=completed,
-                unavailable=unavailable,
-            )
-            if paused:
-                return
-            self.metadata.update_job(
-                job_id,
-                current_file="",
-                message=(
-                    "当前清单已处理完，正在确认是否有新的 Completed Binlog"
-                ),
-            )
+        completed, unavailable, paused = self._consume_pending(
+            job_id, client, settings, flavor, archive, primary_host_instance_id,
+            start_utc=start_utc, end_utc=end_utc,
+        )
+        if paused:
+            return
         cleanup = self._cleanup_after_sync(settings)
         if unavailable:
             completed_message = (
@@ -1741,6 +1704,59 @@ class SyncManager:
                 "success",
                 completed_message,
             )
+
+    def _consume_pending(
+        self, job_id, client, settings, flavor, archive, primary_host_instance_id,
+        *, start_utc=None, end_utc=None,
+    ) -> tuple[int, int, bool]:
+        streaming = not start_utc and not end_utc and callable(
+            getattr(client, "iter_binlog_batches", None))
+        if not streaming:
+            LOGGER.info("Streaming live discovery not used: %s",
+                        "explicit-time-window" if start_utc or end_utc else "client-has-no-page-iterator")
+        scope = (RetainedDiscovery(self, job_id, client, settings, primary_host_instance_id)
+                 if streaming else nullcontext(None))
+        completed, unavailable = 0, 0
+        discovered_ids: set[str] = set()
+        with scope as discovery:
+            def refresh(*, force_recent=False):
+                if discovery is not None:
+                    pending = discovery.pending(force_recent=force_recent)
+                else:
+                    pending = self._discover(
+                        client, settings, primary_host_instance_id=primary_host_instance_id,
+                        start_utc=start_utc, end_utc=end_utc)
+                    pending = [entry for entry in pending
+                               if (self.metadata.file_record(entry[0]) or {}).get("state") != "done"]
+                discovered_ids.update(entry[0] for entry in pending)
+                self.metadata.update_job(
+                    job_id, total_files=len(discovered_ids), discovered_files=len(discovered_ids),
+                    current_file="" if not pending else pending[0][1].log_file_name,
+                    message=(f"发现 {len(discovered_ids)} 个待处理文件" if pending
+                             else "正在确认是否已到 API 最新文件"))
+                return pending
+
+            while not self._shutdown.is_set() and not self._pause_after_current.is_set():
+                pending = refresh()
+                if not pending and discovery is not None:
+                    if not discovery.finished:
+                        # A still-running retained scan is not evidence of catch-up.
+                        self._shutdown.wait(0.25)
+                        continue
+                    pending = refresh(force_recent=True)
+                if not pending:
+                    return completed, unavailable, False
+                kwargs = {"refresh_pending": refresh} if discovery is not None else {}
+                completed, unavailable, paused = self._run_pending_parallel(
+                    job_id, client, settings, pending, flavor, archive,
+                    completed=completed, unavailable=unavailable, **kwargs)
+                if paused:
+                    return completed, unavailable, True
+                self.metadata.update_job(
+                    job_id, current_file="",
+                    message="当前清单已处理完，正在确认是否有新的 Completed Binlog")
+            self.metadata.finish_job(job_id, "paused", "已在文件边界暂停；下次从断点继续")
+            return completed, unavailable, True
 
     def _cleanup_after_sync(self, settings: Settings) -> dict[str, Any]:
         # The live Application always has a primary scheduler over this shared
