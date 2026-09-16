@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -137,6 +139,132 @@ class SearchIndexCancellationTests(unittest.TestCase):
             storage.search_index.candidate_blocks.call_args.kwargs.get("control"),
             self.control,
         )
+
+
+class SearchIndexScopeTests(unittest.TestCase):
+    setUp = SearchIndexCancellationTests.setUp
+
+    def seed_parts(self):
+        parts = [
+            {"path": f"p-{n:04d}.parquet", "sha256": "sha"}
+            for n in range(405)
+        ]
+        structural = {"path": "structural.parquet", "sha256": "sha"}
+        stale = {"path": "stale.parquet", "sha256": "sha"}
+        unknown = {"path": "unknown.parquet", "sha256": "sha"}
+        with self.index.connection() as conn:
+            for part in parts + [stale, structural]:
+                table = "structural_parts" if part == structural else "indexed_parts"
+                version = INDEX_SCHEMA_VERSION - (part == stale)
+                conn.execute(
+                    f"INSERT INTO {table} VALUES(?, ?, '', 2, 2, ?, '')",
+                    (part["path"], part["sha256"], version),
+                )
+            for part in parts + [stale, structural, unknown, {"path": "foreign"}]:
+                for group in range(2):
+                    conn.execute(
+                        "INSERT INTO blocks(part_path, part_sha256, row_group_id, "
+                        "min_event_epoch_us, max_event_epoch_us, row_count, "
+                        "databases_json, tables_json, operations_json) "
+                        "VALUES(?, 'sha', ?, ?, ?, 1, '[]', '[]', ?)",
+                        (part["path"], group, group * 5, group * 5 + 5,
+                         json.dumps(["UPDATE" if group else "DELETE"])),
+                    )
+            # A stale block under an otherwise covered path must still fail
+            # the identity check, even though it passes the new path prefilter.
+            conn.execute(
+                "INSERT INTO blocks(part_path, part_sha256, row_group_id, "
+                "min_event_epoch_us, max_event_epoch_us, row_count, "
+                "databases_json, tables_json, operations_json) "
+                "VALUES(?, 'old-sha', 2, 1, 10, 1, '[]', '[]', '[\"UPDATE\"]')",
+                (parts[0]["path"],),
+            )
+        return parts + [structural, stale, unknown]
+
+    @contextlib.contextmanager
+    def capture_block_reads(self, reads, control=None):
+        original = self.index.connection
+
+        @contextlib.contextmanager
+        def connection(**kwargs):
+            with original(**kwargs) as conn:
+                def trace(sql):
+                    if sql.startswith("SELECT * FROM blocks"):
+                        reads.append(sql)
+                        if control is not None:
+                            control.cancel()
+                conn.set_trace_callback(trace)
+                yield conn
+
+        with patch.object(self.index, "connection", side_effect=connection):
+            yield
+
+    def test_path_batches_equal_legacy_global_scan_including_ties_and_coverage(self):
+        parts = self.seed_parts()
+        part_map = {p["path"]: p for p in parts}
+        covered = set(part_map) - {"stale.parquet", "unknown.parquet"}
+        with self.index.connection() as conn:
+            legacy_rows = conn.execute(
+                "SELECT * FROM blocks WHERE max_event_epoch_us >= 3 "
+                "AND min_event_epoch_us <= 7 "
+                "ORDER BY max_event_epoch_us DESC, min_event_epoch_us DESC, id DESC"
+            ).fetchall()
+        for operations in ([], ["UPDATE"], ["INSERT"]):
+            with self.subTest(operations=operations):
+                expected = []
+                for row in legacy_rows:
+                    path = row["part_path"]
+                    if path not in covered or row["part_sha256"] != "sha":
+                        continue
+                    if operations and set(operations).isdisjoint(
+                        json.loads(row["operations_json"])
+                    ):
+                        continue
+                    expected.append({
+                        "path": path, "part": part_map[path],
+                        "row_group_id": row["row_group_id"],
+                        "min_event_epoch_us": row["min_event_epoch_us"],
+                        "max_event_epoch_us": row["max_event_epoch_us"],
+                        "complete": path != "structural.parquet",
+                    })
+                reads = []
+                with self.capture_block_reads(reads):
+                    plan = self.index.candidate_blocks(
+                        list(reversed(parts)), {"operations": operations},
+                        start_epoch_us=3, end_epoch_us=7,
+                    )
+                self.assertEqual(plan["entries"], expected)
+                self.assertEqual(plan["covered_paths"], covered)
+                self.assertEqual(plan["structural_covered_paths"], {"structural.parquet"})
+                self.assertEqual(plan["full_covered_paths"], covered - {"structural.parquet"})
+                self.assertEqual(plan["unknown_paths"], {"stale.parquet", "unknown.parquet"})
+                self.assertEqual(plan["skipped_parts"], len(covered - {e["path"] for e in expected}))
+                self.assertEqual(len(reads), 2)
+                self.assertTrue(all("WHERE part_path IN (" in sql for sql in reads))
+                self.assertTrue(all("'foreign'" not in sql for sql in reads))
+
+    def test_cancellation_stops_before_next_block_path_batch(self):
+        parts = self.seed_parts()
+        reads = []
+        with self.capture_block_reads(reads, self.control):
+            with self.assertRaises(QueryCancelled):
+                self.index.candidate_blocks(
+                    parts, {}, start_epoch_us=1, end_epoch_us=10,
+                    control=self.control,
+                )
+        self.assertEqual(len(reads), 1)
+
+    def test_unknown_only_does_not_read_blocks_or_claim_coverage(self):
+        reads = []
+        with self.capture_block_reads(reads):
+            plan = self.index.candidate_blocks(
+                [{"path": self.part["path"], "sha256": "changed-sha"}], {},
+                start_epoch_us=1, end_epoch_us=10,
+            )
+        self.assertEqual(reads, [])
+        self.assertEqual(plan["entries"], [])
+        self.assertEqual(plan["covered_paths"], set())
+        self.assertEqual(plan["unknown_paths"], {self.part["path"]})
 
 
 if __name__ == "__main__":

@@ -983,18 +983,30 @@ class SearchIndex:
                 else:
                     for value in term_sets:
                         intersect_full(value)
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM blocks
-                WHERE max_event_epoch_us >= ?
-                  AND min_event_epoch_us <= ?
-                ORDER BY max_event_epoch_us DESC,
-                         min_event_epoch_us DESC,
-                         id DESC
-                """,
-                (int(start_epoch_us), int(end_epoch_us)),
-            ).fetchall()
+            # Coverage already established the exact input path set. Reading
+            # every source's blocks in this window before discarding unrelated
+            # paths makes a sparse audit query scale with the whole archive.
+            # Path is only a safe prefilter: identity, schema coverage and all
+            # mutable predicates remain checked below. Unknown paths stay unknown.
+            paths = sorted(covered)
+            rows: list[sqlite3.Row] = []
+            for offset in range(0, len(paths), 400):
+                if control is not None:
+                    control.check_cancelled()
+                chunk = paths[offset : offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(conn.execute(
+                    "SELECT * FROM blocks "
+                    f"WHERE part_path IN ({placeholders}) "
+                    "AND max_event_epoch_us >= ? AND min_event_epoch_us <= ?",
+                    [*chunk, int(start_epoch_us), int(end_epoch_us)],
+                ).fetchall())
+            # Keep the original global order across path batches, including
+            # equal timestamps. No per-batch LIMIT can truncate candidates.
+            rows.sort(key=lambda row: (
+                int(row["max_event_epoch_us"]),
+                int(row["min_event_epoch_us"]), int(row["id"]),
+            ), reverse=True)
         entries: list[dict[str, Any]] = []
         candidate_paths: set[str] = set()
         for row in rows:
