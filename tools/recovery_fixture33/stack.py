@@ -31,6 +31,7 @@ class Stack:
         self.root=root/stage;self.root.mkdir();self.stage=stage;self.fixture=fixture
         self.net='recovery-'+uuid.uuid4().hex[:12];self.slice=self.net+'.slice';self.names={};self.created=[];self.started=0
         for p in ['data','control','edge','ch-data','ch-logs']: (self.root/p).mkdir(mode=0o777)
+        os.chmod(self.root/'control',0o777)
         run(['sudo','chown','1003:1003',str(self.root/'data'),str(self.root/'control')])
         write_json(self.root/'control/fault.json',{'stage':stage})
     def common(self):
@@ -61,7 +62,7 @@ class Stack:
             env={'RDS_BINLOG_CLICKHOUSE_OSS_ENABLED':'1','RDS_BINLOG_CLICKHOUSE_OSS_AUTH_MODE':'access_key','RDS_BINLOG_OSS_CREDENTIAL_FILE':'/fixture/credentials.json','CLICKHOUSE_USER':'fixture-admin','CLICKHOUSE_PASSWORD':'fixture-only','CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT':'1'}
             self.names[role]=self.create(role,CH,options+self.environment(env),[])
         wait_for(lambda:self.ch('SELECT 1'),60,'ClickHouse ready')
-        init="from pathlib import Path;from app.metadata import MetadataStore;from app.config import Settings;from app.storage import EventStorage;m=MetadataStore(Path('/data/metadata.sqlite3'));m.save_settings(Settings(db_instance_id='rm-test000001',auto_sync=True,oss_enabled=True,oss_bucket='test-fixture-bucket',oss_region_id='cn-hangzhou',oss_endpoint='https://oss-cn-hangzhou-internal.aliyuncs.com',oss_prefix='fixture/',oss_auth_mode='access_key'));EventStorage(m,Path('/data'));print('fixture metadata initialized')"
+        init="from pathlib import Path;from app.metadata import MetadataStore;from app.config import Settings;from app.storage import EventStorage;m=MetadataStore(Path('/data/metadata.sqlite3'));m.save_settings(Settings(db_instance_id='rm-test000001',auto_sync=True,oss_enabled=True,oss_bucket='test-fixture-bucket',oss_region_id='cn-hangzhou',oss_endpoint='https://oss-cn-hangzhou-internal.aliyuncs.com',oss_prefix='fixture/',oss_auth_mode='access_key'));EventStorage(m,Path('/data'));Path('/data/binlog-instances.json').write_text('[{\"instanceId\":\"rm-test000002\",\"label\":\"secondary-fixture\",\"autoSync\":true}]');print('fixture metadata initialized')"
         (self.root/'init.log').write_text(self.init_container(['python','-c',init]))
         (self.root/'migrate.log').write_text(self.init_container(['python','-m','app.clickhouse_migrate','--data-dir','/data','--raw-oss-tables']))
         for role,spec in SPEC.items():

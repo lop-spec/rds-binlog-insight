@@ -1,6 +1,6 @@
 import os,struct,unittest,zlib
 from unittest.mock import patch
-from tools.recovery_isolation33 import read_query_events,require_ci
+from tools.recovery_isolation33 import read_query_events,require_ci,crc64_xz,event_identity
 
 class RecoveryFixtureTests(unittest.TestCase):
     def sample(self):
@@ -13,6 +13,10 @@ class RecoveryFixtureTests(unittest.TestCase):
         raw=self.sample()
         for invalid in [raw[:-1],raw[:-1]+bytes([raw[-1]^1]),b'bad!'+raw[4:]]:
             with self.assertRaises(AssertionError):read_query_events(invalid)
+    def test_crc_and_native_identity_independent_vectors(self):
+        self.assertEqual(crc64_xz(b'123456789'),0x995DC9BBDF1939FA)
+        row={'start_position':324,'end_position':480,'emitted_ordinal':2,'operation':'INSERT'}
+        self.assertEqual(event_identity('e9c5eea00d4b767d96890b5a4fec0b91cc255b26170877a68769a2f9d9472479',row),'1444629e474bacd5021c224f3d23b3f99ced20e78ddb718fc71a743fec120cdc')
     def test_local_execution_rejected_before_docker(self):
         with patch.dict(os.environ,{'GITHUB_ACTIONS':'false'}),patch('tools.recovery_isolation33.run') as run:
             with self.assertRaises(AssertionError):require_ci()

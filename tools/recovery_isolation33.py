@@ -46,8 +46,13 @@ def crc64_xz(raw):
     for byte in raw:value=table[(value^byte)&255]^(value>>8)
     return value^((1<<64)-1)
 
+def event_identity(file_id,row):
+    # Immutable parser emit ABI: file/start/end/1-based emitted ordinal/row/operation.
+    fields=[file_id,row['start_position'],row['end_position'],row['emitted_ordinal'],0,row['operation']]
+    return hashlib.sha256('\x1f'.join(map(str,fields)).encode()).hexdigest()
+
 def read_query_events(raw):
-    """Independent MySQL v4 Query-event reader; verifies each on-disk CRC32."""
+    """Independent fixture Query/XID reader, including GTID commit time and CRC32."""
     assert raw[:4]==b'\xfebin','binlog magic'
     at=4;rows=[];commit_us=0
     while at<len(raw):
@@ -63,7 +68,11 @@ def read_query_events(raw):
             body=event[19:-4];thread,elapsed,db_len,error,status_len=struct.unpack_from('<IIBHH',body)
             database=body[13+status_len:13+status_len+db_len].decode()
             sql=body[14+status_len+db_len:].decode()
-            rows.append({'start_position':at,'end_position':end,'server_id':server,'thread_id':thread,'header_seconds':timestamp,'commit_epoch_us':commit_us,'database_name':database,'sql_text':sql})
+            assert sql=='BEGIN' or sql.startswith('INSERT INTO recovery_rows '),'unexpected fixture SQL'
+            rows.append({'start_position':at,'end_position':end,'server_id':server,'thread_id':thread,'header_seconds':timestamp,'commit_epoch_us':commit_us,'database_name':database,'sql_text':sql,'operation':'TRANSACTION' if sql=='BEGIN' else 'INSERT','raw_event_type':'QueryEvent','emitted_ordinal':len(rows)+1})
+        elif kind==16:
+            xid=struct.unpack_from('<Q',event,19)[0]
+            rows.append({'start_position':at,'end_position':end,'server_id':server,'thread_id':0,'header_seconds':timestamp,'commit_epoch_us':commit_us,'database_name':'','sql_text':f'COMMIT /* XID {xid} */','operation':'TRANSACTION','raw_event_type':'XIDEvent','emitted_ordinal':len(rows)+1})
         at+=size
     assert at==len(raw)
     return rows
@@ -85,7 +94,7 @@ def prepare(root):
         filename=mysql('SHOW MASTER STATUS;').split('\t')[0].strip()
         now=int(time.time())-120
         statements=[f"INSERT INTO recovery_rows VALUES ({i}, 'fixture value {i:04d} unicode 中文')" for i in range(137)]
-        mysql('USE fixture; SET TIMESTAMP='+str(now)+';\n'+';\n'.join(statements)+';')
+        mysql('USE fixture; SET TIMESTAMP='+str(now)+'; BEGIN;\n'+';\n'.join(statements)+'; COMMIT;')
         mysql('FLUSH BINARY LOGS;')
         run(['docker','cp',f'{name}:/var/lib/mysql/{filename}',str(fixture/'source.binlog')],15)
         raw=(fixture/'source.binlog').read_bytes();events=read_query_events(raw)
@@ -103,8 +112,19 @@ def prepare(root):
         parsed_rows=[json.loads(l) for l in parsed.splitlines() if l.strip()]
         native_inserts=[r for r in parsed_rows if r.get('sql_text') in set(statements)]
         assert [r['sql_text'] for r in native_inserts]==statements,'native parser lost or changed fixture SQL'
-        for actual,expected in zip(native_inserts,inserts,strict=True):
-            for key in ['start_position','end_position','server_id','database_name','commit_epoch_us']:assert actual[key]==expected[key],(key,actual,expected)
+        for actual,expected in zip(parsed_rows,events,strict=True):
+            for key in ['start_position','end_position','server_id','database_name','commit_epoch_us','sql_text','operation','raw_event_type']:assert actual[key]==expected[key],(key,actual,expected)
+            assert actual['event_id']==event_identity(identity['file_id'],expected),'independent native event identity mismatch'
+        assert len({r['commit_epoch_us'] for r in events})==1,'fixture must exercise timestamp ties'
+        oracle_rows=[];source_files=[]
+        for instance in [INSTANCE,'rm-test000002']:
+            file_id=hashlib.sha256((instance+'\x1f'+stable).encode()).hexdigest()
+            source_files.append({'id':file_id,'instance_id':instance,'expectedEvents':len(events)})
+            for e in events:
+                row={k:e[k] for k in ['start_position','end_position','server_id','thread_id','database_name','sql_text','operation','raw_event_type']}
+                row.update(instance_id=instance,event_id=event_identity(file_id,e),event_epoch_us=e['commit_epoch_us'],row_index=0,table_name='',before_json='',after_json='',row_query='',host_instance_id='fixture-host',source_file_name=filename)
+                oracle_rows.append(row)
+        write_json(fixture/'oracle.json',{'fixtureSha256':hashlib.sha256(raw).hexdigest(),'services':['insight','clickhouse','indexer','raw-worker','slowlog-ingester','slowlog-worker'],'files':source_files,'rows':oracle_rows})
         remote['checksum_crc64']=identity['crc64']
         write_json(fixture/'manifest.json',{'identity':{'engine':'mysql','engineVersion':'8.0'},'binlogs':[remote]})
         write_json(fixture/'independent-input.json',{'instance_id':INSTANCE,'file_id':identity['file_id'],'binlogSha256':hashlib.sha256(raw).hexdigest(),'queryEvents':events,'expectedInsertRows':inserts,'nativeCount':len(parsed_rows),'nativeSample':native_inserts[:2]})
