@@ -44,7 +44,21 @@ class Stack:
         self.created.append(name);return name
     def init_container(self,command):
         env=self.common();env.pop('RDS_RECOVERY_FIXTURE');env.update({'RDS_BINLOG_CLICKHOUSE_ENABLED':'1','RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED':'1','CLICKHOUSE_USER':'fixture-admin'})
-        return run(['docker','run','--rm','--network',self.net,'--user','1003:1003',*self.environment(env),*self.mounts(),APP,*command],120)
+        role='init-'+uuid.uuid4().hex[:8]
+        if command[:3]==['python','-m','app.clickhouse_migrate']:
+            payload="import faulthandler,runpy,sys;faulthandler.dump_traceback_later(20);sys.argv="+repr(command[2:])+";runpy.run_module('app.clickhouse_migrate',run_name='__main__')"
+            command=['python','-u','-c',payload]
+        name=self.create(role,APP,['--user','1003:1003',*self.environment(env),*self.mounts()],command)
+        try:
+            exit_code=run(['docker','wait',name],120).strip()
+            logs=subprocess.run(['docker','logs',name],capture_output=True,text=True,timeout=10)
+            assert exit_code=='0',logs.stderr+logs.stdout
+            return logs.stdout
+        finally:
+            logs=subprocess.run(['docker','logs',name],capture_output=True,text=True,timeout=10)
+            (self.root/(role+'.log')).write_text(logs.stdout+logs.stderr)
+            if name in self.created:
+                remove_owned(name);self.created.remove(name)
     def boot(self):
         run(['docker','network','create','--internal','--label','scope='+SCOPE,self.net])
         run(['sudo','systemctl','set-property','--runtime',self.slice,'MemoryHigh=12G','MemoryMax=13G','CPUQuota=330%','IOAccounting=yes'])
@@ -172,10 +186,10 @@ def create_material(fixture):
     (fixture/'server.xml').write_text('<clickhouse><max_server_memory_usage>2500000000</max_server_memory_usage><max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio><memory_worker_correct_memory_tracker>0</memory_worker_correct_memory_tracker><memory_worker_use_cgroup>1</memory_worker_use_cgroup><openSSL><client><caConfig>/fixture/cert.pem</caConfig><verificationMode>strict</verificationMode></client></openSSL></clickhouse>')
     (fixture/'users.xml').write_text('<clickhouse><profiles><query><max_threads>1</max_threads><max_memory_usage>500000000</max_memory_usage><max_execution_time>60</max_execution_time><log_queries>1</log_queries></query><ingester><max_threads>4</max_threads><max_insert_threads>2</max_insert_threads><max_memory_usage>3000000000</max_memory_usage><max_execution_time>0</max_execution_time></ingester></profiles><users>'+''.join(f'<{u}><password>fixture-only</password><networks><ip>::/0</ip></networks><profile>{u}</profile><quota>default</quota></{u}>' for u in ['query','ingester'])+'</users></clickhouse>')
 
-def exercise(root,fixture):
+def exercise(root,fixture,results=None):
     create_material(fixture)
     for image in [WORKER,CH]:run(['docker','pull',image],240)
-    results=[]
+    if results is None:results=[]
     for stage in ['raw_fsync','chunk_commit','parquet_commit','oss_upload_before_verify']:
         s=Stack(root,fixture,stage);proof={'stage':stage};results.append(proof)
         try:
@@ -193,7 +207,12 @@ def exercise(root,fixture):
             proof['binlogOraclePassed']=True
             # Idle slowlog/general-log fixture sources are not a loaded all-source verdict.
             print(json.dumps({'stage':stage,'recoverySeconds':proof['recoverySeconds'],'files':proof['files']}),flush=True)
-        except BaseException as exc:proof['failure']=str(exc);raise
+        except BaseException as exc:
+            proof['failure']=str(exc)
+            if 'clickhouse' in s.names:
+                try:proof['nativeProcessesAtFailure']=s.ch('SELECT query_id,elapsed,query FROM system.processes FORMAT JSON')
+                except Exception as diagnostic:proof['diagnosticError']=str(diagnostic)
+            raise
         finally:
             write_json(s.root/'drill.json',proof)
             try:s.close()

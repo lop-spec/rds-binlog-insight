@@ -46,9 +46,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Recovery fixture contract tests
-        run: python -m unittest tests.test_recovery_isolation33 -v
+        run: python -m unittest tests.test_recovery_isolation33 tests.test_recovery_cloud_edge tests.test_recovery_archive_probe -v
       - name: Prepare isolated native binlog and independent input oracle
         run: python -u -m tools.recovery_isolation33
+      - name: Make stopped fixture evidence readable
+        if: always()
+        run: |
+          test "$GITHUB_ACTIONS" = true
+          if [ -d "$GITHUB_WORKSPACE/recovery-evidence" ]; then
+            sudo chmod -R a+rX -- "$GITHUB_WORKSPACE/recovery-evidence"
+          else
+            echo 'No fixture evidence directory; preparation did not start'
+          fi
       - name: Preserve all recovery evidence, including failure
         if: always()
         uses: actions/upload-artifact@v7

@@ -139,7 +139,7 @@ def main():
     try:
         proof['fixture']=prepare(root);proof['gate']['fixturePrepared']=True
         from tools.recovery_fixture33.stack import exercise
-        proof['drills']=exercise(root,root/'fixture');proof['gate']['processRecovery']=True
+        exercise(root,root/'fixture',proof['drills']);proof['gate']['processRecovery']=True
     except Exception as exc:proof['failure']=str(exc);raise
     finally:write_json(root/'recovery-isolated33.json',proof)
 
