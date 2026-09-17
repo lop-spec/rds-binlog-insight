@@ -8,6 +8,11 @@ on:
         required: true
         type: boolean
         default: false
+      recovery_isolation:
+        description: Run only credential-free whole-stack recovery fixture preparation
+        required: true
+        type: boolean
+        default: false
       thp_isolation:
         description: Run only per-process THP mechanism and single-factor ClickHouse ABBA; never publish
         required: true
@@ -32,6 +37,27 @@ env:
   LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.33-rawoss
 
 jobs:
+  recovery-isolation:
+    if: github.event_name == 'workflow_dispatch' && inputs.recovery_isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Recovery fixture contract tests
+        run: python -m unittest tests.test_recovery_isolation33 -v
+      - name: Prepare isolated native binlog and independent input oracle
+        run: python -u -m tools.recovery_isolation33
+      - name: Preserve all recovery evidence, including failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: recovery-isolated33
+          path: recovery-evidence/
+          if-no-files-found: error
+          retention-days: 30
+
   memory-isolation:
     if: github.event_name == 'workflow_dispatch' && (inputs.memory_isolation || inputs.thp_isolation)
     permissions:
@@ -61,7 +87,7 @@ jobs:
           retention-days: 14
 
   build-test-package:
-    if: github.event_name != 'workflow_dispatch' || (!inputs.memory_isolation && !inputs.thp_isolation)
+    if: github.event_name != 'workflow_dispatch' || (!inputs.memory_isolation && !inputs.thp_isolation && !inputs.recovery_isolation)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
