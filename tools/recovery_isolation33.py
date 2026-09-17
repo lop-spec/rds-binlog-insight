@@ -35,6 +35,17 @@ def remove_owned(name):
     if c['State']['Running']:run(['docker','stop','--time','10',name],20)
     run(['docker','rm',name],10)
 
+def crc64_xz(raw):
+    # Independent fixture oracle (not the application/native CRC implementation).
+    table=[]
+    for byte in range(256):
+        value=byte
+        for _ in range(8):value=(value>>1)^(0xc96c5795d7870f42 if value&1 else 0)
+        table.append(value)
+    value=(1<<64)-1
+    for byte in raw:value=table[(value^byte)&255]^(value>>8)
+    return value^((1<<64)-1)
+
 def read_query_events(raw):
     """Independent MySQL v4 Query-event reader; verifies each on-disk CRC32."""
     assert raw[:4]==b'\xfebin','binlog magic'
@@ -78,10 +89,11 @@ def prepare(root):
         assert [r['sql_text'] for r in inserts]==statements,'input SQL vs independent binary oracle mismatch'
         begin=datetime.fromtimestamp(now-10,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ');end=datetime.fromtimestamp(now+10,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         remote={'log_file_name':filename,'host_instance_id':'fixture-host','log_begin_utc':begin,'log_end_utc':end,'file_size':len(raw),'checksum_crc64':'','download_link':'http://fixture-edge:8080/source.binlog','intranet_download_link':'http://fixture-edge:8080/source.binlog','link_expired_utc':'2099-01-01T00:00:00Z','remote_status':'Completed'}
-        # File identity is captured from the immutable source adapter; expected content above never uses app results.
-        identity_code="import json;from app.rds_api import RemoteBinlog;from app.metadata import MetadataStore;from app.checksum import crc64_xz_update;from pathlib import Path;j=json.loads(Path('/fixture/remote.json').read_text());r=RemoteBinlog(**j);print(json.dumps({'file_id':MetadataStore.file_id('rm-test000001',r),'crc64':str(crc64_xz_update(0,Path('/fixture/source.binlog').read_bytes()))}))"
+        # Independently implement the documented remote/file identity, using only fixture input.
+        stable=hashlib.sha256('\x1f'.join([filename,begin,end,str(len(raw)),'fixture-host']).encode()).hexdigest()
+        identity={'file_id':hashlib.sha256((INSTANCE+'\x1f'+stable).encode()).hexdigest(),'crc64':str(crc64_xz(raw))}
+        assert crc64_xz(b'123456789')==0x995DC9BBDF1939FA
         write_json(fixture/'remote.json',remote)
-        identity=json.loads(run(['docker','run','--rm','--network','none','--memory','256m','--memory-swap','256m','--entrypoint','python','-v',f'{fixture}:/fixture:ro',APP,'-c',identity_code],20))
         parsed=run(['docker','run','--rm','--network','none','--memory','256m','--memory-swap','256m','--entrypoint','/app/tools/binlog-parser','-v',f'{fixture}:/fixture:ro',APP,'--input','/fixture/source.binlog','--source-file-id',identity['file_id'],'--flavor','mysql'],30)
         (fixture/'native.ndjson').write_text(parsed)
         parsed_rows=[json.loads(l) for l in parsed.splitlines() if l.strip()]
