@@ -19,7 +19,9 @@ from .slowlog_correlation import pearson, differences
 LOGGER = logging.getLogger(__name__)
 MINUTE = 60_000_000
 WINDOW = 5 * MINUTE
-VERSION = 2
+VERSION = 2  # Existing collection fingerprints must remain comparable.
+NORMALIZATION_VERSION = 3  # Reprocess source windows when parsing changes.
+DATABASE_COMMANDS = ('dbStats',)
 COMMANDS = ('find', 'aggregate', 'distinct', 'count', 'findAndModify', 'update',
             'insert', 'delete', 'getMore', 'bulkWrite', 'mapReduce')
 NOISE = {'lsid', '$db', '$clusterTime', 'txnNumber', 'comment', 'maxTimeMS'}
@@ -102,12 +104,24 @@ def normalize_record(record: dict, instance: str, prefixes: list[str]) -> dict:
     cmd = q.get('command', q.get('query', {}))
     if not isinstance(cmd, dict):
         raise ValueError('invalid_command_document')
-    op = next((name for name in COMMANDS if name in cmd), str(q.get('op', 'unknown')))
+    op = next((name for name in COMMANDS + DATABASE_COMMANDS if name in cmd), str(q.get('op', 'unknown')))
     kind = 'suboperation' if q.get('op') in {'update', 'insert', 'remove', 'delete'} and not any(name in cmd for name in COMMANDS) else 'command'
-    ns = str(q.get('ns') or (str(record.get('DBName', '')) + '.' + str(record.get('TableName', ''))))
-    if ns.endswith('.$cmd') and isinstance(cmd.get(op), str):
+    ns = q.get('ns') or (str(record.get('DBName') or '') + '.' + str(record.get('TableName') or ''))
+    if not isinstance(ns, str):
+        raise ValueError('invalid_namespace')
+    if ns.endswith('.$cmd') and op in COMMANDS and isinstance(cmd.get(op), str):
         ns = ns[:-4] + cmd[op]
-    if '.' not in ns or ns.startswith('.'):
+    database, separator, collection = ns.partition('.')
+    known_database_command = op in DATABASE_COMMANDS or (op in {'aggregate', 'bulkWrite'} and cmd.get(op) == 1)
+    database_scope = bool(database) and (not collection or (collection == '$cmd' and known_database_command)) and (
+        q.get('op') == 'command' and bool(cmd) and (op not in COMMANDS or known_database_command))
+    if database_scope:
+        # DDS can report dbStats as just the database name. Do not invent a
+        # collection, drop the record, or let it block the entire source window.
+        ns = database
+        if op in {'unknown', 'command'}:
+            LOGGER.warning('mongo_normalization incomplete: database=%s reason=unrecognized_database_command',database)
+    elif not database or not separator or not collection:
         raise ValueError('namespace_missing')
     truncated = '$truncated' in cmd or op in {'unknown', 'command'}
     shape = normalize_shape(cmd, prefixes=prefixes)
@@ -115,6 +129,8 @@ def normalize_record(record: dict, instance: str, prefixes: list[str]) -> dict:
         shape = {'incomplete': True, 'source_hash': q.get('queryShapeHash') or digest(cmd)}
     profile = dict(version=VERSION, engine='mongodb', namespace=family(ns, prefixes),
                    database=ns.split('.', 1)[0], command=op, kind=kind, shape=shape, incomplete=truncated)
+    if database_scope:
+        profile['scope'] = 'database'
     start = epoch_us(record['ExecutionStartTime'])
     ms = number(record.get('QueryTimes', q.get('durationMillis', q.get('millis'))))
     if ms is None:
@@ -133,6 +149,8 @@ def normalize_record(record: dict, instance: str, prefixes: list[str]) -> dict:
                   plan=q.get('planSummary'), used_disk=q.get('usedDisk'), error_code=q.get('errCode'),
                   error_name=q.get('errName'), role=role, costs=values,
                   query_shape_hash=q.get('queryShapeHash'), plan_cache_key=q.get('planCacheKey'))
+    if database_scope:
+        sample['scope'] = 'database'
     return dict(instance=instance, namespace=ns, role=role, command=op, kind=kind,
                 group_id=digest(profile), profile=canonical(profile), start_us=start,
                 finish_us=start+ms*1000, sample=canonical(sample),

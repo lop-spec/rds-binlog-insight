@@ -20,7 +20,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .clickhouse_client import ClickHouseClient, ClickHouseConfig
-from .mongo_insight import COSTS, MINUTE, WINDOW, VERSION, canonical, digest, normalize_record, rollup_events
+from .mongo_insight import COSTS, MINUTE, WINDOW, VERSION, NORMALIZATION_VERSION, canonical, digest, normalize_record, rollup_events
 from .storage import _BodyFileLock
 
 LOGGER = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ class MongoStore:
     def publish(self, instance, start, end, records, prefixes, archive=None):
         if start%WINDOW or end!=start+WINDOW:
             raise ValueError('source_windows_must_be_five_minutes')
-        revision=digest({'instance':instance,'start':start,'end':end,'version':VERSION,
+        revision=digest({'instance':instance,'start':start,'end':end,'version':VERSION,'normalization_version':NORMALIZATION_VERSION,
                          'prefixes':prefixes,'records':sorted(canonical(r) for r in records)})
         path=self.manifest_path(instance,start)
         path.parent.mkdir(parents=True,exist_ok=True)

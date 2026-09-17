@@ -118,6 +118,9 @@ test('source switching suppresses late Mongo errors',async()=>{
  c.$('#analytics-source').value='slowlog';c.$('#analytics-meta').textContent='MySQL';reject(new Error('late'));await pending;
  assert.equal(nodes['#analytics-meta'].textContent,'MySQL');
 });
+test('database-scoped statements, outliers and details are labeled without a fabricated collection',()=>{
+ assert.equal((source.match(/x\.scope==='database'\?' · 库级命令':''/g)||[]).length,3);
+});
 test('no causal claim or fabricated full collection counts',()=>{
  assert.match(source,/相关与|因果/);assert.match(source,/尚无应用命令聚合接入/);
  assert.match(source,/不是慢日志计数/);assert.match(source,/未采集原生命令计数/);

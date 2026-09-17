@@ -161,7 +161,7 @@ function renderMongoAnalytics(data) {
   const scopeNotice=(!coverage.complete||!baseline.complete)?`当前窗口：${mongoCoverageText(coverage)}。基线：${mongoCoverageText(baseline)}。下面仍展示已采集记录的成本；不外推全窗口，不判断增减。`:'';
   const orderNotice=data.order_reason?`原排序“${MONGO_ORDERS[data.requested_order]||data.requested_order}”不可用（${mongoReason(data.order_reason)}），已明确改按“${MONGO_ORDERS[data.order]||data.order}”排序，不是异常增量榜。`:'';
   const rows=(data.statements||[]).map(x=>[
-    `<button type="button" class="button ghost compact" data-mongo-group="${escapeHtml(x.group_id)}" data-mongo-role="${escapeHtml(x.role)}">${escapeHtml(x.namespace)}<br><strong>${['unknown','command'].includes(x.command)?'命令类型未识别':escapeHtml(x.command)}</strong> · ${escapeHtml(x.role)}</button>${x.incomplete?'<br><small>正文不完整，详情保留已知成本</small>':''}`,
+    `<button type="button" class="button ghost compact" data-mongo-group="${escapeHtml(x.group_id)}" data-mongo-role="${escapeHtml(x.role)}">${escapeHtml(x.namespace)}${x.scope==='database'?' · 库级命令':''}<br><strong>${['unknown','command'].includes(x.command)?'命令类型未识别':escapeHtml(x.command)}</strong> · ${escapeHtml(x.role)}</button>${x.incomplete?'<br><small>正文不完整，详情保留已知成本</small>':''}`,
     `<strong>${mongoNumber(x.count)} 条</strong>${x.baseline_count==null?'':`<br>基线 ${mongoNumber(x.baseline_count)} 条`}${x.count_delta==null?'':`<br>增量 ${mongoDelta(x.count_delta)}`}`,
     `${mongoCost(x.costs.duration_us,1e6,'s')}<br>平均 ${mongoNumber(x.avg_us/1000)} ms<br>最大 ${mongoNumber(x.max_us/1000)} ms`,
     `扫描 ${mongoCost(x.costs.docs)}<br>读取 ${mongoCost(x.costs.bytes_read,2**20,'MiB')}`,
@@ -171,7 +171,7 @@ function renderMongoAnalytics(data) {
   ]);
   const performance=(data.metric_points||[]).filter(x=>!$('#mongo-role').value||x.role===$('#mongo-role').value);
   const roles=[...new Set(performance.map(x=>x.role))];
-  const outlierRows=(data.outliers||[]).map(x=>[`<button class="button ghost compact" data-mongo-group="${escapeHtml(x.group_id)}" data-mongo-role="${escapeHtml(x.role)}">${escapeHtml(x.namespace)} · ${escapeHtml(x.command)}</button>`,mongoNumber(x.max_us/1000)+' ms',formatTime(x.sample.start_us),(x.exclusions||[]).map(escapeHtml).join('；')||'没有足够反证，不等于已证明因果']);
+  const outlierRows=(data.outliers||[]).map(x=>[`<button class="button ghost compact" data-mongo-group="${escapeHtml(x.group_id)}" data-mongo-role="${escapeHtml(x.role)}">${escapeHtml(x.namespace)}${x.scope==='database'?' · 库级命令':''} · ${escapeHtml(x.command)}</button>`,mongoNumber(x.max_us/1000)+' ms',formatTime(x.sample.start_us),(x.exclusions||[]).map(escapeHtml).join('；')||'没有足够反证，不等于已证明因果']);
   const counterRows=(data.native_counters||[]).map(x=>[escapeHtml(x.node),escapeHtml(x.role),`<details><summary>${escapeHtml(x.command)} · 分钟趋势</summary>${mongoSparkline((x.intervals||[]).map(p=>({timestamp:p.end_us/1000,value:p.qps,metric:'QPS'})))}</details>`,mongoNumber(x.count),`${mongoNumber(x.baseline_qps)} → ${mongoNumber(x.qps)}`,mongoDelta(x.qps_delta),`${mongoNumber(x.coverage_seconds)} / ${mongoNumber(x.window_seconds)} 秒；基线 ${mongoNumber(x.baseline_coverage_seconds)} 秒`,mongoNumber(x.failed)]);
   const memory=(data.native_latest||[]).map(x=>{
     const g=x.tcmalloc?.generic||{},c=x.wt_cache||{},free=mongoAllocatorFree(x.tcmalloc);
@@ -190,7 +190,7 @@ function renderMongoAnalytics(data) {
 
 function openMongoDetail(id,role) {
   const x=[...(mongoResult?.statements||[]),...(mongoResult?.outliers||[])].find(x=>x.group_id===id&&x.role===role); if(!x)return;
-  $('#detail-title').textContent=`${x.namespace} · ${x.command}`;
+  $('#detail-title').textContent=`${x.namespace}${x.scope==='database'?' · 库级命令':''} · ${x.command}`;
   const costRows=Object.entries(x.costs).map(([k,v])=>[escapeHtml(k),mongoNumber(v.baseline),mongoNumber(v.observed),v.delta==null?'不可比较（见窗口与字段覆盖）':mongoDelta(v.delta),`${v.known}/${v.total}；基线 ${v.baseline_known??'?'}/${v.baseline_total??'?'}`]);
   $('#detail-body').innerHTML=`<section class="detail-block"><h3>异常增量与反证</h3><p>${mongoAssessment(x)}。这里展示已记录值，不外推缺失数据。</p><p>${(x.exclusions||[]).map(escapeHtml).join('；')||'未触发时序排除项，仍需直接成本和业务验证。'}</p>
     <p>次数 ${mongoNumber(x.baseline_count)} → ${mongoNumber(x.count)}；频次成本项 ${mongoNumber(mongoScale(x.frequency_cost_delta_us,1e6))} s；单次成本项 ${mongoNumber(mongoScale(x.per_call_cost_delta_us,1e6))} s。基线为零时不能计算该分解。</p>

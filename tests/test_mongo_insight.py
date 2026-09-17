@@ -31,6 +31,85 @@ class MongoGates(unittest.TestCase):
         c=self.norm(record(command={'find':'messages_1','filter':{'x':'99'}}))
         self.assertNotEqual(a['group_id'],c['group_id'])
 
+    def database_record(self, namespace='demo', command=None):
+        value=record(ns='demo.$cmd',command=command or {'dbStats':1,'lsid':{'id':'private'},'$db':'demo'})
+        document=json.loads(value['SQLText']);document['ns']=namespace
+        value['SQLText']=json.dumps(document);value.pop('TableName')
+        return value
+
+    def test_database_stats_has_no_fabricated_collection_and_retains_costs(self):
+        events=[self.norm(self.database_record(ns)) for ns in ['demo','demo.$cmd','']]
+        self.assertEqual(len({e['group_id'] for e in events}),1)
+        for event in events:
+            profile=json.loads(event['profile']);sample=json.loads(event['sample'])
+            self.assertEqual((event['namespace'],event['command'],event['kind']),('demo','dbStats','command'))
+            self.assertEqual((profile['database'],profile['scope'],sample['scope']),('demo','database','database'))
+            self.assertFalse(profile['incomplete'])
+            self.assertEqual(profile['shape'],{'dbStats':'?number'})
+            self.assertEqual((event['duration_us'],event['docs'],event['keys']),(120000,10,10))
+            self.assertNotIn('private',event['profile'])
+
+    def test_unknown_database_command_retains_costs_with_explicit_incomplete_reason(self):
+        with self.assertLogs('app.mongo_insight',level='WARNING') as logs:
+            event=self.norm(self.database_record(command={'serverStatus':1,'$db':'demo'}))
+        self.assertIn('unrecognized_database_command',logs.output[0])
+        self.assertTrue(json.loads(event['profile'])['incomplete'])
+        self.assertEqual(event['duration_us'],120000)
+        self.assertEqual(event['namespace'],'demo')
+
+    def test_database_namespace_does_not_relax_missing_collection_or_database(self):
+        for command in [{'find':'messages_1'},{'update':'messages_1'},{'getMore':123,'collection':'messages_1'}]:
+            with self.subTest(command=command),self.assertRaisesRegex(ValueError,'namespace_missing'):
+                self.norm(self.database_record(command=command))
+        for namespace in ['', '.bad']:
+            value=self.database_record(namespace);value['DBName']=''
+            with self.assertRaisesRegex(ValueError,'namespace_missing'):
+                self.norm(value)
+        value=self.database_record(123)
+        with self.assertRaisesRegex(ValueError,'invalid_namespace'):
+            self.norm(value)
+
+    def test_database_aggregate_and_truncated_collection_command_are_distinct(self):
+        event=self.norm(self.database_record(command={'aggregate':1,'pipeline':[{'$currentOp':{}}],'cursor':{}}))
+        self.assertEqual(json.loads(event['profile'])['scope'],'database')
+        event=self.norm(self.database_record('demo.$cmd',{'$truncated':'find body unavailable'}))
+        self.assertNotIn('scope',json.loads(event['profile']))
+        self.assertTrue(json.loads(event['profile'])['incomplete'])
+
+    def test_existing_collection_fingerprint_is_unchanged(self):
+        self.assertEqual(self.norm(record())['group_id'],'242aad3e2b611648daa30e097d00ee9f746b285f17515ba3f53ea4f31ec29b6e')
+
+    def test_database_record_does_not_block_or_reduce_complete_batch(self):
+        import pyarrow.parquet as pq
+        from app.mongo_insight import canonical
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            records=[record(),self.database_record(),record()]
+            start=self.norm(records[0])['start_us']//300_000_000*300_000_000
+            manifest=store.publish('dds-example',start,start+300_000_000,records,['messages'])
+            rows,coverage=store.read('dds-example',start,start+300_000_000)
+            self.assertTrue(coverage['complete'])
+            self.assertEqual((coverage['records'],sum(x['count'] for x in rows)),(3,3))
+            self.assertEqual(sum(x['count'] for x in rows if json.loads(x['profile'])['command']=='dbStats'),1)
+            raw=store.manifest_path('dds-example',start).parent/manifest['raw']
+            self.assertEqual(pq.read_table(raw).column('record').to_pylist(),[canonical(r) for r in records])
+
+    def test_parser_revision_invalidates_replay_without_changing_collection_fingerprint(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            start=self.norm(record())['start_us']//300_000_000*300_000_000
+            with patch('app.mongo_store.NORMALIZATION_VERSION',2):
+                before=store.publish('dds-example',start,start+300_000_000,[record()],['messages'])
+            folder=store.manifest_path('dds-example',start).parent
+            original=(folder/before['raw']).read_bytes()
+            after=store.publish('dds-example',start,start+300_000_000,[record()],['messages'])
+            self.assertNotEqual(before['revision'],after['revision'])
+            self.assertEqual((folder/before['raw']).read_bytes(),original)
+            rows,coverage=store.read('dds-example',start,start+300_000_000)
+            self.assertTrue(coverage['complete']);self.assertEqual(sum(r['count'] for r in rows),1)
+            self.assertEqual(rows[0]['group_id'],self.norm(record())['group_id'])
+
     def test_dollar_prefixed_literals_are_redacted(self):
         a=self.norm(record(command={'find':'messages_1','filter':{'password':'$private-value','find':'private-name'}}))
         self.assertNotIn('private-value',a['profile'])
