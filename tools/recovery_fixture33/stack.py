@@ -87,14 +87,18 @@ class Stack:
         init="from pathlib import Path;from app.metadata import MetadataStore;from app.config import Settings;from app.storage import EventStorage;m=MetadataStore(Path('/data/metadata.sqlite3'));m.save_settings(Settings(db_instance_id='rm-test000001',auto_sync=True,oss_enabled=True,oss_bucket='test-fixture-bucket',oss_region_id='cn-hangzhou',oss_endpoint='https://oss-cn-hangzhou-internal.aliyuncs.com',oss_prefix='fixture/',oss_auth_mode='access_key'));EventStorage(m,Path('/data'));Path('/data/binlog-instances.json').write_text('[{\"instanceId\":\"rm-test000002\",\"label\":\"secondary-fixture\",\"autoSync\":true}]');print('fixture metadata initialized')"
         (self.root/'init.log').write_text(self.init_container(['python','-c',init]))
         (self.root/'migrate.log').write_text(self.init_container(['python','-m','app.clickhouse_migrate','--data-dir','/data','--raw-oss-tables']))
+        (self.root/'pack-manifest-init.log').write_text(self.init_container(['python','-c',"from pathlib import Path;from app.clickhouse_manifest import ClickHouseManifest;ClickHouseManifest(Path('/data/index/clickhouse/raw-oss-packed-manifest.sqlite3'),run_migrations=True);print('fixture packed manifest initialized')"]))
         for role,spec in SPEC.items():
             if role=='clickhouse':continue
             env={**self.common(),**spec['flags']};env['CLICKHOUSE_USER']='query' if role=='insight' else 'ingester'
             if role=='insight':env['RECOVERY_FAULT_ACTOR']='1'
             opts=self.options(role,spec)+self.environment(env)+self.mounts()
-            if role=='insight':opts+=['-p','127.0.0.1::8769']
             self.names[role]=self.create(role,APP if role=='insight' else WORKER,opts,spec['command'])
-        port=inspect(self.names['insight'])['NetworkSettings']['Ports']['8769/tcp'][0]['HostPort'];self.url='http://127.0.0.1:'+port
+        # The Linux runner reaches its internal bridge directly; no public/NAT port.
+        address=inspect(self.names['insight'])['NetworkSettings']['Networks'][self.net]['IPAddress']
+        import ipaddress
+        assert ipaddress.ip_address(address).is_private
+        self.url='http://'+address+':8769'
         wait_for(lambda:api(self.url+'/healthz'),40,'application ready')
         wait_for(lambda:all((self.root/'data'/path).exists() for path in STATUS.values()),50,'all worker status files')
         return self.snapshot()
@@ -151,7 +155,7 @@ class Stack:
         result={}
         for role,name in self.names.items():
             c=inspect(name);assert c['Image']==SPEC[role]['imageId'],(role,c['Image'])
-            h=c['HostConfig'];result[role]={'scope':c['Config']['Labels']['scope'],'imageDigest':c['Image'],'running':c['State']['Running'],'pid':c['State']['Pid'],'restartCount':c['RestartCount'],'startedAt':c['State']['StartedAt'],'resourceSpec':{k:h.get(k) for k in ['Memory','MemorySwap','NanoCpus','PidsLimit','RestartPolicy','ReadonlyRootfs','Tmpfs','CgroupParent']}}
+            h=c['HostConfig'];result[role]={'scope':c['Config']['Labels']['scope'],'imageDigest':c['Image'],'running':c['State']['Running'],'exitCode':c['State']['ExitCode'],'error':c['State']['Error'],'oomKilled':c['State']['OOMKilled'],'pid':c['State']['Pid'],'restartCount':c['RestartCount'],'startedAt':c['State']['StartedAt'],'resourceSpec':{k:h.get(k) for k in ['Memory','MemorySwap','NanoCpus','PidsLimit','RestartPolicy','ReadonlyRootfs','Tmpfs','CgroupParent']}}
         return result
     def files(self):return db_rows(self.root/'data/metadata.sqlite3',"SELECT id,state,event_count,raw_deleted_at,error_message FROM binlog_files")
     def recovered(self,before):
@@ -209,6 +213,8 @@ def exercise(root,fixture,results=None):
             print(json.dumps({'stage':stage,'recoverySeconds':proof['recoverySeconds'],'files':proof['files']}),flush=True)
         except BaseException as exc:
             proof['failure']=str(exc)
+            try:proof['servicesAtFailure']=s.snapshot()
+            except Exception as diagnostic:proof['snapshotDiagnosticError']=str(diagnostic)
             if 'clickhouse' in s.names:
                 try:proof['nativeProcessesAtFailure']=s.ch('SELECT query_id,elapsed,query FROM system.processes FORMAT JSON')
                 except Exception as diagnostic:proof['diagnosticError']=str(diagnostic)
