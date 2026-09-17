@@ -1201,8 +1201,8 @@ class EventStorage:
                     predicate, needle = "lower({column}) = ?", value.lower()
                 else:
                     predicate, needle = (
-                        "lower({column}) LIKE ?",
-                        "%" + value.lower() + "%",
+                        "contains(lower({column}), ?)",
+                        value.lower(),
                     )
                 clauses.append(
                     "("
@@ -1229,7 +1229,7 @@ class EventStorage:
                 term_clauses.append(
                     "("
                     + " OR ".join(
-                        f"lower({column}) LIKE ?"
+                        f"contains(lower({column}), ?)"
                         for column in (
                             "sql_text",
                             "before_json",
@@ -1243,7 +1243,9 @@ class EventStorage:
                     )
                     + ")"
                 )
-                params.extend(["%" + term.lower() + "%"] * 8)
+                # Match ClickHouse/Arrow/index literal-substring semantics:
+                # '%' and '_' in user text are not SQL wildcard operators.
+                params.extend([term.lower()] * 8)
             clauses.append("(" + joiner.join(term_clauses) + ")")
         return " AND ".join(clauses), params
 
@@ -1767,6 +1769,7 @@ class EventStorage:
                 "OSS_QUERY_UNAVAILABLE",
             )
         reader_factory = getattr(archive, "open_part_reader", None)
+        failed_range_stats = {"range_requests": 0, "range_bytes": 0}
         if callable(reader_factory):
             reader = None
             try:
@@ -1776,12 +1779,27 @@ class EventStorage:
                 stats["full_object_fallback_bytes"] = 0
                 stats.update(selection_stats)
                 return table, "oss-range", stats
-            except Exception:
-                # One evidence-preserving recovery: a transient full-object read.
-                pass
+            except Exception as exc:
+                # Identity failures, resource limits and cancellation cannot be
+                # bypassed by silently downloading the entire object.
+                if getattr(exc, "code", "") in {
+                    "OSS_QUERY_BUDGET_EXCEEDED", "QUERY_CANCELLED",
+                    "OSS_RANGE_VERIFY_FAILED", "INDEX_ROW_GROUP_INVALID",
+                }:
+                    raise
+                if reader is not None:
+                    failed_range_stats = dict(reader.stats())
+                LOGGER.warning(
+                    "OSS range read failed; using transient full-object read: "
+                    "part=%s reason=%s range_stats=%s",
+                    part.get("logical_part_id") or part.get("sha256"),
+                    type(exc).__name__, failed_range_stats,
+                )
             finally:
                 if reader is not None:
                     reader.close()
+        else:
+            LOGGER.warning("OSS range reader unavailable; using full-object read")
         destination = self.paths["scratch"] / f".query-{uuid.uuid4().hex}.parquet"
         try:
             archive.download_part(part, destination)
@@ -1793,6 +1811,7 @@ class EventStorage:
                     "range_requests": 0,
                     "range_bytes": 0,
                     "full_object_fallback_bytes": destination.stat().st_size,
+                    **failed_range_stats,
                     **selection_stats,
                 },
             )

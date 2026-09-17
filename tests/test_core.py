@@ -2083,7 +2083,8 @@ class OssTieringTests(unittest.TestCase):
 
         self.assertEqual(reader.read(), payload)
         self.assertEqual(bucket.calls, 3)
-        self.assertEqual(reader.stats(), {"range_requests": 1, "range_bytes": len(payload)})
+        # Include both failed GET attempts; successful-only counts hide I/O work.
+        self.assertEqual(reader.stats(), {"range_requests": 3, "range_bytes": len(payload)})
 
     def test_unindexed_part_prunes_row_groups_with_structural_predicates(
         self,

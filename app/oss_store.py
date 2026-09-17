@@ -47,6 +47,10 @@ class OssRangeReader(io.RawIOBase):
         cache_blocks: int = 8,
         fetch_attempts: int = 3,
         retry_delay_seconds: float = 0.05,
+        *,
+        max_bytes: int | None = None,
+        max_requests: int | None = None,
+        check_cancelled: Callable[[], None] | None = None,
     ):
         super().__init__()
         self.bucket = bucket
@@ -58,9 +62,15 @@ class OssRangeReader(io.RawIOBase):
         self.cache_blocks = max(int(cache_blocks), 0)
         self.fetch_attempts = max(int(fetch_attempts), 1)
         self.retry_delay_seconds = max(float(retry_delay_seconds), 0.0)
+        self.max_bytes = None if max_bytes is None else max(int(max_bytes), 0)
+        self.max_requests = None if max_requests is None else max(int(max_requests), 0)
+        self.check_cancelled = check_cancelled
         self.position = 0
         self.request_count = 0
         self.bytes_read = 0
+        # Charge requested bytes even on transport failure: a failed response
+        # may have transferred a partial body the SDK cannot report to us.
+        self._requested_bytes = 0
         self._range_cache: OrderedDict[int, bytes] = OrderedDict()
 
     def readable(self) -> bool:
@@ -91,14 +101,35 @@ class OssRangeReader(io.RawIOBase):
         end = start + length - 1
         last_error: Exception | None = None
         for attempt in range(self.fetch_attempts):
+            if self.check_cancelled is not None:
+                self.check_cancelled()
+            if ((self.max_bytes is not None and self._requested_bytes + length > self.max_bytes)
+                    or (self.max_requests is not None and self.request_count >= self.max_requests)):
+                raise OssArchiveError(
+                    "OSS query read budget exceeded before GET",
+                    "OSS_QUERY_BUDGET_EXCEEDED",
+                )
+            self.request_count += 1
+            self._requested_bytes += length
             try:
                 result = self.bucket.get_object(
                     self.key,
                     byte_range=(start, end),
                 )
-                payload = result.read()
+                try:
+                    payload = result.read()
+                    self.bytes_read += len(payload)
+                finally:
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
                 break
             except Exception as exc:
+                if getattr(exc, "code", "") in {
+                    "QUERY_CANCELLED", "OSS_QUERY_BUDGET_EXCEEDED",
+                    "OSS_RANGE_VERIFY_FAILED",
+                }:
+                    raise
                 last_error = exc
                 if attempt + 1 < self.fetch_attempts and self.retry_delay_seconds:
                     time.sleep(self.retry_delay_seconds * (2**attempt))
@@ -117,13 +148,11 @@ class OssRangeReader(io.RawIOBase):
             or getattr(result, "etag", "")
             or ""
         ).strip('"')
-        if self.expected_etag and actual_etag and actual_etag != self.expected_etag:
+        if self.expected_etag and actual_etag != self.expected_etag:
             raise OssArchiveError(
                 f"OSS Range ETag 不一致：{self.key}",
                 "OSS_RANGE_VERIFY_FAILED",
             )
-        self.request_count += 1
-        self.bytes_read += length
         return payload
 
     def _cached(self, start: int, length: int) -> bytes | None:
@@ -141,6 +170,8 @@ class OssRangeReader(io.RawIOBase):
         return payload[offset : offset + length]
 
     def read(self, size: int = -1) -> bytes:
+        if self.check_cancelled is not None:
+            self.check_cancelled()
         if self.closed:
             raise ValueError("OSS Range reader 已关闭")
         remaining = self.size_bytes - self.position

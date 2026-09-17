@@ -15,13 +15,19 @@ from typing import Any
 import pyarrow.parquet as pq
 
 
-INDEX_SCHEMA_VERSION = 2
+# v3 adds the three audit fields searched by both serving backends. v2
+# postings remain structurally useful, but cannot exclude keyword matches.
+INDEX_SCHEMA_VERSION = 3
+STRUCTURAL_SCHEMA_VERSIONS = (2, 3)
 KEYWORD_COLUMNS = (
     "sql_text",
     "before_json",
     "after_json",
     "transaction_id",
     "source_file_name",
+    "connection_name",
+    "database_account",
+    "error_message",
 )
 INDEX_COLUMNS = (
     "event_epoch_us",
@@ -328,7 +334,7 @@ class SearchIndex:
                 part, row["logical_part_id"], row["sha256"]
             )
             and int(row["row_group_count"]) > 0
-            and int(row["schema_version"]) == INDEX_SCHEMA_VERSION
+            and int(row["schema_version"]) in STRUCTURAL_SCHEMA_VERSIONS
         )
 
     @staticmethod
@@ -833,7 +839,11 @@ class SearchIndex:
                             row["logical_part_id"],
                             row["sha256"],
                         )
-                        and int(row["schema_version"]) == INDEX_SCHEMA_VERSION
+                        and int(row["schema_version"]) in (
+                            STRUCTURAL_SCHEMA_VERSIONS
+                            if table == "structural_parts"
+                            else (INDEX_SCHEMA_VERSION,)
+                        )
                     ):
                         covered.add(path)
         return covered, set(expected) - covered

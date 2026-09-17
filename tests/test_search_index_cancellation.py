@@ -155,7 +155,9 @@ class SearchIndexScopeTests(unittest.TestCase):
         with self.index.connection() as conn:
             for part in parts + [stale, structural]:
                 table = "structural_parts" if part == structural else "indexed_parts"
-                version = INDEX_SCHEMA_VERSION - (part == stale)
+                # v2 still supplies valid structural candidates after the v3
+                # keyword-field fix; v1 is genuinely unsupported coverage.
+                version = 1 if part == stale else INDEX_SCHEMA_VERSION
                 conn.execute(
                     f"INSERT INTO {table} VALUES(?, ?, '', 2, 2, ?, '')",
                     (part["path"], part["sha256"], version),

@@ -38,7 +38,9 @@
   当前 SHA-256 与 OSS 归档状态。搜索索引绑定稳定 `logical_part_id`，物理
   `object_sha256` 独立保存，冷压缩无需重建索引；旧 OSS pack 仅在所有引用
   都迁移并经过查询安全宽限期后删除。
-- 查询固定按“本地搜索索引 → OSS Range → RDS 范围核对”执行。SQLite
+- 非 CK 检索路径按“本地搜索索引 → OSS Range → RDS 范围核对”执行。
+  启用 CK raw-OSS serving 时，主路由优先交给 CK，不会先走该关键词索引。
+  SQLite
   FTS5 只保存 Row Group 级库表、完整词/标量值和 trigram 兼容关系，不保存
   事件正文；完整词/值优先走精确倒排，短词和标点查询走兼容慢路径。PyArrow
   只读取命中的 Row Group 与必要列。索引缺失时保持准确回退，后台从最新对象
@@ -479,3 +481,33 @@ Linux 环境变量中的凭据优先级最高。GUI 保存的凭据原子写入�
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+### 索引驱动检索 P1（开发验证，不自动切换生产）
+
+```sh
+python -m unittest tests.test_indexed_parquet_contract tests.test_search_index_cancellation -v
+python -u -m tools.benchmark_index_layout
+# 仅对已授权、固定 SHA256 的小型本地样本；不传入活跃生产数据库
+python -u -m tools.benchmark_index_layout --parquet /path/to/immutable-sample.parquet
+```
+
+- 单任务串行比较同一正文的全扫描和候选行组读取，使用独立 Python oracle
+  核对身份、完整行内容、排序、分页；同时核对真实 Range 返回字节与请求次数。
+  内置样本要求选择性查询至少少读50%，零命中不读取正文。真实样本不写死收益门槛，
+  必须如实报告选择率；这些时延来自本地 Range 响应，不代表 OSS 网络或生产 P95。
+- 输入上限64 MiB/20万行、Parquet元数据解码量上限512 MiB，测试状态使用临时目录；
+  每查询最多4096次 Range、256 MiB请求预算，DuckDB单线程/256 MB、临时空间128 MB，
+  原生查询60秒到期后调用interrupt并等待终态；整个进程的时限由执行端另行限制。
+  输出拆分计划、Range/解码、原生排序分页耗时，以及整个进程峰值RSS（含oracle/索引/Arrow，
+  不冒充单个生产查询的内存）。这些是开发样本护栏，不是进程树/cgroup硬内存保证。
+  ECS测试仍须另有可执行的整组预算，
+  不以本工具默认值作为同机压测许可。
+- 搜索索引v3补齐连接名、数据库账号、错误信息；存量v2只能用作结构候选，不能再凭
+  缺字段的关键词倒排排除命中。旧库不删除、不重写正文；**不要直接启动新版indexer去
+  全历史追赶**，本阶段只在测试目录构建本批索引，生产升级/回填需单独排期与额度。
+- Parquet的字符串筛选统一为与CK一致的字面包含，`%`、`_`不再被错误解释为SQL通配符。
+  Range读取可设置字节/请求预算及取消回调；重试计入GET次数，失败响应已返回的字节
+  计入读取量，无法观察的失败传输按请求长度保守占预算，不冒充已测得的网络字节。
+  身份校验、预算或取消失败不得触发全对象下载绕过；允许的下载回退必须记录原因和前置读取量。
+- 本阶段不启第二套采集/归档/CK，不修改生产路由，也不把小样替代原30天20项、
+  19/20≤60秒、持续归档覆盖及整服务恢复验收。
