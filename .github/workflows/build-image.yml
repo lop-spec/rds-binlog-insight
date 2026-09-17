@@ -8,6 +8,11 @@ on:
         required: true
         type: boolean
         default: false
+      thp_isolation:
+        description: Run only per-process THP mechanism and single-factor ClickHouse ABBA; never publish
+        required: true
+        type: boolean
+        default: false
       memory_isolation:
         description: Run only the credential-free v33 memory ABBA experiment; never publish
         required: true
@@ -28,7 +33,7 @@ env:
 
 jobs:
   memory-isolation:
-    if: github.event_name == 'workflow_dispatch' && inputs.memory_isolation
+    if: github.event_name == 'workflow_dispatch' && (inputs.memory_isolation || inputs.thp_isolation)
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -36,9 +41,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Verify fixture safety contracts
-        run: python -m unittest tests.test_memory_isolation33 -v
+        run: python -m unittest tests.test_memory_isolation33 tests.test_thp_isolation33 -v
       - name: Run isolated same-version ABBA without production credentials
-        run: python -u tools/memory_isolation33.py
+        env:
+          THP_EXPERIMENT: ${{ inputs.thp_isolation }}
+        run: |
+          if [ "$THP_EXPERIMENT" = "true" ]; then
+            python -u -m tools.thp_isolation33
+          else
+            python -u tools/memory_isolation33.py
+          fi
       - name: Preserve measurements even when a gate fails
         if: always()
         uses: actions/upload-artifact@v7
@@ -49,7 +61,7 @@ jobs:
           retention-days: 14
 
   build-test-package:
-    if: github.event_name != 'workflow_dispatch' || !inputs.memory_isolation
+    if: github.event_name != 'workflow_dispatch' || (!inputs.memory_isolation && !inputs.thp_isolation)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 

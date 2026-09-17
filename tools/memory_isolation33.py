@@ -148,13 +148,19 @@ def main():
     assert os.environ.get('GITHUB_ACTIONS')=='true','cloud CI only; never operate production Docker'
     root=Path('memory-evidence').resolve();root.mkdir(exist_ok=False)
     data=root/'fixture';data.mkdir();source=Path.cwd()
+    thp_exec=os.environ.get('THP_ISOLATION_EXEC','');thp_mode=bool(thp_exec)
+    if thp_mode:assert Path(thp_exec).is_file(),'missing isolated THP exec helper'
     for image in [APP,CH]:run(['docker','pull',image],240)
     app_cmd=['docker','run','--rm','--network','host','--cpus','2','--memory','2g','--user',str(os.getuid()),'--entrypoint','python','--workdir','/src','-v',f'{source}:/src:ro','-e','MEMORY_ISOLATION_FIXTURE=1']
     generated=run(app_cmd+['-v',f'{data}:/fixture',APP,'tools/memory_isolation33.py','--generate'],150)
     evidence={'scope':'synthetic ABBA; not a proven reproduction of incident 31','version':VERSION,'hardLimit':LIMIT,
-              'appImage':APP,'sourceSha':os.environ.get('GITHUB_SHA'),'images':{},'fixture':json.loads(generated),'phases':[]}
+              'appImage':APP,'sourceSha':os.environ.get('GITHUB_SHA'),'images':{},'fixture':json.loads(generated),'phases':[],
+              'comparison':'process THP only; both 2.5 GB, correction off' if thp_mode else '2.5 GB/correction off vs 1.8 GB/correction on'}
+    ch_entrypoint=[]
     for image in [APP,CH]:
         c=json.loads(run(['docker','image','inspect',image],10))[0];evidence['images'][image]={'id':c['Id'],'repoDigests':c['RepoDigests']}
+        if image==CH:ch_entrypoint=(c['Config'].get('Entrypoint') or [])+(c['Config'].get('Cmd') or [])
+    assert ch_entrypoint,'official ClickHouse entrypoint must be present'
     def save():
         raw=json.dumps(evidence,indent=2).encode();p=root/'memory-isolated33.json';p.write_bytes(raw)
         (root/'memory-isolated33.json.sha256').write_text(hashlib.sha256(raw).hexdigest()+'  memory-isolated33.json\n')
@@ -165,12 +171,14 @@ def main():
     try:
         for ordinal,variant in enumerate(['baseline','candidate','candidate','baseline']):
             name=f'memory-isolation-{uuid.uuid4().hex[:12]}'
-            cap,correct=(2500000000,0) if variant=='baseline' else (1800000000,1)
+            cap,correct=(2500000000,0) if variant=='baseline' or thp_mode else (1800000000,1)
+            disable_thp=thp_mode and variant=='candidate'
+            thp_flags=['--entrypoint','/thp-exec','-v',f'{thp_exec}:/thp-exec:ro'] if disable_thp else []
             conf=root/f'config-{ordinal}.xml';conf.write_text(f'<clickhouse><max_server_memory_usage>{cap}</max_server_memory_usage><max_server_memory_usage_to_ram_ratio>0.8</max_server_memory_usage_to_ram_ratio><memory_worker_correct_memory_tracker>{correct}</memory_worker_correct_memory_tracker><memory_worker_use_cgroup>1</memory_worker_use_cgroup><background_pool_size>1</background_pool_size><background_merges_mutations_concurrency_ratio>1</background_merges_mutations_concurrency_ratio><background_schedule_pool_size>32</background_schedule_pool_size><background_buffer_flush_schedule_pool_size>2</background_buffer_flush_schedule_pool_size><background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size><merge_tree><number_of_free_entries_in_pool_to_execute_mutation>0</number_of_free_entries_in_pool_to_execute_mutation><number_of_free_entries_in_pool_to_execute_optimize_entire_partition>0</number_of_free_entries_in_pool_to_execute_optimize_entire_partition><number_of_free_entries_in_pool_to_lower_max_size_of_merge>0</number_of_free_entries_in_pool_to_lower_max_size_of_merge></merge_tree><mark_cache_size>5368709120</mark_cache_size><uncompressed_cache_size>8589934592</uncompressed_cache_size></clickhouse>')
             phase={'ordinal':ordinal,'variant':variant,'cap':cap,'correct':correct,'samples':[],'queries':[]};evidence['phases'].append(phase)
             stop=threading.Event();thread=None
             try:
-                run(['docker','run','-d','--name',name,'--label','scope=memory-isolation-ci','--memory','3g','--memory-swap','3g','--cpus','2','--restart','no','-p','127.0.0.1:18123:8123','-v',f'{conf}:/etc/clickhouse-server/config.d/memory-fixture.xml:ro','-v',f'{data}:/var/lib/clickhouse/user_files','-e','CLICKHOUSE_DB=mongo_ci_fixture','-e','CLICKHOUSE_USER=fixture','-e','CLICKHOUSE_PASSWORD=fixture-ci-only',CH],30)
+                run(['docker','run','-d','--name',name,'--label','scope=memory-isolation-ci','--memory','3g','--memory-swap','3g','--cpus','2','--restart','no','-p','127.0.0.1:18123:8123','-v',f'{conf}:/etc/clickhouse-server/config.d/memory-fixture.xml:ro','-v',f'{data}:/var/lib/clickhouse/user_files','-e','CLICKHOUSE_DB=mongo_ci_fixture','-e','CLICKHOUSE_USER=fixture','-e','CLICKHOUSE_PASSWORD=fixture-ci-only',*thp_flags,CH,*(ch_entrypoint if disable_thp else [])],30)
                 for attempt in range(40):
                     try:
                         version=sql('SELECT version()').strip()
@@ -182,6 +190,10 @@ def main():
                         time.sleep(1)
                 else:raise RuntimeError('fixture readiness deadline')
                 c=inspect(name);assert c['HostConfig']['Memory']==LIMIT and c['HostConfig']['MemorySwap']==LIMIT
+                if thp_mode:
+                    status=Path(f"/proc/{c['State']['Pid']}/status").read_text()
+                    phase['processThpEnabled']=int(next(line.split()[1] for line in status.splitlines() if line.startswith('THP_enabled:')))
+                    assert phase['processThpEnabled']==int(not disable_thp),'THP process flag did not take effect'
                 phase['settings']=rows("SELECT name,value FROM system.server_settings WHERE name IN ('max_server_memory_usage','memory_worker_correct_memory_tracker','memory_worker_use_cgroup')")
                 effective={r['name']:r['value'] for r in phase['settings']}
                 assert effective['max_server_memory_usage']==str(cap) and effective['memory_worker_correct_memory_tracker']==str(correct)
