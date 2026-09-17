@@ -45,6 +45,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Preserve production disk safety floor on the disposable hosted runner
+        run: |
+          python -m unittest tests.test_recovery_runner -v
+          python -u -m tools.recovery_fixture33.prepare_runner
       - name: Install fixture protocol SDK from the application lock
         run: python -m pip install "$(grep '^oss2==' requirements.txt)"
       - name: Recovery fixture contract tests
@@ -55,6 +59,10 @@ jobs:
         if: always()
         run: |
           test "$GITHUB_ACTIONS" = true
+          if [ -f "$GITHUB_WORKSPACE/runner-disk33.json" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/recovery-evidence"
+            cp -n "$GITHUB_WORKSPACE/runner-disk33.json" "$GITHUB_WORKSPACE/runner-disk33.json.sha256" "$GITHUB_WORKSPACE/recovery-evidence/"
+          fi
           if [ -d "$GITHUB_WORKSPACE/recovery-evidence" ]; then
             sudo chmod -R a+rX -- "$GITHUB_WORKSPACE/recovery-evidence"
           else

@@ -54,7 +54,7 @@ def event_identity(file_id,row):
 def read_query_events(raw):
     """Independent fixture Query/XID reader, including GTID commit time and CRC32."""
     assert raw[:4]==b'\xfebin','binlog magic'
-    at=4;rows=[];commit_us=0
+    at=4;rows=[];commit_us=0;transaction_thread=None
     while at<len(raw):
         timestamp,kind,server,size,end,flags=struct.unpack_from('<IBIIIH',raw,at)
         assert size>=23 and at+size<=len(raw),'truncated event'
@@ -64,15 +64,21 @@ def read_query_events(raw):
             body=event[19:-4]
             assert len(body)>=49 and body[25]==2,'fixture GTID logical timestamp missing'
             commit_us=int.from_bytes(body[42:49],'little')&((1<<55)-1)
+            transaction_thread=None
         if kind==2:
             body=event[19:-4];thread,elapsed,db_len,error,status_len=struct.unpack_from('<IIBHH',body)
+            transaction_thread=thread
             database=body[13+status_len:13+status_len+db_len].decode()
             sql=body[14+status_len+db_len:].decode()
             assert sql=='BEGIN' or sql.startswith('INSERT INTO recovery_rows '),'unexpected fixture SQL'
             rows.append({'start_position':at,'end_position':end,'server_id':server,'thread_id':thread,'header_seconds':timestamp,'commit_epoch_us':commit_us,'database_name':database,'sql_text':sql,'operation':'TRANSACTION' if sql=='BEGIN' else 'INSERT','raw_event_type':'QueryEvent','emitted_ordinal':len(rows)+1})
         elif kind==16:
+            # XID has no connection field: the commit belongs to its preceding
+            # transaction's QueryEvent connection, independently read above.
+            assert transaction_thread is not None,'XID without transaction connection context'
             xid=struct.unpack_from('<Q',event,19)[0]
-            rows.append({'start_position':at,'end_position':end,'server_id':server,'thread_id':0,'header_seconds':timestamp,'commit_epoch_us':commit_us,'database_name':'','sql_text':f'COMMIT /* XID {xid} */','operation':'TRANSACTION','raw_event_type':'XIDEvent','emitted_ordinal':len(rows)+1})
+            rows.append({'start_position':at,'end_position':end,'server_id':server,'thread_id':transaction_thread,'header_seconds':timestamp,'commit_epoch_us':commit_us,'database_name':'','sql_text':f'COMMIT /* XID {xid} */','operation':'TRANSACTION','raw_event_type':'XIDEvent','emitted_ordinal':len(rows)+1})
+            transaction_thread=None
         at+=size
     assert at==len(raw)
     return rows
@@ -113,7 +119,7 @@ def prepare(root):
         native_inserts=[r for r in parsed_rows if r.get('sql_text') in set(statements)]
         assert [r['sql_text'] for r in native_inserts]==statements,'native parser lost or changed fixture SQL'
         for actual,expected in zip(parsed_rows,events,strict=True):
-            for key in ['start_position','end_position','server_id','database_name','commit_epoch_us','sql_text','operation','raw_event_type']:assert actual[key]==expected[key],(key,actual,expected)
+            for key in ['start_position','end_position','server_id','thread_id','database_name','commit_epoch_us','sql_text','operation','raw_event_type']:assert actual[key]==expected[key],(key,actual,expected)
             assert actual['event_id']==event_identity(identity['file_id'],expected),'independent native event identity mismatch'
         assert len({r['commit_epoch_us'] for r in events})==1,'fixture must exercise timestamp ties'
         oracle_rows=[];source_files=[]
