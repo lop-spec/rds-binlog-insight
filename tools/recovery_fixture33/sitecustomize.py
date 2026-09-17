@@ -52,6 +52,24 @@ if os.environ.get('RDS_RECOVERY_FIXTURE')=='1':
             if result is not None:note('archive_head_verified',key=args[1])
             return result
         oss_store.OssArchive._head_pack_verified=head
+        original_single_head=oss_store.OssArchive._head_verified
+        @functools.wraps(original_single_head)
+        def single_head(*args,**kwargs):
+            result=original_single_head(*args,**kwargs)
+            if result is not None:note('archive_head_verified',key=args[1])
+            return result
+        oss_store.OssArchive._head_verified=single_head
+        from contextlib import contextmanager
+        original_connection=metadata.MetadataStore.connection;observed_connections=set()
+        @contextmanager
+        def connection(self,*args,**kwargs):
+            with original_connection(self,*args,**kwargs) as conn:
+                key=(os.getpid(),id(self))
+                if key not in observed_connections:
+                    observed_connections.add(key)
+                    note('sqlite_durability',synchronous=conn.execute('PRAGMA synchronous').fetchone()[0],wal_autocheckpoint=conn.execute('PRAGMA wal_autocheckpoint').fetchone()[0])
+                yield conn
+        metadata.MetadataStore.connection=connection
         original_list=mock_api.ManifestRdsClient.list_binlogs
         @functools.wraps(original_list)
         def listing(*args,**kwargs):

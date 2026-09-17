@@ -1,8 +1,10 @@
 """Isolated, persistent OSS HTTP(S) boundary. No production/cloud SDK credentials."""
-import hashlib,json,os,re,ssl,threading,time,uuid
+import base64,hashlib,json,os,re,ssl,threading,time,uuid
+from datetime import datetime,timezone
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit,unquote
+from urllib.parse import urlsplit,unquote,parse_qs
+from xml.etree.ElementTree import Element,SubElement,tostring
 from tools.recovery_isolation33 import crc64_xz
 ROOT=Path('/edge');LOCK=threading.Lock()
 
@@ -35,7 +37,10 @@ class Handler(BaseHTTPRequestHandler):
         key,query=self.path_info();size=int(self.headers.get('Content-Length','0'));assert 0<=size<=64*1024**2
         body=self.rfile.read(size);assert len(body)==size
         if query=='lifecycle':atomic(ROOT/'lifecycle.xml',body);self.send(200);return
-        assert key;sha=hashlib.sha256(body).hexdigest();crc=crc64_xz(body);etag='"'+hashlib.md5(body).hexdigest()+'"'
+        assert key
+        if self.headers.get('x-oss-forbid-overwrite')=='true' and (ROOT/'objects'/key).exists():
+            self.send(409,b'<Error><Code>FileAlreadyExists</Code><Message>immutable fixture object</Message></Error>');return
+        sha=hashlib.sha256(body).hexdigest();crc=crc64_xz(body);etag='"'+hashlib.md5(body).hexdigest()+'"'
         headers={k.lower():v for k,v in self.headers.items() if k.lower().startswith('x-oss-meta-')}
         headers.update({'ETag':etag,'x-oss-hash-crc64ecma':str(crc),'Content-Type':'application/octet-stream'})
         atomic(ROOT/'objects'/key,body);atomic(ROOT/'headers'/(key+'.json'),json.dumps(headers).encode())
@@ -46,6 +51,17 @@ class Handler(BaseHTTPRequestHandler):
         key,query=self.path_info()
         if query=='lifecycle':
             p=ROOT/'lifecycle.xml';self.send(200,p.read_bytes() if p.exists() else b'<LifecycleConfiguration/>',{'Content-Type':'application/xml'});return
+        params=parse_qs(query)
+        if params.get('list-type')==['2']:
+            prefix=params.get('prefix',[''])[0];limit=int(params.get('max-keys',['1000'])[0]);assert 1<=limit<=1000
+            token=params.get('continuation-token',[''])[0];after=base64.urlsafe_b64decode(token).decode() if token else ''
+            result=Element('ListBucketResult')
+            objects=sorted(p for p in (ROOT/'objects').rglob('*') if p.is_file() and p.relative_to(ROOT/'objects').as_posix().startswith(prefix) and p.relative_to(ROOT/'objects').as_posix()>after) if (ROOT/'objects').exists() else []
+            for k,v in [('Name','test-fixture-bucket'),('Prefix',prefix),('MaxKeys',str(limit)),('IsTruncated',str(len(objects)>limit).lower())]:SubElement(result,k).text=v
+            for p in objects[:limit]:
+                item=SubElement(result,'Contents');SubElement(item,'Key').text=p.relative_to(ROOT/'objects').as_posix();SubElement(item,'Size').text=str(p.stat().st_size);SubElement(item,'LastModified').text=datetime.fromtimestamp(p.stat().st_mtime,timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z');SubElement(item,'ETag').text='"'+hashlib.md5(p.read_bytes()).hexdigest()+'"'
+            if len(objects)>limit:SubElement(result,'NextContinuationToken').text=base64.urlsafe_b64encode(objects[limit-1].relative_to(ROOT/'objects').as_posix().encode()).decode()
+            self.send(200,tostring(result),{'Content-Type':'application/xml'});return
         if key=='healthz':self.send(200,b'OK');return
         if key=='source.binlog':p=Path('/fixture/source.binlog');headers={'Content-Type':'application/octet-stream'}
         else:

@@ -48,7 +48,10 @@ class Stack:
     def boot(self):
         run(['docker','network','create','--internal','--label','scope='+SCOPE,self.net])
         run(['sudo','systemctl','set-property','--runtime',self.slice,'MemoryHigh=12G','MemoryMax=13G','CPUQuota=330%','IOAccounting=yes'])
-        run(['sudo','systemctl','start',self.slice]);self.cgroup=Path('/sys/fs/cgroup')/self.slice
+        run(['sudo','systemctl','start',self.slice])
+        group=run(['systemctl','show',self.slice,'--property=ControlGroup','--value']).strip()
+        assert group.startswith('/') and group!='/'
+        self.cgroup=Path('/sys/fs/cgroup')/group.lstrip('/')
         device=os.stat(run(['docker','info','--format','{{.DockerRootDir}}']).strip()).st_dev
         assert os.major(device)>0,'real backing device required for I/O cap'
         run(['sudo','tee',str(self.cgroup/'io.max')],input=f'{os.major(device)}:{os.minor(device)} rbps=67108864 wbps=33554432\n')
