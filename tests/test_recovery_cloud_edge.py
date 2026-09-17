@@ -26,7 +26,7 @@ class CloudEdgeTests(unittest.TestCase):
         _,h,body=self.request('/a','HEAD');self.assertEqual(body,b'');self.assertEqual(h['Content-Length'],'9');self.assertEqual(h['x-oss-hash-crc64ecma'],str(0x995DC9BBDF1939FA))
         code,h,body=self.request('/a',headers={'Range':'bytes=2-5'});self.assertEqual((code,body),(206,b'3456'));self.assertEqual(h['Content-Range'],'bytes 2-5/9')
         with self.assertRaises(urllib.error.HTTPError) as caught:self.request('/a','PUT',b'wrong',{'x-oss-forbid-overwrite':'true'})
-        self.assertEqual(caught.exception.code,409);self.assertEqual(self.request('/a')[2],data)
+        self.assertEqual(caught.exception.code,409);caught.exception.close();self.assertEqual(self.request('/a')[2],data)
     def test_lifecycle_and_list_pagination(self):
         xml=b'<LifecycleConfiguration><Rule><ID>fixture</ID></Rule></LifecycleConfiguration>'
         self.request('/?lifecycle','PUT',xml);self.assertEqual(self.request('/?lifecycle')[2],xml)

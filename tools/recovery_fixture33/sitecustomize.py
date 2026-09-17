@@ -35,11 +35,13 @@ if os.environ.get('RDS_RECOVERY_FIXTURE')=='1':
             if result[0]>0:fault('parquet_commit',fileId=kwargs.get('file_id'),parts=[p['path'] for p in result[1]])
             return result
         storage.EventStorage._finish_stage=finish
-        original_chunk=metadata.MetadataStore.record_file_chunk_progress
-        @functools.wraps(original_chunk)
-        def chunk(*args,**kwargs):
-            result=original_chunk(*args,**kwargs);fault('chunk_commit',fileId=args[1] if len(args)>1 else kwargs['file_id']);return result
-        metadata.MetadataStore.record_file_chunk_progress=chunk
+        if os.environ.get('RECOVERY_FAULT_ACTOR')=='1':
+            original_chunk=metadata.MetadataStore.record_file_chunk_progress
+            @functools.wraps(original_chunk)
+            def chunk(*args,**kwargs):
+                result=original_chunk(*args,**kwargs);fault('chunk_commit',fileId=args[1] if len(args)>1 else kwargs['file_id']);return result
+            metadata.MetadataStore.record_file_chunk_progress=chunk
+        else:note('chunk_fault_hook_skipped',reason='fault actor is the v33 application, not legacy workers')
         original_put=oss2.Bucket.put_object_from_file
         @functools.wraps(original_put)
         def put(*args,**kwargs):

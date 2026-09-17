@@ -54,7 +54,12 @@ class Stack:
         self.cgroup=Path('/sys/fs/cgroup')/group.lstrip('/')
         device=os.stat(run(['docker','info','--format','{{.DockerRootDir}}']).strip()).st_dev
         assert os.major(device)>0,'real backing device required for I/O cap'
-        run(['sudo','tee',str(self.cgroup/'io.max')],input=f'{os.major(device)}:{os.minor(device)} rbps=67108864 wbps=33554432\n')
+        block=(Path('/sys/dev/block')/f'{os.major(device)}:{os.minor(device)}').resolve(strict=True)
+        partition_device=(block/'dev').read_text().strip()
+        while (block/'partition').exists():block=block.parent
+        whole_device=(block/'dev').read_text().strip()
+        write_json(self.root/'io-device.json',{'dockerRootStatDevice':partition_device,'blockPath':str(block),'wholeDevice':whole_device,'controlGroup':group})
+        run(['sudo','tee',str(self.cgroup/'io.max')],input=f'{whole_device} rbps=67108864 wbps=33554432\n')
         write_json(self.root/'parent-limits.json',{k:(self.cgroup/k).read_text().strip() for k in ['memory.high','memory.max','cpu.max','io.max']})
         edge=self.create('edge',APP,['--network-alias','fixture-edge','--network-alias','test-fixture-bucket.oss-cn-hangzhou-internal.aliyuncs.com','--memory','256m','--memory-swap','256m','-e','PYTHONPATH=/harness','-v',f'{TOOLS}:/harness/tools:ro','-v',f'{self.fixture}:/fixture:ro','-v',f'{self.root}/edge:/edge'],['python','-m','tools.recovery_fixture33.cloud_edge'])
         mysql=self.create('mysql',MYSQL,['--network-alias','fixture-mysql','--memory','1g','--memory-swap','1g','--cpus','1','-e','MYSQL_ROOT_PASSWORD=fixture-only','-e','MYSQL_ROOT_HOST=%'],[])
@@ -89,6 +94,45 @@ class Stack:
         if role in ['raw-worker','slowlog-ingester']:result+=['--tmpfs','/data/scratch:size=256m,mode=1777']
         return result
     def ch(self,sql):return run(['docker','exec',self.names['clickhouse'],'clickhouse-client','--user','fixture-admin','--password','fixture-only','--query',sql],10).strip()
+    def policy(self):
+        settings=json.loads(db_rows(self.root/'data/metadata.sqlite3','SELECT value_json FROM app_settings WHERE singleton=1')[0]['value_json'])
+        state=api(self.url+'/api/status')['data'];syncs=[state['sync'],*(x['sync'] for x in state['secondarySyncs'])]
+        return {'settings':settings,'secondaryConfig':(self.root/'data/binlog-instances.json').read_text(),'pauseRequested':[s['pauseRequested'] for s in syncs],'pause':[s['pause'] for s in syncs]}
+    def verify_queries(self):
+        from tools.recovery_fixture33.archive_probe import verify_rows,project
+        oracle=json.loads((self.fixture/'oracle.json').read_text());pages=[];tasks=[]
+        for source in oracle['files']:
+            expected=[r for r in oracle['rows'] if r['instance_id']==source['instance_id']]
+            expected.sort(key=lambda r:(r['event_epoch_us'],r['source_file_name'],r['end_position'],r['row_index'],r['event_id']),reverse=True)
+            for offset in range(0,len(expected),50):
+                query={'source':'binlog','instance':source['instance_id'],'startEpochUs':min(r['event_epoch_us'] for r in expected)-1,'endEpochUs':max(r['event_epoch_us'] for r in expected)+1,'limit':50,'offset':offset}
+                task_id=api(self.url+'/api/query-tasks',query)['data']['taskId'];tasks.append(task_id)
+                def finished():
+                    task=api(self.url+'/api/query-task?id='+task_id)['data']
+                    return task if task['status'] in ['succeeded','failed','cancelled'] else None
+                task=wait_for(finished,70,'fixture query '+task_id);write_json(self.root/('query-'+task_id+'.json'),task)
+                assert task['status']=='succeeded',task
+                result=task['result'];assert 'clickhouse-raw-oss' in result['tiers_used'],'fixture must exercise native serving, not a fallback'
+                rows=[project(r,expected[0]) for r in result['rows']]
+                assert rows==expected[offset:offset+50],'pagination/tied ordering differs from independent oracle'
+                pages.append(rows)
+        verify_rows([r for p in pages for r in p],oracle['rows'])
+        notes=[json.loads(l) for l in (self.root/'control/application.jsonl').read_text().splitlines()]
+        owned=[r for r in notes if r['kind']=='owned_query' and r['taskId'] in tasks]
+        assert set(tasks)=={r['taskId'] for r in owned},'task to native query ownership missing'
+        ids=sorted({r['queryId'] for r in owned})
+        import re
+        assert all(re.fullmatch('[a-zA-Z0-9_-]+',q) for q in ids)
+        sql_ids=','.join("'"+q+"'" for q in ids)
+        remaining=json.loads(self.ch('SELECT query_id FROM system.processes WHERE query_id IN ('+sql_ids+') FORMAT JSON'))['data'];assert not remaining
+        # CI-only isolated database. No production FLUSH or cancellation.
+        self.ch('SYSTEM FLUSH LOGS')
+        terminals=json.loads(self.ch("SELECT query_id,toString(type) AS type FROM system.query_log WHERE query_id IN ("+sql_ids+") AND type!='QueryStart' FORMAT JSON"))['data']
+        assert {r['query_id'] for r in terminals}==set(ids) and all(r['type']=='QueryFinish' for r in terminals),'native terminal state missing/failed'
+        return {'queryPages':pages,'ownedQueries':owned,'ownedQueriesRemaining':remaining,'nativeTerminals':terminals}
+    def verify_archive(self):
+        result=run(['docker','run','--rm','--network','none','--read-only','--memory','512m','--memory-swap','512m','-e','PYTHONPATH=/harness','-v',f'{TOOLS}:/harness/tools:ro','-v',f'{self.fixture}:/fixture:ro','-v',f'{self.root}/data:/data:ro','-v',f'{self.root}/edge:/edge:ro','-v',f'{self.root}/control:/control:ro',APP,'python','-m','tools.recovery_fixture33.archive_probe'],30)
+        return json.loads(result)
     def snapshot(self):
         result={}
         for role,name in self.names.items():
@@ -135,15 +179,19 @@ def exercise(root,fixture):
     for stage in ['raw_fsync','chunk_commit','parquet_commit','oss_upload_before_verify']:
         s=Stack(root,fixture,stage);proof={'stage':stage};results.append(proof)
         try:
-            proof['before']=s.boot();write_json(s.root/'before.json',proof['before'])
+            proof['before']=s.boot();write_json(s.root/'before.json',proof['before']);proof['syncPolicyBefore']=s.policy()
             (s.root/'control/release').touch()
             proof['boundary']=wait_for(lambda:json.loads((s.root/'control/fired.json').read_text()) if (s.root/'control/fired.json').exists() else None,90,'fault boundary '+stage)
             s.fault_ns=time.time_ns();started=time.monotonic()
             run(['sudo','--preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_WORKSPACE,GITHUB_RUN_ID','python3','-m','tools.recovery_fixture33.kill_stack',str(s.root),*s.names.values()],30)
             proof['fault']=json.loads((s.root/'fault-signals.json').read_text())
             proof['after']=wait_for(lambda:s.recovered(proof['before']),120,'automatic whole-stack recovery '+stage)
-            proof['recoverySeconds']=time.monotonic()-started;proof['files']=s.files()
-            # Further query/archive oracle validation is deliberately separate from process recovery.
+            proof['serviceRecoverySeconds']=time.monotonic()-started
+            proof['syncPolicyAfter']=s.policy();assert proof['syncPolicyBefore']==proof['syncPolicyAfter'],'sync policy changed'
+            proof.update(s.verify_archive());proof.update(s.verify_queries())
+            proof['recoverySeconds']=time.monotonic()-started;assert proof['recoverySeconds']<=120
+            proof['binlogOraclePassed']=True
+            # Idle slowlog/general-log fixture sources are not a loaded all-source verdict.
             print(json.dumps({'stage':stage,'recoverySeconds':proof['recoverySeconds'],'files':proof['files']}),flush=True)
         except BaseException as exc:proof['failure']=str(exc);raise
         finally:
