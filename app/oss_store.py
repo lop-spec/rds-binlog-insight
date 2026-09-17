@@ -117,7 +117,16 @@ class OssRangeReader(io.RawIOBase):
                     byte_range=(start, end),
                 )
                 try:
-                    payload = result.read()
+                    headers = getattr(result, "headers", {})
+                    content_length = headers.get("Content-Length") or headers.get("content-length")
+                    content_range = headers.get("Content-Range") or headers.get("content-range")
+                    if ((content_length is not None and int(content_length) != length)
+                            or (content_range and str(content_range).split("/", 1)[0] != f"bytes {start}-{end}")):
+                        raise OssArchiveError("OSS Range response headers do not match request",
+                                              "OSS_RANGE_VERIFY_FAILED")
+                    # The SDK supports read(amt). Never consume an unbounded
+                    # response body before discovering that Range was ignored.
+                    payload = result.read(length)
                     self.bytes_read += len(payload)
                 finally:
                     close = getattr(result, "close", None)
@@ -203,6 +212,11 @@ class OssRangeReader(io.RawIOBase):
     def close(self) -> None:
         getattr(self, "_range_cache", {}).clear()
         super().close()
+
+    @property
+    def reserved_bytes(self) -> int:
+        """Include failed/retried GETs when sharing a budget across objects."""
+        return self._requested_bytes
 
     def stats(self) -> dict[str, int]:
         return {
@@ -862,7 +876,11 @@ class OssArchive:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def open_part_reader(self, part: dict[str, Any]) -> OssRangeReader:
+    def open_part_reader(
+        self, part: dict[str, Any], *, max_bytes: int | None = None,
+        max_requests: int | None = None,
+        check_cancelled: Callable[[], None] | None = None,
+    ) -> OssRangeReader:
         key = str(part.get("oss_key") or "")
         if not key:
             raise OssArchiveError("分区缺少 OSS 对象键", "OSS_KEY_MISSING")
@@ -880,4 +898,7 @@ class OssArchive:
             logical_size,
             str(part.get("oss_etag") or ""),
             base_offset=offset,
+            max_bytes=max_bytes,
+            max_requests=max_requests,
+            check_cancelled=check_cancelled,
         )

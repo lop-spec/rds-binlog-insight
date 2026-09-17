@@ -1,0 +1,58 @@
+# Opt-in overlay, not a production switch. Preserve the deployed base/overrides.
+# Requires the EXISTING shared parent and a VERIFIED backing device, never defaults
+# to an unconstrained parent. Only insight + query-worker may be recreated.
+services:
+  insight:
+    environment:
+      RDS_BINLOG_INDEXED_QUERY_WORKER_URL: http://query-worker:8770
+      RDS_BINLOG_QUERY_TASK_WORKERS: "1"
+
+  query-worker:
+    image: local/rds-binlog-insight:1.28.37-rawoss
+    restart: unless-stopped
+    init: true
+    user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
+    command: [python, -m, app.indexed_query_worker]
+    environment:
+      RDS_BINLOG_DATA_DIR: /data
+      TMPDIR: /scratch
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      ARROW_NUM_THREADS: "1"
+    # No metadata/index/config DB, credentials, ports, collector or indexer.
+    volumes:
+      - ./data/events:/data/events:ro
+    read_only: true
+    tmpfs:
+      - /scratch:size=128m,mode=1777
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cgroup_parent: "${RDS_BINLOG_QUERY_CGROUP_PARENT:?set the existing shared service parent}"
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: "0.5"
+    pids_limit: 64
+    blkio_config:
+      weight: 10
+      device_read_bps:
+        - path: "${RDS_BINLOG_QUERY_IO_DEVICE:?set the verified backing device}"
+          rate: 8mb
+      device_write_bps:
+        - path: "${RDS_BINLOG_QUERY_IO_DEVICE:?set the verified backing device}"
+          rate: 4mb
+    logging:
+      driver: local
+      options:
+        mode: non-blocking
+        max-buffer-size: "1m"
+        max-size: "10m"
+        max-file: "2"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8770/healthz', timeout=2).read()"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    stop_grace_period: 10s

@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import duckdb
 import pyarrow as pa
@@ -105,7 +106,7 @@ class RangeBudgetTests(unittest.TestCase):
         def get_object(key, byte_range):
             self.calls.append((key, byte_range))
             a, b = byte_range
-            return SimpleNamespace(read=lambda: payload[a:b + 1], headers={'ETag': etag})
+            return SimpleNamespace(read=lambda size=None: payload[a:b + 1][:size], headers={'ETag': etag})
         return SimpleNamespace(get_object=get_object)
 
     def test_budget_stops_before_request_and_pack_ranges_stay_inside_member(self):
@@ -127,6 +128,18 @@ class RangeBudgetTests(unittest.TestCase):
                     reader.read()
                 self.assertEqual(reader.stats(), {'range_requests': 1, 'range_bytes': 4})
                 reader.close()
+
+    def test_ignored_range_is_rejected_before_reading_oversized_response(self):
+        for headers in ({'Content-Length': '1000000000'}, {'Content-Range': 'bytes 5-8/100'}):
+            response = SimpleNamespace(read=Mock(), close=Mock(), headers=headers)
+            bucket = SimpleNamespace(get_object=lambda *args, **kwargs: response)
+            with OssRangeReader(bucket, 'object', 4, max_bytes=4) as reader:
+                with self.assertRaises(OssArchiveError) as caught:
+                    reader.read()
+                self.assertEqual(caught.exception.code, 'OSS_RANGE_VERIFY_FAILED')
+                self.assertEqual(reader.reserved_bytes, 4)
+                response.read.assert_not_called()
+                response.close.assert_called_once()
 
     def test_transport_retry_cannot_bypass_byte_budget(self):
         calls = []

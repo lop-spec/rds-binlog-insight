@@ -39,7 +39,10 @@
   `object_sha256` 独立保存，冷压缩无需重建索引；旧 OSS pack 仅在所有引用
   都迁移并经过查询安全宽限期后删除。
 - 非 CK 检索路径按“本地搜索索引 → OSS Range → RDS 范围核对”执行。
-  启用 CK raw-OSS serving 时，主路由优先交给 CK，不会先走该关键词索引。
+  默认保留原有路由：启用 CK raw-OSS serving 时优先交给 CK。
+  显式配置 `RDS_BINLOG_INDEXED_QUERY_WORKER_URL` 后，普通 binlog/database/all
+  查询改为先用既有索引缩小候选，再由独立限额进程逐行组读取、去重和分页；
+  超预算或取消不回退主服务全扫。部署与边界见 [隔离式索引检索](docs/indexed-query.md)。
   SQLite
   FTS5 只保存 Row Group 级库表、完整词/标量值和 trigram 兼容关系，不保存
   事件正文；完整词/值优先走精确倒排，短词和标点查询走兼容慢路径。PyArrow

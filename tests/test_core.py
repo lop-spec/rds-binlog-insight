@@ -2027,7 +2027,7 @@ class OssTieringTests(unittest.TestCase):
                 self.calls.append((key, byte_range))
                 start, end = byte_range
                 return SimpleNamespace(
-                    read=lambda: payload[start : end + 1],
+                    read=lambda size=None: payload[start : end + 1][:size],
                     headers={"ETag": self.etag},
                 )
 
@@ -2066,7 +2066,7 @@ class OssTieringTests(unittest.TestCase):
                     raise RuntimeError("transient TLS connect failure")
                 start, end = byte_range
                 return SimpleNamespace(
-                    read=lambda: payload[start : end + 1],
+                    read=lambda size=None: payload[start : end + 1][:size],
                     headers={"ETag": '"retry-etag"'},
                 )
 
@@ -2327,7 +2327,7 @@ class OssTieringTests(unittest.TestCase):
                 def get_object(self, _key, byte_range):
                     start, end = byte_range
                     return SimpleNamespace(
-                        read=lambda: payload[start : end + 1],
+                        read=lambda size=None: payload[start : end + 1][:size],
                         headers={"ETag": '"range-etag"'},
                     )
 

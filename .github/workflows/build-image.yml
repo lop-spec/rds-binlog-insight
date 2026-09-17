@@ -156,6 +156,18 @@ jobs:
           cache-from: type=gha,scope=clickhouse
           cache-to: type=gha,scope=clickhouse,mode=max
 
+      - name: Verify indexed query isolation in a bounded Linux process tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --memory=1g --memory-swap=1g --cpus=0.5 --pids-limit=64 \
+            --read-only --tmpfs /tmp:rw,size=128m,mode=1777 \
+            -e OMP_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 -e ARROW_NUM_THREADS=1 \
+            --entrypoint sh --workdir /src --volume "$PWD:/src:ro" "$LOCAL_IMAGE" -ec '
+              python -c "from pathlib import Path; p=Path(\"/sys/fs/cgroup\"); assert int((p/\"memory.max\").read_text()) == 1073741824; assert int((p/\"memory.swap.max\").read_text()) == 0; q,t=map(int,(p/\"cpu.max\").read_text().split()); assert q/t <= 0.5; print(\"query process-tree limits verified\")"
+              python -m unittest tests.test_indexed_query_worker tests.test_indexed_parquet_contract -v
+            '
+
       - name: Run release regression suite
         shell: bash
         run: |

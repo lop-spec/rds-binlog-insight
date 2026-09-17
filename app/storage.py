@@ -1392,7 +1392,8 @@ class EventStorage:
         keyword = str(query.get("keyword") or "").strip()
         terms = [value.lower() for value in keyword.split() if value][:20]
         payload = {
-            "schema": 4,
+            # Literal substring semantics must not reuse LIKE-era probe rows.
+            "schema": 5,
             "start_epoch_us": effective_start,
             "end_epoch_us": effective_end,
             "source": str(query.get("source") or "").strip().lower(),
@@ -1435,9 +1436,8 @@ class EventStorage:
         keyword = str(query.get("keyword") or "").strip()
         terms = [value.lower() for value in keyword.split() if value][:20]
         payload = {
-            # schema 3：加入 instance 过滤维度，旧证书全部失效（否则带/不带
-            # 实例过滤的两个查询会命中同一份缓存结果）。
-            "schema": 4,
+            # Schema 5 invalidates certificates produced by LIKE wildcard semantics.
+            "schema": 5,
             "instance_id": str(instance_id or "").strip(),
             "instance": str(query.get("instance") or "").strip(),
             "start_epoch_us": int(start_us),
@@ -1655,9 +1655,10 @@ class EventStorage:
                     )
                 if mask is None or bool(pc.any(mask).as_py()):
                     selected.append(group_id)
-            except Exception:
-                # Predicate acceleration must never turn an unknown group into
-                # a false negative when an old Parquet schema is encountered.
+            except Exception as exc:
+                # Unknown predicates cannot eliminate a potentially matching group.
+                LOGGER.warning("Parquet structural probe failed; retaining group=%s reason=%s",
+                               group_id, type(exc).__name__)
                 selected.append(group_id)
         return selected, scanned
 
@@ -1826,6 +1827,7 @@ class EventStorage:
         *,
         locator: str,
         limit_cap: int,
+        deduplicate: bool = False,
     ) -> dict[str, Any]:
         limit = min(max(int(query.get("limit") or 100), 1), limit_cap)
         offset = min(max(int(query.get("offset") or 0), 0), 100_000)
@@ -1851,7 +1853,7 @@ class EventStorage:
         try:
             conn.register("candidate_events", table)
             cursor = conn.execute(
-                f"SELECT {columns} FROM candidate_events WHERE {where} "
+                f"SELECT {'DISTINCT ' if deduplicate else ''}{columns} FROM candidate_events WHERE {where} "
                 "ORDER BY event_epoch_us DESC, source_file_name DESC, "
                 "end_position DESC, row_index DESC, event_id DESC "
                 "LIMIT ? OFFSET ?",
@@ -3333,6 +3335,16 @@ class EventStorage:
         limit_cap: int = 1000,
         control: Any | None = None,
     ) -> dict[str, Any]:
+        worker_url = os.environ.get("RDS_BINLOG_INDEXED_QUERY_WORKER_URL", "").strip()
+        if not worker_url:
+            LOGGER.info("Indexed query worker disabled: URL not configured; retaining existing route")
+        if worker_url and (query.get("exact") or query.get("fingerprint")
+                           or str(query.get("source") or "").strip().lower() not in {"", "all", "database", "binlog"}):
+            LOGGER.info("Indexed worker route declined: specialized query retains existing backend")
+            worker_url = ""
+        if worker_url:
+            from .indexed_query_client import DeadlineControl
+            control = DeadlineControl(control)
         if control is not None:
             control.check_cancelled()
         limit = min(
@@ -3427,7 +3439,7 @@ class EventStorage:
                 latest_us=latest_us,
                 token=certificate_token,
             )
-        if self.clickhouse_backend is not None:
+        if self.clickhouse_backend is not None and not worker_url:
             hot_query = dict(query)
             hot_query["start_epoch_us"] = start_us
             hot_query["end_epoch_us"] = end_us
@@ -3694,6 +3706,57 @@ class EventStorage:
                 unknown_parts=len(index_plan["unknown_paths"]),
                 estimated_bytes=estimated_bytes,
             )
+        if worker_url:
+            from .indexed_query_client import execute
+            if unavailable_parts:
+                raise StorageError("候选源存在缺失正文，未返回不完整结果", "INDEXED_QUERY_SOURCE_INCOMPLETE")
+            # Only public OSS location/role settings cross this internal boundary.
+            # No DB handle, credentials, SQLite snapshot or mutable index is copied.
+            public_settings = {
+                name: getattr(settings, name) for name in (
+                    "retention_days", "db_instance_id", "oss_enabled", "oss_bucket",
+                    "oss_region_id", "oss_endpoint", "oss_prefix", "oss_auth_mode", "oss_role_name",
+                )
+            }
+            result = execute(worker_url, {
+                "settings": public_settings,
+                "query": {**query, "start_epoch_us": start_us, "end_epoch_us": end_us,
+                          "limit": limit, "offset": offset},
+                "work": [{
+                    "part": entry["part"],
+                    "row_groups": (None if entry["row_groups"] is None else sorted(entry["row_groups"])),
+                    "max_event_epoch_us": entry["max_event_epoch_us"],
+                    **({"cached_rows": positive_pages[str(entry["part"]["path"])]}
+                       if str(entry["part"]["path"]) in positive_pages else {}),
+                } for entry in work],
+            }, control)
+            control.check_cancelled()
+            current_token, _ = self.metadata.complete_query_certificate(
+                certificate_fingerprint, start_epoch_us=start_us, end_epoch_us=end_us, control=control,
+            )
+            if current_token != certificate_token:
+                raise StorageError("查询期间源身份或覆盖发生变化，结果未发布", "QUERY_SOURCE_CHANGED")
+            complete_rows = result.pop("complete_rows", None)
+            recorded = complete_rows is not None and self.metadata.record_complete_query_certificate(
+                certificate_fingerprint, start_epoch_us=start_us, end_epoch_us=end_us,
+                expected_token=certificate_token, rows=complete_rows,
+            )
+            control.check_cancelled()
+            return {
+                **result, "coverage_found": bool(parts), "unavailable_parts": 0,
+                "indexed_parts": len(index_plan.get("full_covered_paths", index_plan["covered_paths"])),
+                "structural_indexed_parts": len(index_plan.get("structural_covered_paths", set())),
+                "structural_prime_parts": 0, "index_unknown_parts": len(index_plan["unknown_paths"]),
+                "index_skipped_parts": int(index_plan["skipped_parts"]),
+                "index_coverage": len(index_plan["covered_paths"]) / len(parts) if parts else 1.0,
+                "catalog_skipped_parts": catalog_skipped_parts,
+                "negative_probe_skipped_parts": len(negative_paths),
+                "query_certificate_recorded": bool(recorded),
+                "query_certificate_part_count": certificate_token["part_count"],
+                "query_certificate_rows": len(complete_rows) if recorded else 0,
+                "range_start_epoch_us": start_us, "range_end_epoch_us": end_us,
+                "available_start_epoch_us": oldest_us, "available_end_epoch_us": latest_us,
+            }
         target = min(limit + offset + 1, 100_001)
         internal_query = dict(query)
         internal_query["start_epoch_us"] = start_us
