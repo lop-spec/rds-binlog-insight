@@ -49,17 +49,21 @@ def crc64_xz(raw):
 def read_query_events(raw):
     """Independent MySQL v4 Query-event reader; verifies each on-disk CRC32."""
     assert raw[:4]==b'\xfebin','binlog magic'
-    at=4;rows=[]
+    at=4;rows=[];commit_us=0
     while at<len(raw):
         timestamp,kind,server,size,end,flags=struct.unpack_from('<IBIIIH',raw,at)
         assert size>=23 and at+size<=len(raw),'truncated event'
         event=raw[at:at+size]
         assert zlib.crc32(event[:-4])==struct.unpack('<I',event[-4:])[0],'binlog event CRC32 mismatch'
+        if kind in {33,34}:
+            body=event[19:-4]
+            assert len(body)>=49 and body[25]==2,'fixture GTID logical timestamp missing'
+            commit_us=int.from_bytes(body[42:49],'little')&((1<<55)-1)
         if kind==2:
             body=event[19:-4];thread,elapsed,db_len,error,status_len=struct.unpack_from('<IIBHH',body)
             database=body[13+status_len:13+status_len+db_len].decode()
             sql=body[14+status_len+db_len:].decode()
-            rows.append({'start_position':at,'end_position':end,'server_id':server,'thread_id':thread,'header_seconds':timestamp,'database_name':database,'sql_text':sql})
+            rows.append({'start_position':at,'end_position':end,'server_id':server,'thread_id':thread,'header_seconds':timestamp,'commit_epoch_us':commit_us,'database_name':database,'sql_text':sql})
         at+=size
     assert at==len(raw)
     return rows
@@ -87,7 +91,7 @@ def prepare(root):
         raw=(fixture/'source.binlog').read_bytes();events=read_query_events(raw)
         inserts=[r for r in events if r['sql_text'] in set(statements)]
         assert [r['sql_text'] for r in inserts]==statements,'input SQL vs independent binary oracle mismatch'
-        begin=datetime.fromtimestamp(now-10,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ');end=datetime.fromtimestamp(now+10,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        begin=datetime.fromtimestamp(now-10,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ');end=datetime.fromtimestamp(time.time()+10,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         remote={'log_file_name':filename,'host_instance_id':'fixture-host','log_begin_utc':begin,'log_end_utc':end,'file_size':len(raw),'checksum_crc64':'','download_link':'http://fixture-edge:8080/source.binlog','intranet_download_link':'http://fixture-edge:8080/source.binlog','link_expired_utc':'2099-01-01T00:00:00Z','remote_status':'Completed'}
         # Independently implement the documented remote/file identity, using only fixture input.
         stable=hashlib.sha256('\x1f'.join([filename,begin,end,str(len(raw)),'fixture-host']).encode()).hexdigest()
@@ -100,7 +104,7 @@ def prepare(root):
         native_inserts=[r for r in parsed_rows if r.get('sql_text') in set(statements)]
         assert [r['sql_text'] for r in native_inserts]==statements,'native parser lost or changed fixture SQL'
         for actual,expected in zip(native_inserts,inserts,strict=True):
-            for key in ['start_position','end_position','server_id','database_name']:assert actual[key]==expected[key],(key,actual,expected)
+            for key in ['start_position','end_position','server_id','database_name','commit_epoch_us']:assert actual[key]==expected[key],(key,actual,expected)
         remote['checksum_crc64']=identity['crc64']
         write_json(fixture/'manifest.json',{'identity':{'engine':'mysql','engineVersion':'8.0'},'binlogs':[remote]})
         write_json(fixture/'independent-input.json',{'instance_id':INSTANCE,'file_id':identity['file_id'],'binlogSha256':hashlib.sha256(raw).hexdigest(),'queryEvents':events,'expectedInsertRows':inserts,'nativeCount':len(parsed_rows),'nativeSample':native_inserts[:2]})
@@ -111,9 +115,11 @@ def prepare(root):
 
 def main():
     require_ci();root=Path('recovery-evidence').resolve();root.mkdir()
-    proof={'scope':'fixture preparation only; NOT a full-stack recovery verdict','gate':{'fixturePrepared':False,'wholeStackRecovery':False},'drills':[]}
+    proof={'scope':'real fixture and process-recovery experiment; full verdict requires query/archive oracle','sourceSha':os.environ['GITHUB_SHA'],'gate':{'fixturePrepared':False,'processRecovery':False,'wholeStackRecovery':False},'drills':[]}
     try:
         proof['fixture']=prepare(root);proof['gate']['fixturePrepared']=True
+        from tools.recovery_fixture33.stack import exercise
+        proof['drills']=exercise(root,root/'fixture');proof['gate']['processRecovery']=True
     except Exception as exc:proof['failure']=str(exc);raise
     finally:write_json(root/'recovery-isolated33.json',proof)
 

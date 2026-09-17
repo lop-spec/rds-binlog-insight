@@ -1,0 +1,262 @@
+{
+  "sourceSha256": "f607424faf302eaabf975b91126a7b85f4b012b61526d3cdeb4be01c09fa3ae1",
+  "services": {
+    "insight": {
+      "imageId": "sha256:24c24d6cc7c3d6e84b62e1f94c27be08a3d80a5e77b37c7854c22b83ee0c9345",
+      "entrypoint": null,
+      "command": [
+        "python",
+        "-m",
+        "app.service_supervisor",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8769",
+        "--data-dir",
+        "/data"
+      ],
+      "memory": 6442450944,
+      "swap": 12884901888,
+      "nanoCpus": 2000000000,
+      "restart": {
+        "Name": "unless-stopped",
+        "MaximumRetryCount": 0
+      },
+      "init": null,
+      "readOnly": true,
+      "pidsLimit": 256,
+      "flags": {
+        "RDS_BINLOG_QUERY_TASK_WORKERS": "2",
+        "RDS_BINLOG_CLICKHOUSE_OSS_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED": "0",
+        "RDS_BINLOG_GLOG_POLL_SECONDS": "120",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS": "2",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS": "4",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED": "1",
+        "RDS_BINLOG_QUERY_SCAN_WORKERS": "4",
+        "RDS_BINLOG_CLICKHOUSE_HOT_HOURS": "27",
+        "RDS_BINLOG_CLICKHOUSE_ENABLED": "1",
+        "RDS_BINLOG_FILE_WORKERS": "2",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS": "1",
+        "RDS_BINLOG_TRANSFORM_WORKERS": "2",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_ENABLED": "1",
+        "RDS_BINLOG_GLOG_TRUNCATE_MIN_INTERVAL_SECONDS": "3600",
+        "RDS_BINLOG_CLICKHOUSE_SERVING_HOURS": "25",
+        "RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED": "1",
+        "RDS_BINLOG_PARSER_NO_PROGRESS_SECONDS": "300",
+        "RDS_BINLOG_GLOG_ENABLED": "1"
+      }
+    },
+    "raw-worker": {
+      "imageId": "sha256:bbcc064771156b104586fc25ccfa2eaf28f8a6b647452b9ccb9794a33b04b61e",
+      "entrypoint": null,
+      "command": [
+        "ionice",
+        "-c",
+        "3",
+        "nice",
+        "-n",
+        "15",
+        "python",
+        "-m",
+        "app.clickhouse_raw_worker",
+        "--data-dir",
+        "/data"
+      ],
+      "memory": 805306368,
+      "swap": 1610612736,
+      "nanoCpus": 300000000,
+      "restart": {
+        "Name": "unless-stopped",
+        "MaximumRetryCount": 0
+      },
+      "init": null,
+      "readOnly": true,
+      "pidsLimit": 64,
+      "flags": {
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_HEALTH_MAX_SECONDS": "1",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED": "1",
+        "RDS_BINLOG_GLOG_POLL_SECONDS": "120",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS": "4",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS": "2",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_IDLE_SECONDS": "2",
+        "RDS_BINLOG_CLICKHOUSE_ENABLED": "1",
+        "RDS_BINLOG_GLOG_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED": "0"
+      }
+    },
+    "indexer": {
+      "imageId": "sha256:bbcc064771156b104586fc25ccfa2eaf28f8a6b647452b9ccb9794a33b04b61e",
+      "entrypoint": null,
+      "command": [
+        "ionice",
+        "-c",
+        "3",
+        "nice",
+        "-n",
+        "10",
+        "python",
+        "-m",
+        "app.index_supervisor",
+        "--data-dir",
+        "/data"
+      ],
+      "memory": 2147483648,
+      "swap": 4294967296,
+      "nanoCpus": 400000000,
+      "restart": {
+        "Name": "unless-stopped",
+        "MaximumRetryCount": 0
+      },
+      "init": null,
+      "readOnly": true,
+      "pidsLimit": 96,
+      "flags": {
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS": "4",
+        "RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED": "0",
+        "RDS_BINLOG_SLOWLOG_WORKERS": "8",
+        "RDS_BINLOG_SELECT_EXPLAIN_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS": "1",
+        "RDS_BINLOG_INDEX_SOURCE_PRIORITY_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_OSS_ENABLED": "0",
+        "RDS_BINLOG_INDEX_NO_PROGRESS_SECONDS": "600",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_ENABLED": "1",
+        "RDS_BINLOG_GLOG_ENABLED": "1",
+        "RDS_BINLOG_GLOG_POLL_SECONDS": "120",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED": "1",
+        "RDS_BINLOG_INDEX_IDLE_SECONDS": "15",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS": "2",
+        "RDS_BINLOG_ANALYTICS_WORKERS": "2",
+        "RDS_BINLOG_SLOWLOG_INDEX_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED": "0"
+      }
+    },
+    "slowlog-ingester": {
+      "imageId": "sha256:bbcc064771156b104586fc25ccfa2eaf28f8a6b647452b9ccb9794a33b04b61e",
+      "entrypoint": null,
+      "command": [
+        "ionice",
+        "-c",
+        "3",
+        "nice",
+        "-n",
+        "15",
+        "python",
+        "-m",
+        "app.clickhouse_slowlog",
+        "--data-dir",
+        "/data"
+      ],
+      "memory": 805306368,
+      "swap": 1610612736,
+      "nanoCpus": 300000000,
+      "restart": {
+        "Name": "unless-stopped",
+        "MaximumRetryCount": 0
+      },
+      "init": null,
+      "readOnly": true,
+      "pidsLimit": 64,
+      "flags": {
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_RECONCILE_SECONDS": "30",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_SOURCE_STATUS_STALE_SECONDS": "30",
+        "RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED": "0",
+        "RDS_BINLOG_GLOG_POLL_SECONDS": "120",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_SOURCE_MAX_PENDING_AGE_SECONDS": "600",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS": "2",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_IDLE_SECONDS": "5",
+        "RDS_BINLOG_CLICKHOUSE_HEALTH_MAX_SECONDS": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS": "4",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS": "1",
+        "RDS_BINLOG_CLICKHOUSE_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_ENABLED": "0",
+        "RDS_BINLOG_GLOG_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED": "0"
+      }
+    },
+    "slowlog-worker": {
+      "imageId": "sha256:bbcc064771156b104586fc25ccfa2eaf28f8a6b647452b9ccb9794a33b04b61e",
+      "entrypoint": null,
+      "command": [
+        "ionice",
+        "-c",
+        "3",
+        "nice",
+        "-n",
+        "10",
+        "python",
+        "-m",
+        "app.slowlog_worker",
+        "--data-dir",
+        "/data",
+        "--idle-seconds",
+        "0.2"
+      ],
+      "memory": 1073741824,
+      "swap": 2147483648,
+      "nanoCpus": 300000000,
+      "restart": {
+        "Name": "unless-stopped",
+        "MaximumRetryCount": 0
+      },
+      "init": null,
+      "readOnly": true,
+      "pidsLimit": 64,
+      "flags": {
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_THREADS": "4",
+        "RDS_BINLOG_SLOWLOG_INDEX_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_WORKERS": "1",
+        "RDS_BINLOG_SLOWLOG_RECONCILE_SECONDS": "3600",
+        "RDS_BINLOG_GLOG_POLL_SECONDS": "120",
+        "RDS_BINLOG_CLICKHOUSE_OSS_BACKFILL_INSERT_THREADS": "2",
+        "RDS_BINLOG_CLICKHOUSE_SERVING_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_ENABLED": "1",
+        "RDS_BINLOG_CLICKHOUSE_OSS_SERVING_ENABLED": "0",
+        "RDS_BINLOG_GLOG_ENABLED": "1",
+        "RDS_BINLOG_SLOWLOG_WORKERS": "1",
+        "RDS_BINLOG_CLICKHOUSE_SLOWLOG_SERVING_ENABLED": "0",
+        "RDS_BINLOG_CLICKHOUSE_HEALTH_MAX_SECONDS": "1",
+        "RDS_BINLOG_CLICKHOUSE_RAW_OSS_SERVING_ENABLED": "0"
+      }
+    },
+    "clickhouse": {
+      "imageId": "sha256:6c70c2fd66a35022d27028f86562086d08e1371f31ec9c0c5d8562c41dcd2881",
+      "entrypoint": [
+        "sh",
+        "/opt/sql-insight/oss-entrypoint.sh"
+      ],
+      "command": null,
+      "memory": 3221225472,
+      "swap": 6442450944,
+      "nanoCpus": 1500000000,
+      "restart": {
+        "Name": "unless-stopped",
+        "MaximumRetryCount": 0
+      },
+      "init": null,
+      "readOnly": false,
+      "pidsLimit": 1024,
+      "flags": {
+        "RDS_BINLOG_CLICKHOUSE_OSS_ENABLED": "1"
+      }
+    }
+  }
+}

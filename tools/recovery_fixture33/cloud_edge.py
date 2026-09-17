@@ -1,0 +1,70 @@
+"""Isolated, persistent OSS HTTP(S) boundary. No production/cloud SDK credentials."""
+import hashlib,json,os,re,ssl,threading,time,uuid
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlsplit,unquote
+from tools.recovery_isolation33 import crc64_xz
+ROOT=Path('/edge');LOCK=threading.Lock()
+
+def journal(event,**values):
+    raw=(json.dumps({'event':event,'atNs':time.time_ns(),**values})+'\n').encode()
+    with LOCK:
+        with (ROOT/'journal.jsonl').open('ab') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+
+def atomic(path,raw):
+    tmp=path.with_name('.'+uuid.uuid4().hex);tmp.parent.mkdir(parents=True,exist_ok=True)
+    with tmp.open('xb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+    os.replace(tmp,path)
+    fd=os.open(path.parent,os.O_DIRECTORY)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version='HTTP/1.1'
+    def log_message(self,*args):pass
+    def path_info(self):
+        u=urlsplit(self.path);key=unquote(u.path).lstrip('/')
+        if any(x in {'.','..',''} for x in key.split('/')) and key:raise ValueError('invalid object path')
+        return key,u.query
+    def send(self,code,body=b'',headers=None,length=None):
+        self.send_response(code);self.send_header('Content-Length',str(len(body) if length is None else length));self.send_header('x-oss-request-id','fixture-'+uuid.uuid4().hex)
+        for k,v in (headers or {}).items():self.send_header(k,str(v))
+        self.end_headers()
+        if self.command!='HEAD':self.wfile.write(body)
+    def do_PUT(self):
+        key,query=self.path_info();size=int(self.headers.get('Content-Length','0'));assert 0<=size<=64*1024**2
+        body=self.rfile.read(size);assert len(body)==size
+        if query=='lifecycle':atomic(ROOT/'lifecycle.xml',body);self.send(200);return
+        assert key;sha=hashlib.sha256(body).hexdigest();crc=crc64_xz(body);etag='"'+hashlib.md5(body).hexdigest()+'"'
+        headers={k.lower():v for k,v in self.headers.items() if k.lower().startswith('x-oss-meta-')}
+        headers.update({'ETag':etag,'x-oss-hash-crc64ecma':str(crc),'Content-Type':'application/octet-stream'})
+        atomic(ROOT/'objects'/key,body);atomic(ROOT/'headers'/(key+'.json'),json.dumps(headers).encode())
+        journal('put_durable',key=key,sha256=sha,crc64=str(crc),bytes=size)
+        self.send(200,headers=headers)
+    def do_HEAD(self):self.do_GET()
+    def do_GET(self):
+        key,query=self.path_info()
+        if query=='lifecycle':
+            p=ROOT/'lifecycle.xml';self.send(200,p.read_bytes() if p.exists() else b'<LifecycleConfiguration/>',{'Content-Type':'application/xml'});return
+        if key=='healthz':self.send(200,b'OK');return
+        if key=='source.binlog':p=Path('/fixture/source.binlog');headers={'Content-Type':'application/octet-stream'}
+        else:
+            p=ROOT/'objects'/key;h=ROOT/'headers'/(key+'.json')
+            if not p.is_file() or not h.is_file():self.send(404,b'<Error><Code>NoSuchKey</Code><Message>fixture missing</Message></Error>');return
+            headers=json.loads(h.read_text())
+        body=p.read_bytes();total=len(body);code=200
+        if self.command=='HEAD':journal('head',key=key,bytes=total);self.send(200,headers=headers,length=total);return
+        r=self.headers.get('Range')
+        if r:
+            match=re.fullmatch(r'bytes=(\d*)-(\d*)',r);assert match and any(match.groups()),'invalid Range'
+            lo=int(match[1]) if match[1] else max(total-int(match[2]),0)
+            hi=min(int(match[2]),total-1) if match[1] and match[2] else total-1
+            if lo>=total:self.send(416,headers={'Content-Range':f'bytes */{total}'});return
+            body=body[lo:hi+1];headers['Content-Range']=f'bytes {lo}-{hi}/{total}';code=206
+        journal('get',key=key,bytes=len(body),range=r);self.send(code,body,headers)
+
+if __name__=='__main__':
+    guard=json.loads(Path('/fixture/guard.json').read_text());assert guard['scope']=='sql-insight-recovery-ci'
+    ROOT.mkdir(exist_ok=True);http=ThreadingHTTPServer(('0.0.0.0',8080),Handler);tls=ThreadingHTTPServer(('0.0.0.0',443),Handler)
+    context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain('/fixture/cert.pem','/fixture/key.pem');tls.socket=context.wrap_socket(tls.socket,server_side=True)
+    threading.Thread(target=http.serve_forever,daemon=True).start();tls.serve_forever()
