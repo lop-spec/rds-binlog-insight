@@ -11,6 +11,7 @@ from pathlib import Path
 from .mongo_collector import MongoCollector, load_instances, METRICS
 from .mongo_insight import analyze, MINUTE, canonical, digest, summarize_native_intervals
 from .mongo_store import MongoStore
+from .mongo_metrics import ANALYSIS_METRICS, lock_wait_points
 
 LOGGER=logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ class MongoService:
         cases=json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
         return dict(status='unavailable' if self.error else 'ok' if self.entries else 'not_configured',reason=self.error,
                     instances=[{'id':e['instanceId'],'label':e.get('label',e['instanceId'])} for e in self.entries],
-                    collectors=[c.status() for c in self.collectors],metrics=list(METRICS),replays=cases,
+                    collectors=[c.status() for c in self.collectors],metrics=list(ANALYSIS_METRICS),replays=cases,
                     scopes={'slowlog':'collected_records','native':'node_command_counters','client':'connected_services_only'})
 
     def shutdown(self):
@@ -57,7 +58,7 @@ class MongoService:
         if role not in ('','Primary','Secondary','Unknown'):raise ValueError('invalid_role')
         if kind not in ('command','suboperation',''):raise ValueError('invalid_record_kind')
         metric=get('metric','CPUUtilization')
-        if metric not in METRICS:raise ValueError('unsupported_mongo_metric')
+        if metric not in (*METRICS, 'LockWaits'):raise ValueError('unsupported_mongo_metric')
         store=self.stores[instance];width=store.width(start,end)
         rows,coverage=store.read(instance,start,end,role=role,kind=kind,command=command,namespace=namespace,width=width)
         before,baseline=store.read(instance,base,base_end,role=role,kind=kind,command=command,namespace=namespace,width=width)
@@ -67,13 +68,14 @@ class MongoService:
             except Exception as exc:
                 optional[name]=type(exc).__name__+':'+str(exc)[:100]
                 LOGGER.warning('mongo_query %s unavailable: %s',name,optional[name]);return []
-        points=read_optional('metrics',lambda:store.read_telemetry(instance,'metrics',start,end,metric=metric))
         native=read_optional('native',lambda:store.read_telemetry(instance,'native',start,end,compact=True))
+        points=(lock_wait_points(native,start,end) if metric=='LockWaits' else
+                read_optional('metrics',lambda:store.read_telemetry(instance,'metrics',start,end,metric=metric)))
         native_before=read_optional('native_baseline',lambda:store.read_telemetry(instance,'native',base,base_end,compact=True))
         latest=read_optional('native_latest',lambda:store.latest_native(instance,end))
         clients=read_optional('client',lambda:store.read_telemetry(instance,'client',start,end))
         result=analyze(rows,before,points,start,end,coverage=coverage['complete'],baseline_coverage=baseline['complete'],
-                       metric=metric,order=get('order','duration_growth'),limit=int(get('limit','50')),bucket_width=width)
+                       metric=metric,order=get('order','correlation'),limit=int(get('limit','50')),bucket_width=width)
         counter_groups,counter_gaps=summarize_native_intervals(native,start,end,role)
         baseline_groups,baseline_gaps=summarize_native_intervals(native_before,base,base_end,role)
         for key,row in counter_groups.items():

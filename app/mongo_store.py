@@ -257,7 +257,7 @@ class MongoStore:
 
     def read_telemetry(self, instance, kind, start, end, *, metric='', compact=False):
         if self.backend=='clickhouse':
-            select="concat('{\"interval\":', JSONExtractRaw(src.payload,'interval'), ',\"timestamp\":', toString(src.timestamp), ',\"node\":', toJSONString(src.node), ',\"role\":', toJSONString(src.role), '}') AS payload" if compact else 'src.payload AS payload'
+            select="concat('{\"interval\":', JSONExtractRaw(src.payload,'interval'), ',\"timestamp\":', toString(src.timestamp), ',\"node\":', toJSONString(src.node), ',\"role\":', toJSONString(src.role), ',\"global_lock\":', if(empty(JSONExtractRaw(src.payload,'global_lock')), 'null', JSONExtractRaw(src.payload,'global_lock')), '}') AS payload" if compact else 'src.payload AS payload'
             predicate=" AND JSONExtractString(payload,'metric')={metric:String}" if metric else ''
             rows=self.client.json_rows('SELECT '+select+' FROM (SELECT * FROM '+self.table('telemetry')+
                 ' FINAL WHERE instance={instance:String} AND kind={kind:String} AND timestamp >= {start:Int64} AND timestamp <= {end:Int64}'+predicate+') AS src LIMIT 100001',

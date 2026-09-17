@@ -286,4 +286,118 @@ class MongoGates(unittest.TestCase):
             self.assertFalse(store.read('dds-example',t,t+600_000_000)[1]['complete'])
 
 
+class CorrelationRankingGates(unittest.TestCase):
+    def signals(self):
+        from app.mongo_insight import rollup_events
+        patterns={'rising':[1,2,3,4,5,6,7,8,9,10], 'falling':[10,9,8,7,6,5,4,3,2,1], 'constant':[20]*10}
+        events=[]
+        for name, values in patterns.items():
+            for i,value in enumerate(values):
+                event=normalize_record(record(ns='demo.'+name,ms=value*10),'dds-example',[])
+                event['start_us']=T+i*MINUTE;event['finish_us']=event['start_us']+event['duration_us']
+                events.append(event)
+        return rollup_events(events)
+
+    def query(self, metric='CPUUtilization', values=range(1,11), **changes):
+        points=[dict(timestamp=(T+(i+1)*MINUTE)//1000,role='Primary',metric=metric,value=v) for i,v in enumerate(values)]
+        args=dict(coverage=True,baseline_coverage=False,metric=metric,order='correlation')
+        args.update(changes)
+        return analyze(self.signals(),[],points,T,T+10*MINUTE,**args)
+
+    def test_all_five_metrics_rank_by_signed_correlation_not_cost_or_growth(self):
+        from app.mongo_metrics import ANALYSIS_METRICS
+        self.assertEqual(len(ANALYSIS_METRICS),5)
+        for metric in ANALYSIS_METRICS:
+            with self.subTest(metric=metric):
+                result=self.query(metric)
+                self.assertEqual(result['order'],'correlation');self.assertEqual(result['order_reason'],'')
+                self.assertEqual([r['namespace'] for r in result['statements']],['demo.rising','demo.falling','demo.constant'])
+                self.assertAlmostEqual(result['statements'][0]['evidence']['pearson'],1)
+                self.assertAlmostEqual(result['statements'][1]['evidence']['pearson'],-1)
+                self.assertIsNone(result['statements'][2]['evidence']['pearson'])
+                self.assertEqual(result['ranking']['ranked_groups'],2)
+                self.assertEqual(result['ranking']['unranked_groups'],1)
+                self.assertTrue(result['ranking']['available'])
+
+    def test_changing_metric_signal_reverses_ranking(self):
+        result=self.query('AvgRt',list(range(10,0,-1)))
+        self.assertEqual(result['statements'][0]['namespace'],'demo.falling')
+
+    def test_missing_source_points_constant_series_or_coarse_grain_never_fall_back(self):
+        for args in [dict(coverage=False),dict(values=[1,2]),dict(values=[1]*10),dict(bucket_width=5*MINUTE)]:
+            with self.subTest(args=args):
+                result=self.query(**args)
+                self.assertEqual(result['order'],'correlation');self.assertEqual(result['requested_order'],'correlation')
+                self.assertFalse(result['ranking']['available']);self.assertTrue(result['order_reason'])
+                self.assertTrue(all(r['evidence']['pearson'] is None for r in result['statements']))
+
+    def test_complete_baseline_does_not_change_current_ranking(self):
+        a=self.query();b=self.query(baseline_coverage=True)
+        self.assertEqual([r['group_id'] for r in a['statements']],[r['group_id'] for r in b['statements']])
+
+    def test_zero_slow_records_has_an_explicit_unavailable_result(self):
+        r=analyze([],[],[],T,T+10*MINUTE,coverage=True,baseline_coverage=True,order='correlation')
+        self.assertEqual(r['ranking']['reason'],'no_slow_records')
+        self.assertEqual(r['order'],'correlation')
+
+
+class LockWaitGates(unittest.TestCase):
+    def sample(self, minute=1, node='n1', role='Primary', **queue):
+        return dict(timestamp=(T+minute*MINUTE)//1000,node=node,role=role,global_lock={'currentQueue':queue})
+
+    def points(self, samples):
+        from app.mongo_metrics import lock_wait_points
+        return lock_wait_points(samples,T,T+10*MINUTE)
+
+    def test_native_queue_total_and_explicit_zero_are_preserved(self):
+        values=self.points([self.sample(total=3),self.sample(2,total=0)])
+        self.assertEqual([p['value'] for p in values],[3,0])
+        self.assertTrue(all(p['metric']=='LockWaits' and p['unit']=='queued_operations' for p in values))
+
+    def test_complete_readers_writers_sum_is_not_concurrency_or_write_concern(self):
+        sample=self.sample(readers=2,writers=4)
+        sample.update(ConcurrentReads=999,waitForWriteConcernDuration=888)
+        self.assertEqual(self.points([sample])[0]['value'],6)
+        self.assertEqual(self.points([self.sample(readers=2)]),[])
+
+    def test_missing_snapshot_is_not_filled_and_role_is_preserved(self):
+        values=self.points([self.sample(1,total=2),self.sample(3,role='Secondary',total=4)])
+        self.assertEqual([p['timestamp'] for p in values],[(T+MINUTE)//1000,(T+3*MINUTE)//1000])
+        self.assertEqual([p['role'] for p in values],['Primary','Secondary'])
+
+    def test_distinct_nodes_or_conflicting_same_time_samples_are_not_averaged(self):
+        self.assertEqual(self.points([self.sample(total=2),self.sample(node='n2',total=4)]),[])
+        self.assertEqual(self.points([self.sample(total=2),self.sample(total=4)]),[])
+
+    def test_latest_snapshot_not_an_old_good_value_represents_the_minute(self):
+        old=self.sample(total=1);old['timestamp']-=30000
+        new=self.sample(total=4)
+        self.assertEqual(self.points([new,old])[0]['value'],4)
+        new['global_lock']={}
+        self.assertEqual(self.points([old,new]),[])
+
+    def test_missing_invalid_and_negative_fields_never_become_zero(self):
+        for value in [None,-1,float('nan'),True,'2',1.2]:
+            with self.subTest(value=value):self.assertEqual(self.points([self.sample(total=value)]),[])
+
+    def test_malformed_queue_or_inconsistent_totals_are_logged_as_gaps(self):
+        for lock in ['bad',[],{'currentQueue':[]},{'currentQueue':{'readers':'bad','writers':2}},
+                     {'currentQueue':{'total':4,'readers':1,'writers':1}}]:
+            sample=self.sample();sample['global_lock']=lock
+            with self.subTest(lock=lock),self.assertLogs('app.mongo_metrics',level='WARNING'):
+                self.assertEqual(self.points([sample]),[])
+
+    def test_service_uses_compact_native_without_requesting_a_fake_cloud_metric(self):
+        from app.mongo_service import MongoService
+        from unittest.mock import Mock
+        service=MongoService.__new__(MongoService);service.collectors=[]
+        store=Mock();store.width.return_value=MINUTE;store.read.return_value=([],{'complete':True})
+        store.read_telemetry.side_effect=lambda instance,kind,start,end,**kw:[self.sample(total=3)] if kind=='native' and start==T else []
+        store.latest_native.return_value=[];service.stores={'dds-example':store}
+        result=service.query(dict(instance='dds-example',startEpochUs=T,endEpochUs=T+10*MINUTE,baselineStart=T-10*MINUTE,metric='LockWaits'))
+        self.assertEqual(result['order'],'correlation');self.assertEqual(result['metric_points'][0]['value'],3)
+        self.assertTrue(all(call.args[1]!='metrics' for call in store.read_telemetry.call_args_list))
+        self.assertTrue(all(call.kwargs.get('compact') is True for call in store.read_telemetry.call_args_list if call.args[1]=='native'))
+
+
 if __name__=='__main__': unittest.main()

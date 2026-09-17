@@ -395,6 +395,9 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
     if order_reason:
         LOGGER.warning('mongo_analysis ordering changed: requested=%s effective=%s reason=%s',requested_order,order,order_reason)
     def score(row):
+        if order=='correlation':
+            value = row['evidence']['pearson']
+            return value if value is not None else -2
         if order=='count_growth': return row['count_delta'] if row['count_delta'] is not None else -1
         if order=='count': return row['count']
         if order=='max_latency': return row['max_us']
@@ -407,6 +410,16 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         return v if v is not None else -1
     statements.sort(key=lambda row:(-score(row),row['role'],row['group_id']))
     unavailable=Counter(row['evidence']['metric_status'] for row in statements if row['evidence']['metric_status']!='ok')
+    ranked = sum(r['evidence']['pearson'] is not None for r in statements)
+    ranking_reason = ('' if ranked else 'incomplete_source' if not coverage else
+                      'no_slow_records' if not statements else next(iter(unavailable))
+                      if len(unavailable)==1 else 'correlation_unavailable')
+    ranking = dict(method='pearson',direction='descending',applied=order=='correlation',available=ranked>0,
+                   ranked_groups=ranked,unranked_groups=len(statements)-ranked,reason=ranking_reason,
+                   unavailable_reasons=dict(unavailable),series='slow_command_runtime_us_per_minute',metric=metric)
+    if order=='correlation' and ranking_reason:
+        order_reason=ranking_reason
+        LOGGER.warning('mongo_correlation ranking unavailable: metric=%s reason=%s; no alternate ordering',metric,ranking_reason)
     if unavailable:
         LOGGER.warning('mongo_resource_correlation unavailable: %s',dict(unavailable))
     status = 'ok' if coverage and baseline_coverage else 'incomplete_source' if not coverage else 'incomplete_baseline'
@@ -415,6 +428,6 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
     return dict(engine='mongodb',status=status,statements=statements[:max(1,min(limit,200))],
                 outliers=sorted(statements,key=lambda row:(-row['max_us'],row['group_id']))[:3],
                 total_groups=len(statements),totals=totals,order=order,requested_order=requested_order,order_reason=order_reason,
-                metric=metric,start_us=start,end_us=end,
+                ranking=ranking,metric=metric,start_us=start,end_us=end,
                 bucket_width=bucket_width,warning='慢记录不是全部执行；相关与重合不是因果。父子操作分层统计。',
                 command_count_scope='serverStatus_node_native_counts',client_count_scope='not_connected')

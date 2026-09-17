@@ -37,7 +37,7 @@ test('missing baseline does not hide measured costs or imply no growth',()=>{
  const cost=vm.runInContext('mongoCost({observed:527430000,known:931,total:931,delta:null},1e6,"s")',c);
  assert.match(cost,/527\.43 s/);assert.doesNotMatch(cost,/不可比较|未完整/);
  assert.match(vm.runInContext('mongoCost({observed:2000,known:50,total:931,delta:null})',c),/50\/931/);
- assert.equal(vm.runInContext('mongoCost({observed:null,known:0,total:931})',c),'未上报');
+ assert.equal(vm.runInContext('mongoCost({observed:null,known:0,total:931})',c),'—');
  assert.match(vm.runInContext('mongoAssessment({assessment:"incomplete_baseline"})',c),/不判断增长/);
  assert.doesNotMatch(source,/证据不足 \/ 无成本增长/);
  assert.match(source,/data\.order_reason/);assert.match(source,/missing_ranges/);
@@ -120,6 +120,45 @@ test('source switching suppresses late Mongo errors',async()=>{
 });
 test('database-scoped statements, outliers and details are labeled without a fabricated collection',()=>{
  assert.equal((source.match(/x\.scope==='database'\?' · 库级命令':''/g)||[]).length,3);
+});
+test('workspace offers exactly the five requested metrics and no independent sort selector',()=>{
+ const c=context();vm.runInContext(source,c);
+ assert.deepEqual(Array.from(vm.runInContext('Object.keys(MONGO_METRICS)',c)),['CPUUtilization','IOPSUtilization','ScannedDocs','LockWaits','AvgRt']);
+ assert.doesNotMatch(fs.readFileSync('web/index.html','utf8'),/id="mongo-order"/);
+ assert.doesNotMatch(source,/\$\('#mongo-order'\)/);
+});
+test('every metric requests correlation regardless of an old saved sort value',async()=>{
+ for(const metric of ['CPUUtilization','IOPSUtilization','ScannedDocs','LockWaits','AvgRt']) {
+  const {calls,run}=requestContext({'#mongo-metric':metric,'#mongo-order':'cpu_growth'});await run();
+  const q=new URL(calls[0],'http://fixture').searchParams;assert.equal(q.get('metric'),metric);assert.equal(q.get('order'),'correlation');
+ }
+});
+test('switching metrics invalidates displayed and in-flight results',async()=>{
+ const {c,nodes,run}=requestContext();let resolve;c.api=()=>new Promise(r=>{resolve=r;});const old=run();
+ c.$('#analytics-panel-sql').innerHTML='old CPU result';c.$('#mongo-metric').value='AvgRt';vm.runInContext('mongoMetricChanged()',c);
+ resolve({});await old;
+ assert.equal(nodes['#analytics-panel-sql'].innerHTML,'');assert.match(nodes['#analytics-meta'].textContent,/平均响应/);
+ assert.equal(vm.runInContext('mongoResult',c),null);
+});
+test('automatic ranking page distinguishes unavailable correlation without changing order',()=>{
+ const c=context(),nodes={};c.$=s=>nodes[s]??={value:s==='#mongo-role'?'Primary':''};
+ c.analyticsTable=(headers,rows)=>headers.join('|')+rows.map(r=>r.join('|')).join('\n');
+ c.detailBlock=(a,b)=>a+b;c.switchAnalyticsTab=()=>{};vm.runInContext(source,c);
+ c.data={order:'correlation',metric:'LockWaits',total_groups:0,coverage:{complete:true},baseline_coverage:{complete:false},ranking:{available:true}};
+ vm.runInContext('renderMongoAnalytics(data)',c);
+ assert.match(nodes['#analytics-meta'].textContent,/锁等待.*相关度从高到低/);
+ assert.match(nodes['#analytics-panel-sql'].innerHTML,/不受对照窗口缺口影响/);
+ assert.doesNotMatch(nodes['#analytics-panel-sql'].innerHTML,/已明确改按|增量榜/);
+ c.data.ranking={available:false,reason:'metric_gaps'};vm.runInContext('renderMongoAnalytics(data)',c);
+ assert.match(nodes['#analytics-panel-sql'].innerHTML,/相关度暂不可计算/);
+ assert.match(nodes['#analytics-panel-sql'].innerHTML,/不改按耗时或次数排序/);
+ assert.match(nodes['#analytics-meta'].textContent,/暂无可计算结果/);
+});
+test('correlation renders signed real coefficients and missing is not zero',()=>{
+ const c=context();vm.runInContext(source,c);
+ assert.match(vm.runInContext('mongoCorrelation({evidence:{pearson:-0.8}})',c),/r -0.8.*负相关/);
+ const missing=vm.runInContext('mongoCorrelation({evidence:{pearson:null,metric_status:"metric_gaps"}})',c);
+ assert.match(missing,/暂不可计算/);assert.doesNotMatch(missing,/r 0/);
 });
 test('no causal claim or fabricated full collection counts',()=>{
  assert.match(source,/相关与|因果/);assert.match(source,/尚无应用命令聚合接入/);
