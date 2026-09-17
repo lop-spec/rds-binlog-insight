@@ -74,8 +74,13 @@ def main():
         with tempfile.TemporaryDirectory(prefix='thp-isolation-') as tmp:
             c=Path(tmp)/'thp-exec.c';exe=Path(tmp)/'thp-exec';c.write_text(WRAPPER)
             memory.run(['cc','-static','-O2','-o',str(exe),str(c)],30)
+            executable=exe.read_bytes();executable_sha=hashlib.sha256(executable).hexdigest()
             os.environ['THP_ISOLATION_EXEC']=str(exe)
             memory.main()
+            assert exe.read_bytes()==executable,'tested helper changed'
+            root=Path('memory-evidence');(root/'thp-exec').write_bytes(executable)
+            (root/'thp-exec.c').write_text(WRAPPER)
+            (root/'thp-exec.sha256').write_text(executable_sha+'  thp-exec\n')
     except Exception as exc:
         failure=str(exc);raise
     finally:
@@ -85,6 +90,7 @@ def main():
         (root/'thp-mechanism33.json.sha256').write_text(hashlib.sha256(raw).hexdigest()+'  thp-mechanism33.json\n')
         p=root/'memory-isolated33.json';evidence=json.loads(p.read_text()) if p.exists() else {'gate':{}}
         evidence['thpMechanismSha256']=hashlib.sha256(raw).hexdigest();evidence['gate']['thpMechanismReproduced']=detail['gate'] and not failure
+        if (root/'thp-exec').exists():evidence['testedThpExecSha256']=hashlib.sha256((root/'thp-exec').read_bytes()).hexdigest()
         raw=json.dumps(evidence,indent=2).encode();p.write_bytes(raw);(root/'memory-isolated33.json.sha256').write_text(hashlib.sha256(raw).hexdigest()+'  memory-isolated33.json\n')
 
 if __name__=='__main__':
