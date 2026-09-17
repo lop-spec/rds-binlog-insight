@@ -46,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Recovery fixture contract tests
-        run: python -m unittest tests.test_recovery_isolation33 tests.test_recovery_cloud_edge tests.test_recovery_archive_probe -v
+        run: python -m unittest tests.test_recovery_isolation33 tests.test_recovery_cloud_edge tests.test_recovery_archive_probe tests.test_recovery_bootstrap -v
       - name: Prepare isolated native binlog and independent input oracle
         run: python -u -m tools.recovery_isolation33
       - name: Make stopped fixture evidence readable

@@ -4,7 +4,7 @@ from datetime import datetime,timezone
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit,unquote,parse_qs
-from xml.etree.ElementTree import Element,SubElement,tostring
+from xml.etree.ElementTree import Element,SubElement,tostring,fromstring
 from tools.recovery_isolation33 import crc64_xz
 ROOT=Path('/edge');LOCK=threading.Lock()
 
@@ -17,9 +17,20 @@ def atomic(path,raw):
     tmp=path.with_name('.'+uuid.uuid4().hex);tmp.parent.mkdir(parents=True,exist_ok=True)
     with tmp.open('xb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
     os.replace(tmp,path)
-    fd=os.open(path.parent,os.O_DIRECTORY)
+    sync_directory(path.parent)
+
+def sync_directory(path):
+    fd=os.open(path,os.O_DIRECTORY)
     try:os.fsync(fd)
     finally:os.close(fd)
+
+def delete_object(key):
+    assert key and all(x not in {'.','..',''} for x in key.split('/')),'invalid delete key'
+    assert '\\' not in key and not key.startswith('/')
+    existed=False
+    for path in [ROOT/'objects'/key,ROOT/'headers'/(key+'.json')]:
+        if path.exists():path.unlink();sync_directory(path.parent);existed=True
+    journal('delete_durable',key=key,existed=existed)
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version='HTTP/1.1'
@@ -46,6 +57,20 @@ class Handler(BaseHTTPRequestHandler):
         atomic(ROOT/'objects'/key,body);atomic(ROOT/'headers'/(key+'.json'),json.dumps(headers).encode())
         journal('put_durable',key=key,sha256=sha,crc64=str(crc),bytes=size)
         self.send(200,headers=headers)
+    def do_DELETE(self):
+        key,query=self.path_info();assert not query
+        delete_object(key);self.send(204)
+    def do_POST(self):
+        key,query=self.path_info()
+        if query!='delete':self.send(501,b'unsupported fixture POST');return
+        size=int(self.headers.get('Content-Length','0'));assert 0<size<=1024**2
+        raw=self.rfile.read(size);assert len(raw)==size
+        request=fromstring(raw);objects=request.findall('{*}Object');assert 0<len(objects)<=1000
+        result=Element('DeleteResult',xmlns='http://s3.amazonaws.com/doc/2006-03-01/')
+        for item in objects:
+            name=item.findtext('{*}Key');delete_object(name)
+            if request.findtext('{*}Quiet')!='true':SubElement(SubElement(result,'Deleted'),'Key').text=name
+        self.send(200,tostring(result),{'Content-Type':'application/xml'})
     def do_HEAD(self):self.do_GET()
     def do_GET(self):
         key,query=self.path_info()

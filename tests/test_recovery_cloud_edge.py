@@ -10,7 +10,7 @@ class CloudEdgeTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name)
         def atomic(path,raw):path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(raw)
-        self.patches=[patch.object(edge,'ROOT',self.root),patch.object(edge,'atomic',atomic)]
+        self.patches=[patch.object(edge,'ROOT',self.root),patch.object(edge,'atomic',atomic),patch.object(edge,'sync_directory',lambda path:None)]
         for p in self.patches:p.start()
         self.server=edge.ThreadingHTTPServer(('127.0.0.1',0),edge.Handler)
         self.thread=threading.Thread(target=self.server.serve_forever,daemon=True);self.thread.start()
@@ -27,6 +27,17 @@ class CloudEdgeTests(unittest.TestCase):
         code,h,body=self.request('/a',headers={'Range':'bytes=2-5'});self.assertEqual((code,body),(206,b'3456'));self.assertEqual(h['Content-Range'],'bytes 2-5/9')
         with self.assertRaises(urllib.error.HTTPError) as caught:self.request('/a','PUT',b'wrong',{'x-oss-forbid-overwrite':'true'})
         self.assertEqual(caught.exception.code,409);caught.exception.close();self.assertEqual(self.request('/a')[2],data)
+    def test_storage_probe_delete_and_bulk_delete_are_idempotent(self):
+        self.request('/probe','PUT',b'test');self.assertEqual(self.request('/probe','DELETE')[0],204)
+        self.assertEqual(self.request('/probe','DELETE')[0],204)
+        self.assertFalse((self.root/'objects/probe').exists());self.assertFalse((self.root/'headers/probe.json').exists())
+        for key in ['bulk/a','bulk/b']:self.request('/'+key,'PUT',b'part')
+        body=b'<Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Object><Key>bulk/a</Key></Object><Object><Key>bulk/b</Key></Object></Delete>'
+        code,_,raw=self.request('/?delete','POST',body);self.assertEqual(code,200)
+        self.assertEqual([x.text for x in fromstring(raw).findall('{*}Deleted/{*}Key')],['bulk/a','bulk/b'])
+        self.assertEqual(list((self.root/'objects/bulk').iterdir()),[])
+        notes=[json.loads(line) for line in (self.root/'journal.jsonl').read_text().splitlines()]
+        self.assertEqual(len([r for r in notes if r['event']=='delete_durable']),4)
     def test_lifecycle_and_list_pagination(self):
         xml=b'<LifecycleConfiguration><Rule><ID>fixture</ID></Rule></LifecycleConfiguration>'
         self.request('/?lifecycle','PUT',xml);self.assertEqual(self.request('/?lifecycle')[2],xml)
