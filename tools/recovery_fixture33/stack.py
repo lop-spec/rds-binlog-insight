@@ -7,7 +7,7 @@ SPEC=json.loads((Path(__file__).parent/'runtime.json').read_text())['services']
 STATUS={'indexer':'index/index-worker-status.json','slowlog-worker':'index/slowlog-worker-status.json','slowlog-ingester':'logs/clickhouse-slowlog-worker-status.json','raw-worker':'logs/clickhouse-raw-oss-worker-status.json'}
 
 def api(url,payload=None):
-    request=urllib.request.Request(url,data=json.dumps(payload).encode() if payload is not None else None,headers={'Content-Type':'application/json'})
+    request=urllib.request.Request(url,data=json.dumps(payload).encode() if payload is not None else None,headers={'Content-Type':'application/json','Host':'localhost:8769'})
     with urllib.request.urlopen(request,timeout=3) as r:return json.load(r)
 
 def wait_for(check,seconds,label):
@@ -168,7 +168,8 @@ class Stack:
             value=json.loads(f.read_text())
             if value.get('lastError') or value.get('state') in ['error','failed','starting']:return None
         files=self.files()
-        if not files or not all(f['state']=='done' for f in files):return None
+        expected_ids={f['id'] for f in json.loads((self.fixture/'oracle.json').read_text())['files']}
+        if not expected_ids.issubset({f['id'] for f in files}) or not all(f['state']=='done' for f in files):return None
         for value in current.values():value['healthy']=True
         return current
     def close(self):
@@ -200,8 +201,9 @@ def exercise(root,fixture,results=None):
             proof['before']=s.boot();write_json(s.root/'before.json',proof['before']);proof['syncPolicyBefore']=s.policy()
             (s.root/'control/release').touch()
             proof['boundary']=wait_for(lambda:json.loads((s.root/'control/fired.json').read_text()) if (s.root/'control/fired.json').exists() else None,90,'fault boundary '+stage)
-            s.fault_ns=time.time_ns();started=time.monotonic()
+            started=time.monotonic()
             run(['sudo','--preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_WORKSPACE,GITHUB_RUN_ID','python3','-m','tools.recovery_fixture33.kill_stack',str(s.root),*s.names.values()],30)
+            s.fault_ns=time.time_ns()
             proof['fault']=json.loads((s.root/'fault-signals.json').read_text())
             proof['after']=wait_for(lambda:s.recovered(proof['before']),120,'automatic whole-stack recovery '+stage)
             proof['serviceRecoverySeconds']=time.monotonic()-started

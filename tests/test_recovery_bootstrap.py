@@ -1,11 +1,31 @@
-import subprocess
+import io,json,subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from tools.recovery_fixture33.stack import Stack
+from tools.recovery_fixture33.stack import Stack,STATUS,api
 
 class BootstrapEvidenceTests(unittest.TestCase):
+    def test_bridge_request_keeps_existing_local_virtual_host(self):
+        with patch('tools.recovery_fixture33.stack.urllib.request.urlopen',return_value=io.BytesIO(b'{}')) as fetch:
+            self.assertEqual(api('http://172.19.0.3:8769/healthz'),{})
+            request=fetch.call_args.args[0];self.assertEqual(request.get_header('Host'),'localhost:8769')
+            self.assertEqual(request.full_url,'http://172.19.0.3:8769/healthz')
+    def test_recovery_waits_for_every_oracle_source_and_fresh_heartbeats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stack=Stack.__new__(Stack);stack.root=Path(directory);stack.fixture=stack.root/'fixture';stack.fixture.mkdir()
+            (stack.fixture/'oracle.json').write_text(json.dumps({'files':[{'id':'a'},{'id':'b'}]}))
+            for path in STATUS.values():
+                f=stack.root/'data'/path;f.parent.mkdir(parents=True,exist_ok=True);f.write_text('{}')
+            stack.url='http://unused';stack.ch=lambda sql:'1';stack.fault_ns=0
+            stack.snapshot=lambda:{name:{'running':True,'restartCount':1} for name in ['insight','clickhouse',*STATUS]}
+            before={name:{'restartCount':0} for name in stack.snapshot()}
+            stack.files=lambda:[{'id':'a','state':'done'}]
+            with patch('tools.recovery_fixture33.stack.api',return_value={}):
+                self.assertIsNone(stack.recovered(before))
+                stack.files=lambda:[{'id':key,'state':'done'} for key in ['a','b']]
+                self.assertEqual(len(stack.recovered(before)),6)
+                stack.fault_ns=2**63-1;self.assertIsNone(stack.recovered(before))
     def exercise(self, failure=None):
         with tempfile.TemporaryDirectory() as directory:
             stack=Stack.__new__(Stack);stack.root=Path(directory);stack.created=[]
