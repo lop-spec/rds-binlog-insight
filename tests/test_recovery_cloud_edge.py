@@ -38,6 +38,26 @@ class CloudEdgeTests(unittest.TestCase):
         self.assertEqual(list((self.root/'objects/bulk').iterdir()),[])
         notes=[json.loads(line) for line in (self.root/'journal.jsonl').read_text().splitlines()]
         self.assertEqual(len([r for r in notes if r['event']=='delete_durable']),4)
+    def test_real_oss_sdk_lifecycle_crc_and_listing(self):
+        import oss2,socket
+        from oss2.models import BucketLifecycle,LifecycleRule,LifecycleExpiration
+        # IP/localhost makes the SDK select path-style even with is_cname=True.
+        # Replace DNS only, not the SDK's URL construction, signing or XML parsing.
+        original=socket.getaddrinfo
+        def resolve(host,port,*args,**kwargs):
+            assert host=='fixture.test' and int(port)==self.server.server_port
+            return original('127.0.0.1',port,*args,**kwargs)
+        bucket=oss2.Bucket(oss2.Auth('test-ak','test-secret'),self.url.replace('127.0.0.1','fixture.test'),'test-fixture-bucket',is_cname=True)
+        bucket.session.session.trust_env=False
+        dns=patch('socket.getaddrinfo',resolve);dns.start()
+        try:
+            self.assertEqual(bucket.get_bucket_lifecycle().rules,[])
+            bucket.put_bucket_lifecycle(BucketLifecycle([LifecycleRule('fixture','fixture/',status=LifecycleRule.ENABLED,expiration=LifecycleExpiration(days=60))]))
+            self.assertEqual(bucket.get_bucket_lifecycle().rules[0].expiration.days,60)
+            result=bucket.put_object('fixture/sdk',b'123456789');self.assertEqual(result.crc,0x995DC9BBDF1939FA)
+            self.assertEqual(bucket.head_object('fixture/sdk').content_length,9)
+            self.assertEqual([o.key for o in bucket.list_objects_v2(prefix='fixture/',max_keys=1).object_list],['fixture/sdk'])
+        finally:bucket.session.session.close();dns.stop()
     def test_lifecycle_and_list_pagination(self):
         xml=b'<LifecycleConfiguration><Rule><ID>fixture</ID></Rule></LifecycleConfiguration>'
         self.request('/?lifecycle','PUT',xml);self.assertEqual(self.request('/?lifecycle')[2],xml)

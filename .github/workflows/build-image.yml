@@ -45,6 +45,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Install fixture protocol SDK from the application lock
+        run: python -m pip install "$(grep '^oss2==' requirements.txt)"
       - name: Recovery fixture contract tests
         run: python -m unittest tests.test_recovery_isolation33 tests.test_recovery_cloud_edge tests.test_recovery_archive_probe tests.test_recovery_bootstrap -v
       - name: Prepare isolated native binlog and independent input oracle

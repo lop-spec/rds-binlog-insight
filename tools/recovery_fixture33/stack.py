@@ -87,7 +87,11 @@ class Stack:
         init="from pathlib import Path;from app.metadata import MetadataStore;from app.config import Settings;from app.storage import EventStorage;m=MetadataStore(Path('/data/metadata.sqlite3'));m.save_settings(Settings(db_instance_id='rm-test000001',auto_sync=True,oss_enabled=True,oss_bucket='test-fixture-bucket',oss_region_id='cn-hangzhou',oss_endpoint='https://oss-cn-hangzhou-internal.aliyuncs.com',oss_prefix='fixture/',oss_auth_mode='access_key'));EventStorage(m,Path('/data'));Path('/data/binlog-instances.json').write_text('[{\"instanceId\":\"rm-test000002\",\"label\":\"secondary-fixture\",\"autoSync\":true}]');print('fixture metadata initialized')"
         (self.root/'init.log').write_text(self.init_container(['python','-c',init]))
         (self.root/'migrate.log').write_text(self.init_container(['python','-m','app.clickhouse_migrate','--data-dir','/data','--raw-oss-tables']))
-        (self.root/'pack-manifest-init.log').write_text(self.init_container(['python','-c',"from pathlib import Path;from app.clickhouse_manifest import ClickHouseManifest;ClickHouseManifest(Path('/data/index/clickhouse/raw-oss-packed-manifest.sqlite3'),run_migrations=True);print('fixture packed manifest initialized')"]))
+        # Establish the empty source baseline through the normal audited tools,
+        # before any service can discover inputs; never force a coverage flag.
+        assert not self.files()
+        (self.root/'pack-manifest-init.log').write_text(self.init_container(['python','-m','tools.clickhouse_raw_manifest_backfill','--data-dir','/data','--batch-size','256','--max-pages','1']))
+        (self.root/'source-baseline.log').write_text(self.init_container(['python','-m','tools.clickhouse_raw_reconcile','--data-dir','/data','--limit','256','--max-rounds','1','--mark-complete']))
         for role,spec in SPEC.items():
             if role=='clickhouse':continue
             env={**self.common(),**spec['flags']};env['CLICKHOUSE_USER']='query' if role=='insight' else 'ingester'

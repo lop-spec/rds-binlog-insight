@@ -32,14 +32,19 @@ def delete_object(key):
         if path.exists():path.unlink();sync_directory(path.parent);existed=True
     journal('delete_durable',key=key,existed=existed)
 
+def subresource(query,name):
+    return parse_qs(query,keep_blank_values=True)=={name:['']}
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version='HTTP/1.1'
     def log_message(self,*args):pass
+    def log_error(self,format,*args):journal('http_protocol_error',method=self.command,path=urlsplit(self.path).path,reason=format%args)
     def path_info(self):
         u=urlsplit(self.path);key=unquote(u.path).lstrip('/')
         if any(x in {'.','..',''} for x in key.split('/')) and key:raise ValueError('invalid object path')
         return key,u.query
     def send(self,code,body=b'',headers=None,length=None):
+        if code>=400:journal('http_error',method=self.command,path=urlsplit(self.path).path,queryFields=sorted(parse_qs(urlsplit(self.path).query,keep_blank_values=True)),status=code,reason=body.decode(errors='replace')[:300])
         self.send_response(code);self.send_header('Content-Length',str(len(body) if length is None else length));self.send_header('x-oss-request-id','fixture-'+uuid.uuid4().hex)
         for k,v in (headers or {}).items():self.send_header(k,str(v))
         self.end_headers()
@@ -47,7 +52,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         key,query=self.path_info();size=int(self.headers.get('Content-Length','0'));assert 0<=size<=64*1024**2
         body=self.rfile.read(size);assert len(body)==size
-        if query=='lifecycle':atomic(ROOT/'lifecycle.xml',body);self.send(200);return
+        if subresource(query,'lifecycle'):atomic(ROOT/'lifecycle.xml',body);journal('lifecycle_put');self.send(200);return
         assert key
         if self.headers.get('x-oss-forbid-overwrite')=='true' and (ROOT/'objects'/key).exists():
             self.send(409,b'<Error><Code>FileAlreadyExists</Code><Message>immutable fixture object</Message></Error>');return
@@ -62,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
         delete_object(key);self.send(204)
     def do_POST(self):
         key,query=self.path_info()
-        if query!='delete':self.send(501,b'unsupported fixture POST');return
+        if not subresource(query,'delete'):self.send(501,b'unsupported fixture POST');return
         size=int(self.headers.get('Content-Length','0'));assert 0<size<=1024**2
         raw=self.rfile.read(size);assert len(raw)==size
         request=fromstring(raw);objects=request.findall('{*}Object');assert 0<len(objects)<=1000
@@ -74,8 +79,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):self.do_GET()
     def do_GET(self):
         key,query=self.path_info()
-        if query=='lifecycle':
-            p=ROOT/'lifecycle.xml';self.send(200,p.read_bytes() if p.exists() else b'<LifecycleConfiguration/>',{'Content-Type':'application/xml'});return
+        if subresource(query,'lifecycle'):
+            journal('lifecycle_get');p=ROOT/'lifecycle.xml';self.send(200,p.read_bytes() if p.exists() else b'<LifecycleConfiguration/>',{'Content-Type':'application/xml'});return
         params=parse_qs(query)
         if params.get('list-type')==['2']:
             prefix=params.get('prefix',[''])[0];limit=int(params.get('max-keys',['1000'])[0]);assert 1<=limit<=1000
@@ -85,6 +90,7 @@ class Handler(BaseHTTPRequestHandler):
             for k,v in [('Name','test-fixture-bucket'),('Prefix',prefix),('MaxKeys',str(limit)),('IsTruncated',str(len(objects)>limit).lower())]:SubElement(result,k).text=v
             for p in objects[:limit]:
                 item=SubElement(result,'Contents');SubElement(item,'Key').text=p.relative_to(ROOT/'objects').as_posix();SubElement(item,'Size').text=str(p.stat().st_size);SubElement(item,'LastModified').text=datetime.fromtimestamp(p.stat().st_mtime,timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z');SubElement(item,'ETag').text='"'+hashlib.md5(p.read_bytes()).hexdigest()+'"'
+                SubElement(item,'Type').text='Normal';SubElement(item,'StorageClass').text='Standard'
             if len(objects)>limit:SubElement(result,'NextContinuationToken').text=base64.urlsafe_b64encode(objects[limit-1].relative_to(ROOT/'objects').as_posix().encode()).decode()
             self.send(200,tostring(result),{'Content-Type':'application/xml'});return
         if key=='healthz':self.send(200,b'OK');return
