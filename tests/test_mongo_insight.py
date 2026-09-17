@@ -156,6 +156,41 @@ class MongoGates(unittest.TestCase):
         for changed in ({'node':'b'},{'epoch':2},{'commands':{'find':{'total':1}}}):
             self.assertNotEqual(counter_interval(a,{**b,**changed})['status'],'ok')
 
+    def test_invalid_namespace_retains_exact_batch_without_publishing(self):
+        import pyarrow.parquet as pq
+        from app.mongo_insight import canonical
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            bad=record()
+            document=json.loads(bad['SQLText']);document.pop('ns')
+            bad.update(SQLText=json.dumps(document),DBName='',TableName='')
+            records=[record(),bad,record()]
+            t=self.norm(records[0])['start_us']//300_000_000*300_000_000
+            for attempt in range(2):
+                with self.assertLogs('app.mongo_store',level='WARNING') as logs:
+                    with self.assertRaisesRegex(ValueError,'namespace_missing'):
+                        store.publish('dds-example',t,t+300_000_000,records,['messages'])
+                self.assertIn('record_index=1',logs.output[0])
+                self.assertIn('namespace_missing',logs.output[0])
+                manifest=store.manifest_path('dds-example',t)
+                self.assertFalse(manifest.exists())
+                raw=list(manifest.parent.glob('*.raw.parquet'))
+                self.assertEqual(len(raw),1)
+                self.assertEqual(pq.read_table(raw[0]).column('record').to_pylist(),[canonical(r) for r in records])
+                self.assertEqual(list(manifest.parent.glob('*.rollup.parquet')),[])
+                self.assertFalse(store.manifests('dds-example',t,t+300_000_000)[1]['complete'])
+
+    def test_failed_raw_write_does_not_parse_or_publish(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            t=self.norm(record())['start_us']//300_000_000*300_000_000
+            with patch('app.mongo_store.atomic_parquet',side_effect=OSError('disk full')),patch('app.mongo_store.normalize_record') as normalize:
+                with self.assertRaisesRegex(OSError,'disk full'):
+                    store.publish('dds-example',t,t+300_000_000,[record()],[])
+                normalize.assert_not_called()
+            self.assertFalse(store.manifest_path('dds-example',t).exists())
+
     def test_immutable_window_replay_and_incomplete_publish(self):
         with tempfile.TemporaryDirectory() as td:
             store=MongoStore(Path(td), backend='parquet')

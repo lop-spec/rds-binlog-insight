@@ -55,6 +55,69 @@ test('full incomplete-window page contains measured totals, scope and effective 
  assert.match(html,/已明确改按/);assert.match(html,/不是异常增量榜/);assert.match(html,/50\/931/);
  assert.doesNotMatch(html,/suboperation|无成本增长|基线或字段未完整/);
 });
+function requestContext(values={}) {
+ const c=context(),nodes={},calls=[],notices=[];
+ const defaults={'#analytics-source':'mongodb','#analytics-range':'custom','#analytics-start':'2026-09-16T09:40:29Z','#analytics-end':'2026-09-17T09:59:29Z','#mongo-baseline':'yesterday','#mongo-baseline-start':'','#mongo-instance':'dds-example','#mongo-role':'Primary','#mongo-kind':'command','#mongo-metric':'CPUUtilization','#mongo-order':'duration_growth','#analytics-limit':'50'};
+ c.$=s=>nodes[s]??={value:values[s]??defaults[s]??'',textContent:'',innerHTML:'',hidden:false};
+ c.toast=(...args)=>notices.push(args);c.console={...console,warn:()=>{}};
+ c.api=async path=>{calls.push(path);return {total_groups:0};};
+ vm.runInContext(source,c);vm.runInContext('renderMongoAnalytics=data=>{$("#analytics-meta").textContent="分析完成";}',c);
+ return {c,nodes,calls,notices,run:()=>vm.runInContext('runMongoAnalytics()',c)};
+}
+test('24h19m yesterday selection becomes an explicit non-overlapping equal baseline without changing scope',async()=>{
+ const {c,nodes,calls,notices,run}=requestContext();await run();
+ const q=new URL(calls[0],'http://fixture').searchParams,start=Date.parse('2026-09-16T09:40:29Z')*1000,end=Date.parse('2026-09-17T09:59:29Z')*1000;
+ assert.equal(Number(q.get('startEpochUs')),start);assert.equal(Number(q.get('endEpochUs')),end);
+ assert.equal(Number(q.get('baselineStart')),start-(end-start));assert.equal(nodes['#mongo-baseline'].value,'previous');
+ assert.equal(notices.length,1);assert.match(notices[0][0],/已改为前一个等长窗口/);
+ assert.match(nodes['#mongo-baseline-hint'].textContent,/等长、不重叠/);assert.equal(nodes['#mongo-baseline-start'].disabled,true);
+ assert.equal(nodes['#analytics-meta'].textContent,'分析完成');
+});
+test('exactly 24 hours preserves yesterday; 24h plus one second and seven days use previous',()=>{
+ const c=context();vm.runInContext(source,c);c.start=Date.parse('2026-09-16T09:40:29Z')*1000;
+ for(const hours of [1,24,24+1/3600,168]) {
+  c.span=Math.round(hours*3600*1e6);const p=vm.runInContext('mongoBaselineWindow(start,start+span,"yesterday",NaN)',c);
+  assert.equal(p.mode,hours<=24?'yesterday':'previous');assert.ok(p.end<=c.start);
+ }
+});
+test('invalid, reversed and over-seven-day windows fail locally without a loading or stale result',async()=>{
+ for(const values of [{'#analytics-start':''},{'#analytics-end':'2026-09-16T09:40:29Z'},{'#analytics-end':'2026-09-24T09:40:29Z'}]) {
+  const {c,nodes,calls,run}=requestContext(values);c.$('#analytics-panel-sql').innerHTML='stale';
+  await assert.rejects(run());assert.equal(calls.length,0);assert.match(nodes['#analytics-meta'].textContent,/分析未完成/);
+  assert.equal(nodes['#analytics-panel-sql'].innerHTML,'');assert.equal(vm.runInContext('mongoResult',c),null);
+ }
+});
+test('explicit overlapping or invalid custom baseline is rejected, never silently changed',async()=>{
+ for(const baseline of ['2026-09-15T09:40:29Z','']) {
+  const {nodes,calls,run}=requestContext({'#mongo-baseline':'custom','#mongo-baseline-start':baseline});
+  await assert.rejects(run(),/基线/);assert.equal(calls.length,0);assert.equal(nodes['#mongo-baseline'].value,'custom');
+  assert.equal(nodes['#mongo-baseline-start'].value,baseline);assert.equal(nodes['#mongo-baseline-start'].disabled,false);
+ }
+});
+test('valid custom baseline remains exact',async()=>{
+ const {calls,run}=requestContext({'#mongo-baseline':'custom','#mongo-baseline-start':'2026-09-14T09:40:29Z'});await run();
+ assert.equal(Number(new URL(calls[0],'http://fixture').searchParams.get('baselineStart')),Date.parse('2026-09-14T09:40:29Z')*1000);
+});
+test('backend and network errors terminate loading, clear stale data and allow retry',async()=>{
+ for(const message of ['baseline_must_not_overlap_current_window','mongo_window_exceeds_seven_days','网络连接失败']) {
+  const {c,nodes,run}=requestContext();c.api=async()=>{throw new Error(message);};
+  await assert.rejects(run());assert.match(nodes['#analytics-meta'].textContent,/分析未完成/);
+  assert.doesNotMatch(nodes['#analytics-meta'].textContent,/正在读取|baseline_must|mongo_window/);
+  assert.equal(nodes['#analytics-panel-sql'].innerHTML,'');assert.equal(nodes['#analytics-empty'].hidden,false);
+  c.api=async()=>({});await run();assert.equal(nodes['#analytics-meta'].textContent,'分析完成');
+ }
+});
+test('an older rejected request cannot overwrite a newer result',async()=>{
+ const {c,nodes,run}=requestContext();let reject;
+ c.api=()=>new Promise((_,r)=>{reject=r;});const old=run();
+ c.api=async()=>({});await run();reject(new Error('old failure'));await old;
+ assert.equal(nodes['#analytics-meta'].textContent,'分析完成');
+});
+test('source switching suppresses late Mongo errors',async()=>{
+ const {c,nodes,run}=requestContext();let reject;c.api=()=>new Promise((_,r)=>{reject=r;});const pending=run();
+ c.$('#analytics-source').value='slowlog';c.$('#analytics-meta').textContent='MySQL';reject(new Error('late'));await pending;
+ assert.equal(nodes['#analytics-meta'].textContent,'MySQL');
+});
 test('no causal claim or fabricated full collection counts',()=>{
  assert.match(source,/相关与|因果/);assert.match(source,/尚无应用命令聚合接入/);
  assert.match(source,/不是慢日志计数/);assert.match(source,/未采集原生命令计数/);

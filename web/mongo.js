@@ -30,6 +30,42 @@ function mongoCoverageText(c){
 }
 function mongoOptions(rows) { return rows.map(([v,t])=>`<option value="${escapeHtml(v)}">${escapeHtml(t)}</option>`).join(''); }
 
+function mongoBaselineWindow(start,end,mode,custom) {
+  const day=86400*1e6,span=end-start;
+  if (!Number.isFinite(start)||!Number.isFinite(end)||span<=0) throw new Error('请选择有效的分析时间，结束时间必须晚于开始时间');
+  if (span>7*day) throw new Error('MongoDB 单次最多分析 7 天，请缩小时间范围');
+  let adjustment='';
+  if (mode==='yesterday'&&span>day) {
+    mode='previous';adjustment='分析范围超过 24 小时，昨日同窗会重叠，已改为前一个等长窗口；分析时间不变。';
+  }
+  const baseline=mode==='custom'?custom:mode==='previous'?start-span:start-day;
+  if (!Number.isFinite(baseline)) throw new Error('请选择有效的基线开始时间');
+  if (baseline+span>start) throw new Error('基线与分析时间重叠：请选择更早的基线开始时间，或改选“前一个等长窗口”');
+  return {start:baseline,end:baseline+span,mode,adjustment};
+}
+function syncMongoBaseline(start=new Date($('#analytics-start').value).getTime()*1000,end=new Date($('#analytics-end').value).getTime()*1000,strict=false) {
+  const select=$('#mongo-baseline'),input=$('#mongo-baseline-start'),hint=$('#mongo-baseline-hint');
+  input.disabled=select.value!=='custom';
+  try {
+    const plan=mongoBaselineWindow(start,end,select.value,new Date(input.value).getTime()*1000);
+    if (plan.adjustment) {
+      select.value=plan.mode;
+      console.warn('mongo_baseline adjusted: yesterday overlaps current window; using previous equal-length window');
+      toast(plan.adjustment,'info',8000);
+    }
+    hint.textContent=`${plan.adjustment}基线：${formatTime(plan.start)} → ${formatTime(plan.end)}（等长、不重叠）`;
+    return plan;
+  } catch(error) {
+    hint.textContent=error.message;
+    if(strict)throw error;
+    return null;
+  }
+}
+function mongoAnalysisError(error) {
+  const messages={baseline_must_not_overlap_current_window:'基线与分析时间重叠，请改选“前一个等长窗口”或更早的基线开始时间',mongo_window_exceeds_seven_days:'MongoDB 单次最多分析 7 天，请缩小时间范围'};
+  return messages[error.message]||error.message;
+}
+
 async function syncMongoMode(enabled) {
   const controls = $('#mongo-controls'); if (!controls) return;
   controls.hidden = !enabled;
@@ -49,11 +85,15 @@ async function syncMongoMode(enabled) {
       $('#mongo-role').value=c.role||'Primary';$('#mongo-order').value=c.order||'duration_growth';
       $('#mongo-metric').value=c.metric||'CPUUtilization';$('#mongo-kind').value='command';$('#mongo-command').value='';$('#mongo-namespace').value='';
     });
+    $('#analytics-form').addEventListener('change',()=>{
+      if($('#analytics-source').value==='mongodb')syncMongoBaseline();
+    });
     $('#analytics-panel-sql').addEventListener('click',e=>{
       const button=e.target.closest('[data-mongo-group]'); if (button) openMongoDetail(button.dataset.mongoGroup,button.dataset.mongoRole);
       if(e.target.closest('[data-mongo-recent]')){setAnalyticsRange('1h');$('#mongo-baseline').value='previous';runMongoAnalytics().catch(err=>toast(err.message,'error'));}
     });
   }
+  syncMongoBaseline();
   if (mongoStatus) return;
   try {
     mongoStatus=await api('/api/mongo/status');
@@ -66,24 +106,38 @@ async function syncMongoMode(enabled) {
 
 async function runMongoAnalytics() {
   const request=++mongoRequest;
-  let start=new Date($('#analytics-start').value).getTime()*1000,end=new Date($('#analytics-end').value).getTime()*1000;
-  if ($('#analytics-range').value!=='custom') {
-    const current=await api('/api/mongo/status');
+  mongoResult=null;
+  $('#analytics-panel-sql').innerHTML='';
+  $('#analytics-empty').hidden=false;
+  $('#analytics-coverage').textContent='正在检查 MongoDB 分析时间与基线…';
+  try {
+    let start=new Date($('#analytics-start').value).getTime()*1000,end=new Date($('#analytics-end').value).getTime()*1000;
+    let baseline=syncMongoBaseline(start,end,true);
+    if ($('#analytics-range').value!=='custom') {
+      const current=await api('/api/mongo/status');
+      if(request!==mongoRequest||$('#analytics-source').value!=='mongodb')return;
+      const watermark=current.collectors?.find(x=>x.instanceId===$('#mongo-instance').value)?.slowlog_window;
+      if(Number.isFinite(watermark)&&watermark>0){const span=end-start;end=watermark;start=end-span;$('#analytics-start').value=toLocalInput(new Date(start/1000));$('#analytics-end').value=toLocalInput(new Date(end/1000));}
+      baseline=syncMongoBaseline(start,end,true);
+    }
+    const params=new URLSearchParams({instance:$('#mongo-instance').value,startEpochUs:String(start),endEpochUs:String(end),baselineStart:String(baseline.start),
+      role:$('#mongo-role').value,kind:$('#mongo-kind').value,metric:$('#mongo-metric').value,order:$('#mongo-order').value,
+      command:$('#mongo-command').value,namespace:$('#mongo-namespace').value,limit:$('#analytics-limit').value});
+    $('#analytics-meta').textContent='正在读取 MongoDB 既有汇总、计数与性能点…';
+    $('#analytics-coverage').textContent=$('#mongo-baseline-hint').textContent;
+    const data=await api('/api/mongo/analytics?'+params);
+    if (request!==mongoRequest||$('#analytics-source').value!=='mongodb') return;
+    mongoResult=data;renderMongoAnalytics(data);
+  } catch(error) {
     if(request!==mongoRequest||$('#analytics-source').value!=='mongodb')return;
-    const watermark=current.collectors?.find(x=>x.instanceId===$('#mongo-instance').value)?.slowlog_window;
-    if(Number.isFinite(watermark)&&watermark>0){const span=end-start;end=watermark;start=end-span;$('#analytics-start').value=toLocalInput(new Date(start/1000));$('#analytics-end').value=toLocalInput(new Date(end/1000));}
+    const message=mongoAnalysisError(error);
+    $('#analytics-meta').textContent=`MongoDB 分析未完成：${message}`;
+    $('#analytics-coverage').textContent=message;
+    $('#analytics-panel-sql').innerHTML='';
+    $('#analytics-empty').hidden=false;
+    mongoResult=null;
+    throw new Error(message);
   }
-  if (!Number.isFinite(start)||!Number.isFinite(end)||end<=start) throw new Error('请选择有效的异常窗口');
-  let baseline=$('#mongo-baseline').value==='previous'?start-(end-start):start-86400*1e6;
-  if ($('#mongo-baseline').value==='custom') baseline=new Date($('#mongo-baseline-start').value).getTime()*1000;
-  if (!Number.isFinite(baseline)) throw new Error('请选择有效的基线开始时间');
-  const params=new URLSearchParams({instance:$('#mongo-instance').value,startEpochUs:String(start),endEpochUs:String(end),baselineStart:String(baseline),
-    role:$('#mongo-role').value,kind:$('#mongo-kind').value,metric:$('#mongo-metric').value,order:$('#mongo-order').value,
-    command:$('#mongo-command').value,namespace:$('#mongo-namespace').value,limit:$('#analytics-limit').value});
-  $('#analytics-meta').textContent='正在读取 MongoDB 既有汇总、计数与性能点…';
-  const data=await api('/api/mongo/analytics?'+params);
-  if (request!==mongoRequest||$('#analytics-source').value!=='mongodb') return;
-  mongoResult=data;renderMongoAnalytics(data);
 }
 
 function mongoSparkline(points) {

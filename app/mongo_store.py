@@ -105,9 +105,6 @@ class MongoStore:
     def publish(self, instance, start, end, records, prefixes, archive=None):
         if start%WINDOW or end!=start+WINDOW:
             raise ValueError('source_windows_must_be_five_minutes')
-        events=[normalize_record(r,instance,prefixes) for r in records]
-        if any(not start<=e['start_us']<end for e in events):
-            raise ValueError('event_outside_source_window')
         revision=digest({'instance':instance,'start':start,'end':end,'version':VERSION,
                          'prefixes':prefixes,'records':sorted(canonical(r) for r in records)})
         path=self.manifest_path(instance,start)
@@ -123,12 +120,24 @@ class MongoStore:
                     if index_ok and (archive is None or old.get('archived')):
                         return old
                     LOGGER.warning('mongo_window repair: incomplete index/archive instance=%s window=%s',instance,start)
-            rows=rollup_events(events)
             raw=path.parent/(revision+'.raw.parquet')
             roll=path.parent/(revision+'.rollup.parquet')
-            # Unique immutable versions remain recoverable even if indexing fails.
+            # Retain the complete provider batch before parsing. A bad record
+            # must not erase the source or make an incomplete window visible.
             if not raw.exists():
                 atomic_parquet(pa.table({'record':[canonical(r) for r in records]},schema=pa.schema([('record',pa.string())])),raw)
+            events=[]
+            for index,record in enumerate(records):
+                try:
+                    event=normalize_record(record,instance,prefixes)
+                    if not start<=event['start_us']<end:
+                        raise ValueError('event_outside_source_window')
+                    events.append(event)
+                except Exception as exc:
+                    LOGGER.warning('mongo_normalization failed: instance=%s window=%s record_index=%s raw=%s reason=%s:%s',
+                                   instance,start,index,raw,type(exc).__name__,exc)
+                    raise
+            rows=rollup_events(events)
             if not roll.exists():
                 atomic_parquet(pa.Table.from_pylist(rows,schema=SCHEMA),roll)
             if self.backend=='clickhouse':
