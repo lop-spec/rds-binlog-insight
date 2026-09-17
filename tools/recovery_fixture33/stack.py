@@ -16,6 +16,7 @@ def wait_for(check,seconds,label):
         try:
             result=check()
             if result:return result
+            last='condition not satisfied'
         except (OSError,RuntimeError,KeyError,ValueError,sqlite3.Error) as exc:last=str(exc)
         if time.monotonic()>end:raise TimeoutError(f'{label}: {last}')
         if time.monotonic()-reported>10:print(json.dumps({'waiting':label,'lastError':last}),flush=True);reported=time.monotonic()
@@ -99,12 +100,16 @@ class Stack:
             self.names[role]=self.create(role,APP if role=='insight' else WORKER,opts,spec['command'])
         # The Linux runner reaches its internal bridge directly; no public/NAT port.
         address=inspect(self.names['insight'])['NetworkSettings']['Networks'][self.net]['IPAddress']
-        import ipaddress
-        assert ipaddress.ip_address(address).is_private
-        self.url='http://'+address+':8769'
+        self.set_app_address(address)
         wait_for(lambda:api(self.url+'/healthz'),40,'application ready')
         wait_for(lambda:all((self.root/'data'/path).exists() for path in STATUS.values()),50,'all worker status files')
         return self.snapshot()
+    def set_app_address(self,address):
+        import ipaddress
+        assert ipaddress.ip_address(address).version==4 and ipaddress.ip_address(address).is_private
+        url='http://'+address+':8769'
+        if getattr(self,'url',None)!=url:print(json.dumps({'event':'fixture_endpoint','previous':getattr(self,'url',None),'current':url}),flush=True)
+        self.url=url
     def options(self,role,spec):
         result=['--restart','unless-stopped','--cgroup-parent',self.slice,'--memory',str(spec['memory']),'--memory-swap',str(spec['swap']),'--cpus',str(spec['nanoCpus']/1e9),'--pids-limit',str(spec['pidsLimit']),'--security-opt','no-new-privileges:true']
         if spec['readOnly']:result+=['--read-only']
@@ -158,21 +163,25 @@ class Stack:
         result={}
         for role,name in self.names.items():
             c=inspect(name);assert c['Image']==SPEC[role]['imageId'],(role,c['Image'])
-            h=c['HostConfig'];result[role]={'scope':c['Config']['Labels']['scope'],'imageDigest':c['Image'],'running':c['State']['Running'],'exitCode':c['State']['ExitCode'],'error':c['State']['Error'],'oomKilled':c['State']['OOMKilled'],'pid':c['State']['Pid'],'restartCount':c['RestartCount'],'startedAt':c['State']['StartedAt'],'resourceSpec':{k:h.get(k) for k in ['Memory','MemorySwap','NanoCpus','PidsLimit','RestartPolicy','ReadonlyRootfs','Tmpfs','CgroupParent']}}
+            h=c['HostConfig'];result[role]={'scope':c['Config']['Labels']['scope'],'imageDigest':c['Image'],'running':c['State']['Running'],'exitCode':c['State']['ExitCode'],'error':c['State']['Error'],'oomKilled':c['State']['OOMKilled'],'pid':c['State']['Pid'],'restartCount':c['RestartCount'],'startedAt':c['State']['StartedAt'],'bridgeAddress':c['NetworkSettings']['Networks'].get(self.net,{}).get('IPAddress',''),'resourceSpec':{k:h.get(k) for k in ['Memory','MemorySwap','NanoCpus','PidsLimit','RestartPolicy','ReadonlyRootfs','Tmpfs','CgroupParent']}}
         return result
     def files(self):return db_rows(self.root/'data/metadata.sqlite3',"SELECT id,state,event_count,raw_deleted_at,error_message FROM binlog_files")
     def recovered(self,before):
         current=self.snapshot()
-        if not all(v['running'] and v['restartCount']>before[k]['restartCount'] for k,v in current.items()):return None
+        pending=[k for k,v in current.items() if not (v['running'] and v['restartCount']>before[k]['restartCount'])]
+        if pending:raise RuntimeError('services not yet restarted: '+','.join(pending))
+        # Docker may reassign bridge IPs when the six containers restart together.
+        # Follow the inspected container identity, not a cached pre-fault address.
+        self.set_app_address(current['insight']['bridgeAddress'])
         api(self.url+'/healthz');self.ch('SELECT 1')
         for role,path in STATUS.items():
             f=self.root/'data'/path
-            if f.stat().st_mtime_ns<self.fault_ns:return None
+            if f.stat().st_mtime_ns<self.fault_ns:raise RuntimeError('stale worker heartbeat: '+role)
             value=json.loads(f.read_text())
-            if value.get('lastError') or value.get('state') in ['error','failed','starting']:return None
+            if value.get('lastError') or value.get('state') in ['error','failed','starting']:raise RuntimeError('worker not ready: '+role+' '+json.dumps(value))
         files=self.files()
         expected_ids={f['id'] for f in json.loads((self.fixture/'oracle.json').read_text())['files']}
-        if not expected_ids.issubset({f['id'] for f in files}) or not all(f['state']=='done' for f in files):return None
+        if not expected_ids.issubset({f['id'] for f in files}) or not all(f['state']=='done' for f in files):raise RuntimeError('source recovery incomplete: '+json.dumps(files))
         for value in current.values():value['healthy']=True
         return current
     def close(self):
@@ -208,7 +217,7 @@ def exercise(root,fixture,results=None):
             run(['sudo','--preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,GITHUB_WORKSPACE,GITHUB_RUN_ID','python3','-m','tools.recovery_fixture33.kill_stack',str(s.root),*s.names.values()],30)
             s.fault_ns=time.time_ns()
             proof['fault']=json.loads((s.root/'fault-signals.json').read_text())
-            proof['after']=wait_for(lambda:s.recovered(proof['before']),120,'automatic whole-stack recovery '+stage)
+            proof['after']=wait_for(lambda:s.recovered(proof['before']),120,'automatic service and binlog recovery '+stage)
             proof['serviceRecoverySeconds']=time.monotonic()-started
             proof['syncPolicyAfter']=s.policy();assert proof['syncPolicyBefore']==proof['syncPolicyAfter'],'sync policy changed'
             proof.update(s.verify_archive());proof.update(s.verify_queries())

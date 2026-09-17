@@ -17,15 +17,22 @@ class BootstrapEvidenceTests(unittest.TestCase):
             (stack.fixture/'oracle.json').write_text(json.dumps({'files':[{'id':'a'},{'id':'b'}]}))
             for path in STATUS.values():
                 f=stack.root/'data'/path;f.parent.mkdir(parents=True,exist_ok=True);f.write_text('{}')
-            stack.url='http://unused';stack.ch=lambda sql:'1';stack.fault_ns=0
-            stack.snapshot=lambda:{name:{'running':True,'restartCount':1} for name in ['insight','clickhouse',*STATUS]}
+            stack.url='http://172.19.0.3:8769';stack.ch=lambda sql:'1';stack.fault_ns=0
+            stack.snapshot=lambda:{name:{'running':True,'restartCount':1,'bridgeAddress':'172.19.0.8'} for name in ['insight','clickhouse',*STATUS]}
             before={name:{'restartCount':0} for name in stack.snapshot()}
             stack.files=lambda:[{'id':'a','state':'done'}]
-            with patch('tools.recovery_fixture33.stack.api',return_value={}):
-                self.assertIsNone(stack.recovered(before))
+            with patch('tools.recovery_fixture33.stack.api',return_value={}) as fetch:
+                with self.assertRaisesRegex(RuntimeError,'source recovery incomplete'):stack.recovered(before)
+                fetch.assert_called_once_with('http://172.19.0.8:8769/healthz')
                 stack.files=lambda:[{'id':key,'state':'done'} for key in ['a','b']]
                 self.assertEqual(len(stack.recovered(before)),6)
-                stack.fault_ns=2**63-1;self.assertIsNone(stack.recovered(before))
+                stack.fault_ns=2**63-1
+                with self.assertRaisesRegex(RuntimeError,'stale worker heartbeat'):stack.recovered(before)
+    def test_public_probe_address_rejected(self):
+        stack=Stack.__new__(Stack)
+        with patch('ipaddress.ip_address') as parse:
+            parse.return_value.version=4;parse.return_value.is_private=False
+            with self.assertRaises(AssertionError):stack.set_app_address('fixture-public-address')
     def exercise(self, failure=None):
         with tempfile.TemporaryDirectory() as directory:
             stack=Stack.__new__(Stack);stack.root=Path(directory);stack.created=[]

@@ -56,6 +56,8 @@ class CloudEdgeTests(unittest.TestCase):
             self.assertEqual(bucket.get_bucket_lifecycle().rules[0].expiration.days,60)
             result=bucket.put_object('fixture/sdk',b'123456789');self.assertEqual(result.crc,0x995DC9BBDF1939FA)
             self.assertEqual(bucket.head_object('fixture/sdk').content_length,9)
+            with self.assertRaises(oss2.exceptions.NotFound):bucket.head_object('fixture/absent')
+            self.assertEqual(bucket.get_object('fixture/sdk',byte_range=(2,5)).read(),b'3456')
             self.assertEqual([o.key for o in bucket.list_objects_v2(prefix='fixture/',max_keys=1).object_list],['fixture/sdk'])
         finally:bucket.session.session.close();dns.stop()
     def test_lifecycle_and_list_pagination(self):
