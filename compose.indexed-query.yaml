@@ -8,7 +8,7 @@ services:
       RDS_BINLOG_QUERY_TASK_WORKERS: "1"
 
   query-worker:
-    image: local/rds-binlog-insight:1.28.37-rawoss
+    image: local/rds-binlog-insight:1.28.38-rawoss
     restart: unless-stopped
     init: true
     user: "${RDS_BINLOG_UID:-1000}:${RDS_BINLOG_GID:-1000}"
