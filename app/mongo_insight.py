@@ -22,6 +22,8 @@ WINDOW = 5 * MINUTE
 VERSION = 2  # Existing collection fingerprints must remain comparable.
 NORMALIZATION_VERSION = 3  # Reprocess source windows when parsing changes.
 DATABASE_COMMANDS = ('dbStats',)
+TOP_COUNTERS = ('read_count', 'read_us', 'write_count', 'write_us')
+TOP_NAMESPACES = 150
 COMMANDS = ('find', 'aggregate', 'distinct', 'count', 'findAndModify', 'update',
             'insert', 'delete', 'getMore', 'bulkWrite', 'mapReduce')
 NOISE = {'lsid', '$db', '$clusterTime', 'txnNumber', 'comment', 'maxTimeMS'}
@@ -254,6 +256,112 @@ def counter_interval(before: dict | None, after: dict) -> dict:
         result['commands'][command] = delta
     result['interval_seconds'] = (after['time_us'] - before['time_us'])/1e6
     return result
+
+
+def collection_interval(before: dict | None, after: dict, prefixes: list[str], limit: int = TOP_NAMESPACES) -> dict:
+    """Namespace lock counters from `top`, differenced against the previous node sample.
+
+    `top` is cumulative since mongod start and is scoped to namespaces, not commands: it
+    answers which collection was busy, never which statement. Its microseconds are lock
+    hold time including waits, not CPU time. Sharded families are reported in full; only
+    the per-namespace list is truncated, and the truncation is always disclosed.
+    """
+    status = 'ok'
+    if before is None:
+        status = 'initial_sample'
+    elif before['node'] != after['node']:
+        status = 'node_changed'
+    elif before['epoch'] != after['epoch']:
+        status = 'process_restarted'
+    elif before.get('role') != after.get('role'):
+        status = 'role_changed'
+    elif after['time_us'] <= before['time_us']:
+        status = 'invalid_time'
+    result = dict(status=status, node=after['node'], role=after.get('role'),
+                  start_us=before['time_us'] if before else after['time_us'], end_us=after['time_us'],
+                  collections=[], families=[], observed_namespaces=0, truncated=False, limit=limit,
+                  scope='namespace_lock_time_not_cpu')
+    if status != 'ok':
+        LOGGER.warning('mongo_collection_interval unavailable: %s node=%s', status, after['node'])
+        return result
+    previous = before.get('collections', {})
+    rows = []
+    for namespace, current in after.get('collections', {}).items():
+        old = previous.get(namespace)
+        if old is None:
+            # A namespace absent from the earlier sample has no measurable interval.
+            continue
+        delta = {}
+        for k in TOP_COUNTERS:
+            delta[k] = int(current.get(k, 0)) - int(old.get(k, 0))
+            if delta[k] < 0:
+                result.update(status='counter_reset', collections=[], families=[])
+                LOGGER.warning('mongo_collection_interval unavailable: counter_reset node=%s', after['node'])
+                return result
+        if not delta['read_count'] and not delta['write_count']:
+            continue
+        rows.append(dict(namespace=namespace, **delta))
+    grouped = {}
+    for row in rows:
+        key = family(row['namespace'], prefixes)
+        bucket = grouped.setdefault(key, dict(family=key, shards=0, **{k: 0 for k in TOP_COUNTERS}))
+        bucket['shards'] += 1
+        for k in TOP_COUNTERS:
+            bucket[k] += row[k]
+    def cost(row):
+        return -(row['read_us'] + row['write_us'])
+    rows.sort(key=cost)
+    result.update(observed_namespaces=len(rows), truncated=len(rows) > limit, collections=rows[:limit],
+                  families=sorted(grouped.values(), key=cost),
+                  interval_seconds=(after['time_us'] - before['time_us'])/1e6)
+    if result['truncated']:
+        LOGGER.warning('mongo_collection_interval truncated: node=%s observed=%s kept=%s; family totals remain complete',
+                       after['node'], len(rows), limit)
+    return result
+
+
+def summarize_namespace_intervals(points, start, end, role='', limit=50):
+    """Aggregate namespace lock intervals that fall entirely inside the window.
+
+    A partial interval is dropped rather than scaled, so a window never absorbs activity
+    measured outside it. Interval count and observed seconds are reported separately as
+    coverage: they are not extrapolated into whole-window totals.
+    """
+    totals = {}
+    families = {}
+    seconds = 0.0
+    used = 0
+    truncated = False
+    for point in points:
+        if role and point.get('role') != role:
+            continue
+        if point.get('status') != 'ok':
+            continue
+        low = int(point.get('start_us', 0))
+        high = int(point.get('end_us', 0))
+        if high <= low or low < start or high > end:
+            continue
+        used += 1
+        seconds += float(point.get('interval_seconds', 0) or 0)
+        truncated = truncated or bool(point.get('truncated'))
+        for row in point.get('collections', []):
+            bucket = totals.setdefault(row['namespace'], dict(namespace=row['namespace'], **{k: 0 for k in TOP_COUNTERS}))
+            for k in TOP_COUNTERS:
+                bucket[k] += int(row.get(k, 0))
+        for row in point.get('families', []):
+            bucket = families.setdefault(row['family'], dict(family=row['family'], shards=0, **{k: 0 for k in TOP_COUNTERS}))
+            bucket['shards'] = max(bucket['shards'], int(row.get('shards', 0)))
+            for k in TOP_COUNTERS:
+                bucket[k] += int(row.get(k, 0))
+
+    def cost(row):
+        return -(row['read_us'] + row['write_us'])
+    if not used:
+        LOGGER.warning('mongo_namespace_summary unavailable: no complete interval inside window')
+    return dict(collections=sorted(totals.values(), key=cost)[:limit],
+                families=sorted(families.values(), key=cost)[:limit],
+                intervals=used, observed_seconds=round(seconds, 3), truncated_intervals=truncated,
+                scope='namespace_lock_time_not_cpu')
 
 
 def summarize(rows: list[dict]) -> dict:

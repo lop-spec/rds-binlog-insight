@@ -14,7 +14,7 @@ from pathlib import Path
 from .credentials import load_credential
 from .rds_api import RdsRpcClient
 from .slow_log_collector import DasRpcClient
-from .mongo_insight import COMMANDS, MINUTE, WINDOW, epoch_us, counter_interval
+from .mongo_insight import COMMANDS, MINUTE, TOP_NAMESPACES, WINDOW, collection_interval, counter_interval, epoch_us
 from .mongo_store import atomic_json
 
 LOGGER=logging.getLogger(__name__)
@@ -60,6 +60,9 @@ def load_instances(root: Path):
         if item.get('port',3717)!=3717:raise ValueError('mongo_port_not_allowlisted')
         if not isinstance(item.get('families',[]),list) or any(not re.fullmatch(r'[A-Za-z0-9_-]+',p) for p in item.get('families',[])):
             raise ValueError('invalid_mongo_family_registry')
+        limit=item.get('topNamespaceLimit',TOP_NAMESPACES)
+        if not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=1000:
+            raise ValueError('invalid_mongo_top_namespace_limit')
     return value
 
 
@@ -169,6 +172,41 @@ class MongoCollector:
         self.store.telemetry(self.instance,'metrics',points)
         return len(points)
 
+    def namespace_totals(self, host):
+        """Cumulative per-namespace lock counters from `top`.
+
+        A failure here degrades the namespace lane to "no interval" and leaves the native
+        counter lane intact; it never produces a partial or wrong difference.
+        """
+        try:
+            totals=self.clients[host].admin.command({'top':1}).get('totals',{})
+        except Exception as exc:
+            self.state['top:'+host]=type(exc).__name__
+            LOGGER.warning('mongo_top unavailable: endpoint=%s reason=%s; namespace lane skipped this cycle',
+                           host,type(exc).__name__+':'+str(exc)[:160])
+            return {}
+        rows={}
+        for namespace,value in totals.items():
+            if namespace=='note' or not isinstance(value,dict):continue
+            read=value.get('readLock') or {}
+            write=value.get('writeLock') or {}
+            rows[namespace]=dict(read_count=int(read.get('count',0)),read_us=int(read.get('time',0)),
+                                 write_count=int(write.get('count',0)),write_us=int(write.get('time',0)))
+        if not rows:LOGGER.warning('mongo_top empty_totals: endpoint=%s',host)
+        self.state.pop('top:'+host,None)
+        return rows
+
+    def publish_namespaces(self, host, retained):
+        # Called before self.before is advanced, so this differences against the prior sample.
+        if not retained.get('collections'):return
+        interval=collection_interval(self.before.get(host),retained,self.entry.get('families',[]),
+                                     limit=int(self.entry.get('topNamespaceLimit',TOP_NAMESPACES)))
+        self.state['namespaces']=interval['status']
+        if interval['status']!='ok':return
+        point=dict(interval,metric='top',timestamp=retained['timestamp'],node=retained['node'],
+                   endpoint=host,period=round(interval['interval_seconds']))
+        self.store.telemetry(self.instance,'namespaces',[point])
+
     def sample_nodes(self):
         if not self.entry.get('nodes') or not self.entry.get('credentialsFile'):
             raise RuntimeError('readonly_node_credentials_not_configured')
@@ -219,12 +257,16 @@ class MongoCollector:
                             cursor=s.get('metrics',{}).get('cursor',{}),flow_control=s.get('flowControl',{}),
                             transactions=s.get('transactions',{}),opcounters=s.get('opcounters',{}),
                             repl_counters=s.get('opcountersRepl',{}))
-                delta=counter_interval(self.before.get(host),sample)
+                # `top` totals stay out of the persisted native payload: they are cumulative
+                # per-namespace counters kept in memory only to difference the next sample.
+                retained=dict(sample,collections=self.namespace_totals(host))
+                delta=counter_interval(self.before.get(host),retained)
                 if abs(sample['clock_skew_us'])>30_000_000:
                     LOGGER.warning('mongo_clock_skew: node=%s skew_us=%s; native counters use collector interval time',node,sample['clock_skew_us'])
                 sample['interval']=delta
                 self.store.telemetry(self.instance,'native',[sample])
-                self.before[host]=sample
+                self.publish_namespaces(host,retained)
+                self.before[host]=retained
                 success+=1
             except Exception as exc:
                 if candidate_client is not None:candidate_client.close()
