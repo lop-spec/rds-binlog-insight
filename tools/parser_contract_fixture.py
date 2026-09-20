@@ -26,6 +26,14 @@ def run(args, *, stdin=None, seconds=30):
     return result.stdout
 
 
+def mysql_query(container, query):
+    # Applies to DDL as well as mutations: SET NAMES only in the latter would
+    # create mojibake ENUM labels before the Unicode INSERT is ever tested.
+    return run(["docker", "exec", "-i", container, "mysql", "-uroot", "-pfixture-only",
+                "--default-character-set=utf8mb4", "--batch", "--skip-column-names"],
+               stdin=query.encode("utf-8"), seconds=20).decode("utf-8")
+
+
 def read_headers(raw):
     """Independent framing/CRC oracle, not the decoder under test."""
     if raw[:4] != b"\xfebin":
@@ -64,8 +72,7 @@ def prepare(root):
          "--performance-schema=OFF"], seconds=30)
 
     def sql(query):
-        return run(["docker", "exec", "-i", name, "mysql", "-uroot", "-pfixture-only",
-                    "--batch", "--skip-column-names"], stdin=query.encode(), seconds=20).decode()
+        return mysql_query(name, query)
 
     try:
         deadline = time.monotonic() + 120
@@ -101,10 +108,11 @@ DELETE FROM statements WHERE id=1;"""
 UPDATE rows_abi SET txt='after',nullable=2147483647 WHERE id=18446744073709551615;
 DELETE FROM rows_abi WHERE id=2;"""
             script = f"SET NAMES utf8mb4; SET SESSION binlog_format='{mode}'; USE fixture; BEGIN;\n{changes}\nCOMMIT;"
-            sql(script)
-            sql("FLUSH BINARY LOGS;")
             case_dir = root / mode.lower()
             case_dir.mkdir()
+            (case_dir / "input.sql").write_text(script, encoding="utf-8")
+            sql(script)
+            sql("FLUSH BINARY LOGS;")
             raw_path = case_dir / "source.binlog"
             run(["docker", "cp", f"{name}:/var/lib/mysql/{filename}", str(raw_path)])
             raw = raw_path.read_bytes()
@@ -112,7 +120,6 @@ DELETE FROM rows_abi WHERE id=2;"""
             output = run([str(binary), "--input", str(raw_path), "--source-file-id", source_id,
                           "--flavor", "mysql"], seconds=20)
             (case_dir / "legacy.ndjson").write_bytes(output)
-            (case_dir / "input.sql").write_text(script, encoding="utf-8")
             parsed = [json.loads(line) for line in output.splitlines() if line.strip()]
             if not parsed:
                 raise RuntimeError("legacy parser emitted no fixture rows")
@@ -123,6 +130,10 @@ DELETE FROM rows_abi WHERE id=2;"""
                 raise RuntimeError("native fixture contains duplicate identities")
             if not {"INSERT", "UPDATE", "DELETE"}.issubset({r["operation"] for r in parsed}):
                 raise RuntimeError("native fixture lost a mutation operation")
+            from tools.benchmark_raw_cache import measure
+            measure(raw_path, case_dir / "cache-mechanisms", sha256=hashlib.sha256(raw).hexdigest(),
+                    source_id=source_id, source_size=len(raw), physical_budget=16 * 1024 * 1024,
+                    deadline_seconds=30)
             cases[mode] = dict(raw_bytes=len(raw), raw_sha256=hashlib.sha256(raw).hexdigest(),
                                source_id=source_id, header_events=headers, emitted_rows=len(parsed),
                                legacy_sha256=hashlib.sha256(output).hexdigest())
