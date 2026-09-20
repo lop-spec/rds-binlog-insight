@@ -199,7 +199,9 @@ class MongoStore:
             revisions=[m['revision'] for _,m in manifests]
             if any(len(v)!=64 or any(c not in '0123456789abcdef' for c in v) for v in revisions):
                 raise ValueError('invalid_revision')
-            scope='SELECT * FROM '+self.table('rollups')+' FINAL WHERE instance={instance:String} AND revision IN ('+','.join("'"+v+"'" for v in revisions)+')'
+            # Filter immutable sorting keys before reading large profile/sample columns.
+            # PREWHERE preserves FINAL deduplication while avoiding unrelated granules' payloads.
+            scope='SELECT * FROM '+self.table('rollups')+' FINAL PREWHERE instance={instance:String} AND revision IN ('+','.join("'"+v+"'" for v in revisions)+')'
             params={'instance':instance,'lo':lo,'hi':hi}
             settings={'max_execution_time':10,'max_memory_usage':300_000_000,'max_query_size':1_000_000,'enable_positional_arguments':1}
             counts=self.client.json_rows('SELECT revision,count() AS n FROM ('+scope+') GROUP BY revision',parameters=params,settings=settings,timeout=15)
