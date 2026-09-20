@@ -997,33 +997,58 @@ class EventStorage:
                     pass
 
     def ingest_ndjson_file(
+        self, *, ndjson_path: Path, **options: Any,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        return self._ingest_parser_file(
+            parser_path=ndjson_path, parser_format="ndjson", **options,
+        )
+
+    def ingest_arrow_file(
+        self, *, arrow_path: Path, **options: Any,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Candidate input; reuse the exact legacy 47-field normalization/writer."""
+        return self._ingest_parser_file(
+            parser_path=arrow_path, parser_format="arrow", **options,
+        )
+
+    def _ingest_parser_file(
         self,
         *,
+        parser_path: Path,
+        parser_format: str,
         file_id: str,
         instance_id: str,
         host_instance_id: str,
         source_file_name: str,
-        ndjson_path: Path,
         part_key: str = "",
         append: bool = False,
         publish_metadata: bool = True,
     ) -> tuple[int, list[dict[str, Any]]]:
-        if not ndjson_path.is_file():
+        if not parser_path.is_file():
             raise StorageError(
-                f"解析器输出文件不存在：{ndjson_path.name}",
+                f"解析器输出文件不存在：{parser_path.name}",
                 "PARSER_OUTPUT_MISSING",
             )
+        if parser_format not in {"ndjson", "arrow"}:
+            raise StorageError("未知解析器传输格式", "PARSER_FORMAT_INVALID")
         conn = self._duckdb_connect()
+        inputs = ExitStack()
         moved: list[Path] = []
         try:
-            columns_sql = "{" + ",".join(
-                f"{name}: {_sql_string(data_type)}"
-                for name, data_type in PARSER_JSON_COLUMNS.items()
-            ) + "}"
-            source_sql = (
-                f"read_json({_sql_string(str(ndjson_path))}, "
-                f"format='newline_delimited', columns={columns_sql})"
-            )
+            if parser_format == "arrow":
+                from .columnar_input import open_parser_arrow
+                reader = open_parser_arrow(inputs, parser_path, PARSER_JSON_COLUMNS)
+                conn.register("parser_arrow", reader)
+                source_sql = "parser_arrow"
+            else:
+                columns_sql = "{" + ",".join(
+                    f"{name}: {_sql_string(data_type)}"
+                    for name, data_type in PARSER_JSON_COLUMNS.items()
+                ) + "}"
+                source_sql = (
+                    f"read_json({_sql_string(str(parser_path))}, "
+                    f"format='newline_delimited', columns={columns_sql})"
+                )
             separator = "chr(31)"
             fallback_event_id = (
                 "sha256(concat("
@@ -1114,7 +1139,10 @@ class EventStorage:
                         pass
             raise
         finally:
-            conn.close()
+            try:
+                conn.close()
+            finally:
+                inputs.close()
 
     def finalize_file_parts(self, file_id: str, keep_paths: set[str]) -> int:
         removed = 0
