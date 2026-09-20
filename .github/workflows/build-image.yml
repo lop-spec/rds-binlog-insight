@@ -57,9 +57,11 @@ jobs:
       - name: Install locked application dependencies
         run: python -m pip install -r requirements.txt
       - name: Cache recovery and full-field columnar differential tests
-        run: python -m unittest tests.test_raw_cache tests.test_columnar_input tests.test_parser_contract_fixture -v
+        run: python -m unittest tests.test_raw_cache tests.test_columnar_input tests.test_parser_contract_fixture tests.test_parser_contract_oracle -v
       - name: Generate native statement and row decoder contracts
         run: python -u -m tools.parser_contract_fixture
+      - name: Require independent source values and full-field columnar equivalence
+        run: python -u -m tools.parser_contract_oracle --fixture parser-contract-evidence
       - name: Preserve complete synthetic input and native output, including failure
         if: always()
         uses: actions/upload-artifact@v7

@@ -16,9 +16,34 @@ The default parser/download/publish pipeline, Docker parser binary and productio
 
 The original custom Go wrapper source is not present in the known trees/history/archive. The checked-in native executable remains the baseline, not a reproducible source build.
 
-Before replacing it, the new source decoder must match event identities, raw SQL bytes, all emitted fields, transaction/GTID/XID context, row images, decimals, unsigned values, null/empty/binary/JSON/time values, schema identity and error behavior against both the legacy executable and independent binlog fixtures. Upstream `ParseReader` silently continues after its internal missing-table-map error; use a strict loop and explicit coverage checks. Unsupported events must not become apparent success.
+Before replacing it, the new source decoder must preserve event identities, raw SQL bytes, all emitted fields, transaction/GTID/XID context, row images, decimals, unsigned values, null/empty/binary/JSON/time values, schema identity and error behavior. Use legacy differential checks plus independent binlog fixtures; a confirmed legacy defect is not a correct golden value. In go-mysql v1.16.0, both `ParseReader` and `ParseSingleEvent` suppress missing-table-map failure. `ParseSingleEvent` also treats a partial header returning EOF as completion. Use explicit bounded `io.ReadFull` framing followed by `Parse(raw)`, require FDE context and complete callback/event coverage, and reject unsupported input explicitly. Do not assume a loop around `ParseSingleEvent` alone is strict.
 
 The Arrow adapter alone does not remove the legacy parser's JSON encoding. Do not pipe legacy JSON through an extra converter and call that the completed native-columnar architecture.
+
+## Confirmed legacy value-loss blocker (2026-09-20)
+
+The owned MySQL 8.0 fixture in run `35509934369` (commit `19ab949`) contains
+`VARBINARY X'00FFFE'`. The unchanged native binary emits that value as a JSON
+string containing replacement characters: UTF-8 bytes `00efbfbdefbfbd`, not
+`00fffe`. It occurs in the INSERT after-image and both UPDATE images. Source
+binlog SHA and both compressed-cache round trips still match; this loss is
+inside the legacy parser output, not the new cache or Arrow ingestion.
+
+`tools.parser_contract_oracle` now independently checks all known mutation
+images, including binary bytes, unsigned integers, decimal/float/time tags,
+JSON values and NULLs. It also ingests the real legacy outputs through both
+NDJSON and Arrow and compares all 47 fields, order, types and catalogs. **Both
+transports agree while the independent byte oracle fails.** The fixture job
+must fail at this separate gate until a lossless native decoder fixes it;
+there is no expected-failure exemption or success downgrade. Failed reports,
+raw input and outputs are retained. A binary-safe candidate may represent
+bytes as `{"$bytes_base64":"AP/+"}`; this does not alter the existing binary
+or enable a new production parser.
+
+The synthetic STATEMENT/ROW files are only 785/1604 bytes. Measured ZSTD cache
+ratios were 0.743/0.507 and LZ4 0.811/0.596, with full SHA round trips. These
+small-file results neither pass the <0.385 resource gate nor characterize
+production compression; do not extrapolate throughput from them.
 
 ## Resource and durability gates
 
@@ -34,7 +59,7 @@ The Arrow adapter alone does not remove the legacy parser's JSON encoding. Do no
 Local contracts:
 
 ```text
-python -m unittest tests.test_raw_cache tests.test_columnar_input -v
+python -m unittest tests.test_raw_cache tests.test_columnar_input tests.test_parser_contract_fixture tests.test_parser_contract_oracle -v
 ```
 
 Use the existing `build-image.yml` dispatch with `parser_contract=true` and all other inputs false for credential-free cloud fixture generation. It never publishes images/releases. The normal release regression also includes the cache/columnar tests.
