@@ -12,6 +12,7 @@ from .mongo_collector import MongoCollector, load_instances, METRICS
 from .mongo_insight import analyze, MINUTE, canonical, digest, summarize_namespace_intervals, summarize_native_intervals
 from .mongo_store import MongoStore
 from .mongo_metrics import ANALYSIS_METRICS, lock_wait_points
+from .resource_evidence import native_continuity
 
 LOGGER=logging.getLogger(__name__)
 
@@ -73,6 +74,8 @@ class MongoService:
         points=(lock_wait_points(native,start,end) if metric=='LockWaits' else
                 read_optional('metrics',lambda:store.read_telemetry(instance,'metrics',start,end,metric=metric)))
         native_before=read_optional('native_baseline',lambda:store.read_telemetry(instance,'native',base,base_end,compact=True))
+        baseline_points=(lock_wait_points(native_before,base,base_end) if metric=='LockWaits' else
+                         read_optional('metrics_baseline',lambda:store.read_telemetry(instance,'metrics',base,base_end,metric=metric)))
         latest=read_optional('native_latest',lambda:store.latest_native(instance,end))
         clients=read_optional('client',lambda:store.read_telemetry(instance,'client',start,end))
         # Namespace intervals carry one row per collection per minute per node; the same
@@ -84,7 +87,9 @@ class MongoService:
                             scope='namespace_lock_time_not_cpu',unavailable='window_exceeds_180_minutes')
             LOGGER.warning('mongo_namespace_summary unavailable: window_exceeds_180_minutes instance=%s',instance)
         result=analyze(rows,before,points,start,end,coverage=coverage['complete'],baseline_coverage=baseline['complete'],
-                       metric=metric,order=get('order','correlation'),limit=int(get('limit','50')),bucket_width=width)
+                       metric=metric,order=get('order','attribution'),limit=int(get('limit','50')),bucket_width=width,
+                       baseline_metrics=baseline_points,baseline_start=base,
+                       continuity=native_continuity(native+native_before))
         counter_groups,counter_gaps=summarize_native_intervals(native,start,end,role)
         baseline_groups,baseline_gaps=summarize_native_intervals(native_before,base,base_end,role)
         for key,row in counter_groups.items():

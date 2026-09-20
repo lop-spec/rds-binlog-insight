@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .slowlog_correlation import pearson, differences
+from .resource_evidence import metric_windows, metric_comparison, assess, STOCK_METRICS
 
 LOGGER = logging.getLogger(__name__)
 MINUTE = 60_000_000
@@ -388,17 +389,14 @@ def summarize(rows: list[dict]) -> dict:
 
 def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: int, end: int,
             *, coverage: bool, baseline_coverage: bool, metric: str='CPUUtilization',
-            order: str='duration_growth', limit: int=50, bucket_width: int=MINUTE) -> dict:
+            order: str='duration_growth', limit: int=50, bucket_width: int=MINUTE,
+            baseline_metrics: list[dict] | None=None, baseline_start: int | None=None,
+            continuity: dict | None=None) -> dict:
     now, previous = summarize(rows), summarize(baseline)
     statements = []
-    metric_series: dict[str, dict[int, int]] = defaultdict(dict)
-    for p in metrics:
-        if p.get('metric') != metric:
-            continue
-        t = int(p['timestamp'])*1000
-        value = p.get('value')
-        if value is not None and math.isfinite(float(value)) and start < t <= end:
-            metric_series[str(p.get('role', 'Unknown'))][t] = round(float(value)*1000)
+    metric_series, expected = metric_windows(metrics, metric, start, end)
+    base_start = baseline_start if baseline_start is not None else start - 86400 * 1_000_000
+    baseline_series, _ = metric_windows(baseline_metrics or [], metric, base_start, base_start + end - start)
     # Only report populations actually selected; filtered-out layers are not zero.
     populations = {(k[0], v['profile']['kind']) for source in (now, previous) for k,v in source.items()}
     totals = []
@@ -433,13 +431,13 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         c0 = b['duration_us']/b['count'] if valid and b and b['count'] else None
         row['frequency_cost_delta_us'] = (a['count']-n0)*c0 if c0 is not None else None
         row['per_call_cost_delta_us'] = a['count']*(row['avg_us']-c0) if c0 is not None and row['avg_us'] is not None else None
-        points = metric_series.get(role,{})
-        expected = list(range((start//MINUTE+1)*MINUTE,(end//MINUTE+1)*MINUTE,MINUTE))
-        stock_metric = metric in {'MemoryUtilization','WtCacheUsage','CentralCacheFree','TcmallocCacheMemRatio'}
-        points_ok = bool(expected) and all(t in points for t in expected) and bucket_width == MINUTE and not stock_metric
+        metric_window = metric_series.get(role, {})
+        points = metric_window.get('values', {})
+        stock_metric = metric in STOCK_METRICS
+        points_ok = bool(expected) and metric_window.get('reason') == 'ok' and all(t in points for t in expected) and bucket_width == MINUTE and not stock_metric
         r = dr = None
         reason = ('memory_requires_component_deltas' if stock_metric else 'coarse_grain_zoom_required' if bucket_width != MINUTE
-                  else 'metric_gaps' if not points_ok else 'insufficient_buckets')
+                  else metric_window.get('reason', 'metric_gaps') if not points_ok else 'insufficient_buckets')
         overlap = 0
         precedes = False
         peak_time = None
@@ -461,7 +459,10 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
                                difference_r=dr if correlation_valid else None, resource_overlap=str(overlap) if correlation_valid else None,
                                peak_end_us=peak_time,resource_peak_precedes_candidate=precedes,
                                source_scope='collected_slow_records',count_is_total_execution=False,
-                               direct_cost_complete={k:a[k+'_known']==a['count'] for k in ('cpu_ns','bytes_read','docs')})
+                               direct_cost_complete={k:a[k+'_known']==a['count'] for k in ('cpu_ns','bytes_read','docs')},
+                               complete_minutes=len(expected), active_minutes=sum(a['runtime'].get(t-MINUTE,0)>0 for t in expected),
+                               metric_nodes=metric_window.get('nodes',[]), identity_verified=metric_window.get('identity_verified',False),
+                               native_continuity=(continuity or {}).get(role,'unverified'))
         growth = row['count_delta'] is not None and row['count_delta'] > 0
         cost_growth = any((row['costs'][k]['delta'] or 0)>0 for k in ('duration_us','docs','cpu_ns','bytes_read'))
         row['conclusion'] = 'candidate' if valid and cost_growth and not precedes and not row['incomplete'] else 'insufficient_evidence'
@@ -486,6 +487,9 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
             row['exclusions'].append('内部操作与外层命令不可相加')
         if row['incomplete']:
             row['exclusions'].append('命令正文截断或类型不完整')
+        row['attribution'] = assess(row, metric, comparison=metric_comparison(metric_window, baseline_series.get(role)))
+        # A cost of an unrelated resource (or elapsed waits) cannot make a CPU candidate.
+        row['conclusion'] = 'candidate' if row['attribution']['priority'] >= 2 else 'insufficient_evidence'
         statements.append(row)
     requested_order = order
     order_reason = ''
@@ -503,6 +507,9 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
     if order_reason:
         LOGGER.warning('mongo_analysis ordering changed: requested=%s effective=%s reason=%s',requested_order,order,order_reason)
     def score(row):
+        if order=='attribution':
+            evidence = row['attribution']
+            return (evidence['priority'], max(0, evidence['delta'] or 0))
         if order=='correlation':
             value = row['evidence']['pearson']
             return value if value is not None else -2
@@ -516,7 +523,10 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         c = order_cost.get(order,'duration_us')
         v = row['costs'][c]['delta']
         return v if v is not None else -1
-    statements.sort(key=lambda row:(-score(row),row['role'],row['group_id']))
+    if order == 'attribution':
+        statements.sort(key=lambda row:(-score(row)[0],-score(row)[1],row['role'],row['group_id']))
+    else:
+        statements.sort(key=lambda row:(-score(row),row['role'],row['group_id']))
     unavailable=Counter(row['evidence']['metric_status'] for row in statements if row['evidence']['metric_status']!='ok')
     ranked = sum(r['evidence']['pearson'] is not None for r in statements)
     ranking_reason = ('' if ranked else 'incomplete_source' if not coverage else
@@ -530,6 +540,15 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         LOGGER.warning('mongo_correlation ranking unavailable: metric=%s reason=%s; no alternate ordering',metric,ranking_reason)
     if unavailable:
         LOGGER.warning('mongo_resource_correlation unavailable: %s',dict(unavailable))
+    if order == 'attribution':
+        eligible = sum(r['attribution']['priority'] > 0 for r in statements)
+        reasons = Counter(r['attribution']['status'] for r in statements if not r['attribution']['priority'])
+        ranking = dict(method='resource_matched_cost_growth_v1', applied=True, available=bool(eligible),
+                       ranked_groups=eligible, unranked_groups=len(statements)-eligible,
+                       reason='' if eligible else 'no_resource_growth_evidence', unavailable_reasons=dict(reasons),
+                       metric=metric, scope='observed_slow_record_costs_not_causal_contribution')
+        if not eligible:
+            LOGGER.warning('mongo_attribution unavailable: metric=%s reasons=%s; no alternate ordering',metric,dict(reasons))
     status = 'ok' if coverage and baseline_coverage else 'incomplete_source' if not coverage else 'incomplete_baseline'
     if status != 'ok':
         LOGGER.warning('mongo_analysis unavailable: %s',status)

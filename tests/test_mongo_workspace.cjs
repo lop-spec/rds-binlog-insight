@@ -127,11 +127,19 @@ test('workspace offers exactly the five requested metrics and no independent sor
  assert.doesNotMatch(fs.readFileSync('web/index.html','utf8'),/id="mongo-order"/);
  assert.doesNotMatch(source,/\$\('#mongo-order'\)/);
 });
-test('every metric requests correlation regardless of an old saved sort value',async()=>{
+test('each resource defaults to cost evidence and explicit correlation remains available',async()=>{
  for(const metric of ['CPUUtilization','IOPSUtilization','ScannedDocs','LockWaits','AvgRt']) {
-  const {calls,run}=requestContext({'#mongo-metric':metric,'#mongo-order':'cpu_growth'});await run();
-  const q=new URL(calls[0],'http://fixture').searchParams;assert.equal(q.get('metric'),metric);assert.equal(q.get('order'),'correlation');
+  for(const mode of ['attribution','correlation']) {
+   const {calls,run}=requestContext({'#mongo-metric':metric,'#mongo-order':'cpu_growth','#mongo-analysis-mode':mode});await run();
+   const q=new URL(calls[0],'http://fixture').searchParams;assert.equal(q.get('metric'),metric);assert.equal(q.get('order'),mode);
+  }
  }
+ const {calls,run}=requestContext();await run();assert.equal(new URL(calls[0],'http://fixture').searchParams.get('order'),'attribution');
+});
+test('resource evidence exposes waiting counterexample and missing deltas without a causal score',()=>{
+ const c=context();vm.runInContext(source,c);
+ const html=vm.runInContext('mongoEvidence({attribution:{status:"no_resource_cost_growth",cost_field:"cpu_ns",delta:null,reasons:["elapsed_growth_without_resource_cost_growth","write_concern_wait_increased"]}})',c);
+ assert.match(html,/未增长/);assert.match(html,/等待/);assert.match(html,/不可比较/);assert.doesNotMatch(html,/增量 0|根因概率.*%/);
 });
 test('switching metrics invalidates displayed and in-flight results',async()=>{
  const {c,nodes,run}=requestContext();let resolve;c.api=()=>new Promise(r=>{resolve=r;});const old=run();

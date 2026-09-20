@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.28.39-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.39-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.28.40-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.40-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -192,7 +192,8 @@
               <label class="field span-2"><span>MongoDB 实例</span><select id="mongo-instance"></select></label>
               <label class="field"><span>角色</span><select id="mongo-role"><option value="Primary">Primary</option><option value="Secondary">Secondary</option><option value="">全部角色（分开计算）</option></select></label>
               <label class="field"><span>慢记录层级</span><select id="mongo-kind"><option value="command">外层命令</option><option value="suboperation">内部操作</option></select></label>
-              <label class="field span-4"><span>性能指标 · 按相关度排序</span><select id="mongo-metric"></select></label>
+              <label class="field span-2"><span>性能指标</span><select id="mongo-metric"></select></label>
+              <label class="field span-2"><span>判断方式</span><select id="mongo-analysis-mode"><option value="attribution">上涨排查 · 成本增量证据</option><option value="correlation">时序相关 · 不判断根因</option></select></label>
               <label class="field"><span>命令</span><select id="mongo-command"><option value="">全部</option><option>find</option><option>aggregate</option><option>distinct</option><option>update</option><option>insert</option><option>delete</option><option>getMore</option><option>count</option><option>findAndModify</option></select></label>
               <label class="field span-2"><span>集合 / 集合族</span><input id="mongo-namespace" placeholder="库.集合；支持片段筛选"></label>
               <label class="field"><span>对照基线</span><select id="mongo-baseline"><option value="yesterday">昨日同窗（不超过 24 小时）</option><option value="previous">前一个等长窗口</option><option value="custom">指定开始时间</option></select></label>
@@ -464,8 +465,8 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.28.39-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.28.39-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.28.39-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.28.40-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.28.40-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.28.40-rawoss" defer></script>
 </body>
 </html>

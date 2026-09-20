@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any
 
 from .slowlog_correlation import pearson
+from .resource_evidence import metric_windows, metric_comparison
 
 LOGGER = logging.getLogger(__name__)
 PERIOD_US = 60_000_000
@@ -32,13 +34,17 @@ def family_key(event: dict[str, Any]) -> str:
 
 def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[dict[str, Any]],
                             points: list[dict[str, Any]], *, start_us: int, end_us: int,
-                            index_complete: bool, baseline_complete: bool) -> dict[str, Any]:
+                            index_complete: bool, baseline_complete: bool,
+                            baseline_points: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Resource overlap discounted by the non-growing fraction of execution time.
 
     Identical full-minute windows exactly 24 hours apart. All SQL families are
     treated identically. There is no incident-specific threshold or SQL allowlist.
     Fraction preserves the exact ordering before conversion to display shares.
     """
+    if end_us - start_us >= DAY_US:
+        LOGGER.warning('slowlog_performance_growth unavailable: overlapping_baseline')
+        return {'status':'overlapping_baseline','nodes':[]}
     if not baseline_complete or len(baseline_events) > MAX_EVENTS:
         reason = "incomplete_baseline_index" if not baseline_complete else "baseline_event_limit_exceeded"
         LOGGER.warning("slowlog_performance_growth unavailable: %s", reason)
@@ -57,8 +63,25 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
         key = str(event.get("node_id") or ""), family_key(event)
         members[key].add(str(event["fingerprint"]))
         ids[key] = str(event.get("sql_id") or "")
+    def costs(source):
+        result = {}
+        for event in source:
+            key = str(event.get('node_id') or ''), family_key(event)
+            entry = result.setdefault(key, dict(count=0, rows_examined=0, lock_time_ms=0, rows_examined_known=0, lock_time_ms_known=0))
+            entry['count'] += 1
+            for field in ('rows_examined', 'lock_time_ms'):
+                value = event.get(field)
+                if value is not None and not isinstance(value, bool) and isinstance(value, (int,float)) and value >= 0 and math.isfinite(value):
+                    entry[field] += value; entry[field+'_known'] += 1
+        return result
+    now_costs, before_costs = costs(events), costs(baseline_events)
+    def metric_input(source):
+        return [dict(p, role=p.get('nodeId',''), node=p.get('nodeId',''), metric='IOPS', value=p['Average']) for p in source]
+    current_metrics, _ = metric_windows(metric_input(points),'IOPS',start_us,end_us+1)
+    previous_metrics, _ = metric_windows(metric_input(baseline_points or []),'IOPS',start_us-DAY_US,end_us-DAY_US+1)
     for node in result.get("nodes", []):
         rows = node.get("statements", [])
+        node['resource_comparison'] = metric_comparison(current_metrics.get(node['node_id']),previous_metrics.get(node['node_id']))
         scores = {}
         for row in rows:
             key = node["node_id"], row["fingerprint"]
@@ -69,20 +92,45 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
             row.update(raw_overlap_rank=row["rank"], baseline_runtime_us_total=before,
                        runtime_delta_us=current - before, sql_id=ids[key],
                        member_fingerprints=sorted(members[key]))
-        rows.sort(key=lambda row: (-scores[row["fingerprint"]], row["fingerprint"]))
+            now = now_costs[key]; old = before_costs.get(key, dict(count=0,rows_examined=0,lock_time_ms=0,rows_examined_known=0,lock_time_ms_known=0))
+            evidence = dict(status='elapsed_overlap_only', causal=False, scope='collected_slow_records',
+                            current_count=now['count'],baseline_count=old['count'],
+                            warnings=['runtime_includes_waits','scans_not_physical_iops','index_coverage_not_source_completeness'])
+            for field in ('rows_examined','lock_time_ms'):
+                complete = now[field+'_known']==now['count'] and old[field+'_known']==old['count']
+                evidence[field] = dict(current=now[field] if now[field+'_known'] else None,
+                                       baseline=old[field] if old[field+'_known'] or not old['count'] else None,
+                                       delta=now[field]-old[field] if complete else None,
+                                       known=now[field+'_known'],total=now['count'],
+                                       baseline_known=old[field+'_known'],baseline_total=old['count'])
+            scan_delta = evidence['rows_examined']['delta']
+            if scan_delta is not None:
+                evidence['status'] = 'scan_growth_related_evidence' if scan_delta>0 else 'no_scan_growth'
+            if (evidence['lock_time_ms']['delta'] or 0)>0:
+                evidence['warnings'].append('lock_wait_increased_possible_victim')
+            if node['resource_comparison'].get('delta') is not None and node['resource_comparison']['delta']<=0:
+                evidence['warnings'].append('resource_window_mean_not_increased')
+            row['attribution'] = evidence
+        # Related work evidence precedes elapsed-time overlap; neither is IOPS attribution.
+        rows.sort(key=lambda row: (-(1 if (row['attribution']['rows_examined']['delta'] or 0)>0 else 0),
+                                   -max(0,row['attribution']['rows_examined']['delta'] or 0),
+                                   -scores[row["fingerprint"]], row["fingerprint"]))
         total = sum(scores.values(), Fraction())
         for rank, row in enumerate(rows, 1):
             score = scores[row["fingerprint"]]
-            row.update(rank=rank if score else None,
+            row.update(rank=rank if score or (row['attribution']['rows_examined']['delta'] or 0)>0 else None,
                        growth_score_numerator=str(score.numerator),
                        growth_score_denominator=str(score.denominator),
                        growth_share=float(score / total) if total else None)
-        if rows and not total:
+        if any((row['attribution']['rows_examined']['delta'] or 0)>0 for row in rows):
+            node['status'] = 'ok'
+        elif rows and not total:
             node["status"] = "no_growth_overlap"
             LOGGER.warning("slowlog_performance_growth unavailable: node=%s no growth overlap", node["node_id"])
     if result.get("nodes"):
         result["status"] = "ok" if all(n["status"] == "ok" for n in result["nodes"]) else "partial"
-    result.update(method="baseline_adjusted_resource_overlap_v2", rank_unit="database_and_cloud_sql_id",
+    result.update(method="resource_evidence_then_overlap_v3", rank_unit="database_and_cloud_sql_id",
+                  ranking_warning='Scan growth is related work, not physical IOPS contribution; overlap includes waits.',
                   baseline_start_us=start_us - DAY_US, baseline_end_us=end_us - DAY_US)
     return result
 
