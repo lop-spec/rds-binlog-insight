@@ -120,6 +120,13 @@ class AttributionGates(unittest.TestCase):
         self.assertIn('lock_wait_increased_possible_victim',rows[1]['attribution']['warnings'])
         self.assertFalse(rows[0]['attribution']['causal'])
 
+    def test_different_partial_edges_cannot_create_cost_growth(self):
+        r=self.run_case(self.events(cpu=10000),self.events(baseline=True),baseline_start=T-DAY_US+MINUTE//2)
+        a=r['statements'][0]['attribution']
+        self.assertEqual(a['status'],'incomparable_windows')
+        self.assertIsNone(a['delta'])
+        self.assertFalse(r['ranking']['available'])
+
     def test_mysql_missing_baseline_cost_is_not_zero(self):
         now=[dict(event_id=str(i),node_id='n',sql_id='q',fingerprint='q',database_name='demo',
                   start_us=T+i*MINUTE,duration_ms=1000,rows_examined=100) for i in range(6)]

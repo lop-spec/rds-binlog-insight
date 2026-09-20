@@ -396,7 +396,10 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
     statements = []
     metric_series, expected = metric_windows(metrics, metric, start, end)
     base_start = baseline_start if baseline_start is not None else start - 86400 * 1_000_000
-    baseline_series, _ = metric_windows(baseline_metrics or [], metric, base_start, base_start + end - start)
+    baseline_series, baseline_expected = metric_windows(baseline_metrics or [], metric, base_start, base_start + end - start)
+    comparable_minutes = len(expected) == len(baseline_expected) and bool(expected)
+    if not comparable_minutes:
+        LOGGER.warning('mongo_cost_growth unavailable: unequal or empty complete-minute windows current=%s baseline=%s',len(expected),len(baseline_expected))
     # Only report populations actually selected; filtered-out layers are not zero.
     populations = {(k[0], v['profile']['kind']) for source in (now, previous) for k,v in source.items()}
     totals = []
@@ -412,7 +415,7 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
                    failed=a['failed'], collscan=a['collscan'], spill=a['spill'], max_us=a['max_us'],
                    first_us=a['first_us'], last_us=a['last_us'], sample=json.loads(a['sample']),
                    trend=[{'bucket':t,'count':v,'runtime_us':a['runtime'].get(t,0)} for t,v in sorted(a['trend'].items())])
-        valid = coverage and baseline_coverage
+        valid = coverage and baseline_coverage and comparable_minutes
         row['baseline_count'] = (b['count'] if b else 0) if baseline_coverage else None
         row['count_delta'] = a['count'] - row['baseline_count'] if valid else None
         row['new_slow_shape'] = valid and row['baseline_count'] == 0
@@ -467,7 +470,7 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         cost_growth = any((row['costs'][k]['delta'] or 0)>0 for k in ('duration_us','docs','cpu_ns','bytes_read'))
         row['conclusion'] = 'candidate' if valid and cost_growth and not precedes and not row['incomplete'] else 'insufficient_evidence'
         row['assessment'] = ('incomplete_source' if not coverage else 'incomplete_baseline' if not baseline_coverage
-                             else 'incomplete_command' if row['incomplete'] else 'after_peak' if precedes
+                             else 'incomparable_windows' if not comparable_minutes else 'incomplete_command' if row['incomplete'] else 'after_peak' if precedes
                              else 'candidate' if cost_growth else 'insufficient_cost_fields'
                              if any(row['costs'][k]['delta'] is None for k in ('duration_us','docs','cpu_ns','bytes_read'))
                              else 'no_observed_growth')

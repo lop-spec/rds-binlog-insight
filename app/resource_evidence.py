@@ -107,7 +107,7 @@ def assess(row, metric, *, comparison=None):
         status = 'memory_requires_component_deltas'
     elif not field:
         status = 'resource_cost_unavailable'
-    elif row.get('assessment') in {'incomplete_source', 'incomplete_baseline', 'incomplete_command', 'after_peak'}:
+    elif row.get('assessment') in {'incomplete_source', 'incomplete_baseline', 'incomplete_command', 'after_peak', 'incomparable_windows'}:
         status = row['assessment']
     elif delta is None:
         status = 'resource_cost_incomplete'
