@@ -1465,17 +1465,6 @@ class SyncManager:
                         strict=True,
                     ):
                         file_id, item, prior_state = entry
-                        prepared_download: tuple[Path, str] | None = None
-                        download_error: Exception | None = None
-                        if download_future is not None:
-                            try:
-                                prepared_download = download_future.result()
-                            except Exception as exc:
-                                download_error = exc
-                        if download_error is not None:
-                            staged.append((None, download_error))
-                            continue
-
                         def submit_archive(
                             parts: list[dict[str, Any]],
                         ) -> Future[int]:
@@ -1489,31 +1478,29 @@ class SyncManager:
                                 payload,
                             )
 
-                        staged.append(
-                            (
-                                process_executor.submit(
-                                    self._process_one,
-                                    job_id,
-                                    client,
-                                    settings,
-                                    file_id,
-                                    item,
-                                    prior_state,
-                                    flavor,
-                                    archive,
-                                    prepared_download=prepared_download,
-                                    defer_commit=True,
-                                    query_visible_event=visible_event,
-                                    archive_submitter=(
-                                        submit_archive
-                                        if archive is not None
-                                        else None
-                                    ),
-                                    transform_submitter=submit_transform,
-                                ),
-                                None,
+                        def prepare_downloaded(
+                            entry: tuple[str, RemoteBinlog, str],
+                            downloaded: Future[tuple[Path, str]] | None,
+                            visible: threading.Event,
+                        ) -> PreparedBinlog | int:
+                            # Waiting in the coordinator used to prevent every
+                            # later lane from starting when the first URL/API
+                            # refresh stalled. Each bounded file lane waits for
+                            # its own download; publication/commit below remains
+                            # strictly ordered, including failures and pause.
+                            prepared_download = downloaded.result() if downloaded is not None else None
+                            return self._process_one(
+                                job_id, client, settings, *entry, flavor, archive,
+                                prepared_download=prepared_download,
+                                defer_commit=True,
+                                query_visible_event=visible,
+                                archive_submitter=submit_archive if archive is not None else None,
+                                transform_submitter=submit_transform,
                             )
-                        )
+
+                        staged.append((process_executor.submit(
+                            prepare_downloaded, entry, download_future, visible_event,
+                        ), None))
 
                     next_start = batch_start + len(batch)
 

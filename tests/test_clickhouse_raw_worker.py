@@ -61,7 +61,7 @@ class RawOssWorkerAdmissionTest(unittest.TestCase):
             _sync_progressed(None, deferred, {**deferred, "acknowledged": 1})
         )
 
-    def test_healthy_serving_canary_overrides_host_psi_for_one_bounded_part(self):
+    def _run_fixture(self, *, pressure_override, progressed, invalidated):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             paths = {
@@ -134,25 +134,46 @@ class RawOssWorkerAdmissionTest(unittest.TestCase):
                 ),
                 patch(
                     "app.clickhouse_raw_worker._admit_io_pressure",
-                    return_value=(True, pressure),
+                    return_value=(pressure_override, pressure if pressure_override else None),
                 ),
                 patch(
                     "app.clickhouse_raw_worker.apply_pending_raw_oss_changes",
                     return_value=reconcile_result,
                 ),
                 patch("app.clickhouse_raw_worker.ingest_one") as ingest,
+                patch("app.clickhouse_raw_worker.audit_ready_packed_parts", return_value={
+                    "checked": 64, "invalidated": invalidated,
+                    "after": ("part-64", "identity-64"), "cycleComplete": False,
+                }) as audit,
                 patch(
                     "app.clickhouse_raw_worker.write_json_status",
                     side_effect=lambda _path, payload: status_updates.append(payload),
                 ),
             ):
-                ingest.return_value = {"state": "ready", "part_path": "part-1"}
+                ingest.return_value = {"state": "ready", "part_path": "part-1"} if progressed else None
                 result = run_worker(root, once=True)
 
             self.assertEqual(result, 0)
             self.assertEqual(ingest.call_count, 1)
-            self.assertTrue(ingest.call_args.kwargs["allow_high_io_pressure"])
-            self.assertTrue(status_updates[-1]["ioPressureCanaryOverride"])
+            return ingest, audit, status_updates[-1]
+
+    def test_healthy_serving_canary_overrides_host_psi_for_one_bounded_part(self):
+        ingest, audit, status = self._run_fixture(pressure_override=True, progressed=True, invalidated=0)
+        self.assertTrue(ingest.call_args.kwargs["allow_high_io_pressure"])
+        self.assertTrue(status["ioPressureCanaryOverride"])
+        audit.assert_not_called()
+
+    def test_idle_worker_audits_ready_native_parts_and_reports_repair(self):
+        _, audit, status = self._run_fixture(pressure_override=False, progressed=False, invalidated=1)
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args.kwargs, {"database": "insight", "after": ("", "")})
+        self.assertEqual(status["state"], "running")
+        self.assertEqual(status["nativeAudit"]["invalidated"], 1)
+
+    def test_successful_native_audit_without_changes_remains_idle(self):
+        _, audit, status = self._run_fixture(pressure_override=False, progressed=False, invalidated=0)
+        audit.assert_called_once()
+        self.assertEqual(status["state"], "idle")
 
 
 if __name__ == "__main__":

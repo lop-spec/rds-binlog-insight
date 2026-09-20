@@ -456,6 +456,58 @@ LIMIT {{raw_candidate_limit:UInt64}}
     return sql, parameters
 
 
+def build_packed_state_sql(
+    config: ClickHouseRawOssConfig,
+    *,
+    database: str,
+    parts: list[dict[str, Any]],
+) -> tuple[str, dict[str, str]]:
+    """Read the native aggregate projection, never trust a historical ready flag.
+
+    Shared by serving and the bounded repair sweep. Missing projections fail at
+    the read budget rather than silently launching a whole-table body scan.
+    """
+    keys = list(dict.fromkeys(str(part["logical_part_id"]) for part in parts))
+    if not keys or len(keys) > 64 or any(not key for key in keys):
+        raise ValueError("Packed verification requires 1..64 nonempty identities")
+    parameters = {f"packed_key_{i}": key for i, key in enumerate(keys)}
+    placeholders = ", ".join("{" + name + ":String}" for name in parameters)
+    sql = f"""
+SELECT _source_part_key AS part_key, count() AS rows,
+       uniqExact(_source_part_sha256) AS sha_count,
+       any(_source_part_sha256) AS sha256,
+       min(_content_revision) AS min_revision,
+       max(_content_revision) AS max_revision
+FROM {_identifier(database)}.{_identifier(config.packed_table)}
+WHERE _source_part_key IN ({placeholders})
+GROUP BY _source_part_key
+""".strip()
+    return sql, parameters
+
+
+PACKED_VERIFY_SETTINGS = {
+    "max_threads": 1,
+    "max_execution_time": 10,
+    "max_memory_usage": 128 * 1024 * 1024,
+    "max_bytes_to_read": 32 * 1024 * 1024,
+    "max_result_rows": 64,
+    "max_result_bytes": 128 * 1024,
+    "read_overflow_mode": "throw",
+    "result_overflow_mode": "throw",
+}
+
+
+def packed_state_matches(part: dict[str, Any], state: dict[str, Any]) -> bool:
+    return bool(
+        state
+        and int(state.get("rows") or 0) == int(part["row_count"])
+        and int(state.get("sha_count") or 0) == 1
+        and str(state.get("sha256") or "") == str(part["sha256"])
+        and int(state.get("min_revision", -1)) == int(part["content_revision"])
+        and int(state.get("max_revision", -1)) == int(part["content_revision"])
+    )
+
+
 def _exact_oss_url(settings: Settings, keys: list[str]) -> str:
     cleaned: list[str] = []
     for value in keys:

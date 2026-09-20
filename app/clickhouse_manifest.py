@@ -150,6 +150,38 @@ class ClickHouseManifest:
             ).fetchone()
         return str(row["status"]) if row is not None else None
 
+    def ready_parts_page(
+        self, *, after: tuple[str, str] = ("", ""), limit: int = 64,
+    ) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT part_path, logical_part_id, sha256, content_revision, "
+                "row_count, ready_at_us FROM clickhouse_parts "
+                "WHERE (part_path, logical_part_id) > (?, ?) AND status = 'ready' "
+                "ORDER BY part_path, logical_part_id LIMIT ?",
+                (*after, min(max(int(limit), 1), 64)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def invalidate_ready_parts(self, parts: list[dict[str, Any]]) -> int:
+        """CAS against the audited incarnation; never revive a tombstone/claim."""
+        if not parts:
+            return 0
+        now_us = time.time_ns() // 1000
+        count = 0
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for part in parts:
+                count += connection.execute(
+                    "UPDATE clickhouse_parts SET status = 'pending', next_retry_us = 0, "
+                    "last_error = 'native row/hash/revision coverage changed', updated_at_us = ? "
+                    "WHERE part_path = ? AND logical_part_id = ? AND status = 'ready' "
+                    "AND sha256 = ? AND content_revision = ? AND row_count = ? AND ready_at_us = ?",
+                    (now_us, part["part_path"], part["logical_part_id"], part["sha256"],
+                     part["content_revision"], part["row_count"], part["ready_at_us"]),
+                ).rowcount
+        return count
+
     def reconcile(
         self,
         parts: list[dict[str, Any]],

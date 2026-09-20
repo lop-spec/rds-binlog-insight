@@ -123,7 +123,8 @@ class ParserCapacityTests(unittest.TestCase):
 
 
 class DownloadCapacityTests(unittest.TestCase):
-    def run_pipeline(self, sizes, *, pause=False, wait_for_ahead=False):
+    def run_pipeline(self, sizes, *, pause=False, wait_for_ahead=False,
+                     slow_first_download=False, unavailable_first=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manager = SyncManager.__new__(SyncManager)
@@ -139,6 +140,7 @@ class DownloadCapacityTests(unittest.TestCase):
                        for i, size in enumerate(sizes)]
             lock = threading.Lock()
             ahead = threading.Event()
+            second_parsing = threading.Event()
             first_two = threading.Barrier(2)
             downloaded, processed, committed = [], [], []
             retained, peaks = {}, []
@@ -150,6 +152,13 @@ class DownloadCapacityTests(unittest.TestCase):
                     peaks.append(sum(retained.values()))
                     if len(downloaded) >= 4:
                         ahead.set()
+                if slow_first_download and file_id == 'file-0':
+                    self.assertTrue(second_parsing.wait(2), 'first download blocked the second parser lane')
+                if unavailable_first and file_id == 'file-0':
+                    from app.downloader import DownloadError
+                    with lock:
+                        retained.pop(file_id)
+                    raise DownloadError('fixture missing from source', 'DOWNLOAD_LINK_REFRESH_MISSING')
                 path = root / file_id
                 path.write_bytes(b'fixture')
                 return path, 'sha256'
@@ -157,6 +166,8 @@ class DownloadCapacityTests(unittest.TestCase):
             def process(_job, _client, _settings, file_id, item, *_args, **kwargs):
                 with lock:
                     processed.append(file_id)
+                if file_id == 'file-1':
+                    second_parsing.set()
                 if wait_for_ahead and file_id in {'file-0', 'file-1'}:
                     self.assertTrue(ahead.wait(2), 'independent prefetch did not run')
                     first_two.wait(timeout=2)
@@ -179,6 +190,22 @@ class DownloadCapacityTests(unittest.TestCase):
                 'job', object(), Settings(), pending, 'mysql', None,
                 completed=0, unavailable=0)
             return result, downloaded, processed, committed, max(peaks)
+
+    def test_slow_first_download_does_not_block_second_parser_or_change_commit_order(self):
+        result, _, processed, committed, peak = self.run_pipeline(
+            [100] * 5, slow_first_download=True)
+        self.assertEqual(result, (5, 0, False))
+        self.assertEqual(processed[0], 'file-1')
+        self.assertEqual(committed, [f'file-{i}' for i in range(5)])
+        self.assertLessEqual(peak, pipeline.DOWNLOAD_PREFETCH_FILES * 100)
+
+    def test_missing_first_download_is_accounted_without_losing_later_files(self):
+        result, _, processed, committed, peak = self.run_pipeline(
+            [100] * 5, slow_first_download=True, unavailable_first=True)
+        self.assertEqual(result, (4, 1, False))
+        self.assertNotIn('file-0', processed)
+        self.assertEqual(committed, [f'file-{i}' for i in range(1, 5)])
+        self.assertLessEqual(peak, pipeline.DOWNLOAD_PREFETCH_FILES * 100)
 
     def test_prefetch_runs_ahead_of_both_parsers_and_commit_remains_ordered(self):
         result, downloaded, processed, committed, peak = self.run_pipeline(

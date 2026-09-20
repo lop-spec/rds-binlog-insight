@@ -1,15 +1,52 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .clickhouse_client import ClickHouseClient
 from .clickhouse_manifest import ClickHouseManifest
-from .clickhouse_raw_oss import build_raw_oss_manifest_rows
+from .clickhouse_raw_oss import (
+    ClickHouseRawOssConfig, build_raw_oss_manifest_rows, build_packed_state_sql,
+    packed_state_matches, PACKED_VERIFY_SETTINGS,
+)
 from .config import Settings
 from .metadata import MetadataStore
 
 
+LOGGER = logging.getLogger(__name__)
 ACTIVE_PACK_STATES = frozenset({"pending", "loading", "ready", "load_failed"})
+
+
+def audit_ready_packed_parts(
+    manifest: ClickHouseManifest,
+    client: ClickHouseClient,
+    config: ClickHouseRawOssConfig,
+    *,
+    database: str,
+    after: tuple[str, str] = ("", ""),
+) -> dict[str, Any]:
+    """One bounded projection page; repairs use the existing claim/verify lane.
+
+    Do not hold a SQLite write transaction across network I/O. A failed native
+    query leaves the cursor unchanged and must be reported by the worker.
+    """
+    parts = manifest.ready_parts_page(after=after)
+    if not parts:
+        return {"checked": 0, "invalidated": 0, "after": ("", ""), "cycleComplete": True}
+    sql, parameters = build_packed_state_sql(config, database=database, parts=parts)
+    rows = client.json_rows(sql, parameters=parameters,
+                            settings=PACKED_VERIFY_SETTINGS, timeout=12)
+    states = {str(row["part_key"]): row for row in rows}
+    invalid = [part for part in parts
+               if not packed_state_matches(part, states.get(str(part["logical_part_id"]), {}))]
+    invalidated = manifest.invalidate_ready_parts(invalid)
+    if invalid:
+        LOGGER.error("Packed native audit mismatch: checked=%d missing_or_changed=%d "
+                     "requeued=%d first=%s", len(parts), len(invalid), invalidated,
+                     invalid[0]["logical_part_id"])
+    return {"checked": len(parts), "invalidated": invalidated,
+            "after": (parts[-1]["part_path"], parts[-1]["logical_part_id"]),
+            "cycleComplete": False}
 
 
 def _active_archived(part: dict[str, Any]) -> bool:

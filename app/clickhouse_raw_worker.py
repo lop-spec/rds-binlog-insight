@@ -20,7 +20,7 @@ from .clickhouse_ingest import (
 )
 from .clickhouse_manifest import ClickHouseManifest
 from .clickhouse_raw_oss import ClickHouseRawOssConfig
-from .clickhouse_raw_sync import apply_pending_raw_oss_changes
+from .clickhouse_raw_sync import apply_pending_raw_oss_changes, audit_ready_packed_parts
 from .config import ensure_data_dirs
 from .credentials import load_credential
 from .maintenance_status import write_json_status
@@ -90,6 +90,9 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
         stopping = False
         io_pressure_paused = False
         io_pressure_override_active = False
+        audit_after = ("", "")
+        next_audit = 0.0
+        last_audit: dict[str, Any] = {}
 
         def stop(_signum: int, _frame: Any) -> None:
             nonlocal stopping
@@ -167,7 +170,24 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
                         ),
                         max_rounds=1,
                     )
-                    state = "running" if ingested or before["scanned"] else "idle"
+                    progressed = _sync_progressed(ingested, before, after)
+                    audit_invalidated = 0
+                    # Reuse this worker and its canary/I/O admission. Never add
+                    # a second native read to the one-part pressure override.
+                    if (not stopping and not io_pressure_canary_override
+                            and time.monotonic() >= next_audit):
+                        canary.probe()
+                        last_audit = audit_ready_packed_parts(
+                            pack_manifest, client, raw_config,
+                            database=base_config.database, after=audit_after,
+                        )
+                        audit_invalidated = int(last_audit["invalidated"])
+                        audit_after = tuple(last_audit["after"])
+                        next_audit = time.monotonic() + (
+                            60.0 if last_audit["cycleComplete"] else
+                            30.0 if progressed else max(idle_seconds, 2.0)
+                        )
+                    state = "running" if progressed or audit_invalidated else "idle"
                     write_json_status(
                         status_path,
                         {
@@ -175,6 +195,7 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
                             "reconcileBefore": before,
                             "lastPart": ingested or {},
                             "reconcileAfter": after,
+                            "nativeAudit": last_audit,
                             "ioPressureCanaryOverride": (
                                 io_pressure_canary_override
                             ),
@@ -184,7 +205,7 @@ def run_worker(data_dir: Path, *, once: bool = False) -> int:
                     )
                     if once:
                         return 0
-                    if not _sync_progressed(ingested, before, after):
+                    if not progressed:
                         time.sleep(idle_seconds)
                 except IngestPaused as exc:
                     was_paused = io_pressure_paused

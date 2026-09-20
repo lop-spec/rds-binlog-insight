@@ -16,6 +16,9 @@ from .clickhouse_raw_oss import (
     ClickHouseRawOssConfig,
     build_exact_raw_oss_source_sql,
     build_raw_oss_candidate_sql,
+    build_packed_state_sql,
+    packed_state_matches,
+    PACKED_VERIFY_SETTINGS,
 )
 from .metadata import MetadataStore
 
@@ -500,6 +503,28 @@ class ClickHouseQueryBackend:
             settings=settings,
         )
 
+    def _verify_raw_packed_candidates(
+        self, candidates: list[dict[str, Any]], control: Any | None,
+    ) -> None:
+        packed = [part for part in candidates if int(part.get("oss_length") or 0) > 0]
+        if not packed:
+            return
+        sql, parameters = build_packed_state_sql(
+            self.raw_config, database=self.config.database, parts=packed,
+        )
+        rows = self._query_with_cancel(
+            sql, parameters, control, settings=PACKED_VERIFY_SETTINGS,
+        )
+        states = {str(row["part_key"]): row for row in rows}
+        missing = [str(part["logical_part_id"]) for part in packed
+                   if not packed_state_matches(part, states.get(str(part["logical_part_id"]), {}))]
+        if missing:
+            LOGGER.error("Packed ClickHouse coverage changed: %d/%d identities; first=%s",
+                         len(missing), len(packed), missing[0])
+            raise ClickHouseRawOssUnavailable(
+                "Raw OSS packed native row/hash/revision coverage is incomplete"
+            )
+
     def _query_raw_events(
         self,
         query: dict[str, Any],
@@ -601,6 +626,7 @@ class ClickHouseQueryBackend:
                     int(candidate.get("oss_length") or 0) > 0
                     for candidate in candidate_batch
                 )
+                self._verify_raw_packed_candidates(candidate_batch, control)
                 source_sql, source_parameters = build_exact_raw_oss_source_sql(
                     settings,
                     self.raw_config,
@@ -642,6 +668,10 @@ class ClickHouseQueryBackend:
                     if len(rows) < int(parameters["raw_limit"]):
                         break
 
+                # A ready flag may outlive native deletion/loss. Verify again
+                # after paging, including empty results, before publishing any
+                # rows or claiming complete coverage. No body-scan fallback.
+                self._verify_raw_packed_candidates(candidate_batch, control)
                 unique_rows.sort(
                     key=lambda row: (
                         int(row.get("event_epoch_us") or 0),

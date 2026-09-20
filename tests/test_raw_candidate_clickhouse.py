@@ -113,6 +113,40 @@ class RawCandidateFixtureSetup(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("RAW_CANDIDATE_CI_FIXTURE") == "1",
                      "isolated CI ClickHouse fixture only")
 class RawCandidateClickHouse(unittest.TestCase):
+    def test_packed_native_verification_rejects_stale_ready_and_content_changes(self):
+        from app.clickhouse_raw_oss import build_packed_state_sql, packed_state_matches, PACKED_VERIFY_SETTINGS
+        config = ClickHouseConfig.from_env()
+        self.assertEqual((config.database, config.host, config.port),
+                         ('mongo_ci_fixture', '127.0.0.1', 18123))
+        client = ClickHouseClient(config)
+        raw = replace(ClickHouseRawOssConfig.from_env(), packed_table='packed_integrity_ci_fixture')
+        table = f'{config.database}.{raw.packed_table}'
+        client.query(f'''CREATE TABLE {table} (
+            _source_part_key String, _source_part_sha256 String, _content_revision UInt64,
+            PROJECTION source_part_state_v1 (
+                SELECT _source_part_key, count() AS rows,
+                       uniqExact(_source_part_sha256) AS sha_count,
+                       any(_source_part_sha256) AS sha256,
+                       min(_content_revision) AS min_revision,
+                       max(_content_revision) AS max_revision GROUP BY _source_part_key
+            )) ENGINE=MergeTree ORDER BY _source_part_key''')
+        expected = [dict(logical_part_id=f'part-{i}', sha256='a'*64, content_revision=1,
+                         row_count=3) for i in range(5)]
+        try:
+            values = [dict(_source_part_key=f'part-{i}', _source_part_sha256='a'*64,
+                           _content_revision=1) for i in (0, 1, 2, 3) for _ in range(3)]
+            values[3]['_source_part_sha256'] = 'b'*64
+            values[6]['_content_revision'] = 2
+            values.pop()  # part-3 truncated; part-4 entirely absent
+            client.insert_json_rows(table, values)
+            sql, parameters = build_packed_state_sql(raw, database=config.database, parts=expected)
+            rows = client.json_rows(sql, parameters=parameters, settings=PACKED_VERIFY_SETTINGS, timeout=12)
+            states = {row['part_key']: row for row in rows}
+            self.assertEqual([packed_state_matches(p, states.get(p['logical_part_id'], {}))
+                              for p in expected], [True, False, False, False, False])
+        finally:
+            client.query(f'DROP TABLE {table}')
+
     def test_versions_tombstones_catalogs_and_cursor_match_independent_oracle(self):
         config = ClickHouseConfig.from_env()
         self.assertEqual(config.database, "mongo_ci_fixture")

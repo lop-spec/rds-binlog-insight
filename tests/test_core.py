@@ -1476,14 +1476,20 @@ class MetadataSecurityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cached.binlog"
             path.write_bytes(b"cached")
-            result = download_file(
-                "",
-                path,
-                expected_size=6,
-                expected_crc64="",
-            )
+            # This unit contract is reuse after successful verification, not
+            # availability of a Linux-only executable on the test host. Real
+            # checksum execution is covered by NativeDownloadChecksumTests.
+            with patch("app.downloader.checksum_file", return_value=NativeChecksumResult(
+                6, hashlib.sha256(b"cached").hexdigest(), "0",
+            )) as checksum, patch("app.downloader.urllib.request.urlopen") as network:
+                result = download_file(
+                    "", path, expected_size=6, expected_crc64="",
+                )
+            checksum.assert_called_once_with(path)
+            network.assert_not_called()
             self.assertEqual(result.path, path)
             self.assertEqual(result.size_bytes, 6)
+            self.assertEqual(result.sha256, hashlib.sha256(b"cached").hexdigest())
 
     def test_service_restart_reconciles_running_job(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

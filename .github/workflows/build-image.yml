@@ -195,6 +195,7 @@ jobs:
             tests.test_clickhouse_hot \
             tests.test_clickhouse_query_lifecycle.ClickHouseQueryLifecycle \
             tests.test_clickhouse_raw_worker \
+            tests.test_clickhouse_packed_integrity \
             tests.test_clickhouse_slowlog \
             tests.test_clickhouse_slowlog_verify \
             tests.test_slowlog_collector \

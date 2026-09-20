@@ -1,6 +1,10 @@
 """Direct Binlog downloads must distinguish list access from download access."""
 from __future__ import annotations
 
+import hashlib
+import io
+import sys
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -12,7 +16,8 @@ from unittest.mock import Mock, patch
 
 from app.config import Settings
 from app.credentials import CloudCredential
-from app.downloader import DownloadError
+from app.downloader import DownloadError, download_file
+from app.parser_bridge import NativeChecksumResult, ParserError
 from app.pipeline import SyncManager
 from app.rds_api import RdsApiError, RemoteBinlog
 from app.server import RequestHandler
@@ -39,6 +44,80 @@ def manager_stub():
     manager._event = Mock()
     manager.storage = SimpleNamespace(paths={"downloads": Path("fixture-downloads")})
     return manager
+
+
+class CachedChecksumFailureTests(unittest.TestCase):
+    def test_checksum_tool_failures_preserve_cached_bytes_and_original_error(self):
+        for code in ('PARSER_EXECUTABLE_MISSING', 'CHECKSUM_PROCESS_FAILED', 'CHECKSUM_OUTPUT_INVALID'):
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / 'cached.binlog'
+                path.write_bytes(b'cached')
+                with patch('app.downloader.checksum_file', side_effect=ParserError('fixture tool failure', code)), patch('app.downloader.urllib.request.urlopen') as network:
+                    with self.assertRaises(DownloadError) as raised:
+                        download_file('', path, expected_size=6, expected_crc64='')
+                self.assertEqual(raised.exception.code, code)
+                self.assertEqual(path.read_bytes(), b'cached')
+                self.assertEqual(list(Path(root).iterdir()), [path])
+                network.assert_not_called()
+
+    def test_actual_corruption_is_quarantined_not_mistaken_for_tool_failure(self):
+        for size, crc, expected_code in ((5, '456', 'SIZE_MISMATCH'), (6, '123', 'CRC64_MISMATCH')):
+            with self.subTest(code=expected_code), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / 'cached.binlog'; path.write_bytes(b'cached')
+                with patch('app.downloader.checksum_file', return_value=NativeChecksumResult(size, 'a'*64, crc)), self.assertLogs('app.downloader', 'WARNING') as logged:
+                    with self.assertRaises(DownloadError) as raised:
+                        download_file('', path, expected_size=6, expected_crc64='456')
+                self.assertEqual(raised.exception.code, 'DOWNLOAD_LINK_MISSING')
+                self.assertIn(expected_code, str(logged.output))
+                self.assertFalse(path.exists())
+                self.assertEqual(list(Path(root).glob('*.corrupt-*'))[0].read_bytes(), b'cached')
+
+    def test_416_checksum_tool_failure_preserves_partial(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'cached.binlog'
+            partial = path.with_suffix('.binlog.part'); partial.write_bytes(b'cached')
+            error = urllib.error.HTTPError('https://fixture.invalid/', 416, 'range', {}, None)
+            with patch('app.downloader.urllib.request.urlopen', side_effect=error), patch('app.downloader.checksum_file', side_effect=ParserError('tool failed', 'CHECKSUM_PROCESS_FAILED')):
+                with self.assertRaises(DownloadError) as raised:
+                    download_file('https://fixture.invalid/', path, expected_size=6, expected_crc64='')
+            self.assertEqual(raised.exception.code, 'CHECKSUM_PROCESS_FAILED')
+            self.assertEqual(partial.read_bytes(), b'cached')
+            self.assertFalse(path.exists())
+
+    def test_stream_start_failure_closes_http_response(self):
+        with tempfile.TemporaryDirectory() as root:
+            response = Mock(status=200)
+            with patch('app.downloader.urllib.request.urlopen', return_value=response), patch('app.downloader.NativeChecksumStream', side_effect=ParserError('missing', 'PARSER_EXECUTABLE_MISSING')):
+                with self.assertRaises(DownloadError) as raised:
+                    download_file('https://fixture.invalid/', Path(root)/'cache', expected_size=6, expected_crc64='')
+            self.assertEqual(raised.exception.code, 'PARSER_EXECUTABLE_MISSING')
+            response.close.assert_called_once()
+
+    def test_progress_failure_aborts_native_stream_and_keeps_partial(self):
+        with tempfile.TemporaryDirectory() as root:
+            response = io.BytesIO(b'cached'); response.status = 200
+            path = Path(root)/'cache'
+            with patch('app.downloader.urllib.request.urlopen', return_value=response), patch('app.downloader.NativeChecksumStream') as stream:
+                with self.assertRaisesRegex(RuntimeError, 'progress fixture failure'):
+                    download_file('https://fixture.invalid/', path, expected_size=6, expected_crc64='',
+                                  progress=Mock(side_effect=RuntimeError('progress fixture failure')))
+            stream.return_value.abort.assert_called_once()
+            self.assertTrue(response.closed)
+            self.assertEqual(path.with_suffix('.part').read_bytes(), b'cached')
+            self.assertFalse(path.exists())
+
+
+@unittest.skipUnless(sys.platform.startswith('linux'), 'shipped native checksum executable requires Linux; exercised in cloud CI')
+class NativeDownloadChecksumTests(unittest.TestCase):
+    def test_cached_file_is_really_verified_without_network_or_live_url(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)/'cache'; path.write_bytes(b'123456789')
+            with patch('app.downloader.urllib.request.urlopen') as network:
+                # Independent CRC64/ECMA check vector used by OSS (Go hash/crc64).
+                result = download_file('', path, expected_size=9, expected_crc64='11051210869376104954')
+            self.assertEqual(result.sha256, hashlib.sha256(b'123456789').hexdigest())
+            self.assertEqual(result.size_bytes, 9)
+            network.assert_not_called()
 
 
 class IntranetDownloadTests(unittest.TestCase):

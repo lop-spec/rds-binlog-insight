@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import ssl
 import time
@@ -15,6 +16,10 @@ from .parser_bridge import (
     ParserError,
     checksum_file,
 )
+
+
+LOGGER = logging.getLogger(__name__)
+INTEGRITY_MISMATCH_CODES = frozenset({"SIZE_MISMATCH", "CRC64_MISMATCH"})
 
 
 class DownloadError(RuntimeError):
@@ -82,11 +87,17 @@ def download_file(
     if destination.exists():
         try:
             return verify_file(destination, expected_size, expected_crc64)
-        except DownloadError:
+        except DownloadError as exc:
+            # Missing/crashed checksum tools are not evidence of damaged bytes.
+            # Keep the original and propagate the cause; do not redownload or
+            # mask it as a missing/expired URL (also true on crash recovery).
+            if exc.code not in INTEGRITY_MISMATCH_CODES:
+                raise
             forensic = destination.with_suffix(
                 destination.suffix + f".corrupt-{int(time.time())}"
             )
             os.replace(destination, forensic)
+            LOGGER.warning("Cached binlog %s; preserved as %s", exc.code, forensic.name)
     if not url:
         raise DownloadError("RDS 未提供可下载 URL", "DOWNLOAD_LINK_MISSING")
     offset = partial.stat().st_size if partial.exists() else 0
@@ -106,16 +117,20 @@ def download_file(
             request, timeout=timeout, context=ssl.create_default_context()
         )
     except urllib.error.HTTPError as exc:
+        exc.close()
         if exc.code == 416 and partial.exists() and (
             expected_size <= 0 or partial.stat().st_size == expected_size
         ):
             try:
                 verified = verify_file(partial, expected_size, expected_crc64)
-            except DownloadError:
+            except DownloadError as verification_error:
+                if verification_error.code not in INTEGRITY_MISMATCH_CODES:
+                    raise
                 forensic = partial.with_suffix(
                     partial.suffix + f".corrupt-{int(time.time())}"
                 )
                 os.replace(partial, forensic)
+                LOGGER.warning("Partial binlog %s; preserved as %s", verification_error.code, forensic.name)
                 raise
             os.replace(partial, destination)
             return DownloadResult(
@@ -135,8 +150,11 @@ def download_file(
     last_report = 0.0
     try:
         checksum = NativeChecksumStream()
-    except ParserError as exc:
-        raise DownloadError(str(exc), exc.code) from exc
+    except BaseException as exc:
+        response.close()
+        if isinstance(exc, ParserError):
+            raise DownloadError(str(exc), exc.code) from exc
+        raise
     try:
         if append:
             with partial.open("rb") as existing:
@@ -160,6 +178,11 @@ def download_file(
     except (OSError, urllib.error.URLError, TimeoutError) as exc:
         checksum.abort()
         raise DownloadError(f"Binlog 下载中断：{exc}", "DOWNLOAD_INTERRUPTED") from exc
+    except BaseException:
+        checksum.abort()
+        raise
+    finally:
+        response.close()
     if progress:
         progress(current)
     try:
