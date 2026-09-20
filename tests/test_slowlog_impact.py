@@ -164,6 +164,9 @@ class ServiceTests(unittest.TestCase):
             result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x"}, Settings(), loader)
         self.assertEqual(result["status"], "event_limit_exceeded")
         loader.assert_not_called()
+        sql=backend._rows.call_args.args[0]
+        self.assertIn('nullIf(metric_rows_examined,0)',sql)
+        self.assertIn('nullIf(metric_lock_time_ms,0)',sql)
 
 
 if __name__ == "__main__":

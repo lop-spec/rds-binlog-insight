@@ -133,7 +133,7 @@ function podDetail(value) {
 
 function renderResourceAnalysis(result) {
   const nodes = result.nodes || [];
-  const intro = '<p class="analytics-note">确定性计算，不调用模型。先核对昨日同窗的实际扫描增量，再以耗时增长和 IOPS 时序重合作辅助排序。扫描增长只是相关工作量，不等于物理 IOPS；锁等待增加可能说明 SQL 是拥堵受害者。保留原重合计算供复算，但重合份额不是 IOPS 贡献率，r 不是根因概率。同库同 SQL ID 的数字分表归为一家族。分钟指标 t 对齐前一分钟，不搜索延迟；仅覆盖已采集慢 SQL，索引 100% 不代表来源完整或全量执行。</p>';
+  const intro = '<p class="analytics-note">确定性计算，不调用模型。先核对昨日同窗的实际扫描增量，再以耗时增长和 IOPS 时序重合作辅助排序。扫描增长只是相关工作量，不等于物理 IOPS；锁等待增加可能说明 SQL 是拥堵受害者。保留原重合计算供复算，但重合份额不是 IOPS 贡献率，r 不是根因概率。同库同 SQL ID 的数字分表归为一家族。分钟指标 t 对齐前一分钟，不搜索延迟；仅覆盖已采集慢 SQL，索引 100% 不代表来源完整或全量执行。旧索引无法区分成本字段的零值与缺报，因此不以这些零值计算成本增量；“—”表示无法可靠比较，不是零。</p>';
   if (!nodes.length) return intro + `<p>${escapeHtml(RESOURCE_STATUS[result.status] || result.status || '结果不可用')}</p>`;
   return intro + `<p>${epochMicrosText(result.start_us)} → ${epochMicrosText(result.end_us)} · 当前 / 昨日同窗 ${humanCount(result.executions)} / ${humanCount(result.baseline_executions)} 条执行 · 每节点所有 SQL 家族先排名，再展示前 10</p>` + nodes.map(node => {
     const rows = (node.statements || []).map(row => [String(row.rank ?? '—'),
