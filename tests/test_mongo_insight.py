@@ -395,7 +395,8 @@ class LockWaitGates(unittest.TestCase):
         store.read_telemetry.side_effect=lambda instance,kind,start,end,**kw:[self.sample(total=3)] if kind=='native' and start==T else []
         store.latest_native.return_value=[];service.stores={'dds-example':store}
         result=service.query(dict(instance='dds-example',startEpochUs=T,endEpochUs=T+10*MINUTE,baselineStart=T-10*MINUTE,metric='LockWaits'))
-        self.assertEqual(result['order'],'correlation');self.assertEqual(result['metric_points'][0]['value'],3)
+        self.assertEqual(result['order'],'attribution');self.assertEqual(result['metric_points'][0]['value'],3)
+        self.assertFalse(result['ranking']['available'])  # Queue gauges cannot attribute lock ownership.
         self.assertTrue(all(call.args[1]!='metrics' for call in store.read_telemetry.call_args_list))
         self.assertTrue(all(call.kwargs.get('compact') is True for call in store.read_telemetry.call_args_list if call.args[1]=='native'))
 

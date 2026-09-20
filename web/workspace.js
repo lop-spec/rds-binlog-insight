@@ -105,6 +105,7 @@ function correlationCell(item) {
 }
 
 const RESOURCE_STATUS = {
+  overlapping_baseline: '窗口与昨日同窗重叠，请缩至 24 小时以内；不计算重叠样本的增长归因',
   incomplete_baseline_index: '昨日同窗索引不完整，不计算增长关联', baseline_outside_retention: '昨日同窗超出数据保留期',
   baseline_event_limit_exceeded: '昨日同窗超过 25 万条执行，请缩小窗口', no_growth_overlap: '没有可计算的增长负载重合',
   incomplete_index: '索引尚未完整', event_limit_exceeded: '超过 25 万条执行，请缩小窗口',
@@ -132,17 +133,18 @@ function podDetail(value) {
 
 function renderResourceAnalysis(result) {
   const nodes = result.nodes || [];
-  const intro = '<p class="analytics-note">确定性性能关联排序，不调用模型，也不判定因果。先计算每分钟“执行微秒 × 高于窗口 P20 基线的 IOPS 使用率”，再乘以相比昨日同窗的正向耗时增长比例；常态慢而没有增长的 SQL 不冒充增长主因。同库同 SQL ID 的数字分表归为一个 SQL 家族，保留实际指纹。增长关联份额不是 IOPS 贡献率，耗时可能包含等待；r 仅供核对，不单独作为排序。分钟指标 t 对齐前一分钟，不搜索延迟。仅覆盖窗口内启动且已采集的慢 SQL；索引 100% 不代表采集无遗漏。</p>';
+  const intro = '<p class="analytics-note">确定性计算，不调用模型。先核对昨日同窗的实际扫描增量，再以耗时增长和 IOPS 时序重合作辅助排序。扫描增长只是相关工作量，不等于物理 IOPS；锁等待增加可能说明 SQL 是拥堵受害者。保留原重合计算供复算，但重合份额不是 IOPS 贡献率，r 不是根因概率。同库同 SQL ID 的数字分表归为一家族。分钟指标 t 对齐前一分钟，不搜索延迟；仅覆盖已采集慢 SQL，索引 100% 不代表来源完整或全量执行。</p>';
   if (!nodes.length) return intro + `<p>${escapeHtml(RESOURCE_STATUS[result.status] || result.status || '结果不可用')}</p>`;
   return intro + `<p>${epochMicrosText(result.start_us)} → ${epochMicrosText(result.end_us)} · 当前 / 昨日同窗 ${humanCount(result.executions)} / ${humanCount(result.baseline_executions)} 条执行 · 每节点所有 SQL 家族先排名，再展示前 10</p>` + nodes.map(node => {
     const rows = (node.statements || []).map(row => [String(row.rank ?? '—'),
       `<details><summary>${escapeHtml((row.normalized_sql || row.fingerprint).slice(0, 100))}</summary><p>${row.member_fingerprints?.length || 1} 个实际指纹；SQL 为最慢执行样本，不将家族总量归给样本表。</p>${detailBlock('实际指纹', (row.member_fingerprints || []).join('\n'))}${detailBlock('SQL', row.normalized_sql)}${detailBlock('SQL ID', row.sql_id)}${detailMeta('当前 / 昨日窗口耗时', `${millisText(row.runtime_us_total / 1000)} / ${millisText(row.baseline_runtime_us_total / 1000)}`)}${row.sample_event_id ? `<button type="button" class="button secondary compact" data-resource-event="${escapeHtml(row.sample_event_id)}" data-instance="${escapeHtml(result.instance_id)}">执行样本 / Pod</button>` : ''}</details>`,
+      row.attribution?`${escapeHtml(({scan_growth_related_evidence:'扫描增长旁证（未证明 IOPS 因果）',no_scan_growth:'已记录扫描未增长',elapsed_overlap_only:'仅耗时重合，资源成本不足'})[row.attribution.status]||'证据不足')}<br>扫描增量 ${row.attribution.rows_examined.delta==null?'—':humanCount(row.attribution.rows_examined.delta)}<br>锁等待增量 ${row.attribution.lock_time_ms.delta==null?'—':millisText(row.attribution.lock_time_ms.delta)}${row.attribution.warnings.includes('lock_wait_increased_possible_victim')?'<br>等待增加，可能是受害者':''}${row.attribution.warnings.includes('resource_window_mean_not_increased')?'<br>资源均值并未上涨':''}`:'证据不足',
       row.growth_share == null ? '—' : `${(row.growth_share * 100).toFixed(4)}%`, coefficient(row.resource_r, 4),
       millisText(row.runtime_us_total / 1000), humanCount(row.executions),
     ]);
     const audit = {period_us: result.period_us, sample_end_us: result.sample_end_us, metric_scale: node.metric_scale, metric_values: node.metric_values,
       statements: (node.statements || []).map(({fingerprint, runtime_us, score_numerator, baseline_runtime_us_total, growth_score_numerator, growth_score_denominator}) => ({fingerprint, runtime_us, score_numerator, baseline_runtime_us_total, growth_score_numerator, growth_score_denominator}))};
-    return `<section class="detail-block"><h3>${escapeHtml(node.node_id || '未知节点')}</h3><p>IOPS 基线 ${node.baseline ?? '—'}% / 峰值 ${node.peak ?? '—'}%${node.status !== 'ok' ? ' · ' + escapeHtml(RESOURCE_STATUS[node.status] || node.status) : ''}</p>${analyticsTable(['排名', 'SQL', '增长关联份额', '时序 r', '窗口内执行耗时', '次数'], rows)}<details class="analytics-more"><summary>核对分钟计算序列</summary>${detailBlock('整数序列；metric_values ÷ metric_scale = IOPS 使用率 %', JSON.stringify(audit, null, 2))}</details></section>`;
+    return `<section class="detail-block"><h3>${escapeHtml(node.node_id || '未知节点')}</h3><p>IOPS 基线 ${node.baseline ?? '—'}% / 峰值 ${node.peak ?? '—'}%${node.status !== 'ok' ? ' · ' + escapeHtml(RESOURCE_STATUS[node.status] || node.status) : ''}</p>${analyticsTable(['排查顺序', 'SQL', '工作量与等待证据', '耗时增长重合份额（非贡献）', '时序 r', '窗口内执行耗时', '慢记录次数'], rows)}<details class="analytics-more"><summary>核对分钟计算序列</summary>${detailBlock('资源基线与本期比较（均值非峰值）', JSON.stringify(node.resource_comparison||{},null,2))}${detailBlock('整数序列；metric_values ÷ metric_scale = IOPS 使用率 %', JSON.stringify(audit, null, 2))}</details></section>`;
   }).join('');
 }
 

@@ -76,8 +76,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     if window is None:
         return unavailable("invalid_window")
     start_us, end_us = window
-    if end_us - start_us > 7 * 86400 * 1_000_000:
-        return unavailable("window_exceeds_seven_days")
+    if end_us - start_us >= DAY_US:
+        return unavailable("overlapping_baseline")
     parts = metadata.parts_in_range(start_epoch_us=start_us, end_epoch_us=end_us,
                                    source="slowlog", instance=instance)
     coverage = backend._manifest_coverage(parts)
@@ -89,7 +89,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                              "metric_event_epoch_us AS start_us, metric_node_id AS node_id, "
                              "metric_database_name AS database_name, "
                              "metric_fingerprint AS fingerprint, metric_sql_id AS sql_id, "
-                             "metric_query_time_ms AS duration_ms FROM (" + scope + ") "
+                             "metric_query_time_ms AS duration_ms, metric_rows_examined AS rows_examined, "
+                             "metric_lock_time_ms AS lock_time_ms FROM (" + scope + ") "
                              f"LIMIT {MAX_EVENTS + 1}", parameters, None)
     rows = read_events(start_us, end_us)
     if len(rows) > MAX_EVENTS:
@@ -110,8 +111,13 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     try:
         points = metrics_loader(settings, start_us, end_us, instance,
                                 str(query.get("node_id") or ""))
+        try:
+            baseline_points = metrics_loader(settings, baseline_start, baseline_end, instance, str(query.get('node_id') or ''))
+        except (RuntimeError, ValueError, KeyError, TypeError, OSError):
+            LOGGER.exception('slowlog_resource_query baseline metrics unavailable; not inferring resource growth')
+            baseline_points = []
         result = rank_performance_growth(rows, baseline, points, start_us=start_us, end_us=end_us,
-                                         index_complete=True, baseline_complete=True)
+                                         index_complete=True, baseline_complete=True, baseline_points=baseline_points)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):
         LOGGER.exception("slowlog_resource_query metric or input validation failed")
         return unavailable("metric_or_input_unavailable")
