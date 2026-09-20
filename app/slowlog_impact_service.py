@@ -89,8 +89,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                              "metric_event_epoch_us AS start_us, metric_node_id AS node_id, "
                              "metric_database_name AS database_name, "
                              "metric_fingerprint AS fingerprint, metric_sql_id AS sql_id, "
-                             "metric_query_time_ms AS duration_ms, metric_rows_examined AS rows_examined, "
-                             "metric_lock_time_ms AS lock_time_ms FROM (" + scope + ") "
+                             # Legacy index maps unreported costs to 0: zero lacks presence proof.
+                             "metric_query_time_ms AS duration_ms, nullIf(metric_rows_examined,0) AS rows_examined, "
+                             "nullIf(metric_lock_time_ms,0) AS lock_time_ms FROM (" + scope + ") "
                              f"LIMIT {MAX_EVENTS + 1}", parameters, None)
     rows = read_events(start_us, end_us)
     if len(rows) > MAX_EVENTS:
@@ -116,6 +117,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         except (RuntimeError, ValueError, KeyError, TypeError, OSError):
             LOGGER.exception('slowlog_resource_query baseline metrics unavailable; not inferring resource growth')
             baseline_points = []
+        unknown=sum(event.get('rows_examined') is None or event.get('lock_time_ms') is None for event in rows+baseline)
+        if unknown:
+            LOGGER.warning('slowlog_cost_provenance incomplete: %s records contain legacy zero or absent costs; not treating as measured zero',unknown)
         result = rank_performance_growth(rows, baseline, points, start_us=start_us, end_us=end_us,
                                          index_complete=True, baseline_complete=True, baseline_points=baseline_points)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):

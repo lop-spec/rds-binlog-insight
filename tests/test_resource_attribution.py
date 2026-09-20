@@ -120,6 +120,17 @@ class AttributionGates(unittest.TestCase):
         self.assertIn('lock_wait_increased_possible_victim',rows[1]['attribution']['warnings'])
         self.assertFalse(rows[0]['attribution']['causal'])
 
+    def test_mysql_missing_baseline_cost_is_not_zero(self):
+        now=[dict(event_id=str(i),node_id='n',sql_id='q',fingerprint='q',database_name='demo',
+                  start_us=T+i*MINUTE,duration_ms=1000,rows_examined=100) for i in range(6)]
+        old=[dict(e,start_us=e['start_us']-DAY_US,rows_examined=None) for e in now]
+        p=[dict(timestamp=(T+i*MINUTE)//1000,nodeId='n',Average=i*5) for i in range(1,7)]
+        r=rank_performance_growth(now,old,p,start_us=T,end_us=T+6*MINUTE-1,index_complete=True,baseline_complete=True)
+        a=r['nodes'][0]['statements'][0]['attribution']
+        self.assertIsNone(a['rows_examined']['baseline'])
+        self.assertIsNone(a['rows_examined']['delta'])
+        self.assertEqual(a['status'],'elapsed_overlap_only')
+
     def test_native_epoch_change_blocks_cost_candidate(self):
         continuity=native_continuity([dict(role='Primary',node='a',epoch=e) for e in ('old','new')])
         r=self.run_case(self.events(cpu=10000),self.events(baseline=True),continuity=continuity)
