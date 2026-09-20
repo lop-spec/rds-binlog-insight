@@ -302,8 +302,8 @@ class ConfigAndChecksumTests(unittest.TestCase):
         stylesheet = (root / "web" / "app.css").read_text(encoding="utf-8")
         self.assertIn('id="active-job-speed"', html)
         self.assertIn('id="active-job-eta"', html)
-        self.assertIn("全链路速度", html)
-        self.assertIn("预计追平时间", html)
+        self.assertIn("文件完成速率", html)
+        self.assertIn("本轮库存清空估算", html)
         self.assertIn('id="app-version"', html)
         self.assertNotIn("v1.8.5 · 1 CPU", html)
         self.assertIn("data.version", script)
@@ -1099,7 +1099,7 @@ class MetadataSecurityTests(unittest.TestCase):
                 self.assertEqual(job["events"][0]["code"], "EVENT_05")
                 self.assertEqual(job["events"][-1]["code"], "EVENT_24")
 
-    def test_sync_performance_uses_recorded_full_chain_duration_and_confirmed_backlog(
+    def test_sync_performance_separates_wall_clock_throughput_and_inventory_eta(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1120,9 +1120,8 @@ class MetadataSecurityTests(unittest.TestCase):
                 )
                 if index < 6:
                     store.set_file_state(file_id, "done", raw_deleted=True)
-                    # Completion timestamps deliberately include long gaps.  The
-                    # speed must come from active full-chain duration, not from
-                    # idle time between periodic sync jobs.
+                    # Wall-clock throughput must include gaps and overlap; the
+                    # median per-file latency remains a separate diagnostic.
                     completed_at = completed_start + timedelta(minutes=10 * index)
                     with store.connection() as conn:
                         conn.execute(
@@ -1142,23 +1141,25 @@ class MetadataSecurityTests(unittest.TestCase):
 
             performance = store.sync_performance(
                 job,
-                now=datetime(2026, 8, 2, 0, 5, tzinfo=UTC),
+                host_instance_id="host-a",
+                now=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
             )
 
             self.assertEqual(performance["state"], "available")
             self.assertEqual(performance["completion_sample_size"], 6)
             self.assertAlmostEqual(performance["seconds_per_file"], 50.0)
-            self.assertAlmostEqual(performance["source_seconds_per_file"], 300.0)
-            self.assertAlmostEqual(performance["processing_files_per_hour"], 72.0)
-            self.assertAlmostEqual(performance["source_files_per_hour"], 12.0)
+            self.assertIsNone(performance["source_seconds_per_file"])
+            self.assertAlmostEqual(performance["processing_files_per_hour"], 3.0)
+            self.assertAlmostEqual(performance["processing_bytes_per_hour"], 369.0)
+            self.assertAlmostEqual(performance["source_files_per_hour"], 3.5)
             self.assertEqual(performance["known_remaining_files"], 80)
-            self.assertAlmostEqual(performance["estimated_unseen_files"], 0.0)
+            self.assertIsNone(performance["estimated_unseen_files"])
             self.assertAlmostEqual(performance["estimated_backlog_files"], 80.0)
-            self.assertAlmostEqual(performance["estimated_remaining_seconds"], 4000.0)
-            self.assertEqual(
-                performance["estimated_catch_up_at_utc"],
-                "2026-08-02T01:11:40Z",
-            )
+            self.assertIsNone(performance["estimated_remaining_seconds"])
+            self.assertEqual(performance["estimated_catch_up_at_utc"], "")
+            self.assertEqual(performance["continuous_state"], "not_catching_up")
+            self.assertEqual(performance["inventory_remaining_seconds"], 96000.0)
+            self.assertEqual(performance["inventory_clear_at_utc"], "2026-08-03T03:40:00Z")
 
     def test_file_state_records_active_full_chain_duration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1208,16 +1209,14 @@ class MetadataSecurityTests(unittest.TestCase):
             self.assertEqual(warming["state"], "warming_up")
             self.assertIsNone(warming["seconds_per_file"])
 
+            rows = [dict(host_instance_id="host-a", log_file_name=f"mysql-bin.{i}",
+                         completed_at="2026-08-01T23:55:00Z", processing_seconds=400.0,
+                         file_size=100) for i in range(4)]
             active_backlog = store.estimate_sync_performance(
-                processing_durations=[400.0, 400.0, 400.0, 400.0],
-                source_times=[
-                    "2026-08-01T23:40:00Z",
-                    "2026-08-01T23:45:00Z",
-                    "2026-08-01T23:50:00Z",
-                    "2026-08-01T23:55:00Z",
-                ],
+                completion_rows=rows,
+                source_rows=[],
+                host_instance_id="host-a",
                 known_remaining_files=19,
-                latest_source_end_utc="2026-08-01T23:55:00Z",
                 running=True,
                 active_files=1,
                 now=datetime(2026, 8, 2, tzinfo=UTC),
@@ -1226,15 +1225,14 @@ class MetadataSecurityTests(unittest.TestCase):
             self.assertEqual(active_backlog["known_remaining_files"], 19)
             self.assertEqual(active_backlog["queued_remaining_files"], 18)
             self.assertAlmostEqual(
-                active_backlog["estimated_remaining_seconds"],
-                7600.0,
+                active_backlog["inventory_remaining_seconds"],
+                34200.0,
             )
 
             live_following = store.estimate_sync_performance(
-                processing_durations=[50.0, 50.0, 50.0, 50.0],
-                source_times=[],
+                completion_rows=rows,
+                source_rows=[],
                 known_remaining_files=1,
-                latest_source_end_utc="",
                 running=True,
                 active_files=1,
                 now=datetime(2026, 8, 2, tzinfo=UTC),
@@ -1245,28 +1243,21 @@ class MetadataSecurityTests(unittest.TestCase):
             self.assertIsNone(live_following["estimated_remaining_seconds"])
 
             discovering = store.estimate_sync_performance(
-                processing_durations=[50.0, 50.0, 50.0, 50.0],
-                source_times=[
-                    "2026-08-01T23:40:00Z",
-                    "2026-08-01T23:45:00Z",
-                    "2026-08-01T23:50:00Z",
-                    "2026-08-01T23:55:00Z",
-                ],
+                completion_rows=rows,
+                source_rows=[],
                 known_remaining_files=0,
-                latest_source_end_utc="2026-08-01T23:55:00Z",
                 running=True,
                 workload_ready=False,
                 now=datetime(2026, 8, 2, tzinfo=UTC),
             )
             self.assertEqual(discovering["state"], "checking_latest")
-            self.assertEqual(discovering["seconds_per_file"], 50.0)
+            self.assertEqual(discovering["seconds_per_file"], 400.0)
             self.assertIsNone(discovering["estimated_remaining_seconds"])
 
             caught_up = store.estimate_sync_performance(
-                processing_durations=[50.0, 50.0, 50.0, 50.0],
-                source_times=[],
+                completion_rows=rows,
+                source_rows=[],
                 known_remaining_files=0,
-                latest_source_end_utc="",
                 running=False,
                 now=datetime(2026, 8, 2, tzinfo=UTC),
             )

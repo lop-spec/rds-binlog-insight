@@ -9,14 +9,13 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
-from math import isfinite
 from pathlib import Path
-from statistics import median
 from typing import Any, Iterator
 
 from .catalog_store import CatalogStore
 from .config import Settings, json_dumps, utc_now_text
 from .rds_api import RemoteBinlog
+from .sync_metrics import SAMPLE_LIMIT, WINDOW_SECONDS, estimate_sync_performance, utc_datetime
 
 
 # Tabularis 审计事件登记成伪 binlog 文件，文件名固定用这个前缀（见
@@ -4254,190 +4253,73 @@ class MetadataStore:
                 )
         return [str(row["result_path"] or "") for row in rows]
 
-    @staticmethod
-    def _utc_datetime(value: str) -> datetime | None:
-        text = str(value or "").strip()
-        if not text:
-            return None
-        try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC)
-
-    @classmethod
-    def _median_interval_seconds(cls, values: list[str]) -> tuple[float | None, int]:
-        timestamps = sorted(
-            value
-            for value in (cls._utc_datetime(item) for item in values)
-            if value is not None
-        )
-        intervals = [
-            (current - previous).total_seconds()
-            for previous, current in zip(timestamps, timestamps[1:])
-            if current > previous
-        ]
-        if len(intervals) < 3:
-            return None, len(timestamps)
-        return float(median(intervals)), len(timestamps)
-
-    @staticmethod
-    def _median_duration_seconds(
-        values: list[float | int | str],
-    ) -> tuple[float | None, int]:
-        durations: list[float] = []
-        for value in values:
-            try:
-                duration = float(value)
-            except (TypeError, ValueError):
-                continue
-            if isfinite(duration) and duration > 0:
-                durations.append(duration)
-        if len(durations) < 4:
-            return None, len(durations)
-        return float(median(durations)), len(durations)
-
-    @classmethod
-    def estimate_sync_performance(
-        cls,
-        *,
-        processing_durations: list[float | int | str],
-        source_times: list[str],
-        known_remaining_files: int,
-        latest_source_end_utc: str,
-        running: bool,
-        active_files: int = 0,
-        workload_ready: bool = True,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        current = (now or datetime.now(UTC)).astimezone(UTC)
-        seconds_per_file, completion_sample_size = cls._median_duration_seconds(
-            processing_durations
-        )
-        source_seconds_per_file, source_sample_size = cls._median_interval_seconds(
-            source_times
-        )
-        known_remaining = max(0, int(known_remaining_files))
-        active_count = min(known_remaining, max(0, int(active_files)))
-        queued_remaining = max(0, known_remaining - active_count)
-        result: dict[str, Any] = {
-            "state": "warming_up",
-            "seconds_per_file": (
-                round(seconds_per_file, 3)
-                if seconds_per_file is not None
-                else None
-            ),
-            "source_seconds_per_file": (
-                round(source_seconds_per_file, 3)
-                if source_seconds_per_file is not None
-                else None
-            ),
-            "processing_files_per_hour": None,
-            "source_files_per_hour": None,
-            "completion_sample_size": completion_sample_size,
-            "source_sample_size": source_sample_size,
-            "known_remaining_files": known_remaining,
-            "active_files": active_count,
-            "queued_remaining_files": queued_remaining,
-            "estimated_unseen_files": 0.0,
-            "estimated_backlog_files": float(known_remaining),
-            "estimated_remaining_seconds": None,
-            "estimated_catch_up_at_utc": "",
-        }
-        if seconds_per_file is not None:
-            result["processing_files_per_hour"] = round(
-                3600.0 / seconds_per_file, 3
-            )
-        if source_seconds_per_file is not None:
-            result["source_files_per_hour"] = round(
-                3600.0 / source_seconds_per_file, 3
-            )
-
-        if known_remaining == 0:
-            result["state"] = "checking_latest" if running else "caught_up"
-            return result
-        if running and active_count > 0 and queued_remaining == 0:
-            result["state"] = "live_following"
-            result["estimated_backlog_files"] = 0.0
-            return result
-        if not workload_ready or seconds_per_file is None:
-            return result
-
-        # ETA is scoped to Completed Binlogs already confirmed by the latest
-        # RDS API inventory.  Future or still-open Binlogs are new input, not
-        # hidden backlog, and must not turn an already-caught-up service into a
-        # false "cannot catch up" state.
-        backlog = float(known_remaining)
-        result["estimated_backlog_files"] = backlog
-        remaining_seconds = backlog * seconds_per_file
-        catch_up_at = current + timedelta(seconds=remaining_seconds)
-        result.update(
-            {
-                "state": "available",
-                "estimated_remaining_seconds": round(remaining_seconds, 1),
-                "estimated_catch_up_at_utc": catch_up_at.isoformat(
-                    timespec="seconds"
-                ).replace("+00:00", "Z"),
-            }
-        )
-        return result
+    estimate_sync_performance = staticmethod(estimate_sync_performance)
 
     def sync_performance(
         self,
         job: dict[str, Any],
         *,
         now: datetime | None = None,
-        completion_limit: int = 21,
-        source_limit: int = 61,
+        completion_limit: int = SAMPLE_LIMIT,
+        source_limit: int = SAMPLE_LIMIT,
         active_files: int = 0,
+        host_instance_id: str | None = None,
     ) -> dict[str, Any]:
+        current = utc_datetime(now or datetime.now(UTC))
+        if current is None:
+            raise ValueError("invalid observation clock")
         instance_id = str(job.get("instance_id") or "")
+        completion_limit = min(SAMPLE_LIMIT, max(4, int(completion_limit)))
+        source_limit = min(SAMPLE_LIMIT, max(4, int(source_limit)))
+        # UTC text is canonical in this store. Widen by one second before the
+        # exact Python comparison so fractional timestamps at either edge are
+        # not accidentally excluded by SQLite's textual comparison.
+        lower = (current - timedelta(seconds=WINDOW_SECONDS + 1)).isoformat(timespec="seconds").replace("+00:00", "Z")
+        upper = (current + timedelta(seconds=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
         with self.connection() as conn:
+            conn.execute("BEGIN")  # both indexed reads share one WAL snapshot
             completion_rows = conn.execute(
                 """
-                SELECT processing_seconds
+                SELECT host_instance_id, log_file_name, file_size,
+                       completed_at, processing_seconds
                 FROM binlog_files
-                WHERE instance_id = ? AND state = 'done' AND processing_seconds > 0
+                WHERE instance_id = ? AND state = 'done'
+                  AND completed_at >= ? AND completed_at <= ?
                 ORDER BY completed_at DESC
                 LIMIT ?
                 """,
-                (instance_id, max(4, int(completion_limit))),
+                (instance_id, lower, upper, completion_limit + 1),
             ).fetchall()
+            # No claim that this bounded local inventory proves RDS coverage.
+            # Index order + LIMIT bounds the work without a startup migration
+            # or a scan of every historical row to filter by log_end_utc.
             source_rows = conn.execute(
                 """
-                SELECT log_begin_utc, log_end_utc
+                SELECT host_instance_id, log_file_name, file_size,
+                       log_end_utc, remote_status
                 FROM binlog_files
-                WHERE instance_id = ? AND LOWER(remote_status) = 'completed'
+                WHERE instance_id = ? AND log_begin_utc <= ?
                 ORDER BY log_begin_utc DESC
                 LIMIT ?
                 """,
-                (instance_id, max(4, int(source_limit))),
+                (instance_id, upper, source_limit + 1),
             ).fetchall()
-        latest_source_end_utc = (
-            str(source_rows[0]["log_end_utc"]) if source_rows else ""
-        )
+        completion_truncated = len(completion_rows) > completion_limit
+        source_truncated = len(source_rows) > source_limit
+        if completion_truncated:
+            LOGGER.warning("SYNC_RATE_UNAVAILABLE instance=%s reason=completion_sample_limit", instance_id)
         running = str(job.get("status") or "") == "running"
-        workload_ready = (
-            not running
-            or int(job.get("total_files") or 0) > 0
-            or int(job.get("discovered_files") or 0) > 0
-        )
         return self.estimate_sync_performance(
-            processing_durations=[
-                float(row["processing_seconds"]) for row in completion_rows
-            ],
-            source_times=[str(row["log_begin_utc"]) for row in source_rows],
-            known_remaining_files=(
-                int(job.get("total_files") or 0)
-                - int(job.get("completed_files") or 0)
-            ),
-            latest_source_end_utc=latest_source_end_utc,
-            running=running,
-            active_files=active_files,
-            workload_ready=workload_ready,
-            now=now,
+            completion_rows=[dict(row) for row in completion_rows[:completion_limit]],
+            source_rows=[dict(row) for row in source_rows[:source_limit]],
+            known_remaining_files=int(job.get("total_files") or 0) - int(job.get("completed_files") or 0),
+            failed_files=int(job.get("failed_files") or 0),
+            running=running, active_files=active_files,
+            workload_ready=(str(job.get("status") or "") in {"success", "warning"}
+                            or (running and (int(job.get("total_files") or 0) > 0
+                                             or int(job.get("discovered_files") or 0) > 0))),
+            host_instance_id=host_instance_id, now=current,
+            completion_truncated=completion_truncated, source_truncated=source_truncated,
         )
 
     def known_instances(self) -> list[str]:

@@ -339,14 +339,14 @@
           <div class="progress-track"><span id="active-job-progress"></span></div>
           <div class="active-job-metrics" aria-live="polite">
             <div class="active-job-metric">
-              <span title="下载、解析、Parquet、OSS 与原文件删除全部完成的节奏">全链路速度</span>
+              <span title="同节点近2小时的 done 文件数及原始字节率；含空闲等待，不代表历史或原生索引覆盖完整">文件完成速率</span>
               <strong id="active-job-speed">计算中</strong>
-              <small id="active-job-speed-note">等待完整发布样本</small>
+              <small id="active-job-speed-note">等待同节点墙钟窗口样本</small>
             </div>
             <div class="active-job-metric">
-              <span>预计追平时间</span>
+              <span>本轮库存清空估算</span>
               <strong id="active-job-eta">计算中</strong>
-              <small id="active-job-eta-note">会扣除实例持续新增的 Binlog</small>
+              <small id="active-job-eta-note">仅本轮库存、不含新增；不等于持续净追平时间</small>
             </div>
           </div>
           <p id="active-job-message"></p>

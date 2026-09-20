@@ -333,9 +333,11 @@ class SyncManager:
         # 把本实例的进度显示成对方的。实例 ID 取不到时退回不过滤(单实例旧行为)。
         latest = self.metadata.latest_job(self._job_scope())
         if latest is not None:
+            performance_scope = getattr(self, "_performance_scope", ("", None))
             latest["performance"] = self.metadata.sync_performance(
                 latest,
                 active_files=active_files,
+                host_instance_id=(performance_scope[1] if performance_scope[0] == latest.get("id") else None),
             )
         external = read_json_status(
             self.storage.paths["index"] / SUPERVISOR_STATUS_NAME
@@ -1668,6 +1670,7 @@ class SyncManager:
         primary_resolver = getattr(client, "primary_host_instance_id", None)
         if callable(primary_resolver):
             primary_host_instance_id = str(primary_resolver())
+        self._performance_scope = (job_id, primary_host_instance_id or None)
         self._event(
             job_id,
             "info",

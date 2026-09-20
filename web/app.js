@@ -660,51 +660,57 @@ function humanDuration(input) {
 }
 
 function rateText(value) {
+  if (value == null || value === "") return "—";
   const rate = Number(value);
   return Number.isFinite(rate) ? rate.toFixed(1) : "—";
 }
 
 function renderSyncPerformance(performance, running = false) {
-  const speed = Number(performance?.seconds_per_file);
-  const sampleSize = Number(performance?.completion_sample_size || 0);
-  const processRate = Number(performance?.processing_files_per_hour);
-  const sourceRate = Number(performance?.source_files_per_hour);
-  const stateValue = performance?.state || "warming_up";
-  const knownStates = ["warming_up", "available", "not_catching_up", "checking_latest", "live_following", "caught_up"];
-  const metricState = knownStates.includes(stateValue) ? stateValue : "warming_up";
+  const wallClock = performance?.rate_basis === "recorded_done_per_wall_clock_window";
+  const processRate = wallClock ? performance.processing_files_per_hour : null;
+  const sourceRate = wallClock ? performance.source_files_per_hour : null;
+  const metricState = performance?.state || "warming_up";
+  const bytesRate = performance?.processing_bytes_per_hour;
+  const windowHours = Number(performance?.window_seconds || 0) / 3600;
+  const sourceNote = sourceRate != null && Number.isFinite(Number(sourceRate))
+    ? `同节点已知源文件 ≥ ${rateText(sourceRate)} 个/小时（${performance.source_bytes_per_hour == null ? "—" : humanBytes(performance.source_bytes_per_hour)}/小时）`
+    : "源端速率未知";
+  $("#active-job-speed").title = `统计节点：${performance?.host_instance_id || "未确认"}；${performance?.host_authoritative ? "本轮核验节点" : "仅观察样本，不据此估算库存"}；单文件中位时延 ${rateText(performance?.seconds_per_file)} 秒，不作为吞吐`;
 
-  if (Number.isFinite(speed) && speed > 0) {
-    $("#active-job-speed").textContent = `${speed < 100 ? speed.toFixed(1) : Math.round(speed)} 秒 / Binlog`;
+  if (processRate != null && Number.isFinite(Number(processRate))) {
+    $("#active-job-speed").textContent = `${rateText(processRate)} 个/小时`;
     $("#active-job-speed-note").textContent =
-      `近 ${humanCount(sampleSize)} 个完整发布样本 · ${rateText(processRate)} 个/小时`;
+      `近 ${windowHours} 小时 · ${humanCount(performance.completion_sample_size)} 个完成记录 · ${bytesRate == null ? "—" : humanBytes(bytesRate)}/小时 · ${sourceNote}`;
   } else {
-    $("#active-job-speed").textContent = "计算中";
-    $("#active-job-speed-note").textContent = "至少完成 4 个 Binlog 后生成稳定速度";
+    $("#active-job-speed").textContent = "暂无可靠样本";
+    $("#active-job-speed-note").textContent = "按同节点、同墙钟窗口统计；不以单文件耗时倒数代替吞吐";
   }
 
-  if (metricState === "available") {
+  const continuousNote = performance?.continuous_state === "not_catching_up"
+    ? "本窗口完成速率不高于已知源端速率，尚未净追赶"
+    : "源端完整覆盖未核实，持续净追平时间未知";
+  if (wallClock && metricState === "available" && performance.inventory_remaining_seconds != null) {
     const backlog = Math.ceil(Number(performance.estimated_backlog_files || 0));
-    $("#active-job-eta").textContent = formatTime(performance.estimated_catch_up_at_utc);
+    $("#active-job-eta").textContent = formatTime(performance.inventory_clear_at_utc);
     $("#active-job-eta-note").textContent =
-      `约 ${humanDuration(performance.estimated_remaining_seconds)} · 已确认待处理 ${humanCount(backlog)} 个 Completed Binlog`;
-  } else if (metricState === "not_catching_up") {
-    $("#active-job-eta").textContent = "按当前速度无法追平";
-    $("#active-job-eta-note").textContent =
-      `当前处理 ${rateText(processRate)} 个/小时，实例新增 ${rateText(sourceRate)} 个/小时`;
+      `本轮 ${humanCount(backlog)} 个库存按文件数约 ${humanDuration(performance.inventory_remaining_seconds)}（不含新增）；${continuousNote}`;
+  } else if (metricState === "blocked") {
+    $("#active-job-eta").textContent = "存在未完成缺口";
+    $("#active-job-eta-note").textContent = `${humanCount(performance.failed_files)} 个失败或不可用文件仍保留，不能估算清空时间`;
   } else if (metricState === "caught_up") {
-    $("#active-job-eta").textContent = "已追平";
-    $("#active-job-eta-note").textContent = "等待新的 Completed Binlog";
+    $("#active-job-eta").textContent = "本轮清单已处理";
+    $("#active-job-eta-note").textContent = "不代表历史覆盖完整；等待下一次 RDS 清单核验";
   } else if (metricState === "live_following") {
-    $("#active-job-eta").textContent = "已追平 · 跟随最新";
-    $("#active-job-eta-note").textContent = "正在处理最新 Binlog；队列无历史积压，完成后等待新的 Completed Binlog";
+    $("#active-job-eta").textContent = "本轮仅剩在途文件";
+    $("#active-job-eta-note").textContent = "在途文件尚未完成；不能据此判定已追平";
   } else if (metricState === "checking_latest") {
     $("#active-job-eta").textContent = "正在确认最新文件";
-    $("#active-job-eta-note").textContent = "当前清单已处理完，正在向 RDS API 确认是否有新的 Completed Binlog";
+    $("#active-job-eta-note").textContent = "本轮清单已处理完，仍需向 RDS API 确认新文件及历史缺口";
   } else {
-    $("#active-job-eta").textContent = "计算中";
+    $("#active-job-eta").textContent = "暂不估算";
     $("#active-job-eta-note").textContent = running
-      ? "正在积累完整发布与实例生成速率样本"
-      : "同步启动后开始估算";
+      ? `等待同节点完整窗口样本；${continuousNote}`
+      : "同步启动并确认节点、库存及有效样本后估算";
   }
 }
 
