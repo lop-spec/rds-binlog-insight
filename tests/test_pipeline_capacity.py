@@ -124,7 +124,9 @@ class ParserCapacityTests(unittest.TestCase):
 
 class DownloadCapacityTests(unittest.TestCase):
     def run_pipeline(self, sizes, *, pause=False, wait_for_ahead=False,
-                     slow_first_download=False, unavailable_first=False):
+                     slow_first_download=False, unavailable_first=False,
+                     rolling=False, pause_on_commit=False, shutdown_on_commit=False,
+                     refresh_stale=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manager = SyncManager.__new__(SyncManager)
@@ -141,9 +143,11 @@ class DownloadCapacityTests(unittest.TestCase):
             lock = threading.Lock()
             ahead = threading.Event()
             second_parsing = threading.Event()
+            third_parsing = threading.Event()
             first_two = threading.Barrier(2)
             downloaded, processed, committed = [], [], []
             retained, peaks = {}, []
+            active_parsers = set()
 
             def download(_job, _client, _settings, file_id, item):
                 with lock:
@@ -166,8 +170,17 @@ class DownloadCapacityTests(unittest.TestCase):
             def process(_job, _client, _settings, file_id, item, *_args, **kwargs):
                 with lock:
                     processed.append(file_id)
+                    active_parsers.add(file_id)
+                    self.assertLessEqual(len(active_parsers), pipeline.FILE_PIPELINE_WORKERS)
+                    if kwargs['query_visible_event'].is_set():
+                        prior = range(int(file_id.split('-')[-1]))
+                        self.assertTrue(all(f'file-{i}' in committed or (i == 0 and unavailable_first) for i in prior))
                 if file_id == 'file-1':
                     second_parsing.set()
+                    if rolling:
+                        self.assertTrue(third_parsing.wait(2), 'free first lane waited for the entire batch')
+                if file_id == 'file-2':
+                    third_parsing.set()
                 if wait_for_ahead and file_id in {'file-0', 'file-1'}:
                     self.assertTrue(ahead.wait(2), 'independent prefetch did not run')
                     first_two.wait(timeout=2)
@@ -175,6 +188,8 @@ class DownloadCapacityTests(unittest.TestCase):
                     time.sleep(0.03)  # deliberately complete the second lane first
                 if pause:
                     manager._pause_after_current.set()
+                with lock:
+                    active_parsers.remove(file_id)
                 return PreparedBinlog(file_id, item, kwargs['prepared_download'][0], 1, .01)
 
             def commit(_job, _settings, prepared):
@@ -182,13 +197,19 @@ class DownloadCapacityTests(unittest.TestCase):
                     committed.append(prepared.file_id)
                     retained.pop(prepared.file_id)
                 prepared.raw_path.unlink()
+                if prepared.file_id == 'file-0':
+                    if pause_on_commit:
+                        manager._pause_after_current.set()
+                    if shutdown_on_commit:
+                        manager._shutdown.set()
 
             manager._download = download
             manager._process_one = process
             manager._commit_prepared = commit
             result = manager._run_pending_parallel(
                 'job', object(), Settings(), pending, 'mysql', None,
-                completed=0, unavailable=0)
+                completed=0, unavailable=0,
+                refresh_pending=(lambda: list(pending)) if refresh_stale else None)
             return result, downloaded, processed, committed, max(peaks)
 
     def test_slow_first_download_does_not_block_second_parser_or_change_commit_order(self):
@@ -210,6 +231,45 @@ class DownloadCapacityTests(unittest.TestCase):
     def test_prefetch_runs_ahead_of_both_parsers_and_commit_remains_ordered(self):
         result, downloaded, processed, committed, peak = self.run_pipeline(
             [100] * 7, wait_for_ahead=True)
+        self.assertEqual(result, (7, 0, False))
+        self.assertEqual(len(downloaded), 7)
+        self.assertEqual(len(processed), 7)
+        self.assertEqual(committed, [f'file-{i}' for i in range(7)])
+        self.assertLessEqual(peak, pipeline.DOWNLOAD_PREFETCH_FILES * 100)
+
+    def test_retired_first_lane_refills_before_slow_second_file_finishes(self):
+        result, _, processed, committed, peak = self.run_pipeline([100] * 7, rolling=True)
+        self.assertEqual(result, (7, 0, False))
+        self.assertEqual(set(processed), {f'file-{i}' for i in range(7)})
+        self.assertEqual(committed, [f'file-{i}' for i in range(7)])
+        self.assertLessEqual(peak, pipeline.DOWNLOAD_PREFETCH_FILES * 100)
+
+    def test_unavailable_retirement_also_refills_without_completing_the_gap(self):
+        result, _, processed, committed, peak = self.run_pipeline(
+            [100] * 7, rolling=True, slow_first_download=True, unavailable_first=True)
+        self.assertEqual(result, (6, 1, False))
+        self.assertNotIn('file-0', processed)
+        self.assertEqual(committed, [f'file-{i}' for i in range(1, 7)])
+        self.assertLessEqual(peak, pipeline.DOWNLOAD_PREFETCH_FILES * 100)
+
+    def test_late_oversized_file_waits_for_other_reservations_to_retire(self):
+        with patch.object(pipeline, 'DOWNLOAD_PREFETCH_BYTES', 250), self.assertLogs(pipeline.LOGGER, level='WARNING'):
+            result, _, _, committed, peak = self.run_pipeline([100, 100, 400, 100])
+        self.assertEqual(result, (4, 0, False))
+        self.assertEqual(committed, [f'file-{i}' for i in range(4)])
+        self.assertEqual(peak, 400)
+
+    def test_pause_or_shutdown_at_commit_drains_admitted_lanes_without_refill(self):
+        for flag in ('pause_on_commit', 'shutdown_on_commit'):
+            with self.subTest(flag=flag):
+                result, _, processed, committed, peak = self.run_pipeline([100] * 7, **{flag: True})
+                self.assertEqual(result, (2, 0, True))
+                self.assertEqual(set(processed), {'file-0', 'file-1'})
+                self.assertEqual(committed, ['file-0', 'file-1'])
+                self.assertLessEqual(peak, pipeline.DOWNLOAD_PREFETCH_FILES * 100)
+
+    def test_refresh_preserves_admitted_work_and_does_not_reprocess_retired_ids(self):
+        result, downloaded, processed, committed, peak = self.run_pipeline([100] * 7, rolling=True, refresh_stale=True)
         self.assertEqual(result, (7, 0, False))
         self.assertEqual(len(downloaded), 7)
         self.assertEqual(len(processed), 7)

@@ -1379,40 +1379,56 @@ class SyncManager:
             )
 
         prefetched: dict[str, Future[tuple[Path, str]] | None] = {}
+        waiting = deque(pending)
+        admitted: deque[tuple[str, RemoteBinlog, str]] = deque()
+        processing: deque[tuple[tuple[str, RemoteBinlog, str], Future[PreparedBinlog | int], threading.Event]] = deque()
+        retired: set[str] = set()
 
-        def window(start: int, limit: int) -> list[tuple[str, RemoteBinlog, str]]:
-            entries: list[tuple[str, RemoteBinlog, str]] = []
-            size = 0
-            for entry in pending[start : start + limit]:
-                cost = max(entry[1].file_size, 0)
-                if entries and size + cost > DOWNLOAD_PREFETCH_BYTES:
-                    break
-                entries.append(entry)
-                size += cost
-            if size > DOWNLOAD_PREFETCH_BYTES:
-                LOGGER.warning(
-                    "Oversized binlog admitted alone: bytes=%d prefetch_budget=%d",
-                    size, DOWNLOAD_PREFETCH_BYTES,
-                )
-            return sorted(entries, key=source_order) if refresh_pending is not None else entries
+        def stopping() -> bool:
+            return self._pause_after_current.is_set() or self._shutdown.is_set()
 
-        def schedule_downloads(
-            executor: ThreadPoolExecutor,
-            start: int,
-            batch: list[tuple[str, RemoteBinlog, str]],
-        ) -> list[Future[tuple[Path, str]] | None]:
-            # Download admission is independent of parser lanes. Retire a batch
-            # before refilling so parsed + downloaded + downloading stay bounded.
-            for file_id, item, prior_state in window(start, DOWNLOAD_PREFETCH_FILES):
-                if file_id in prefetched:
+        def schedule_downloads(executor: ThreadPoolExecutor) -> None:
+            # Every admitted file retains its reservation until ordered commit
+            # (or accounted unavailability), including completed hidden lanes.
+            size = sum(max(entry[1].file_size, 0) for entry in admitted)
+            while waiting and len(admitted) < DOWNLOAD_PREFETCH_FILES:
+                file_id, item, prior_state = waiting[0]
+                if file_id in prefetched or file_id in retired:
+                    waiting.popleft()
                     continue
+                cost = max(item.file_size, 0)
+                if admitted and size + cost > DOWNLOAD_PREFETCH_BYTES:
+                    break
+                if not admitted and cost > DOWNLOAD_PREFETCH_BYTES:
+                    LOGGER.warning("Oversized binlog admitted alone: bytes=%d prefetch_budget=%d",
+                                   cost, DOWNLOAD_PREFETCH_BYTES)
+                entry = waiting.popleft()
                 self.metadata.set_file_visibility(file_id, False)
                 prefetched[file_id] = (
                     None if prior_state == "stored" else executor.submit(
                         self._download, job_id, client, settings, file_id, item,
                     )
                 )
-            return [prefetched[entry[0]] for entry in batch]
+                admitted.append(entry)
+                size += cost
+
+        def activate(entry: tuple[str, RemoteBinlog, str], visible: threading.Event) -> None:
+            if visible.is_set():
+                return
+            file_id, item, _state = entry
+            visible.set()
+            self.metadata.set_file_visibility(file_id, True)
+            count = int((self.metadata.file_record(file_id) or {}).get("event_count") or 0)
+            self.metadata.update_job(job_id, current_file=item.log_file_name,
+                                     message=f"{item.log_file_name} 已按源顺序开放；已准备 {count} 条事件")
+            self._event(job_id, "info", "FILE_ORDER_ACTIVATED",
+                        f"{item.log_file_name} 已按源顺序进入可查询状态")
+
+        def publish_status() -> None:
+            self._update_pipeline_status(
+                inFlightFiles=[entry[1].log_file_name for entry, _future, _event in processing],
+                visibleFile=processing[0][0][1].log_file_name if processing else "",
+            )
 
         self._update_pipeline_status(active=True)
         try:
@@ -1434,174 +1450,101 @@ class SyncManager:
                     thread_name_prefix="binlog-oss",
                 ) as archive_executor,
             ):
-                batch_start = 0
-                batch = window(0, FILE_PIPELINE_WORKERS)
-                downloads = schedule_downloads(download_executor, 0, batch)
-                while batch:
-                    visibility_events = [
-                        threading.Event() for _entry in batch
-                    ]
-                    visibility_events[0].set()
-                    self.metadata.set_file_visibility(batch[0][0], True)
-                    self.metadata.update_job(
-                        job_id,
-                        current_file=batch[0][1].log_file_name,
+                def submit_archive(parts: list[dict[str, Any]]) -> Future[int]:
+                    return archive_executor.submit(archive_parts, parts)
+
+                def submit_transform(payload: dict[str, Any]) -> Future[tuple[int, list[dict[str, Any]]]]:
+                    return transform_executor.submit(ingest_ndjson_file_detached, payload)
+
+                def prepare_downloaded(
+                    entry: tuple[str, RemoteBinlog, str],
+                    downloaded: Future[tuple[Path, str]] | None,
+                    visible: threading.Event,
+                ) -> PreparedBinlog | int:
+                    prepared_download = downloaded.result() if downloaded is not None else None
+                    return self._process_one(
+                        job_id, client, settings, *entry, flavor, archive,
+                        prepared_download=prepared_download, defer_commit=True,
+                        query_visible_event=visible,
+                        archive_submitter=submit_archive if archive is not None else None,
+                        transform_submitter=submit_transform,
                     )
-                    self._update_pipeline_status(
-                        inFlightFiles=[
-                            item.log_file_name for _file_id, item, _state in batch
-                        ],
-                        visibleFile=batch[0][1].log_file_name,
-                    )
 
-                    staged: list[
-                        tuple[
-                            Future[PreparedBinlog | int] | None,
-                            Exception | None,
-                        ]
-                    ] = []
-                    for entry, download_future, visible_event in zip(
-                        batch,
-                        downloads,
-                        visibility_events,
-                        strict=True,
-                    ):
-                        file_id, item, prior_state = entry
-                        def submit_archive(
-                            parts: list[dict[str, Any]],
-                        ) -> Future[int]:
-                            return archive_executor.submit(archive_parts, parts)
-
-                        def submit_transform(
-                            payload: dict[str, Any],
-                        ) -> Future[tuple[int, list[dict[str, Any]]]]:
-                            return transform_executor.submit(
-                                ingest_ndjson_file_detached,
-                                payload,
-                            )
-
-                        def prepare_downloaded(
-                            entry: tuple[str, RemoteBinlog, str],
-                            downloaded: Future[tuple[Path, str]] | None,
-                            visible: threading.Event,
-                        ) -> PreparedBinlog | int:
-                            # Waiting in the coordinator used to prevent every
-                            # later lane from starting when the first URL/API
-                            # refresh stalled. Each bounded file lane waits for
-                            # its own download; publication/commit below remains
-                            # strictly ordered, including failures and pause.
-                            prepared_download = downloaded.result() if downloaded is not None else None
-                            return self._process_one(
-                                job_id, client, settings, *entry, flavor, archive,
-                                prepared_download=prepared_download,
-                                defer_commit=True,
-                                query_visible_event=visible,
-                                archive_submitter=submit_archive if archive is not None else None,
-                                transform_submitter=submit_transform,
-                            )
-
-                        staged.append((process_executor.submit(
-                            prepare_downloaded, entry, download_future, visible_event,
-                        ), None))
-
-                    next_start = batch_start + len(batch)
-
-                    for position, (
-                        entry,
-                        visible_event,
-                        stage,
-                    ) in enumerate(
-                        zip(batch, visibility_events, staged, strict=True)
-                    ):
-                        file_id, item, _prior_state = entry
-                        future, stage_error = stage
-                        if position:
-                            visible_event.set()
-                            self.metadata.set_file_visibility(file_id, True)
-                            record = self.metadata.file_record(file_id) or {}
-                            prepared_count = int(record.get("event_count") or 0)
-                            self.metadata.update_job(
-                                job_id,
-                                current_file=item.log_file_name,
-                                message=(
-                                    f"{item.log_file_name} 已按源顺序开放；"
-                                    f"已准备 {prepared_count} 条事件"
-                                ),
-                            )
-                            self._event(
-                                job_id,
-                                "info",
-                                "FILE_ORDER_ACTIVATED",
-                                f"{item.log_file_name} 已按源顺序进入可查询状态",
-                            )
-                            self._update_pipeline_status(
-                                visibleFile=item.log_file_name,
-                            )
-                        try:
-                            if stage_error is not None:
-                                raise stage_error
-                            if future is None:
-                                raise PipelineError(
-                                    "并行文件任务缺少执行句柄",
-                                    "PIPELINE_FUTURE_MISSING",
-                                )
-                            prepared = future.result()
-                            if not isinstance(prepared, PreparedBinlog):
-                                raise PipelineError(
-                                    "并行文件任务返回了无效结果",
-                                    "PIPELINE_RESULT_INVALID",
-                                )
-                            self._commit_prepared(job_id, settings, prepared)
-                        except Exception as exc:
-                            unavailable = self._record_file_error(
-                                job_id,
-                                file_id,
-                                item,
-                                exc,
-                                unavailable,
-                            )
+                def refill() -> None:
+                    if stopping():
+                        return
+                    schedule_downloads(download_executor)
+                    if refresh_pending is not None and not processing:
+                        # Preserve the discovery tail's cold/fresh fairness.
+                        # Only the newly selected lane cohort is source-sorted,
+                        # as before; never sort the whole retained backlog.
+                        cohort = [admitted.popleft() for _ in range(min(len(admitted), FILE_PIPELINE_WORKERS))]
+                        admitted.extendleft(reversed(sorted(cohort, key=source_order)))
+                    processing_ids = {entry[0] for entry, _future, _event in processing}
+                    for entry in admitted:
+                        if len(processing) >= FILE_PIPELINE_WORKERS:
+                            break
+                        if entry[0] in processing_ids:
                             continue
-                        completed += 1
-                        self.metadata.update_job(
-                            job_id,
-                            completed_files=completed,
+                        visible = threading.Event()
+                        if not processing:
+                            activate(entry, visible)
+                        future = process_executor.submit(
+                            prepare_downloaded, entry, prefetched[entry[0]], visible,
                         )
+                        processing.append((entry, future, visible))
+                    publish_status()
 
-                    for file_id, _item, _state in batch:
-                        prefetched.pop(file_id, None)
-                    batch_start = next_start
-                    self._update_pipeline_status(
-                        inFlightFiles=[],
-                        visibleFile="",
-                    )
-                    if (
-                        self._pause_after_current.is_set()
-                        or self._shutdown.is_set()
-                    ):
-                        self.metadata.finish_job(
-                            job_id,
-                            "paused",
-                            "已在并行文件批次边界暂停；下次从断点继续",
-                        )
-                        for future in prefetched.values():
-                            if future is not None:
-                                future.cancel()
-                        return completed, unavailable, True
-                    if refresh_pending is not None:
-                        refreshed = refresh_pending()
-                        # Already admitted downloads keep their bounded places.
-                        # Reordering/discarding them would duplicate work or leave
-                        # invisible files and futures outside the admission budget.
-                        admitted = [entry for entry in pending[next_start:]
-                                    if entry[0] in prefetched]
-                        pending = admitted + [entry for entry in refreshed
-                                              if entry[0] not in prefetched]
-                        batch_start = 0
-                    batch = window(batch_start, FILE_PIPELINE_WORKERS)
-                    downloads = (
-                        schedule_downloads(download_executor, batch_start, batch)
-                        if batch else []
-                    )
+                refill()
+                retired_since_refresh = 0
+                while processing:
+                    entry, future, visible = processing[0]
+                    file_id, item, _prior_state = entry
+                    activate(entry, visible)
+                    publish_status()
+                    try:
+                        prepared = future.result()
+                        if not isinstance(prepared, PreparedBinlog):
+                            raise PipelineError("并行文件任务返回了无效结果", "PIPELINE_RESULT_INVALID")
+                        self._commit_prepared(job_id, settings, prepared)
+                    except Exception as exc:
+                        unavailable = self._record_file_error(job_id, file_id, item, exc, unavailable)
+                    else:
+                        completed += 1
+                        self.metadata.update_job(job_id, completed_files=completed)
+                    # Only ordered retirement releases capacity. Never refill
+                    # merely because a hidden later lane has finished parsing.
+                    processing.popleft()
+                    if admitted[0][0] != file_id:
+                        raise PipelineError("并行准入顺序不一致", "PIPELINE_ADMISSION_ORDER")
+                    admitted.popleft()
+                    prefetched.pop(file_id)
+                    retired.add(file_id)
+                    retired_since_refresh += 1
+                    if processing:
+                        activate(processing[0][0], processing[0][2])
+                    if not stopping():
+                        if refresh_pending is not None and (
+                            not processing or retired_since_refresh >= FILE_PIPELINE_WORKERS
+                        ):
+                            # Keep admitted downloads and parsers in place;
+                            # refresh only the unadmitted tail. Retired IDs may
+                            # occur in a stale API snapshot but cannot run twice.
+                            seen = retired | set(prefetched)
+                            refreshed = deque()
+                            for candidate in refresh_pending():
+                                if candidate[0] not in seen:
+                                    seen.add(candidate[0])
+                                    refreshed.append(candidate)
+                            waiting = refreshed
+                            retired_since_refresh = 0
+                        refill()
+                if stopping():
+                    self.metadata.finish_job(job_id, "paused", "已完成已准入文件并暂停；下次从断点继续")
+                    for download in prefetched.values():
+                        if download is not None:
+                            download.cancel()
+                    return completed, unavailable, True
         finally:
             self._update_pipeline_status(
                 active=False,
