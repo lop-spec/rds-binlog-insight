@@ -810,12 +810,23 @@ class SyncManager:
         self.metadata.set_file_state(
             file_id, "downloading", increment_attempt=True, error_code="", error_message=""
         )
-        last_progress = 0
+        from .raw_binlog import enabled as raw_archive_enabled
+        # The partial file, not this display counter, is the resume checkpoint.
+        # Avoid serializing fast raw downloads behind FULL SQLite commits every
+        # 8 MiB; retain final progress and the verified downloaded-state commit.
+        progress_interval = 5.0 if raw_archive_enabled() else 0.0
+        last_progress, last_progress_at = 0, started
+        progress_writes, progress_seconds = 0, 0.0
 
         def on_progress(value: int) -> None:
-            nonlocal last_progress
-            if value == item.file_size or value - last_progress >= 8 * 1024 * 1024:
+            nonlocal last_progress, last_progress_at, progress_writes, progress_seconds
+            now = time.monotonic()
+            if value == item.file_size or (value - last_progress >= 8 * 1024 * 1024
+                    and now - last_progress_at >= progress_interval):
                 self.metadata.update_download_progress(file_id, value)
+                last_progress_at = time.monotonic()
+                progress_seconds += last_progress_at - now
+                progress_writes += 1
                 last_progress = value
 
         def attempt(remote: RemoteBinlog):
@@ -857,7 +868,8 @@ class SyncManager:
             "info",
             "FILE_DOWNLOADED",
             f"{item.log_file_name}：{result.size_bytes} 字节，"
-            f"流式 CRC64/SHA-256 校验完成，耗时 {time.monotonic() - started:.3f} 秒",
+            f"流式 CRC64/SHA-256 校验完成，耗时 {time.monotonic() - started:.3f} 秒；"
+            f"进度持久化 {progress_writes} 次/{progress_seconds:.3f} 秒",
         )
         return result.path, result.sha256
 

@@ -1,4 +1,9 @@
-# Original binlog archive (v1.28.46)
+# Original binlog archive (v1.28.47)
+
+Raw downloads persist display progress at most once every five seconds (plus
+final completion). Resume still uses the actual partial-file length; streaming
+CRC64/SHA-256, fsync, and the verified downloaded-state commit are unchanged.
+This prevents small FULL SQLite progress commits from throttling byte transfer.
 
 The collector may run with `RDS_BINLOG_RAW_ARCHIVE=1`. The existing OSS credential,
 retention policy and file-discovery/retry state remain authoritative. No business

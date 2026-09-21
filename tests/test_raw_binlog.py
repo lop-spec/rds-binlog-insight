@@ -206,6 +206,31 @@ class ManifestTests(unittest.TestCase):
 
 
 class RawPipelineTests(unittest.TestCase):
+    def test_raw_progress_is_time_bounded_without_changing_final_commit(self):
+        from app.pipeline import SyncManager
+        for raw, expected in [('1',2),('0',32)]:
+            with self.subTest(raw=raw):
+                manager=SyncManager.__new__(SyncManager)
+                manager.metadata=Mock();manager._event=Mock()
+                manager.storage=SimpleNamespace(paths={'downloads':Path('fixture')})
+                item=SimpleNamespace(file_size=512*1024**2,checksum_crc64='1',
+                    log_file_name='mysql-bin.000001',selected_url=lambda:'https://fixture.invalid/binlog')
+                clock=[0.0]
+                def download(url,path,**kwargs):
+                    for i in range(1,33):
+                        clock[0]=i*.25
+                        kwargs['progress'](i*16*1024**2)
+                    return SimpleNamespace(path=path,size_bytes=item.file_size,sha256='a'*64)
+                with patch.dict(os.environ,{'RDS_BINLOG_RAW_ARCHIVE':raw}), \
+                     patch('app.pipeline.time.monotonic',side_effect=lambda:clock[0]), \
+                     patch('app.pipeline.download_file',side_effect=download):
+                    path,sha=manager._download('job',Mock(),Mock(),'file',item)
+                self.assertEqual(manager.metadata.update_download_progress.call_count,expected)
+                manager.metadata.update_download_progress.assert_called_with('file',item.file_size)
+                manager.metadata.set_file_state.assert_called_with('file','downloaded',
+                    downloaded_bytes=item.file_size,local_sha256='a'*64)
+                self.assertEqual(sha,'a'*64)
+
     def manager(self):
         import threading
         from app.pipeline import SyncManager
