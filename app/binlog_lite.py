@@ -5,9 +5,14 @@ keep the range eligible. This index is not a primary-key or row-count index.
 """
 from __future__ import annotations
 
+import json
 import logging
 import mmap
+import os
 import struct
+import subprocess
+import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -15,6 +20,8 @@ LOGGER = logging.getLogger(__name__)
 HEADER = struct.Struct('<IBIIIH')
 MAGIC = b'\xfebin'
 MAX_TIME = 2**62
+MAX_INDEX_BYTES = 256 * 1024**2
+INDEX_WORKER_TIMEOUT = 180
 ROWS = {20, 21, 22, 23, 24, 25, 30, 31, 32, 39}
 # Known non-row event types that cannot hide tables. Query events are handled
 # separately; their SQL is NOT parsed to guess table names.
@@ -158,6 +165,53 @@ def scan(path: Path) -> dict:
                 events=events, regions=regions, uncertainty=sorted(uncertainty))
 
 
+def scan_isolated(path: Path) -> dict:
+    """Release the service interpreter while scanning; the caller bounds lanes.
+
+    Only this CPU-bound directory scan moves to a short-lived child. Downloads,
+    checksum validation, OSS verification and manifest commits stay unchanged.
+    JSON goes through a bounded temporary file, not an unbounded stdout pipe.
+    """
+    path = path.resolve()
+    with tempfile.TemporaryDirectory(prefix='.raw-index-', dir=path.parent) as temp:
+        result_path = Path(temp) / 'directory.json'
+        try:
+            result = subprocess.run(
+                [sys.executable, '-m', 'app.binlog_lite', str(path), str(result_path)],
+                cwd=Path(__file__).resolve().parent.parent,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=INDEX_WORKER_TIMEOUT,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RawBinlogError('轻索引子进程超时；保留原文件', 'RAW_INDEX_TIMEOUT') from exc
+        if result.stderr:
+            LOGGER.warning('RAW_INDEX_WORKER_DIAGNOSTIC %s', result.stderr.decode('utf-8', errors='replace').strip())
+        if result.returncode:
+            try:
+                failure = json.loads(result.stdout)
+                code, message = failure['code'], failure['message']
+            except (ValueError, KeyError, TypeError):
+                code, message = 'RAW_INDEX_WORKER_FAILED', f'轻索引子进程退出 {result.returncode}；保留原文件'
+            raise RawBinlogError(message, code)
+        if not result_path.is_file():
+            raise RawBinlogError('轻索引子进程未输出目录；保留原文件', 'RAW_INDEX_WORKER_FAILED')
+        if result_path.stat().st_size > MAX_INDEX_BYTES:
+            raise RawBinlogError('轻量索引超过查询解压预算，保留源文件', 'RAW_INDEX_SIZE_LIMIT')
+        try:
+            return json.loads(result_path.read_bytes())
+        except (ValueError, OSError) as exc:
+            raise RawBinlogError('轻索引子进程输出无效；保留原文件', 'RAW_INDEX_WORKER_FAILED') from exc
+
+
+def _write_directory(path: Path, destination: Path) -> None:
+    directory = scan(path)
+    data = json.dumps(directory, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    if len(data) > MAX_INDEX_BYTES:
+        raise RawBinlogError('轻量索引超过查询解压预算，保留源文件', 'RAW_INDEX_SIZE_LIMIT')
+    destination.write_bytes(data)
+
+
 def allows(entry: dict, query: dict, start: int, end: int) -> bool:
     if entry['hi'] < start or entry['lo'] > end:
         return False
@@ -170,3 +224,12 @@ def allows(entry: dict, query: dict, start: int, end: int) -> bool:
     def match(needle, value):
         return not needle or (needle == value.lower() if exact else needle in value.lower())
     return any(match(db, d) and match(table, t) for d, t in entry['tables'])
+
+
+if __name__ == '__main__':
+    try:
+        _write_directory(Path(sys.argv[1]), Path(sys.argv[2]))
+    except Exception as exc:
+        print(json.dumps({'code': getattr(exc, 'code', 'RAW_INDEX_WORKER_FAILED'),
+                          'message': str(exc)}, ensure_ascii=True), flush=True)
+        raise SystemExit(1)

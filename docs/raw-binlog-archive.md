@@ -1,4 +1,4 @@
-# Original binlog archive (v1.28.48)
+# Original binlog archive (v1.28.49)
 
 Raw downloads persist display progress at most once every five seconds (plus
 final completion). Resume still uses the actual partial-file length; streaming
@@ -25,10 +25,18 @@ The UI distinguishes these. Header-event counts are NOT reported as decoded row
 counts. A crash before manifest commit reuses verified objects; a crash after it
 verifies the manifest before cleanup. Never delete the legacy Parquet/indices.
 
-Two archive lanes and eight download lanes share a rolling admission budget of
-eight files / 4 GiB (one oversized file alone). The legacy expansion pipeline
+Per collector, two archive lanes and eight download lanes share a rolling
+admission budget of eight source files / 4 GiB (one oversized file alone). The legacy expansion pipeline
 keeps its original three download lanes and four files / 2 GiB budget. A slow earlier download does not
-block a ready later file. Pause stops new admission; downloaded files remain
+block a ready later file. Each archive lane runs the unchanged lightweight scan
+in a short-lived child process, avoiding contention with download threads for
+the service's Python interpreter. Children inherit the existing container CPU
+and memory limits; timeout is 180 seconds, and temporary JSON is capped at
+256 MiB per lane. Worker errors preserve the source and never commit a manifest;
+conservative-index diagnostics are relayed to the service log. No row expansion,
+checksum, OSS validation, or query budget is weakened.
+
+Pause stops new admission; downloaded files remain
 recoverable. Discovery continues through the existing retained-file scheduler.
 
 ## Query safety and compatibility

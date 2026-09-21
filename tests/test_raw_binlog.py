@@ -86,6 +86,49 @@ class LiteTests(unittest.TestCase):
             scan(self.path)
         self.assertEqual(caught.exception.code,'RAW_BINLOG_FORMAT_UNSUPPORTED')
 
+    def test_isolated_scan_matches_inline_and_preserves_source(self):
+        from app.binlog_lite import scan_isolated
+        before=fixture(self.path)
+        expected=json.loads(compact(scan(self.path)))
+        self.assertEqual(scan_isolated(self.path),expected)
+        self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(list(self.path.parent.glob('.raw-index-*')),[])
+
+    def test_isolated_unknown_event_stays_conservative(self):
+        from app.binlog_lite import scan_isolated
+        fixture(self.path,opaque=True)
+        with self.assertLogs('app.binlog_lite',level='WARNING'):
+            result=scan_isolated(self.path)
+        self.assertTrue(result['unknown'])
+        self.assertIn('opaque-event-40',result['uncertainty'])
+
+    def test_isolated_format_failure_preserves_code_and_source(self):
+        from app.binlog_lite import scan_isolated
+        self.path.write_bytes(b'x'*100)
+        with self.assertRaises(RawBinlogError) as caught:scan_isolated(self.path)
+        self.assertEqual(caught.exception.code,'RAW_BINLOG_FORMAT_UNSUPPORTED')
+        self.assertEqual(self.path.read_bytes(),b'x'*100)
+        self.assertEqual(list(self.path.parent.glob('.raw-index-*')),[])
+
+    def test_isolated_timeout_retains_source_and_cleans_temporary_output(self):
+        import subprocess
+        from app.binlog_lite import scan_isolated
+        before=fixture(self.path)
+        with patch('app.binlog_lite.subprocess.run',side_effect=subprocess.TimeoutExpired('worker',180)):
+            with self.assertRaises(RawBinlogError) as caught:scan_isolated(self.path)
+        self.assertEqual(caught.exception.code,'RAW_INDEX_TIMEOUT')
+        self.assertEqual(self.path.read_bytes(),before)
+        self.assertEqual(list(self.path.parent.glob('.raw-index-*')),[])
+
+    def test_directory_size_limit_prevents_publication(self):
+        from app.binlog_lite import _write_directory
+        before=fixture(self.path);output=self.path.parent/'limited.json'
+        with patch('app.binlog_lite.MAX_INDEX_BYTES',8):
+            with self.assertRaises(RawBinlogError) as caught:_write_directory(self.path,output)
+        self.assertEqual(caught.exception.code,'RAW_INDEX_SIZE_LIMIT')
+        self.assertFalse(output.exists())
+        self.assertEqual(self.path.read_bytes(),before)
+
     def test_table_pair_not_cross_product(self):
         entry = dict(lo=0,hi=MAX_TIME,unknown=False,tables=[['a','one'],['b','two']])
         self.assertFalse(allows(entry, {'database':'a','table':'two'},0,MAX_TIME))

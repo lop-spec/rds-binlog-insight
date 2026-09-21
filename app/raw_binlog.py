@@ -11,7 +11,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .binlog_lite import RawBinlogError, allows, scan
+from .binlog_lite import RawBinlogError, allows, scan_isolated as scan
 from .oss_store import OssArchiveError
 
 LOGGER = logging.getLogger(__name__)
