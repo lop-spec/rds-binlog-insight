@@ -9,7 +9,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import nullcontext
-from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -349,6 +349,7 @@ class SyncManager:
             "health": self._collection_health(running, latest),
             "latestJob": latest,
             "pipeline": pipeline_status,
+            "rawBinlog": self.storage.raw_binlogs.status(self._job_scope()) if hasattr(self.storage, 'raw_binlogs') else {},
             "archive": dict(self._archive_status),
             "coldCompression": {
                 **dict(self._cold_compression_status),
@@ -1021,6 +1022,14 @@ class SyncManager:
         raw_path: Path,
         settings: Settings,
     ) -> None:
+        raw_store = getattr(self.storage, 'raw_binlogs', None)
+        raw_descriptor = raw_store.get(file_id) if raw_store is not None else None
+        if raw_descriptor:
+            raw_store.verify(self.archive_for_settings(settings), raw_descriptor)
+            raw_path.unlink(missing_ok=True)
+            raw_path.with_suffix(raw_path.suffix + '.part').unlink(missing_ok=True)
+            self.metadata.set_file_state(file_id, 'done', raw_deleted=True)
+            return
         parts = self.metadata.parts_for_file(file_id)
         for part in parts:
             path = Path(part["path"])
@@ -1098,6 +1107,19 @@ class SyncManager:
         path, _ = prepared_download or self._download(
             job_id, client, settings, file_id, item
         )
+        from .raw_binlog import enabled as raw_archive_enabled
+        if raw_archive_enabled():
+            raw_started = time.monotonic()
+            self.metadata.set_file_state(file_id, 'parsing')
+            descriptor = self.storage.raw_binlogs.archive(archive, path, file_id, item, flavor)
+            # Header events are not decoded rows: never inflate the row counter.
+            self.metadata.set_file_state(file_id, 'stored', event_count=0)
+            prepared = PreparedBinlog(file_id=file_id, item=item, raw_path=path,
+                                      event_count=0, parse_seconds=time.monotonic()-raw_started)
+            if defer_commit:
+                return prepared
+            self._commit_prepared(job_id, settings, prepared)
+            return 0
         parse_started = time.monotonic()
         self.metadata.set_file_state(file_id, "parsing")
         count = 0
@@ -1284,6 +1306,12 @@ class SyncManager:
             prepared.raw_path,
             settings,
         )
+        raw_store = getattr(self.storage, 'raw_binlogs', None)
+        if raw_store is not None and raw_store.get(prepared.file_id):
+            self._event(job_id, 'info', 'FILE_COMPLETE',
+                        f'{prepared.item.log_file_name}：原始 Binlog 与轻量索引已校验归档；'
+                        f'未展开行值；耗时 {prepared.parse_seconds:.3f} 秒')
+            return
         self._event(
             job_id,
             "info",
@@ -1342,6 +1370,100 @@ class SyncManager:
         )
         raise exc
 
+    def _run_pending_raw(
+        self, job_id, client, settings, pending, flavor, archive,
+        *, completed, unavailable, refresh_pending=None,
+    ):
+        """Bounded rolling lanes: a slow download cannot stall a ready file.
+
+        Unlike partially published Parquet, a raw manifest is atomically visible
+        only after BOTH complete objects are verified, so no file-order barrier
+        is needed. Admission includes downloading, prepared and uploading bytes.
+        """
+        entries = deque(pending)
+        downloads, prepared, processing = {}, {}, {}
+        admitted, retired = {}, set()
+        workers = threading.local()
+        refreshed_at = time.monotonic()
+        def process(entry, download):
+            file_id, item, prior_state = entry
+            if not hasattr(workers, 'archive'):
+                workers.archive = self.archive_for_settings(settings)
+            return self._process_one(job_id, client, settings, file_id, item,
+                        prior_state, flavor, workers.archive, prepared_download=download)
+        self._update_pipeline_status(active=True)
+        try:
+            with ThreadPoolExecutor(max_workers=DOWNLOAD_PIPELINE_WORKERS, thread_name_prefix='raw-download') as down, \
+                 ThreadPoolExecutor(max_workers=FILE_PIPELINE_WORKERS, thread_name_prefix='raw-archive') as work:
+                while entries or admitted:
+                    stopping = self._pause_after_current.is_set() or self._shutdown.is_set()
+                    if not stopping:
+                        while entries and len(admitted) < DOWNLOAD_PREFETCH_FILES:
+                            entry = entries[0]
+                            file_id, item, prior_state = entry
+                            if file_id in admitted or file_id in retired:
+                                entries.popleft()
+                                continue
+                            size = sum(max(e[1].file_size, 0) for e in admitted.values())
+                            if admitted and size+item.file_size > DOWNLOAD_PREFETCH_BYTES:
+                                break
+                            if item.file_size > DOWNLOAD_PREFETCH_BYTES:
+                                LOGGER.warning('RAW_OVERSIZED_FILE admitted-alone bytes=%s', item.file_size)
+                            entries.popleft()
+                            admitted[file_id] = entry
+                            self.metadata.set_file_visibility(file_id, False)
+                            if prior_state == 'stored':
+                                prepared[file_id] = None
+                            else:
+                                downloads[down.submit(self._download, job_id, client, settings, file_id, item)] = file_id
+                    for future in list(downloads):
+                        if not future.done():
+                            continue
+                        file_id = downloads.pop(future)
+                        entry = admitted[file_id]
+                        try:
+                            prepared[file_id] = future.result()
+                        except Exception as exc:
+                            unavailable = self._record_file_error(job_id, file_id, entry[1], exc, unavailable)
+                            admitted.pop(file_id)
+                            retired.add(file_id)
+                    for file_id in list(prepared):
+                        if len(processing) >= FILE_PIPELINE_WORKERS or stopping:
+                            break
+                        processing[work.submit(process, admitted[file_id], prepared.pop(file_id))] = file_id
+                    for future in list(processing):
+                        if not future.done():
+                            continue
+                        file_id = processing.pop(future)
+                        entry = admitted.pop(file_id)
+                        retired.add(file_id)
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            unavailable = self._record_file_error(job_id, file_id, entry[1], exc, unavailable)
+                        else:
+                            completed += 1
+                            self.metadata.update_job(job_id, completed_files=completed,
+                                message=f'原文件与轻量索引已校验归档 {completed} 个；有界滚动采集')
+                    self._update_pipeline_status(inFlightFiles=[e[1].log_file_name for e in admitted.values()],
+                        visibleFile=next((admitted[f][1].log_file_name for f in processing.values()), ''))
+                    if stopping and not processing:
+                        for future in downloads:
+                            future.cancel()
+                        self.metadata.finish_job(job_id, 'paused', '已停止原文件归档；已下载文件保留，下次从断点继续')
+                        return completed, unavailable, True
+                    if not stopping and refresh_pending is not None and ((not entries and not admitted) or time.monotonic()-refreshed_at >= 60):
+                        entries = deque(e for e in refresh_pending() if e[0] not in admitted and e[0] not in retired)
+                        refreshed_at = time.monotonic()
+                    futures = list(downloads)+list(processing)
+                    if futures:
+                        wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
+                    elif not entries and not prepared:
+                        break
+        finally:
+            self._update_pipeline_status(active=False, inFlightFiles=[], visibleFile='')
+        return completed, unavailable, False
+
     def _run_pending_parallel(
         self,
         job_id: str,
@@ -1355,6 +1477,10 @@ class SyncManager:
         unavailable: int,
         refresh_pending: Callable[[], list[tuple[str, RemoteBinlog, str]]] | None = None,
     ) -> tuple[int, int, bool]:
+        from .raw_binlog import enabled as raw_archive_enabled
+        if raw_archive_enabled():
+            return self._run_pending_raw(job_id, client, settings, pending, flavor, archive,
+                        completed=completed, unavailable=unavailable, refresh_pending=refresh_pending)
         archive_thread_local = threading.local()
 
         def archive_parts(parts: list[dict[str, Any]]) -> int:

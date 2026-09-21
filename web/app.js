@@ -724,6 +724,14 @@ function renderPrimarySync(status) {
   $("#active-job-progress").style.width = `${percent}%`;
   $("#active-job-message").textContent = job.message || "—";
   renderSyncPerformance(job.performance, Boolean(sync.running));
+  const raw = sync.rawBinlog;
+  if (raw?.enabled) {
+    $("#active-job-speed").textContent = `${rateText(raw.files_per_hour)} 个 / 小时`;
+    $("#active-job-speed-note").textContent = `原文件与轻量索引已归档 ${humanCount(raw.archived_files)} 个 · 未全量展开行值`;
+    const eta = raw.estimated_catchup_seconds;
+    $("#active-job-eta").textContent = eta == null ? "采样中 / 净吞吐不足" : `预计 ${humanDuration(eta)}`;
+    $("#active-job-eta-note").textContent = `扣除持续新增并保留 20% 余量 · 待归档 ${humanCount(raw.pending_files)} 个 · ${humanCount(raw.unavailable_files)} 个源不可用，未计入追平承诺`;
+  }
 }
 
 function renderJobs(jobs) {

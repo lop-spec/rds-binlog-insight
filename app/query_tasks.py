@@ -128,6 +128,11 @@ class QueryTaskManager:
         )
 
     def submit(self, query: dict[str, Any]) -> str:
+        # Reject oversized physical-file plans before enqueue, OSS access, or
+        # fallback scans. Recheck at execution because discovery can add files.
+        preflight = getattr(self.storage, 'query_preflight', None)
+        if preflight is not None:
+            preflight(query, self.settings_loader())
         with self._lock:
             if self._closing:
                 raise RuntimeError("查询任务管理器正在停止")

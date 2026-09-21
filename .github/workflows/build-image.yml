@@ -25,16 +25,16 @@ on:
         default: false
   push:
     tags:
-      - v1.28.44-rawoss
+      - v1.28.45-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.28.44-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.28.44-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.44-rawoss
+  VERSION: 1.28.45-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.28.45-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.28.45-rawoss
 
 jobs:
   recovery-isolation:
@@ -178,6 +178,7 @@ jobs:
             --volume "$PWD:/src:ro" \
             "$LOCAL_IMAGE" \
             -m unittest \
+            tests.test_raw_binlog \
             tests.test_sync_lifecycle \
             tests.test_rds_download \
             tests.test_core \

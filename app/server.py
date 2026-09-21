@@ -528,6 +528,11 @@ class Application:
         settings = self.metadata.load_settings()
         stats = self.metadata.storage_metadata_stats()
         sync_status = self.sync.status()
+        raw_status = sync_status.get('rawBinlog') or {}
+        raw_end = raw_status.get('latest_file_end_utc')
+        if raw_end:
+            raw_end_us = int(datetime.fromisoformat(raw_end.replace('Z', '+00:00')).timestamp()*1_000_000)
+            stats['latest_epoch_us'] = max(int(stats.get('latest_epoch_us') or 0), raw_end_us)
         index_stats = sync_status.get("index") or {}
         catalog_stats = index_stats.get("catalog") or {}
         part_count = int(stats.get("part_count") or 0)
@@ -970,7 +975,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 404
                 if code == "BINLOG_RANGE_NOT_FOUND"
                 else 422
-                if code == "QUERY_END_AFTER_LATEST"
+                if code in {"QUERY_END_AFTER_LATEST", "QUERY_BINLOG_LIMIT", "QUERY_BINLOG_BYTE_LIMIT", "RAW_QUERY_PAGE_LIMIT"}
                 else 409
                 if code == "BINLOG_BACKFILL_QUEUED"
                 else 503

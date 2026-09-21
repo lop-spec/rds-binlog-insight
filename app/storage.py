@@ -383,6 +383,8 @@ class EventStorage:
     def __init__(self, metadata: MetadataStore, data_dir: Path | None = None):
         self.metadata = metadata
         self.paths = ensure_data_dirs(data_dir)
+        from .raw_binlog import RawBinlogStore
+        self.raw_binlogs = RawBinlogStore(metadata)
         self.search_index = SearchIndex(self.paths["index"] / "search.sqlite3")
         self.exact_index = ExactIndex(self.paths["index"] / "exact-v1")
         self.analytics_index = AnalyticsIndex(
@@ -3109,7 +3111,52 @@ class EventStorage:
         )
         return result
 
+    def query_preflight(self, query: dict[str, Any], settings: Settings) -> dict[str, Any]:
+        start, end = self._query_window(query, settings.retention_days)
+        return self.raw_binlogs.plan(query, start, end)
+
     def query_events_tiered(
+        self, query: dict[str, Any], settings: Settings, archive: OssArchive | None,
+        *, limit_cap: int = 1000, control: Any | None = None,
+        archive_factory: Callable[[], OssArchive | None] | None = None,
+    ) -> dict[str, Any]:
+        plan = self.query_preflight(query, settings)
+        if not plan['raw']:
+            result = self._query_events_legacy(query, settings, archive, limit_cap=limit_cap,
+                                               control=control, archive_factory=archive_factory)
+            result['candidate_binlogs'] = plan['candidate_files']
+            return result
+        if archive is None and archive_factory is not None:
+            archive = archive_factory()
+        from .raw_binlog_query import query_raw
+        start, end = self._query_window(query, settings.retention_days)
+        limit = min(max(int(query.get('limit') or 100), 1), limit_cap)
+        offset = min(max(int(query.get('offset') or 0), 0), 100_000)
+        with self.query_activity():
+            raw = query_raw(self, archive, query, start, end, plan, control, limit_cap)
+            old = {'rows': [], 'has_more': False, 'tiers_used': []}
+            has_legacy = plan['candidate_files'] > len(plan['raw'])
+            source = str(query.get('source') or '').strip().lower()
+            if has_legacy or source in {'', 'all', 'database'}:
+                available = self.metadata.storage_metadata_stats(control=control)
+                latest = int(available.get('latest_epoch_us') or 0)
+                if latest >= start:
+                    old_query = {**query, 'limit': offset+limit+1, 'offset': 0,
+                                 'end_epoch_us': min(end, latest),
+                                 '_raw_excluded_files': [e['file_id'] for e in plan['raw']]}
+                    old = self._query_events_legacy(old_query, settings, archive,
+                            limit_cap=offset+limit+1, control=control)
+            combined = {row['event_id']: row for row in old['rows']}
+            combined.update({row['event_id']: row for row in raw['rows']})
+            rows = sorted(combined.values(), key=self._row_sort_key, reverse=True)
+            return {**old, **raw, 'rows': rows[offset:offset+limit],
+                    'limit': limit, 'offset': offset,
+                    'has_more': len(rows)>offset+limit or old.get('has_more', False) or raw['has_more'],
+                    'tiers_used': list(dict.fromkeys(old.get('tiers_used', [])+raw['tiers_used'])),
+                    'coverage_found': True, 'range_start_epoch_us': start, 'range_end_epoch_us': end,
+                    'coverage_note': '原文件已校验归档；仅候选范围查询完成，不代表历史源缺口已经恢复'}
+
+    def _query_events_legacy(
         self,
         query: dict[str, Any],
         settings: Settings,
@@ -3335,7 +3382,11 @@ class EventStorage:
         limit_cap: int = 1000,
         control: Any | None = None,
     ) -> dict[str, Any]:
+        excluded_files = set(query.get('_raw_excluded_files') or [])
         worker_url = os.environ.get("RDS_BINLOG_INDEXED_QUERY_WORKER_URL", "").strip()
+        if excluded_files:
+            LOGGER.info('RAW_QUERY_LEGACY_SUBSET excluding=%d reason=raw-archive-is-authoritative-for-these-files', len(excluded_files))
+            worker_url = ''
         if not worker_url:
             LOGGER.info("Indexed query worker disabled: URL not configured; retaining existing route")
         if worker_url and (query.get("exact") or query.get("fingerprint")
@@ -3401,6 +3452,8 @@ class EventStorage:
             end_us,
             settings.db_instance_id,
         )
+        if excluded_files:
+            certificate_fingerprint += '.raw-subset-' + hashlib.sha256(','.join(sorted(excluded_files)).encode()).hexdigest()
         certificate_token = None
         certificate_rows = None
         if (
@@ -3439,7 +3492,7 @@ class EventStorage:
                 latest_us=latest_us,
                 token=certificate_token,
             )
-        if self.clickhouse_backend is not None and not worker_url:
+        if self.clickhouse_backend is not None and not worker_url and not excluded_files:
             hot_query = dict(query)
             hot_query["start_epoch_us"] = start_us
             hot_query["end_epoch_us"] = end_us
@@ -3529,6 +3582,8 @@ class EventStorage:
             instance=str(query.get("instance") or ""),
             control=control,
         )
+        if excluded_files:
+            parts = [part for part in parts if str(part.get('binlog_id') or '') not in excluded_files]
         if control is not None:
             control.check_cancelled()
         exact = query.get("exact")
@@ -4297,6 +4352,9 @@ class EventStorage:
         instance: str = "",
     ) -> dict[str, Any] | None:
         with self.query_activity():
+            if locator.startswith('raw:'):
+                from .raw_binlog_query import event_detail
+                return event_detail(self, archive, event_id, locator, instance)
             local_execution = self._local_execution_event_detail(event_id, instance)
             if local_execution is not None:
                 return local_execution

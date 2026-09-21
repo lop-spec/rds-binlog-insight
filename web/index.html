@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.28.44-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.44-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.28.45-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.28.45-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -90,7 +90,7 @@
       <section id="view-audit" class="view is-active">
         <div class="query-panel">
           <div class="panel-heading">
-            <div><h2>查询条件</h2><p>所有结果按真实事件时间倒序；最多单页返回 1,000 条。</p></div>
+            <div><h2>查询条件</h2><p>按真实事件时间倒序；单页最多 1,000 条。Binlog 单次最多 16 个候选文件 / 8 GiB，超限请缩小范围。</p></div>
             <label class="range-picker">时间范围<select id="audit-range" aria-label="查询时间范围"><option value="15m">最近 15 分钟</option><option value="1h">最近 1 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></label>
           </div>
 
@@ -143,7 +143,7 @@
 
         <div class="notice info compact-notice">
           <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg>
-          <span>主键精确查询要求完整库名和表名；索引完整时直接返回定位列表且不读取 OSS，回填未完成时自动准确扫描。</span>
+          <span>主键精确查询要求完整库名和表名；精确索引未完成时，仅在候选文件预算内按需解析。缺少可验证的主键 schema 时会明确报错，不将未知当作无结果。</span>
         </div>
 
         <div class="result-section">
@@ -465,8 +465,8 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.28.44-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.28.44-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.28.44-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.28.45-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.28.45-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.28.45-rawoss" defer></script>
 </body>
 </html>
