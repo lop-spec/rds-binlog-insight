@@ -84,7 +84,7 @@ class RawBinlogStore:
         record = self.metadata.file_record(file_id)
         sha = str(record.get('local_sha256') or '')
         crc = str(record.get('checksum_crc64') or '')
-        if len(sha) != 64 or not crc.isdigit():
+        if len(sha) != 64 or not crc.isdigit() or crc == '0':
             from .parser_bridge import checksum_file
             checksum = checksum_file(path)
             sha, crc = checksum.sha256, checksum.crc64
@@ -93,7 +93,12 @@ class RawBinlogStore:
         key_base = f'{archive.prefix}raw-binlog/v1/{file_id}/{sha}'
         raw = self._put(archive, path, key_base + '.binlog', sha, crc)
         # Sidecar is content-addressed independently; raw bytes are never changed.
-        payload = gzip.compress(compact(directory).encode('utf-8'), compresslevel=1, mtime=0)
+        plain = compact(directory).encode('utf-8')
+        if len(plain) > 256*1024**2:
+            raise RawBinlogError('轻量索引超过查询解压预算，保留源文件且不标记完成', 'RAW_INDEX_SIZE_LIMIT')
+        payload = gzip.compress(plain, compresslevel=1, mtime=0)
+        if len(payload) > 32*1024**2:
+            raise RawBinlogError('轻量索引超过查询读取预算，保留源文件且不标记完成', 'RAW_INDEX_SIZE_LIMIT')
         side_sha = hashlib.sha256(payload).hexdigest()
         from oss2.utils import Crc64
         side_crc = Crc64()

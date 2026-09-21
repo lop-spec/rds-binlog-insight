@@ -152,6 +152,15 @@ class ManifestTests(unittest.TestCase):
             self.store.plan({},100,200)
         self.assertEqual(caught.exception.code,'QUERY_BINLOG_LIMIT')
 
+    def test_zero_source_checksum_is_recomputed_not_used_as_oss_crc(self):
+        record={'local_sha256':'a'*64,'checksum_crc64':'0'}
+        with patch.object(self.store,'get',return_value=None), patch.object(self.metadata,'file_record',return_value=record), \
+             patch('app.parser_bridge.checksum_file',return_value=SimpleNamespace(sha256='b'*64,crc64='123')) as checksum, \
+             patch('app.raw_binlog.scan',side_effect=RuntimeError('stop-before-upload')):
+            with self.assertRaisesRegex(RuntimeError,'stop-before-upload'):
+                self.store.archive(Mock(),Path('fixture'),'file',Mock(),'mysql')
+        checksum.assert_called_once_with(Path('fixture'))
+
     def test_resume_verifies_both_objects_without_decoding_again(self):
         previous={'raw':{},'index':{}}
         with patch.object(self.store,'get',return_value=previous), patch.object(self.store,'verify') as verify, patch('app.raw_binlog.scan') as scanner:

@@ -1,4 +1,4 @@
-# Original binlog archive (v1.28.45)
+# Original binlog archive (v1.28.46)
 
 The collector may run with `RDS_BINLOG_RAW_ARCHIVE=1`. The existing OSS credential,
 retention policy and file-discovery/retry state remain authoritative. No business
