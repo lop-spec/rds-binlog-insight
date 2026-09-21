@@ -1,9 +1,10 @@
-# Original binlog archive (v1.28.47)
+# Original binlog archive (v1.28.48)
 
 Raw downloads persist display progress at most once every five seconds (plus
 final completion). Resume still uses the actual partial-file length; streaming
 CRC64/SHA-256, fsync, and the verified downloaded-state commit are unchanged.
-This prevents small FULL SQLite progress commits from throttling byte transfer.
+This bounds unnecessary FULL SQLite progress commits; it is not itself a
+claim that metadata persistence is the dominant throughput bottleneck.
 
 The collector may run with `RDS_BINLOG_RAW_ARCHIVE=1`. The existing OSS credential,
 retention policy and file-discovery/retry state remain authoritative. No business
@@ -24,8 +25,9 @@ The UI distinguishes these. Header-event counts are NOT reported as decoded row
 counts. A crash before manifest commit reuses verified objects; a crash after it
 verifies the manifest before cleanup. Never delete the legacy Parquet/indices.
 
-Two archive lanes and three download lanes share a rolling admission budget of
-four files / 2 GiB (one oversized file alone). A slow earlier download does not
+Two archive lanes and eight download lanes share a rolling admission budget of
+eight files / 4 GiB (one oversized file alone). The legacy expansion pipeline
+keeps its original three download lanes and four files / 2 GiB budget. A slow earlier download does not
 block a ready later file. Pause stops new admission; downloaded files remain
 recoverable. Discovery continues through the existing retained-file scheduler.
 

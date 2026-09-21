@@ -264,7 +264,34 @@ class RawPipelineTests(unittest.TestCase):
         self.assertEqual(result,(7,0,False))
         self.assertLess(order.index('2'),order.index('0'))
         self.assertEqual(len(set(order)),7)
-        self.assertTrue(all(len(c.kwargs.get('inFlightFiles',[]))<=4 for c in manager._update_pipeline_status.call_args_list))
+        self.assertTrue(all(len(c.kwargs.get('inFlightFiles',[]))<=8 for c in manager._update_pipeline_status.call_args_list))
+
+    def test_eight_download_lanes_remain_file_bounded(self):
+        import threading
+        from app.config import Settings
+        manager=self.manager();barrier=threading.Barrier(8,timeout=3)
+        pending=[(str(i),SimpleNamespace(file_size=512*1024**2,log_file_name=str(i)),'discovered') for i in range(8)]
+        def download(*args):
+            barrier.wait()
+            return Path('fixture'),'sha'
+        manager._download=download;manager._process_one=Mock(return_value=0)
+        result=manager._run_pending_raw('job',None,Settings(),pending,'mysql',Mock(),completed=0,unavailable=0)
+        self.assertEqual(result,(8,0,False))
+        self.assertTrue(any(c.kwargs.get('downloadWorkers')==8 for c in manager._update_pipeline_status.call_args_list))
+        self.assertTrue(all(len(c.kwargs.get('inFlightFiles',[]))<=8 for c in manager._update_pipeline_status.call_args_list))
+
+    def test_raw_byte_budget_limits_admission_before_eight_files(self):
+        import time
+        from app.config import Settings
+        manager=self.manager()
+        pending=[(str(i),SimpleNamespace(file_size=600*1024**2,log_file_name=str(i)),'discovered') for i in range(14)]
+        def download(*args):
+            time.sleep(.03)
+            return Path('fixture'),'sha'
+        manager._download=download;manager._process_one=Mock(return_value=0)
+        result=manager._run_pending_raw('job',None,Settings(),pending,'mysql',Mock(),completed=0,unavailable=0)
+        self.assertEqual(result,(14,0,False))
+        self.assertEqual(max(len(c.kwargs.get('inFlightFiles',[])) for c in manager._update_pipeline_status.call_args_list),6)
 
     def test_pause_stops_admission_and_retains_pending_work(self):
         from app.config import Settings

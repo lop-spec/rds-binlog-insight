@@ -44,6 +44,11 @@ DOWNLOAD_PREFETCH_FILES = _pipeline_limit(
     "RDS_BINLOG_DOWNLOAD_PREFETCH_FILES", FILE_PIPELINE_WORKERS + 2, 8
 )
 DOWNLOAD_PREFETCH_BYTES = 2 * 1024**3
+# Raw archival spends most of its time waiting for independent source streams;
+# keep its byte/file admission bound separate from the legacy expansion lanes.
+RAW_DOWNLOAD_WORKERS = 8
+RAW_PREFETCH_FILES = 8
+RAW_PREFETCH_BYTES = 4 * 1024**3
 if DOWNLOAD_PREFETCH_FILES < FILE_PIPELINE_WORKERS:
     raise ValueError("download prefetch must admit every active file lane")
 OSS_ARCHIVE_WORKERS = 4
@@ -1403,23 +1408,23 @@ class SyncManager:
                 workers.archive = self.archive_for_settings(settings)
             return self._process_one(job_id, client, settings, file_id, item,
                         prior_state, flavor, workers.archive, prepared_download=download)
-        self._update_pipeline_status(active=True)
+        self._update_pipeline_status(active=True, downloadWorkers=RAW_DOWNLOAD_WORKERS)
         try:
-            with ThreadPoolExecutor(max_workers=DOWNLOAD_PIPELINE_WORKERS, thread_name_prefix='raw-download') as down, \
+            with ThreadPoolExecutor(max_workers=RAW_DOWNLOAD_WORKERS, thread_name_prefix='raw-download') as down, \
                  ThreadPoolExecutor(max_workers=FILE_PIPELINE_WORKERS, thread_name_prefix='raw-archive') as work:
                 while entries or admitted:
                     stopping = self._pause_after_current.is_set() or self._shutdown.is_set()
                     if not stopping:
-                        while entries and len(admitted) < DOWNLOAD_PREFETCH_FILES:
+                        while entries and len(admitted) < RAW_PREFETCH_FILES:
                             entry = entries[0]
                             file_id, item, prior_state = entry
                             if file_id in admitted or file_id in retired:
                                 entries.popleft()
                                 continue
                             size = sum(max(e[1].file_size, 0) for e in admitted.values())
-                            if admitted and size+item.file_size > DOWNLOAD_PREFETCH_BYTES:
+                            if admitted and size+item.file_size > RAW_PREFETCH_BYTES:
                                 break
-                            if item.file_size > DOWNLOAD_PREFETCH_BYTES:
+                            if item.file_size > RAW_PREFETCH_BYTES:
                                 LOGGER.warning('RAW_OVERSIZED_FILE admitted-alone bytes=%s', item.file_size)
                             entries.popleft()
                             admitted[file_id] = entry
