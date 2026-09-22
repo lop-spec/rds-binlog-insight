@@ -180,6 +180,7 @@ jobs:
             -m unittest \
             tests.test_raw_binlog \
             tests.test_binlog_query_batches \
+            tests.test_raw_event_index \
             tests.test_sync_lifecycle \
             tests.test_rds_download \
             tests.test_core \
@@ -224,8 +225,15 @@ jobs:
           docker run --rm --entrypoint python "$LOCAL_IMAGE" -c \
             "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"
 
+      - name: Benchmark bounded raw-event covering index fixture
+        shell: bash
+        run: |
+          docker run --rm --cpus=1 --memory=768m --pids-limit=128 \
+            --entrypoint python --workdir /src --volume "$PWD:/src:ro" \
+            "$LOCAL_IMAGE" -m tools.benchmark_index_layout --raw-event-index --rows 16384
+
       - name: Verify workspace rendering and disclosure contracts
-        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs tests/test_sync_lifecycle.cjs tests/test_sync_status.cjs
+        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs tests/test_sync_lifecycle.cjs tests/test_sync_status.cjs tests/test_indexed_range.cjs
 
       - name: Verify Mongo, slow-log filters and raw candidate versions against isolated ClickHouse
         shell: bash

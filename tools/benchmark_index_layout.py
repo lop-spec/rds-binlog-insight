@@ -280,6 +280,70 @@ def benchmark(path, root, *, require_reduction=False):
     return summary
 
 
+def benchmark_raw_events(path, root):
+    """Exercise the covering-row layout, not native parsing or production I/O."""
+    from app.metadata import MetadataStore
+    from app.raw_binlog import RawBinlogStore
+    from app.raw_event_index import RawEventIndex
+    from app.exact_index import ExactIndex
+    from app.rds_api import RemoteBinlog
+    from app.config import Settings
+    if not 0 < path.stat().st_size <= MAX_INPUT_BYTES:
+        raise ValueError('sample must be at most 64 MiB')
+    table = pq.read_table(path, use_threads=False)
+    if table.num_rows > MAX_ROWS or table.nbytes > MAX_DECODED_BYTES:
+        raise ValueError('sample exceeds row/decoded-byte budget')
+    rows = table.to_pylist()
+    metadata = MetadataStore(root/'metadata.sqlite3')
+    store = RawBinlogStore(metadata)
+    item = RemoteBinlog(log_file_name='mysql-bin.000001', file_size=path.stat().st_size,
+        log_begin_utc='2026-09-01T00:00:00Z', log_end_utc='2026-09-30T00:00:00Z',
+        checksum_crc64='', download_link='', intranet_download_link='', link_expired_utc='', remote_status='Completed', host_instance_id='fixture')
+    file_id, _ = metadata.upsert_remote(Settings(db_instance_id='fixture'), item)
+    for row in rows:
+        row.update(instance_id='fixture', source_file_id=file_id, event_locator=f'raw:{file_id}:4',
+            columns_json=json.dumps([{'index': 0, 'name': 'id', 'type_id': 8, 'primary_key': True}]))
+    lo, hi = min(r['event_epoch_us'] for r in rows), max(r['event_epoch_us'] for r in rows)
+    descriptor = {'file_id': file_id, 'raw': {'size_bytes': path.stat().st_size}}
+    summary = {'lo': lo, 'hi': hi, 'tables': sorted({(r['database_name'], r['table_name']) for r in rows}), 'unknown': False}
+    with metadata.connection() as conn:
+        conn.execute('INSERT INTO raw_binlog_archives VALUES(?,?,?,?,?,?,?)',
+            (file_id, lo, hi, json.dumps(summary), json.dumps(descriptor), time.time(), time.time()))
+    index = RawEventIndex(metadata, root/'raw-index')
+    start = time.perf_counter()
+    index.build(descriptor, iter(rows), ExactIndex(root/'exact'))
+    build_seconds = time.perf_counter()-start
+    sizes = sum(p.stat().st_size for p in index.path.parent.iterdir())
+    if sizes > MAX_STATE_BYTES:
+        raise RuntimeError('sample index exceeded 512 MiB budget')
+    selected = rows[len(rows)//2]
+    scope = {'source': 'binlog', 'instance': 'fixture', 'database': selected['database_name'], 'table': selected['table_name'], 'limit': 10}
+    results = []
+    for name, query in [('time', scope), ('page', {**scope, 'offset': 10}),
+        ('pk-positive', {**scope, 'exact': {'value': json.loads(selected['after_json'])['id']}}),
+        ('pk-negative', {**scope, 'exact': {'value': -9999}})]:
+        start = time.perf_counter()
+        filtered = [r for r in rows if r['database_name'] == query['database'] and r['table_name'] == query['table']
+            and (not query.get('exact') or any(json.loads(r[column]).get('id') == query['exact']['value'] for column in ('before_json', 'after_json')))]
+        expected, more = page(filtered, query)
+        oracle_seconds = time.perf_counter()-start
+        timings = []
+        for _ in range(3):
+            start = time.perf_counter()
+            result = index.query(query, lo, hi)
+            timings.append(time.perf_counter()-start)
+            assert result['rows'] == expected and result['has_more'] == more, name
+            assert result['range_requests'] == 0
+        results.append({'case': name, 'oracle_seconds': oracle_seconds, 'indexed_seconds': timings,
+            'rows': len(expected), 'rows_sha256': fingerprint(expected), 'all_fields_match': True})
+    result = {'scope': 'local normalized-row fixture; warm OS cache; NOT native parsing, production, or 1TB acceptance',
+        'rows': len(rows), 'fixture_parquet_bytes': path.stat().st_size, 'index_bytes': sizes,
+        'index_bytes_per_event': sizes/len(rows), 'build_seconds': build_seconds,
+        'process_peak_rss_bytes': process_peak_rss_bytes(), 'cases': results}
+    print(json.dumps(result), flush=True)
+    return result
+
+
 def check_deadline(start):
     if time.perf_counter() - start > 60:
         raise TimeoutError('P1 query exceeded 60-second local fixture budget')
@@ -289,6 +353,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--rows', type=int, default=16384)
     parser.add_argument('--parquet', type=Path)
+    parser.add_argument('--raw-event-index', action='store_true', help='measure asynchronous covering-row index with a normalized fixture')
     args = parser.parse_args()
     if not 1024 <= args.rows <= MAX_ROWS:
         parser.error('--rows must be between 1024 and 200000')
@@ -297,7 +362,10 @@ def main():
         path = args.parquet.resolve() if args.parquet else root / 'fixture.parquet'
         if not args.parquet:
             fixture(path, args.rows)
-        benchmark(path, root, require_reduction=not bool(args.parquet) and args.rows >= 8192)
+        if args.raw_event_index:
+            benchmark_raw_events(path, root)
+        else:
+            benchmark(path, root, require_reduction=not bool(args.parquet) and args.rows >= 8192)
 
 
 if __name__ == '__main__':

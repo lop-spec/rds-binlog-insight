@@ -149,22 +149,27 @@ def decode(storage, archive, entry, query, start, end, budget, *, position=None)
                             for line in handle:
                                 budget.check()
                                 row = json.loads(line)
-                                row.update(instance_id=entry['instance_id'], host_instance_id=entry['host_instance_id'],
-                                           source_file_id=entry['file_id'], source_file_name=entry['source_file_name'])
-                                row['operation'] = str(row.get('operation') or 'OTHER').upper()
-                                transaction = str(row.get('gtid') or row.get('transaction_id') or 'ungrouped')
-                                ordinals[transaction] = ordinals.get(transaction, 0)+1
-                                identity = '\x1f'.join(('raw-v1', entry['file_id'], transaction, str(ordinals[transaction])))
-                                row['event_id'] = hashlib.sha256(identity.encode()).hexdigest()
-                                row['event_time_utc'] = datetime.fromtimestamp(int(row.get('event_epoch_us') or 0)/1e6, UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                                position = gtid_positions.get(row.get('gtid'), 4)
-                                row['event_locator'] = f"raw:{entry['file_id']}:{position}"
-                                yield row
+                                yield normalize_row(row, entry, ordinals, gtid_positions)
                     finally:
                         path.unlink(missing_ok=True)
             except Exception:
                 budget.check()  # Preserve user cancellation/deadline over parser wrapper errors.
                 raise
+
+
+def normalize_row(row, entry, ordinals, gtid_positions):
+    """One identity contract for range decoding and asynchronous full-file indexing."""
+    row.update(instance_id=entry['instance_id'], host_instance_id=entry['host_instance_id'],
+               source_file_id=entry['file_id'], source_file_name=entry['source_file_name'])
+    row['operation'] = str(row.get('operation') or 'OTHER').upper()
+    transaction = str(row.get('gtid') or row.get('transaction_id') or 'ungrouped')
+    ordinals[transaction] = ordinals.get(transaction, 0)+1
+    identity = '\x1f'.join(('raw-v1', entry['file_id'], transaction, str(ordinals[transaction])))
+    row['event_id'] = hashlib.sha256(identity.encode()).hexdigest()
+    row['event_time_utc'] = datetime.fromtimestamp(int(row.get('event_epoch_us') or 0)/1e6, UTC).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+    position = gtid_positions.get(row.get('gtid'), 4)
+    row['event_locator'] = f"raw:{entry['file_id']}:{position}"
+    return row
 
 
 def matches(storage, row, query, start, end, schema_cache):

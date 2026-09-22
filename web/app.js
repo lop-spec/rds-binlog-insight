@@ -157,15 +157,45 @@ function switchView(name) {
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
-function setQuickRange(range) {
+let indexedRangeRequest = 0;
+async function setQuickRange(range) {
+  const request = ++indexedRangeRequest;
   const units = { "15m": 15 * 60_000, "1h": 60 * 60_000, "24h": 24 * 60 * 60_000, "7d": 7 * 24 * 60 * 60_000, "30d": 30 * 24 * 60 * 60_000 };
+  $("#audit-range").value = range;
+  const fast = $("#filter-query-mode").value !== "keyword";
+  const hint = $("#indexed-range-hint");
+  if (fast || $("#filter-source").value === "binlog") {
+    $("#filter-start").value = "";
+    $("#filter-end").value = "";
+    $("#filter-end").setCustomValidity("正在读取已索引区间");
+    hint.textContent = "正在读取已索引区间…";
+    const params = new URLSearchParams();
+    for (const key of ["instance", "database", "table"]) params.set(key, $("#filter-" + key).value.trim());
+    try {
+      const coverage = await api("/api/index-coverage?" + params);
+      if (request !== indexedRangeRequest || $("#audit-range").value === "custom") return;
+      const worker = coverage.worker || {};
+      const reasons = { "io-pressure": "磁盘繁忙", "memory-pressure": "内存压力", "cpu-pressure": "CPU 繁忙", "interactive-query-priority": "优先处理查询", "disk-reserve-below-20GiB": "保护磁盘余量" };
+      const workerNote = worker.state === "paused" ? ` · 索引已让位：${reasons[worker.reason] || "资源检查未通过"}` : "";
+      const selected = indexedQuickRange(coverage.intervals || [], units[range]);
+      if (!selected) throw new Error((coverage.reason || "没有可用的已索引区间") + workerNote);
+      $("#filter-start").value = toLocalInput(new Date(selected.start));
+      $("#filter-end").value = toLocalInput(new Date(selected.end));
+      $("#filter-end").setCustomValidity("");
+      hint.textContent = `${selected.clipped ? "区间不足所选时长，已缩至最近连续索引段" : "已对齐最近连续索引段"} · ${formatTime(selected.start * 1000)} — ${formatTime(selected.end * 1000)} · 待索引/缺失 ${coverage.pendingFiles} 个文件${workerNote}`;
+    } catch (error) {
+      if (request !== indexedRangeRequest || $("#audit-range").value === "custom") return;
+      $("#filter-end").setCustomValidity(error.message);
+      hint.textContent = error.message + "；不会自动退回原档扫描。";
+    }
+    return;
+  }
   const latestEpochUs = Number(state.status?.summary?.latestEpochUs || 0);
   const end = latestEpochUs > 0 ? new Date(latestEpochUs / 1000) : new Date();
-  const endInput = $("#filter-end");
-  endInput.value = toLocalInput(end);
-  endInput.setCustomValidity("");
+  $("#filter-end").value = toLocalInput(end);
+  $("#filter-end").setCustomValidity("");
   $("#filter-start").value = toLocalInput(new Date(end.getTime() - units[range]));
-  $("#audit-range").value = range;
+  hint.textContent = "高级查询：时间按已有事件水位选择，不承诺使用 Binlog 精确索引。";
 }
 
 function setDefaultSyncWindow() {
@@ -234,26 +264,42 @@ function eventQueryPayload() {
   };
   if (params.has("startEpochUs")) payload.startEpochUs = Number(params.get("startEpochUs"));
   if (params.has("endEpochUs")) payload.endEpochUs = Number(params.get("endEpochUs"));
+  const fast = $("#filter-query-mode").value !== "keyword";
+  if (fast) {
+    if (!payload.instance || !payload.database || !payload.table) throw new Error("索引快查需要选择实例并填写完整库名、表名");
+    if (!params.has("startEpochUs") || !params.has("endEpochUs")) throw new Error("请先选择可用的已索引区间");
+    payload.indexedOnly = true;
+    payload.source = "binlog";
+  }
   if ($("#filter-query-mode").value === "primary-key") {
     const value = $("#filter-keyword").value.trim();
     if (!payload.database || !payload.table) throw new Error("主键精确查询必须填写完整数据库名和表名");
     if (!value) throw new Error("请填写主键值");
     payload.keyword = "";
-    payload.exact = { kind: "PRIMARY_KEY", value, fallback: "scan" };
+    payload.exact = { kind: "PRIMARY_KEY", value, fallback: "error" };
   }
   return payload;
 }
 
 function syncQueryMode() {
-  const exact = $("#filter-query-mode").value === "primary-key";
+  const mode = $("#filter-query-mode").value;
+  const exact = mode === "primary-key";
+  const fast = mode !== "keyword";
+  if (fast) $("#filter-source").value = "binlog";
+  $("#filter-source").disabled = fast;
+  $("#filter-keyword").disabled = mode === "indexed-time";
+  for (const id of ["connection", "account", "status"]) {
+    $("#filter-" + id).disabled = fast;
+    if (fast) $("#filter-" + id).value = "";
+  }
   $("#filter-value-label").textContent = exact ? "主键值" : "关键词";
   $("#filter-keyword").placeholder = exact ? "例如 3521" : "SQL、行值、GTID 或文件名";
-  $("#filter-keyword-mode").disabled = exact;
-  $("#filter-keyword-mode-field").classList.toggle("is-disabled", exact);
-  $("#filter-database").placeholder = exact ? "完整数据库名" : "支持片段匹配";
-  $("#filter-table").placeholder = exact ? "完整表名" : "支持片段匹配";
-  $("#query-export").disabled = exact;
-  $("#query-export").title = exact ? "主键精确结果请在任务列表中查看" : "导出 CSV";
+  $("#filter-keyword-mode").disabled = fast;
+  $("#filter-keyword-mode-field").classList.toggle("is-disabled", fast);
+  $("#filter-database").placeholder = fast ? "完整数据库名" : "支持片段匹配";
+  $("#filter-table").placeholder = fast ? "完整表名" : "支持片段匹配";
+  $("#query-export").disabled = fast;
+  $("#query-export").title = fast ? "索引结果请在任务列表中查看；批量导出使用高级查询" : "导出 CSV";
 }
 
 function validateEventRange() {
@@ -369,7 +415,7 @@ function renderEvents(result) {
   $("#page-prev").disabled = state.queryOffset === 0;
   $("#page-next").disabled = !state.hasMore;
   const tierNames = (result.tiers_used || []).map((tier) => (
-    tier === "exact-index"
+    tier === "raw-event-index" ? "Binlog 行级索引" : tier === "exact-index"
       ? "主键精确索引 · 0 OSS"
       : tier === "slowlog-index"
       ? "慢日志专用索引 · 0 OSS"
@@ -2015,7 +2061,22 @@ function bindEvents() {
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
   $$("[data-go]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
   setupWorkspaceControls();
-  $("#audit-range").addEventListener("change", (event) => { if (event.target.value !== "custom") setQuickRange(event.target.value); });
+  $("#audit-range").addEventListener("change", (event) => {
+    ++indexedRangeRequest;
+    if (event.target.value !== "custom") setQuickRange(event.target.value);
+    else {
+      $("#filter-end").setCustomValidity("");
+      $("#indexed-range-hint").textContent = "自定义区间仍须通过完整索引检查；不会返回缺失部分的残页。";
+    }
+  });
+  for (const name of ["start", "end"]) {
+    $("#filter-" + name).addEventListener("input", () => {
+      ++indexedRangeRequest;
+      $("#audit-range").value = "custom";
+      $("#filter-end").setCustomValidity("");
+      $("#indexed-range-hint").textContent = "自定义区间：提交时检查完整索引覆盖，不自动扫描原档。";
+    });
+  }
   $("#analytics-range").addEventListener("change", (event) => { if (event.target.value !== "custom") setAnalyticsRange(event.target.value); });
   $("#view-analytics").addEventListener("change", (event) => { if (event.target.matches("[data-sql-sort]")) changeSqlOrder(event.target); });
   $$("[data-analytics-tab]").forEach((button) => button.addEventListener("click", () => switchAnalyticsTab(button.dataset.analyticsTab)));
@@ -2065,7 +2126,15 @@ function bindEvents() {
   $("#filter-end").addEventListener("input", () => {
     $("#filter-end").setCustomValidity("");
   });
-  $("#filter-query-mode").addEventListener("change", syncQueryMode);
+  $("#filter-query-mode").addEventListener("change", () => {
+    syncQueryMode();
+    if ($("#audit-range").value !== "custom") setQuickRange($("#audit-range").value);
+  });
+  for (const name of ["instance", "database", "table", "source"]) {
+    $("#filter-" + name).addEventListener("change", () => {
+      if ($("#audit-range").value !== "custom") setQuickRange($("#audit-range").value);
+    });
+  }
   document.addEventListener("click", (event) => {
     const trigger = event.target.closest(".txn-drill");
     if (trigger) {
@@ -2089,7 +2158,7 @@ function bindEvents() {
     $("#filter-account").value = "";
     $("#filter-status").value = "";
     $("#filter-keyword-mode").value = "AND";
-    $("#filter-query-mode").value = "keyword";
+    $("#filter-query-mode").value = "indexed-time";
     syncQueryMode();
     $$(".operation-filter input").forEach((item) => { item.checked = false; });
     setQuickRange("24h");

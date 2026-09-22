@@ -190,7 +190,9 @@ class QueryTaskManager:
                 return
             control.check_cancelled()
             settings = self.settings_loader()
-            archive = self.archive_loader(settings)
+            # Indexed-only requests are local reads; unavailable OSS credentials
+            # must neither block them nor trigger a silent scan fallback.
+            archive = None if query.get('indexed_only') else self.archive_loader(settings)
             result = self.storage.query_events_tiered(
                 query,
                 settings,

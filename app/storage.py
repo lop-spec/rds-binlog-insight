@@ -387,6 +387,8 @@ class EventStorage:
         self.raw_binlogs = RawBinlogStore(metadata)
         self.search_index = SearchIndex(self.paths["index"] / "search.sqlite3")
         self.exact_index = ExactIndex(self.paths["index"] / "exact-v1")
+        from .raw_event_index import RawEventIndex
+        self.raw_event_index = RawEventIndex(metadata, self.paths['index'], schema_sha=self.exact_index.registry_sha256)
         self.analytics_index = AnalyticsIndex(
             self.paths["index"] / "analytics-v1",
             connect_duckdb=self._duckdb_connect,
@@ -3120,6 +3122,12 @@ class EventStorage:
         from .query_tasks import QueryBatchControl
         from .raw_binlog_query import query_raw
         start, end = self._query_window(query, settings.retention_days)
+        if query.get('indexed_only'):
+            if query.get('start_epoch_us') != start or query.get('end_epoch_us') != end:
+                from .binlog_lite import RawBinlogError
+                raise RawBinlogError('快查需要保留窗口内的明确起止时间，不能自动截断范围', 'INDEX_COVERAGE_INCOMPLETE')
+            with self.query_activity():
+                return self.raw_event_index.query(query, start, end, control=control)
         with self.raw_binlogs.plan(query, start, end, control) as plan:
             # Preserve the existing specialized/indexed routes for small legacy
             # queries and non-Binlog sources; only large plans need subdivision.
@@ -4390,6 +4398,9 @@ class EventStorage:
     ) -> dict[str, Any] | None:
         with self.query_activity():
             if locator.startswith('raw:'):
+                indexed = self.raw_event_index.detail(event_id, locator, instance)
+                if indexed is not None:
+                    return indexed
                 from .raw_binlog_query import event_detail
                 return event_detail(self, archive, event_id, locator, instance)
             local_execution = self._local_execution_event_detail(event_id, instance)

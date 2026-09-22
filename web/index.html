@@ -90,8 +90,8 @@
       <section id="view-audit" class="view is-active">
         <div class="query-panel">
           <div class="panel-heading">
-            <div><h2>查询条件</h2><p>按真实事件时间倒序；单页最多 1,000 条。Binlog 自动分批查询，每批最多 16 个候选文件 / 8 GiB；跨批统一排序，可随时取消。</p></div>
-            <label class="range-picker">时间范围<select id="audit-range" aria-label="查询时间范围"><option value="15m">最近 15 分钟</option><option value="1h">最近 1 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></label>
+            <div><h2>查询条件</h2><p>优先按完整库表＋主键查记录历史，或按库表＋时间浏览变更。采集不等待后台索引；快查只返回索引完整区间，支持取消。</p></div>
+            <label class="range-picker">时间范围<select id="audit-range" aria-label="查询时间范围"><option value="15m">最近可查 15 分钟</option><option value="1h">最近可查 1 小时</option><option value="24h" selected>最近可查 24 小时</option><option value="7d">最近可查 7 天</option><option value="30d">最近可查 30 天</option><option value="custom">自定义</option></select></label>
           </div>
 
           <form id="query-form" class="query-grid">
@@ -100,7 +100,7 @@
             <label class="field span-2"><span>结束时间</span><input id="filter-end" type="datetime-local" step="1"></label>
             <label class="field span-2"><span id="filter-value-label">关键词</span><input id="filter-keyword" type="search" placeholder="SQL、行值、GTID 或文件名"></label>
             <details id="audit-filters" class="filter-disclosure span-8"><summary>更多筛选 <span class="filter-count"></span></summary><div class="query-grid">
-            <label class="field"><span>查询方式</span><select id="filter-query-mode"><option value="keyword">常规</option><option value="primary-key">主键精确</option></select></label>
+            <label class="field"><span>查询方式</span><select id="filter-query-mode"><option value="indexed-time" selected>已索引变更 · 推荐</option><option value="primary-key">主键历史 · 精确</option><option value="keyword">高级查询 · 可能扫描原档</option></select></label>
             <label id="filter-keyword-mode-field" class="field"><span>匹配</span><select id="filter-keyword-mode"><option value="AND">全部词</option><option value="OR">任一词</option></select></label>
             <label class="field span-2"><span>数据库</span><input id="filter-database" type="text" placeholder="支持片段匹配"></label>
             <label class="field span-2"><span>表名</span><input id="filter-table" type="text" placeholder="支持片段匹配"></label>
@@ -143,7 +143,7 @@
 
         <div class="notice info compact-notice">
           <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg>
-          <span>主键精确查询要求完整库名和表名；精确索引未完成时，仅在候选文件预算内按需解析。缺少可验证的主键 schema 时会明确报错，不将未知当作无结果。</span>
+          <span><span id="indexed-range-hint" role="status" aria-live="polite">选择实例和完整库表后，时间快捷项会对齐已索引区间。</span> 主键历史要求可验证的历史 schema；缺失或不支持时明确报错。高级查询保留原档分批扫描，不会在快查失败时自动启动。</span>
         </div>
 
         <div class="result-section">
@@ -467,6 +467,7 @@
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
   <script src="/assets/workspace.js?v=1.28.52-rawoss" defer></script>
   <script src="/assets/mongo.js?v=1.28.52-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.28.52-rawoss" defer></script>
   <script src="/assets/app.js?v=1.28.52-rawoss" defer></script>
 </body>
 </html>

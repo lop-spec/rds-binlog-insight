@@ -514,6 +514,7 @@ def run_one(data_dir: Path, generation: str) -> int:
     _bound_arrow()
     paths = ensure_data_dirs(data_dir)
     progress_path = paths["index"] / WORKER_PROGRESS_NAME
+    raw_state: dict[str, Any] = {}
 
     def publish(
         state: str,
@@ -524,6 +525,8 @@ def run_one(data_dir: Path, generation: str) -> int:
         error: str = "",
         result: dict[str, Any] | None = None,
     ) -> None:
+        if phase == 'raw-events':
+            raw_state.update({'state': state, 'updatedAt': time.time(), 'reason': error, **(result or {})})
         write_json_status(
             progress_path,
             {
@@ -537,6 +540,7 @@ def run_one(data_dir: Path, generation: str) -> int:
                 "progressToken": token,
                 "lastError": error,
                 "result": result or {},
+                "rawEvents": dict(raw_state),
             },
         )
 
@@ -580,6 +584,17 @@ def run_one(data_dir: Path, generation: str) -> int:
     if settings.oss_enabled:
         credential = load_credential(settings.credential_target)
         archive = OssArchive(settings, credential=credential)
+    # Raw indexing is asynchronous: the collector never calls this path.
+    # Reuse this supervisor/worker and its hard resource limits, one file per
+    # pass; continue existing maintenance afterwards to avoid starvation.
+    from .raw_binlog import enabled as raw_archive_enabled
+    if archive is not None and raw_archive_enabled():
+        try:
+            from .raw_index_worker import run_one as index_raw_file
+            index_raw_file(storage, archive, publish)
+        except Exception as exc:
+            traceback.print_exc()
+            publish('error', phase='raw-events', token=f'{generation}:raw-error', error=str(exc))
     if SLOWLOG_INDEX_ENABLED:
         try:
             _advance_slowlog_index(

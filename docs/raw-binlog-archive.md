@@ -39,6 +39,58 @@ checksum, OSS validation, or query budget is weakened.
 Pause stops new admission; downloaded files remain
 recoverable. Discovery continues through the existing retained-file scheduler.
 
+## Asynchronous indexed queries
+
+With the archive switch enabled on the existing `indexer`, each worker pass also
+indexes one committed raw file, newest first. The collector does not call or wait
+for this path. The worker reads OSS sequentially, verifies size/SHA256/CRC64, then
+uses the existing native decoder. Collection-owned downloads are not retained.
+No new queue, service, business database index, or CPU allocation is introduced.
+
+`index/raw-events-v1.sqlite3` is a rebuildable derived store. Ordered keys support
+an exact instance/database/table/time scope and the existing schema-verified
+single-column primary-key types. Before and after primary-key values both point
+to the same immutable event. A registry or source-descriptor change invalidates
+coverage. Missing/unsupported historical schema remains an error for key lookup.
+Event identities and all returned fields match the raw decoder; compressed
+payload blocks share repeated content across at most 256 rows / 4 MiB, with a
+32 MiB single-event ceiling. Only page rows are returned, not truncated fields.
+This is a covering index, not a keys-only format: budget its measured disk growth.
+
+The single lane inherits the indexer's hard limits and low scheduling priority.
+It adjusts its duty cycle to measured host CPU idle time, yields for queued/running
+queries, I/O or memory pressure, and reserves 20 GiB of free disk (plus source
+staging space before a download). Pressure recovery uses hysteresis. Unavailable
+pressure measurements pause rather than assume spare capacity; each reason is
+logged and exposed in the existing worker status. A pause beyond five minutes
+releases the work unit; incomplete files remain invisible and retry later.
+These controls do not establish a measured zero-impact guarantee.
+
+Publication occurs only after EOF and source revalidation. Committed intermediate
+blocks are not queryable; restart retries reclaim them in bounded batches. Source
+retirement reclaims derived rows/blocks only, without deleting source manifests
+or archives. Registered missing files and incomplete overlapping files subtract
+from coverage. Envelope-proven irrelevant tables can be pruned. Opaque files use
+decoded timestamp bounds only after complete indexing, never epoch-to-infinity.
+The certificate covers the registered source catalog, not undiscovered history.
+
+The recommended UI requires one instance and complete database/table names.
+Primary-key history is the most selective lookup. Time shortcuts end at the most
+recent continuous certified interval, clip to it without crossing holes, and
+never substitute wall-clock time when no interval exists. A custom interval is
+revalidated at execution; no automatic widening, clipping, or raw-scan fallback.
+Advanced queries retain the previous bounded raw/legacy path. Fast queries and
+cached details do not initialize OSS. Fast execution has a 10-second deadline,
+a 32 MiB result budget and pagination depth 2,000; failure returns no partial page.
+
+Before production adoption, measure original-file throughput and tail latency
+with/without the worker under identical limits, index bytes/event, ongoing source
+rate, and backlog. Check both cold and warm equal-content queries over at least
+1 TB; the small fixture below does not establish that target or 100× speedup.
+Disable the archive switch **only on the indexer** to stop this new work without
+changing collection. The older raw-aware query image can still read every original
+archive; keep the derived file for investigation/reuse, rather than deleting data.
+
 ## Query safety and compatibility
 
 - Snapshot the union of legacy physical source IDs and eligible raw IDs once at
@@ -67,7 +119,9 @@ recoverable. Discovery continues through the existing retained-file scheduler.
 ## Verification
 
 ```
-python -m unittest tests.test_raw_binlog tests.test_binlog_query_batches tests.test_pipeline_capacity tests.test_query_preflight -v
+python -m unittest tests.test_raw_binlog tests.test_binlog_query_batches tests.test_raw_event_index tests.test_index_worker tests.test_pipeline_capacity tests.test_query_preflight -v
+node --test tests/test_indexed_range.cjs
+python -m tools.benchmark_index_layout --raw-event-index --rows 16384
 python tools/raw_binlog_probe.py /path/to/existing/closed.binlog
 python tools/raw_binlog_acceptance.py http://127.0.0.1:8769/api/status
 ```

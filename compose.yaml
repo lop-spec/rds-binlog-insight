@@ -141,6 +141,8 @@ services:
       RDS_BINLOG_DATA_DIR: /data
       RDS_BINLOG_STAGING_DIR: /data/staging
       TMPDIR: /data/scratch
+      # Same archive switch as the collector; no additional service/queue.
+      RDS_BINLOG_RAW_ARCHIVE: "${RDS_BINLOG_RAW_ARCHIVE:-0}"
       # This worker maintains SQLite-derived indexes only.  Keep query-serving
       # backends disabled here instead of granting it ClickHouse credentials
       # merely because the shared .env enables them for the HTTP service.

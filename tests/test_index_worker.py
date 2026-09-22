@@ -182,7 +182,10 @@ class IndexWorkerCandidateTests(unittest.TestCase):
                 "app.index_worker.ensure_data_dirs",
                 return_value={"index": Path("index")},
             ),
-            patch("app.index_worker.write_json_status"),
+            patch("app.index_worker.write_json_status") as status_write,
+            patch('app.raw_binlog.enabled', return_value=True),
+            patch('app.raw_index_worker.run_one', side_effect=lambda storage, archive, publish:
+                publish('paused', phase='raw-events', token='fixture-pressure', result={'duty': 0, 'reason': 'io-pressure'})),
             patch("app.index_worker.MetadataStore", return_value=metadata),
             patch("app.index_worker.EventStorage", return_value=storage),
             patch("app.index_worker.load_credential", return_value=object()),
@@ -199,6 +202,9 @@ class IndexWorkerCandidateTests(unittest.TestCase):
 
         self.assertEqual(storage.cataloged, [catalog_part["path"]])
         self.assertEqual(storage.indexed, [full_part["path"]])
+        # Later legacy maintenance must not hide why raw indexing yielded.
+        self.assertEqual(status_write.call_args.args[1]['rawEvents']['reason'], 'io-pressure')
+        self.assertEqual(status_write.call_args.args[1]['rawEvents']['duty'], 0)
 
 
 if __name__ == "__main__":

@@ -247,6 +247,10 @@ def _event_query_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("limit 必须在 1 到 1000 之间")
     if not 0 <= result["offset"] <= 100_000:
         raise ValueError("offset 必须在 0 到 100000 之间")
+    indexed_only = payload.get('indexedOnly', payload.get('indexed_only', False))
+    if not isinstance(indexed_only, bool):
+        raise ValueError('indexedOnly 必须是布尔值')
+    result['indexed_only'] = indexed_only
     exact_value = payload.get("exact")
     if exact_value is not None:
         if not isinstance(exact_value, dict):
@@ -768,6 +772,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("app.css")
             elif parsed.path == "/assets/app.js":
                 self._serve_static("app.js")
+            elif parsed.path == "/assets/indexed-range.js":
+                self._serve_static("indexed-range.js")
             elif parsed.path == "/assets/workspace.js":
                 self._serve_static("workspace.js")
             elif parsed.path == "/assets/workspace.css":
@@ -789,6 +795,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "pid": os.getpid(),
                     }
                 )
+            elif parsed.path == "/api/index-coverage":
+                scope = {key: _query_value(query, key) for key in ('instance', 'database', 'table')}
+                scope['exact'] = {'kind': 'SCOPE'}
+                coverage = self.app.storage.raw_event_index.coverage(scope)
+                coverage.pop('_valid_files', None)
+                from .maintenance_status import WORKER_PROGRESS_NAME, read_json_status
+                progress = read_json_status(self.app.storage.paths['index'] / WORKER_PROGRESS_NAME)
+                coverage['worker'] = progress.get('rawEvents', {})
+                settings = self.app.metadata.load_settings()
+                floor, ceiling = self.app.storage._query_window({}, settings.retention_days)
+                coverage['intervals'] = [[max(lo, floor), min(hi, ceiling)]
+                    for lo, hi in coverage['intervals'] if max(lo, floor) <= min(hi, ceiling)]
+                if not coverage['intervals'] and not coverage['reason']:
+                    coverage['reason'] = '保留窗口内尚无连续完整的索引区间'
+                self._json({'ok': True, 'data': coverage})
             elif parsed.path == "/api/status":
                 self._json({"ok": True, "data": self.app.public_status()})
             elif parsed.path == "/api/sync/health":
@@ -856,6 +877,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     result = self.app.storage.slowlog_event_detail(
                         event_id, settings, instance
                     )
+                if result is None and locator.startswith('raw:'):
+                    result = self.app.storage.raw_event_index.detail(event_id, locator, instance)
                 if result is None:
                     archive = self.app.sync.archive_for_settings(settings)
                     result = self.app.storage.event_detail_tiered(
