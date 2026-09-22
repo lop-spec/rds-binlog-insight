@@ -851,6 +851,9 @@ class SyncManager:
                 "DOWNLOAD_LINK_MISSING",
                 "INTRANET_DOWNLOAD_LINK_MISSING",
                 "HTTP_404",
+                # A cached denial is not current authorization evidence. Refresh
+                # once; a fresh denial still propagates from attempt(refreshed).
+                "BINLOG_DOWNLOAD_FORBIDDEN",
             }:
                 raise
             self._event(

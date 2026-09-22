@@ -1,6 +1,7 @@
 """Direct Binlog downloads must distinguish list access from download access."""
 from __future__ import annotations
 
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -13,7 +14,9 @@ from unittest.mock import Mock, patch
 from app.config import Settings
 from app.credentials import CloudCredential
 from app.downloader import DownloadError
+from app.metadata import MetadataStore
 from app.pipeline import SyncManager
+from app.storage import EventStorage
 from app.rds_api import RdsApiError, RemoteBinlog
 from app.server import RequestHandler
 
@@ -132,13 +135,83 @@ class PipelineDownloadTests(unittest.TestCase):
         download.assert_called_once()
         manager._refresh_item.assert_called_once()
 
-    def test_permission_failure_stops_instead_of_retrying_or_downloading(self):
+    def test_cached_denial_refreshes_once_and_preserves_download_validation(self):
         manager = manager_stub()
-        manager._refresh_item = Mock()
-        with patch("app.pipeline.download_file") as download, self.assertLogs("app.rds_api", "WARNING"), self.assertRaises(RdsApiError):
-            manager._download("fixture-job", Mock(), settings(), "fixture-id", remote("sub account not auth permission"))
+        stale = remote("sub account not auth permission")
+        manager._refresh_item = Mock(return_value=remote())
+        result = SimpleNamespace(path=Path("fixture.binlog"), size_bytes=123, sha256="fixture-sha")
+        with patch("app.pipeline.download_file", return_value=result) as download, self.assertLogs("app.rds_api", "WARNING"):
+            self.assertEqual(manager._download("fixture-job", Mock(), settings(), "fixture-id", stale),
+                             (result.path, result.sha256))
+        manager._refresh_item.assert_called_once()
+        download.assert_called_once()
+        self.assertEqual(download.call_args.args[0], remote().intranet_download_link)
+        self.assertEqual(download.call_args.kwargs["expected_size"], 123)
+        self.assertEqual(download.call_args.kwargs["expected_crc64"], "456")
+        manager._event.assert_any_call("fixture-job", "warning", "DOWNLOAD_LINK_REFRESH",
+                                      "mysql-bin.000001 下载链接不可用，刷新一次")
+
+    def test_fresh_permission_failure_stops_after_one_refresh_without_downloading(self):
+        manager = manager_stub()
+        denied = remote("sub account not auth permission")
+        manager._refresh_item = Mock(return_value=denied)
+        with patch("app.pipeline.download_file") as download, self.assertLogs("app.rds_api", "WARNING"), self.assertRaises(RdsApiError) as raised:
+            manager._download("fixture-job", Mock(), settings(), "fixture-id", denied)
+        self.assertEqual(raised.exception.code, "BINLOG_DOWNLOAD_FORBIDDEN")
+        self.assertEqual(raised.exception.request_id, "fixture-request")
         download.assert_not_called()
-        manager._refresh_item.assert_not_called()
+        manager._refresh_item.assert_called_once()
+
+    def test_refresh_api_failure_is_not_misclassified_as_missing(self):
+        manager = manager_stub()
+        manager._refresh_item = Mock(side_effect=RdsApiError("API denied", code="Forbidden.RAM", request_id="fixture-request"))
+        with patch("app.pipeline.download_file") as download, self.assertLogs("app.rds_api", "WARNING"), self.assertRaises(RdsApiError) as raised:
+            manager._download("fixture-job", Mock(), settings(), "fixture-id", remote("sub account not auth permission"))
+        self.assertEqual(raised.exception.code, "Forbidden.RAM")
+        download.assert_not_called()
+        manager._refresh_item.assert_called_once()
+
+    def test_cached_denial_missing_at_source_preserves_partial_and_continues_raw_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = MetadataStore(root / "metadata.sqlite3")
+            storage = EventStorage(metadata, root)
+            manager = SyncManager(metadata, storage)
+            stale = remote("sub account not auth permission")
+            later = replace(remote(), log_file_name="mysql-bin.000002",
+                            log_begin_utc="2026-09-01T01:01:00Z", log_end_utc="2026-09-01T01:02:00Z")
+            old_id, _ = metadata.upsert_remote(settings(), stale)
+            new_id, _ = metadata.upsert_remote(settings(), later)
+            partial = storage.paths["downloads"] / f"{old_id}.binlog.part"
+            partial.write_bytes(b"preserve-checkpoint")
+            job = metadata.create_job("sync", settings().db_instance_id)
+            client = Mock()
+            client.list_binlogs.return_value = [later]
+            result = SimpleNamespace(path=root / "fixture.binlog", size_bytes=123, sha256="fixture-sha")
+            processed = []
+
+            def archive(_job, _client, _settings, file_id, item, *_args, **_kwargs):
+                processed.append(item.log_file_name)
+                metadata.set_file_state(file_id, "done")
+
+            try:
+                with patch("app.pipeline.download_file", return_value=result) as download, \
+                     patch.object(manager, "archive_for_settings", return_value=Mock()), \
+                     patch.object(manager, "_process_one", side_effect=archive), \
+                     self.assertLogs("app.rds_api", "WARNING"):
+                    counts = manager._run_pending_raw(job, client, settings(),
+                        [(old_id, stale, "discovered"), (new_id, later, "discovered")],
+                        "mysql", Mock(), completed=0, unavailable=0)
+                self.assertEqual(counts, (1, 1, False))
+                client.list_binlogs.assert_called_once()
+                download.assert_called_once()
+                self.assertEqual(processed, [later.log_file_name])
+                self.assertEqual(metadata.file_record(old_id)["state"], "unavailable")
+                self.assertEqual(metadata.file_record(old_id)["error_code"], "INSTANCE_BINLOG_NOT_FOUND")
+                self.assertEqual(metadata.file_record(new_id)["state"], "done")
+                self.assertEqual(partial.read_bytes(), b"preserve-checkpoint")
+            finally:
+                manager.shutdown()
 
 
 class SettingsDownloadProbeTests(unittest.TestCase):
