@@ -155,32 +155,43 @@ class ManifestTests(unittest.TestCase):
                 (file_id,100,200,compact(summary),compact(descriptor),time.time()-10,time.time()))
         return file_id
 
-    def test_file_limit_checked_before_any_object_access(self):
-        for i in range(MAX_FILES+1):
-            self.add_raw(i)
-        with self.assertLogs('app.raw_binlog',level='WARNING'):
-            with self.assertRaises(RawBinlogError) as caught:
-                self.store.plan({'source':'binlog'},100,200)
-        self.assertEqual(caught.exception.code,'QUERY_BINLOG_LIMIT')
-        self.assertNotIn('raw-binlog',str(caught.exception))
+    def test_file_limit_splits_without_dropping_candidates(self):
+        expected = {self.add_raw(i) for i in range(MAX_FILES+1)}
+        with self.store.plan({'source':'binlog'},100,200) as plan:
+            batches = list(plan['batches'])
+            self.assertEqual(plan['candidate_files'], MAX_FILES+1)
+            self.assertEqual([b['candidate_files'] for b in batches], [MAX_FILES,1])
+            self.assertEqual({f for b in batches for f in b['file_ids']}, expected)
 
     def test_table_and_instance_pruning_precedes_limit(self):
         for i in range(MAX_FILES+1):
             self.add_raw(i,table='other')
         target=self.add_raw(100,table='target')
-        plan=self.store.plan({'instance':'test','table':'target'},100,200)
-        self.assertEqual(plan['file_ids'],[target])
-        self.assertEqual(self.store.plan({'instance':'elsewhere'},100,200)['candidate_files'],0)
+        with self.store.plan({'instance':'test','table':'target'},100,200) as plan:
+            self.assertEqual(next(plan['batches'])['file_ids'],[target])
+        with self.store.plan({'instance':'elsewhere'},100,200) as plan:
+            self.assertEqual(plan['candidate_files'],0)
 
     def test_byte_limit_cannot_be_bypassed_by_one_large_file(self):
         self.add_raw(0,size=MAX_BYTES+1)
         with self.assertRaises(RawBinlogError):
-            self.store.plan({},100,200)
+            with self.store.plan({},100,200):
+                self.fail('oversized file admitted')
 
     def test_exact_boundary_is_allowed(self):
         for i in range(MAX_FILES):
             self.add_raw(i,size=MAX_BYTES//MAX_FILES)
-        self.assertEqual(self.store.plan({},100,200)['candidate_files'],MAX_FILES)
+        with self.store.plan({},100,200) as plan:
+            self.assertEqual(plan['candidate_files'],MAX_FILES)
+            self.assertEqual(plan['batch_count'],1)
+
+    def test_byte_budget_splits_before_file_count_limit(self):
+        for i in range(3):
+            self.add_raw(i,size=MAX_BYTES//2)
+        with self.store.plan({},100,200) as plan:
+            batches = list(plan['batches'])
+            self.assertEqual([b['candidate_files'] for b in batches],[2,1])
+            self.assertTrue(all(b['estimated_bytes'] <= MAX_BYTES for b in batches))
 
     def test_raw_and_legacy_share_one_combined_file_budget(self):
         for i in range(8):
@@ -191,9 +202,11 @@ class ManifestTests(unittest.TestCase):
                 conn.execute('DELETE FROM raw_binlog_archives WHERE file_id=?',(file_id,))
                 conn.execute('INSERT INTO parquet_file_stats VALUES(?,1,100,100,100,200,1,1,1,0)',(file_id,))
                 conn.execute("INSERT OR REPLACE INTO parquet_file_stats_state VALUES(1,1,'fixture')")
-        with self.assertRaises(RawBinlogError) as caught:
-            self.store.plan({},100,200)
-        self.assertEqual(caught.exception.code,'QUERY_BINLOG_LIMIT')
+        with self.store.plan({},100,200) as plan:
+            batches = list(plan['batches'])
+            self.assertEqual([b['candidate_files'] for b in batches],[16,1])
+            self.assertEqual(sum(len(b['raw']) for b in batches),8)
+            self.assertEqual(len({f for b in batches for f in b['file_ids']}),17)
 
     def test_zero_source_checksum_is_recomputed_not_used_as_oss_crc(self):
         record={'local_sha256':'a'*64,'checksum_crc64':'0'}
@@ -211,19 +224,23 @@ class ManifestTests(unittest.TestCase):
         verify.assert_called_once()
         scanner.assert_not_called()
 
-    def test_submit_rejects_before_task_creation_or_archive_loader(self):
+    def test_submit_queues_without_duplicate_candidate_scan(self):
         from app.query_tasks import QueryTaskManager
         archive_loader=Mock()
-        storage=SimpleNamespace(query_preflight=Mock(side_effect=RawBinlogError('too many','QUERY_BINLOG_LIMIT')))
+        storage=SimpleNamespace(query_preflight=Mock(side_effect=AssertionError('duplicate planning')))
         manager=QueryTaskManager(self.metadata,storage,settings_loader=Mock(),archive_loader=archive_loader)
         self.addCleanup(manager.shutdown)
-        with self.assertRaises(RawBinlogError): manager.submit({'source':'binlog'})
+        with patch.object(manager._executor,'submit'):
+            task_id=manager.submit({'source':'binlog'})
+        storage.query_preflight.assert_not_called()
         archive_loader.assert_not_called()
-        self.assertEqual(self.metadata.query_tasks(),[])
+        self.assertEqual(self.metadata.query_tasks()[0]['id'],task_id)
 
     def test_audit_and_slowlog_are_not_binlog_reads(self):
-        self.assertEqual(self.store.plan({'source':'audit'},0,MAX_TIME)['candidate_files'],0)
-        self.assertEqual(self.store.plan({'source':'slowlog'},0,MAX_TIME)['candidate_files'],0)
+        for source in ('audit','slowlog'):
+            with self.store.plan({'source':source},0,MAX_TIME) as plan:
+                self.assertEqual(plan['candidate_files'],0)
+                self.assertEqual(list(plan['batches']),[])
 
     def test_missing_object_keeps_local_file_and_manifest_uncommitted(self):
         archive=Mock()

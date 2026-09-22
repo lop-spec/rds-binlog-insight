@@ -36,7 +36,7 @@ class Budget:
             self.control.check_cancelled()
         if self.cancel.is_set() or time.monotonic() >= self.until:
             self.cancel.set()
-            raise RawBinlogError(f'原始 Binlog 查询超过 {QUERY_SECONDS} 秒，已停止；请缩小范围', 'QUERY_DEADLINE_EXCEEDED')
+            raise RawBinlogError(f'单批原始 Binlog 查询超过 {QUERY_SECONDS} 秒，已停止；未返回不完整结果', 'QUERY_DEADLINE_EXCEEDED')
 
     def add(self, size):
         self.check()
@@ -222,21 +222,22 @@ def query_raw(storage, archive, query, start, end, plan, control=None, limit_cap
                              indexed_parts=len(plan['raw']), unknown_parts=0, estimated_bytes=plan['estimated_bytes'])
         for entry in plan['raw']:
             budget.check()
-            for row in decode(storage, archive, entry, query, start, end, budget):
-                if matches(storage, row, query, start, end, schema_cache):
-                    sequence += 1
-                    value = (storage._row_sort_key(row), sequence, row)
-                    if len(heap) < keep or value[0] > heap[0][0]:
-                        weight = len(json.dumps(row,ensure_ascii=False).encode('utf-8'))
-                        if len(heap) == keep:
-                            removed = heapq.heapreplace(heap, value)
-                            retained -= weights.pop(removed[1])
-                        else:
-                            heapq.heappush(heap, value)
-                        weights[sequence] = weight
-                        retained += weight
-                        if retained > 32*1024**2:
-                            raise RawBinlogError('查询结果超过 32 MiB 内存预算，请减少页大小或缩小范围', 'RAW_QUERY_RESULT_LIMIT')
+            with closing(decode(storage, archive, entry, query, start, end, budget)) as decoded:
+                for row in decoded:
+                    if matches(storage, row, query, start, end, schema_cache):
+                        sequence += 1
+                        value = (storage._row_sort_key(row), sequence, row)
+                        if len(heap) < keep or value[0] > heap[0][0]:
+                            weight = len(json.dumps(row,ensure_ascii=False).encode('utf-8'))
+                            if len(heap) == keep:
+                                removed = heapq.heapreplace(heap, value)
+                                retained -= weights.pop(removed[1])
+                            else:
+                                heapq.heappush(heap, value)
+                            weights[sequence] = weight
+                            retained += weight
+                            if retained > 32*1024**2:
+                                raise RawBinlogError('查询结果超过 32 MiB 内存预算，请减少页大小或缩小范围', 'RAW_QUERY_RESULT_LIMIT')
             if control is not None:
                 control.advance()
         rows = [r for _, _, r in sorted(heap, reverse=True)]

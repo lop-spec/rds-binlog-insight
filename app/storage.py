@@ -3111,50 +3111,86 @@ class EventStorage:
         )
         return result
 
-    def query_preflight(self, query: dict[str, Any], settings: Settings) -> dict[str, Any]:
-        start, end = self._query_window(query, settings.retention_days)
-        return self.raw_binlogs.plan(query, start, end)
-
     def query_events_tiered(
         self, query: dict[str, Any], settings: Settings, archive: OssArchive | None,
         *, limit_cap: int = 1000, control: Any | None = None,
         archive_factory: Callable[[], OssArchive | None] | None = None,
     ) -> dict[str, Any]:
-        plan = self.query_preflight(query, settings)
-        if not plan['raw']:
-            result = self._query_events_legacy(query, settings, archive, limit_cap=limit_cap,
-                                               control=control, archive_factory=archive_factory)
-            result['candidate_binlogs'] = plan['candidate_files']
-            return result
-        if archive is None and archive_factory is not None:
-            archive = archive_factory()
+        from .binlog_lite import RawBinlogError
+        from .query_tasks import QueryBatchControl
         from .raw_binlog_query import query_raw
         start, end = self._query_window(query, settings.retention_days)
-        limit = min(max(int(query.get('limit') or 100), 1), limit_cap)
-        offset = min(max(int(query.get('offset') or 0), 0), 100_000)
-        with self.query_activity():
-            raw = query_raw(self, archive, query, start, end, plan, control, limit_cap)
-            old = {'rows': [], 'has_more': False, 'tiers_used': []}
-            has_legacy = plan['candidate_files'] > len(plan['raw'])
-            source = str(query.get('source') or '').strip().lower()
-            if has_legacy or source in {'', 'all', 'database'}:
-                available = self.metadata.storage_metadata_stats(control=control)
-                latest = int(available.get('latest_epoch_us') or 0)
+        with self.raw_binlogs.plan(query, start, end, control) as plan:
+            # Preserve the existing specialized/indexed routes for small legacy
+            # queries and non-Binlog sources; only large plans need subdivision.
+            if not plan['raw_files'] and plan['batch_count'] <= 1:
+                result = self._query_events_legacy(query, settings, archive, limit_cap=limit_cap,
+                            control=control, archive_factory=archive_factory)
+                result['candidate_binlogs'] = plan['candidate_files']
+                return result
+            if archive is None and archive_factory is not None:
+                archive = archive_factory()
+            limit = min(max(int(query.get('limit') or 100), 1), limit_cap)
+            offset = min(max(int(query.get('offset') or 0), 0), 100_000)
+            keep = offset+limit+1
+            if keep > 2000:
+                raise RawBinlogError('Binlog 查询分页深度上限 2000；请缩小范围', 'RAW_QUERY_PAGE_LIMIT')
+            page_query = {**query, 'offset': 0, 'limit': keep}
+            rows, tiers, more = [], [], False
+            stats = dict(range_requests=0, range_bytes=0, raw_matches=0)
+
+            def merge(result):
+                nonlocal rows, more
+                if result.get('unavailable_parts'):
+                    raise StorageError('候选分区缺失，未返回不完整的跨批结果', 'QUERY_BATCH_INCOMPLETE')
+                unique = {row['event_id']: row for row in rows}
+                unique.update({row['event_id']: row for row in result.get('rows', [])})
+                ordered = sorted(unique.values(), key=self._row_sort_key, reverse=True)
+                more = more or bool(result.get('has_more')) or len(ordered) > keep
+                rows = ordered[:keep]
+                if len(json.dumps(rows, ensure_ascii=False).encode('utf-8')) > 32*1024**2:
+                    raise RawBinlogError('跨批查询结果超过 32 MiB，未返回残缺页', 'RAW_QUERY_RESULT_LIMIT')
+                tiers.extend(t for t in result.get('tiers_used', []) if t not in tiers)
+                for key in stats:
+                    stats[key] += int(result.get(key) or 0)
+
+            available = self.metadata.storage_metadata_stats(control=control)
+            latest = int(available.get('latest_epoch_us') or 0)
+            if control is not None:
+                control.set_plan(total_parts=plan['candidate_files'], candidate_parts=plan['candidate_files'],
+                    indexed_parts=plan['raw_files'], unknown_parts=plan['candidate_files']-plan['raw_files'],
+                    estimated_bytes=plan['estimated_bytes'])
+            with self.query_activity():
+                for number, batch in enumerate(plan['batches'], 1):
+                    child = QueryBatchControl(control)
+                    child.check_cancelled()
+                    if control is not None:
+                        control.begin_batch(number, plan['batch_count'])
+                    LOGGER.info('BINLOG_QUERY_BATCH number=%d total=%d files=%d bytes=%d',
+                        number, plan['batch_count'], batch['candidate_files'], batch['estimated_bytes'])
+                    if batch['raw']:
+                        merge(query_raw(self, archive, query, start, end, batch, child, limit_cap))
+                    raw_ids = {e['file_id'] for e in batch['raw']}
+                    legacy_ids = [f for f in batch['file_ids'] if f not in raw_ids]
+                    if legacy_ids:
+                        merge(self._query_events_legacy(
+                            {**page_query, 'source': 'binlog', '_binlog_batch_ids': legacy_ids,
+                             'end_epoch_us': min(end, latest)}, settings, archive,
+                            limit_cap=keep, control=child))
+                    child.check_cancelled()
+                    if control is not None:
+                        for file_id in batch['file_ids']:
+                            control.advance(current_file=file_id)
+                # Non-Binlog sources enter the union exactly once, not per batch.
                 if latest >= start:
-                    old_query = {**query, 'limit': offset+limit+1, 'offset': 0,
-                                 'end_epoch_us': min(end, latest),
-                                 '_raw_excluded_files': [e['file_id'] for e in plan['raw']]}
-                    old = self._query_events_legacy(old_query, settings, archive,
-                            limit_cap=offset+limit+1, control=control)
-            combined = {row['event_id']: row for row in old['rows']}
-            combined.update({row['event_id']: row for row in raw['rows']})
-            rows = sorted(combined.values(), key=self._row_sort_key, reverse=True)
-            return {**old, **raw, 'rows': rows[offset:offset+limit],
-                    'limit': limit, 'offset': offset,
-                    'has_more': len(rows)>offset+limit or old.get('has_more', False) or raw['has_more'],
-                    'tiers_used': list(dict.fromkeys(old.get('tiers_used', [])+raw['tiers_used'])),
+                    merge(self._query_events_legacy(
+                        {**page_query, '_binlog_batch_ids': [], 'end_epoch_us': min(end, latest)},
+                        settings, archive, limit_cap=keep, control=QueryBatchControl(control)))
+            return {**stats, 'rows': rows[offset:offset+limit], 'limit': limit, 'offset': offset,
+                    'has_more': more or len(rows)>offset+limit, 'tiers_used': tiers,
+                    'candidate_binlogs': plan['candidate_files'], 'query_batches': plan['batch_count'],
                     'coverage_found': True, 'range_start_epoch_us': start, 'range_end_epoch_us': end,
-                    'coverage_note': '原文件已校验归档；仅候选范围查询完成，不代表历史源缺口已经恢复'}
+                    'coverage_note': '候选文件已分批查询；不代表历史源缺口已经恢复'}
 
     def _query_events_legacy(
         self,
@@ -3382,10 +3418,10 @@ class EventStorage:
         limit_cap: int = 1000,
         control: Any | None = None,
     ) -> dict[str, Any]:
-        excluded_files = set(query.get('_raw_excluded_files') or [])
+        batch_ids = query.get('_binlog_batch_ids')
         worker_url = os.environ.get("RDS_BINLOG_INDEXED_QUERY_WORKER_URL", "").strip()
-        if excluded_files:
-            LOGGER.info('RAW_QUERY_LEGACY_SUBSET excluding=%d reason=raw-archive-is-authoritative-for-these-files', len(excluded_files))
+        if batch_ids is not None:
+            LOGGER.info('BINLOG_QUERY_LEGACY_SUBSET files=%d reason=bounded-batch', len(batch_ids))
             worker_url = ''
         if not worker_url:
             LOGGER.info("Indexed query worker disabled: URL not configured; retaining existing route")
@@ -3452,8 +3488,8 @@ class EventStorage:
             end_us,
             settings.db_instance_id,
         )
-        if excluded_files:
-            certificate_fingerprint += '.raw-subset-' + hashlib.sha256(','.join(sorted(excluded_files)).encode()).hexdigest()
+        if batch_ids is not None:
+            certificate_fingerprint += '.binlog-batch-' + hashlib.sha256(','.join(sorted(batch_ids)).encode()).hexdigest()
         certificate_token = None
         certificate_rows = None
         if (
@@ -3492,7 +3528,7 @@ class EventStorage:
                 latest_us=latest_us,
                 token=certificate_token,
             )
-        if self.clickhouse_backend is not None and not worker_url and not excluded_files:
+        if self.clickhouse_backend is not None and not worker_url and batch_ids is None:
             hot_query = dict(query)
             hot_query["start_epoch_us"] = start_us
             hot_query["end_epoch_us"] = end_us
@@ -3581,9 +3617,10 @@ class EventStorage:
             source=str(query.get("source") or ""),
             instance=str(query.get("instance") or ""),
             control=control,
+            **({'binlog_batch_ids': batch_ids} if batch_ids is not None else {}),
         )
-        if excluded_files:
-            parts = [part for part in parts if str(part.get('binlog_id') or '') not in excluded_files]
+        if batch_ids and set(batch_ids) - {str(p['binlog_id']) for p in parts}:
+            raise StorageError('已计划的 Binlog 分区不再可用，未返回不完整结果', 'QUERY_BATCH_INCOMPLETE')
         if control is not None:
             control.check_cancelled()
         exact = query.get("exact")

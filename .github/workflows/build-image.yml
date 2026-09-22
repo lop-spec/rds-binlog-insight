@@ -179,6 +179,7 @@ jobs:
             "$LOCAL_IMAGE" \
             -m unittest \
             tests.test_raw_binlog \
+            tests.test_binlog_query_batches \
             tests.test_sync_lifecycle \
             tests.test_rds_download \
             tests.test_core \

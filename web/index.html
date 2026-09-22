@@ -90,7 +90,7 @@
       <section id="view-audit" class="view is-active">
         <div class="query-panel">
           <div class="panel-heading">
-            <div><h2>查询条件</h2><p>按真实事件时间倒序；单页最多 1,000 条。Binlog 单次最多 16 个候选文件 / 8 GiB，超限请缩小范围。</p></div>
+            <div><h2>查询条件</h2><p>按真实事件时间倒序；单页最多 1,000 条。Binlog 自动分批查询，每批最多 16 个候选文件 / 8 GiB；跨批统一排序，可随时取消。</p></div>
             <label class="range-picker">时间范围<select id="audit-range" aria-label="查询时间范围"><option value="15m">最近 15 分钟</option><option value="1h">最近 1 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></label>
           </div>
 

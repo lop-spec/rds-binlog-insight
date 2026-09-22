@@ -8,6 +8,8 @@ import logging
 import os
 import threading
 import time
+import tempfile
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -137,51 +139,69 @@ class RawBinlogStore:
             if self._head(archive, descriptor[key]) is None:
                 raise RawBinlogError('原文件或轻量索引缺失，拒绝释放本地文件', 'RAW_ARCHIVE_INCOMPLETE')
 
-    def plan(self, query: dict, start: int, end: int) -> dict:
-        """Bound the UNION of old Parquet source files and raw objects, before I/O.
+    @contextmanager
+    def plan(self, query: dict, start: int, end: int, control=None):
+        """Freeze candidates once, then read bounded batches without a long SQL reader.
 
-        Unknown legacy catalogs are included, never treated as negative matches.
-        SQL LIMIT caps candidate enumeration, not returned query completeness.
+        The temporary plan spills after 1 MiB; neither descriptors nor decoded
+        rows accumulate with the full query size. Unknown catalogs stay eligible.
         """
-        if str(query.get('source') or '').lower() in {'audit', 'slowlog'}:
-            return dict(raw=[], file_ids=[], candidate_files=0, estimated_bytes=0)
-        instance = str(query.get('instance') or '')
-        database = str(query.get('database') or '').strip().lower()
-        table = str(query.get('table') or '').strip().lower()
-        candidates, raw = {}, []
-        with self.metadata.connection() as conn:
-            # One row per physical source, not per Parquet shard. Partial catalogs
-            # remain eligible. The existing source/file indexes bound this query.
-            state = conn.execute('SELECT complete FROM parquet_file_stats_state WHERE singleton=1').fetchone()
-            directory_table = 'parquet_file_stats' if state and state[0] else 'parquet_parts'
-            if directory_table == 'parquet_parts':
-                LOGGER.warning('RAW_QUERY_PREFLIGHT_LEGACY reason=file-summary-not-complete')
-            old = conn.execute(f'''SELECT DISTINCT b.id,b.file_size FROM {directory_table} p
-                JOIN binlog_files b ON b.id=p.binlog_id
-                WHERE p.min_event_epoch_us<=? AND p.max_event_epoch_us>=?
-                  AND b.log_file_name LIKE 'mysql-bin.%' AND (?='' OR b.instance_id=?)
-                  AND NOT EXISTS (SELECT 1 FROM raw_binlog_archives r WHERE r.file_id=b.id)
-                LIMIT ?''', (end, start, instance, instance, MAX_FILES+1)).fetchall()
-            candidates.update({r['id']: int(r['file_size']) for r in old})
-            self._check(candidates)
-            rows = conn.execute('''SELECT r.summary,r.descriptor FROM raw_binlog_archives r
-                JOIN binlog_files b ON b.id=r.file_id
-                WHERE r.lo<=? AND r.hi>=? AND (?='' OR b.instance_id=?)''', (end, start, instance, instance))
-            for row in rows:
-                if not allows(json.loads(row['summary']), query, start, end):
-                    continue
-                entry = json.loads(row['descriptor'])
-                raw.append(entry)
-                candidates[entry['file_id']] = entry['raw']['size_bytes']
-                self._check(candidates)
-        return dict(raw=raw, file_ids=list(candidates), candidate_files=len(candidates), estimated_bytes=sum(candidates.values()))
+        from .query_tasks import QueryBatchControl
+        planning = QueryBatchControl(control)
+        check = planning.check_cancelled
+        total = dict(candidate_files=0, estimated_bytes=0, raw_files=0, batch_count=0)
+        batch = dict(raw=[], file_ids=[], candidate_files=0, estimated_bytes=0)
+        with tempfile.SpooledTemporaryFile(max_size=1024**2, mode='w+t', encoding='utf-8') as manifest:
+            def flush():
+                nonlocal batch
+                if batch['candidate_files']:
+                    manifest.write(compact(batch)+'\n')
+                    total['batch_count'] += 1
+                    batch = dict(raw=[], file_ids=[], candidate_files=0, estimated_bytes=0)
 
-    @staticmethod
-    def _check(candidates):
-        count, size = len(candidates), sum(candidates.values())
-        if count > MAX_FILES or size > MAX_BYTES:
-            LOGGER.warning('QUERY_BINLOG_LIMIT candidates>=%d bytes>=%d limits=%d/%d', count, size, MAX_FILES, MAX_BYTES)
-            raise RawBinlogError(f'候选 Binlog 至少 {count} 个、{size / 1024**3:.2f} GiB；单次上限 {MAX_FILES} 个 / 8 GiB。请缩小时间、实例或库表范围；不会自动全量扫描。', 'QUERY_BINLOG_LIMIT')
+            def add(file_id, size, entry=None):
+                check()
+                if size > MAX_BYTES:
+                    raise RawBinlogError('单个 Binlog 超过 8 GiB 单批上限，不能通过分批绕过', 'QUERY_BINLOG_BYTE_LIMIT')
+                if batch['candidate_files'] >= MAX_FILES or batch['estimated_bytes']+size > MAX_BYTES:
+                    flush()
+                batch['file_ids'].append(file_id)
+                batch['candidate_files'] += 1
+                batch['estimated_bytes'] += size
+                total['candidate_files'] += 1
+                total['estimated_bytes'] += size
+                if entry is not None:
+                    batch['raw'].append(entry)
+                    total['raw_files'] += 1
+
+            check()
+            if str(query.get('source') or '').lower() not in {'audit', 'slowlog'}:
+                instance = str(query.get('instance') or '')
+                with self.metadata.connection(control=planning) as conn:
+                    conn.execute('BEGIN')  # The legacy/raw union has one metadata snapshot.
+                    state = conn.execute('SELECT complete FROM parquet_file_stats_state WHERE singleton=1').fetchone()
+                    directory = 'parquet_file_stats' if state and state[0] else 'parquet_parts'
+                    if directory == 'parquet_parts':
+                        LOGGER.warning('RAW_QUERY_PREFLIGHT_LEGACY reason=file-summary-not-complete')
+                    for row in conn.execute(f'''SELECT DISTINCT b.id,b.file_size FROM {directory} p
+                        JOIN binlog_files b ON b.id=p.binlog_id
+                        WHERE p.min_event_epoch_us<=? AND p.max_event_epoch_us>=?
+                          AND b.log_file_name LIKE 'mysql-bin.%' AND (?='' OR b.instance_id=?)
+                          AND NOT EXISTS (SELECT 1 FROM raw_binlog_archives r WHERE r.file_id=b.id)
+                        ORDER BY b.id''', (end, start, instance, instance)):
+                        add(row['id'], int(row['file_size']))
+                    for row in conn.execute('''SELECT r.summary,r.descriptor FROM raw_binlog_archives r
+                        JOIN binlog_files b ON b.id=r.file_id
+                        WHERE r.lo<=? AND r.hi>=? AND (?='' OR b.instance_id=?)
+                        ORDER BY r.file_id''', (end, start, instance, instance)):
+                        check()
+                        if allows(json.loads(row['summary']), query, start, end):
+                            entry = json.loads(row['descriptor'])
+                            add(entry['file_id'], int(entry['raw']['size_bytes']), entry)
+                flush()
+            manifest.seek(0)
+            LOGGER.info('BINLOG_QUERY_PLAN files=%d bytes=%d batches=%d', total['candidate_files'], total['estimated_bytes'], total['batch_count'])
+            yield {**total, 'batches': (json.loads(line) for line in manifest)}
 
     def status(self, instance: str) -> dict:
         now = time.time()

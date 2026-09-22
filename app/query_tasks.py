@@ -78,6 +78,13 @@ class QueryControl:
         )
         self.check_cancelled()
 
+    def begin_batch(self, number: int, total: int) -> None:
+        self.check_cancelled()
+        self.metadata.update_query_task(
+            self.task_id, message=f"正在查询第 {number} / {total} 批 Binlog",
+            current_file=f"Binlog 批次 {number}/{total}",
+        )
+
     def flush(self) -> None:
         with self._lock:
             completed_parts = self._completed_parts
@@ -87,6 +94,27 @@ class QueryControl:
             completed_parts=completed_parts,
             scanned_bytes=total_scanned,
         )
+
+
+class QueryBatchControl:
+    """A child scan cannot reset the parent task's physical-file progress."""
+    def __init__(self, parent=None):
+        from .raw_binlog import QUERY_SECONDS
+        self.parent = parent
+        self.until = time.monotonic() + QUERY_SECONDS
+
+    def check_cancelled(self):
+        if self.parent is not None:
+            self.parent.check_cancelled()
+        if time.monotonic() >= self.until:
+            from .binlog_lite import RawBinlogError
+            raise RawBinlogError('单批 Binlog 查询超时，未返回不完整结果', 'QUERY_DEADLINE_EXCEEDED')
+
+    def set_plan(self, **kwargs):
+        self.check_cancelled()
+
+    def advance(self, **kwargs):
+        self.check_cancelled()
 
 
 def _bounded_workers(value: int | None = None) -> int:
@@ -128,11 +156,6 @@ class QueryTaskManager:
         )
 
     def submit(self, query: dict[str, Any]) -> str:
-        # Reject oversized physical-file plans before enqueue, OSS access, or
-        # fallback scans. Recheck at execution because discovery can add files.
-        preflight = getattr(self.storage, 'query_preflight', None)
-        if preflight is not None:
-            preflight(query, self.settings_loader())
         with self._lock:
             if self._closing:
                 raise RuntimeError("查询任务管理器正在停止")

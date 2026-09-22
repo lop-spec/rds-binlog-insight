@@ -3313,6 +3313,7 @@ class MetadataStore:
         source: str = "",
         instance: str = "",
         control: Any | None = None,
+        binlog_batch_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """按时间窗取候选分区。
 
@@ -3359,6 +3360,12 @@ class MetadataStore:
         if instance_id:
             clauses.append("b.instance_id = ?")
             params.append(instance_id)
+        if binlog_batch_ids is not None:
+            if binlog_batch_ids:
+                clauses.append('b.id IN ('+','.join('?' for _ in binlog_batch_ids)+')')
+                params.extend(binlog_batch_ids)
+            else:
+                clauses.append("b.log_file_name NOT LIKE 'mysql-bin.%'")
         params.append(int(limit))
         # The existing cold-compression index has max_event_epoch_us second.
         # Enumerate its leading keys with MIN seeks (not a full DISTINCT scan),
