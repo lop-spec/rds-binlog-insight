@@ -404,9 +404,10 @@ function renderEvents(result) {
       <td><span class="primary-cell mono">${escapeHtml(transaction)}</span><span class="secondary-cell">${auditEvent ? escapeHtml(row.connection_id || "连接 ID 未知") : row.thread_id ? `thread ${escapeHtml(row.thread_id)}` : "无连接身份字段"}</span></td>
       <td><span class="primary-cell mono">${escapeHtml(sourceLabel)}</span><span class="secondary-cell mono">${escapeHtml(sourceMeta)}</span></td>
       <td><button class="icon-button row-detail" title="查看详情" aria-label="查看事件详情" type="button">${icons.detail}</button></td>`;
-    tr.addEventListener("click", () => openDetail(row.event_id, row.locator, row.instance_id));
+    const locator = row.event_locator || row.locator || "";
+    tr.addEventListener("click", () => openDetail(row.event_id, locator, row.instance_id));
     tr.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") openDetail(row.event_id, row.locator, row.instance_id);
+      if (event.key === "Enter" || event.key === " ") openDetail(row.event_id, locator, row.instance_id);
     });
     tbody.append(tr);
   }

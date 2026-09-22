@@ -7,9 +7,13 @@ const path = require('node:path');
 
 function uiFixture() {
   const nodes = new Map();
-  const document = { addEventListener() {}, querySelectorAll() { return []; }, querySelector(key) {
+  const document = { addEventListener() {}, querySelectorAll() { return []; },
+    createElement() { return {dataset: {}, events: {}, addEventListener(name, handler) { this.events[name] = handler; }}; },
+    querySelector(key) {
     if (!nodes.has(key)) nodes.set(key, { value: '', textContent: '', disabled: false,
-      classList: { toggle() {} }, setCustomValidity(message) { this.error = message; } });
+      querySelector: key => document.querySelector(key),
+      classList: { toggle() {} }, children: [], append(child) { this.children.push(child); },
+      setCustomValidity(message) { this.error = message; } });
     return nodes.get(key);
   }};
   const requests = [];
@@ -26,6 +30,21 @@ function uiFixture() {
   run('syncQueryMode()');
   return {run, node, requests};
 }
+
+test('actual row click and keyboard preserve raw and legacy detail locators', () => {
+  const {run, node} = uiFixture();
+  run(`globalThis.details = []; openDetail = (...args) => details.push(args);
+    renderEvents({rows: [
+      {event_id: 'raw-id', event_locator: 'raw:file:4', instance_id: 'fixture'},
+      {event_id: 'legacy-id', locator: 'legacy-part', instance_id: 'fixture'}]});`);
+  for (const row of node('event-rows').children) {
+    row.events.click();
+    row.events.keydown({key: 'Enter'});
+  }
+  assert.deepEqual(JSON.parse(run('JSON.stringify(details)')), [
+    ['raw-id', 'raw:file:4', 'fixture'], ['raw-id', 'raw:file:4', 'fixture'],
+    ['legacy-id', 'legacy-part', 'fixture'], ['legacy-id', 'legacy-part', 'fixture']]);
+});
 
 test('fast scope is visible without opening advanced filters', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
