@@ -41,10 +41,15 @@ recoverable. Discovery continues through the existing retained-file scheduler.
 
 ## Query safety and compatibility
 
-- Union legacy physical source IDs and eligible raw IDs BEFORE enqueue and again
-  before execution: at most **16 files and 8 GiB**. No implicit full scan on refusal.
-- Raw queries: one concurrent decoder, 180-second deadline, 512 MiB staging file,
-  32 MiB retained result payload, pagination depth at most 2,000.
+- Snapshot the union of legacy physical source IDs and eligible raw IDs once at
+  execution. One task reads sequential batches of at most **16 files and 8 GiB**;
+  more candidates no longer cause refusal. A single file over 8 GiB still fails.
+  The temporary plan spills after 1 MiB and releases its metadata reader before I/O.
+- Each batch retains the 180-second deadline and one concurrent raw decoder;
+  raw staging remains limited to 512 MiB. Batched queries retain at most 32 MiB
+  of result payload and pagination depth 2,000 across the whole task. Merge by
+  event ID and global descending order before slicing the requested page.
+  Cancellation or any batch failure prevents a successful partial result.
 - Sidecars select whole GTID transaction regions, including FDE/table-map/context.
   Statement SQL and unknown/compressed payloads remain conservative candidates.
   Anonymous/no-GTID and unusual prefix files retain a whole-file range.
@@ -62,7 +67,7 @@ recoverable. Discovery continues through the existing retained-file scheduler.
 ## Verification
 
 ```
-python -m unittest tests.test_raw_binlog tests.test_pipeline_capacity tests.test_query_preflight -v
+python -m unittest tests.test_raw_binlog tests.test_binlog_query_batches tests.test_pipeline_capacity tests.test_query_preflight -v
 python tools/raw_binlog_probe.py /path/to/existing/closed.binlog
 python tools/raw_binlog_acceptance.py http://127.0.0.1:8769/api/status
 ```
