@@ -95,15 +95,15 @@
           </div>
 
           <form id="query-form" class="query-grid">
+            <label class="field span-2"><span>查询方式</span><select id="filter-query-mode"><option value="indexed-time" selected>已索引变更 · 推荐</option><option value="primary-key">主键历史 · 精确</option><option value="keyword">高级查询 · 可能扫描原档</option></select></label>
             <label class="field span-2"><span>实例</span><select id="filter-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
+            <label class="field span-2"><span>数据库</span><input id="filter-database" type="text" placeholder="完整数据库名"></label>
+            <label class="field span-2"><span>表名</span><input id="filter-table" type="text" placeholder="完整表名"></label>
             <label class="field span-2"><span>开始时间</span><input id="filter-start" type="datetime-local" step="1"></label>
             <label class="field span-2"><span>结束时间</span><input id="filter-end" type="datetime-local" step="1"></label>
-            <label class="field span-2"><span id="filter-value-label">关键词</span><input id="filter-keyword" type="search" placeholder="SQL、行值、GTID 或文件名"></label>
+            <label id="filter-value-field" class="field span-4" hidden><span id="filter-value-label">关键词</span><input id="filter-keyword" type="search" placeholder="SQL、行值、GTID 或文件名"></label>
             <details id="audit-filters" class="filter-disclosure span-8"><summary>更多筛选 <span class="filter-count"></span></summary><div class="query-grid">
-            <label class="field"><span>查询方式</span><select id="filter-query-mode"><option value="indexed-time" selected>已索引变更 · 推荐</option><option value="primary-key">主键历史 · 精确</option><option value="keyword">高级查询 · 可能扫描原档</option></select></label>
             <label id="filter-keyword-mode-field" class="field"><span>匹配</span><select id="filter-keyword-mode"><option value="AND">全部词</option><option value="OR">任一词</option></select></label>
-            <label class="field span-2"><span>数据库</span><input id="filter-database" type="text" placeholder="支持片段匹配"></label>
-            <label class="field span-2"><span>表名</span><input id="filter-table" type="text" placeholder="支持片段匹配"></label>
             <label class="field span-2"><span>来源</span><select id="filter-source"><option value="">全部来源</option><option value="audit">本地执行日志</option><option value="binlog">Binlog / General log</option><option value="slowlog">慢日志</option></select></label>
             <label class="field span-2"><span>连接</span><input id="filter-connection" type="text" placeholder="连接名或连接 ID"></label>
             <label class="field span-2"><span>数据库账号</span><input id="filter-account" type="text" placeholder="支持片段匹配"></label>

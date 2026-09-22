@@ -288,6 +288,7 @@ function syncQueryMode() {
   if (fast) $("#filter-source").value = "binlog";
   $("#filter-source").disabled = fast;
   $("#filter-keyword").disabled = mode === "indexed-time";
+  $("#filter-value-field").hidden = mode === "indexed-time";
   for (const id of ["connection", "account", "status"]) {
     $("#filter-" + id).disabled = fast;
     if (fast) $("#filter-" + id).value = "";

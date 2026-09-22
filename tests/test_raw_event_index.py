@@ -262,6 +262,32 @@ class ResourceBudgetTests(unittest.TestCase):
         self.assertEqual(ResourceBudget.allocation(self.sample(io=.7), paused=True)[0], 0)
         self.assertGreater(ResourceBudget.allocation(self.sample(io=.4), paused=True)[0], 0)
 
+    def test_long_chunk_pays_full_duty_debt_in_interruptible_slices(self):
+        clock, sleeps = [0.0], []
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+        gate = ResourceBudget(Mock(), Path('.'), Mock(), sample=lambda: self.sample(idle=.3),
+                              clock=lambda: clock[0], sleep=sleep)
+        clock[0] = 10.0
+        gate.check()
+        self.assertAlmostEqual(clock[0], 25.0)
+        self.assertAlmostEqual(sum(sleeps), 15.0)
+        self.assertLessEqual(max(sleeps), 2.0)
+
+    def test_throttle_detects_cancellation_without_another_work_chunk(self):
+        from app.raw_index_worker import IndexDeferred
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+            gate.cancel.set()
+        gate = ResourceBudget(Mock(), Path('.'), Mock(), sample=lambda: self.sample(idle=.3),
+                              clock=lambda: clock[0], sleep=sleep)
+        clock[0] = 10.0
+        with self.assertRaisesRegex(IndexDeferred, 'stopping'):
+            gate.check()
+        self.assertEqual(clock[0], 12.0)
+
     def test_pressure_yields_then_recovers_without_restarting_work(self):
         clock = [10.0]
         def sleep(n): clock[0] += n

@@ -27,6 +27,19 @@ function uiFixture() {
   return {run, node, requests};
 }
 
+test('fast scope is visible without opening advanced filters', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  const visibleForm = html.slice(html.indexOf('<form id="query-form"'), html.indexOf('<details id="audit-filters"'));
+  for (const field of ['filter-query-mode', 'filter-instance', 'filter-database', 'filter-table']) {
+    assert.ok(visibleForm.includes(`id="${field}"`), `${field} must be outside collapsed filters`);
+  }
+  const {run, node} = uiFixture();
+  assert.equal(node('filter-value-field').hidden, true);
+  node('filter-query-mode').value = 'primary-key';
+  run('syncQueryMode()');
+  assert.equal(node('filter-value-field').hidden, false);
+});
+
 test('actual form aligns to index, clips, and submits strict binlog-only fast query', async () => {
   const {run, node, requests} = uiFixture();
   const pending = run('setQuickRange("24h")');

@@ -99,12 +99,15 @@ class ResourceBudget:
             self.sequence += 1
             self.publish('paused' if not duty else 'running', phase='raw-events',
                          token=f'raw:{self.sequence}:{self.bytes}', result={'duty': duty, 'reason': reason, 'bytes': self.bytes})
-            if duty:
-                self.sleep(min(5.0, worked*(1/duty-1)))
+            waited = self.clock()-wait_since
+            remaining = worked*(1/duty-1)-waited if duty else 2.0
+            if duty and remaining <= 0:
                 break
-            if self.clock()-wait_since >= 300:
+            if waited >= 300:
                 raise IndexDeferred(reason)
-            self.sleep(2)
+            # Keep the entire duty-cycle debt, but resample/cancel between short
+            # waits. Capping total sleep would over-allocate after a long chunk.
+            self.sleep(min(2.0, remaining, 300-waited))
             if self.cancel.is_set():
                 raise IndexDeferred('worker stopping')
         self.last_sample = self.last_checkpoint = self.clock()
