@@ -402,6 +402,9 @@ function renderEvents(result) {
   tbody.innerHTML = "";
   const rows = result.rows || [];
   $("#event-empty").hidden = rows.length > 0;
+  const indexedResult = (result.tiers_used || []).includes("raw-event-index");
+  $("#event-empty strong").textContent = indexedResult ? "所查区间没有匹配记录" : "还没有查询结果";
+  $("#event-empty span").textContent = indexedResult ? "仅检查结果标题显示的时间段；其他历史尚未查询。" : "完成一次同步，或调整上方时间范围后查询。";
   $(".data-table", $("#view-audit")).hidden = rows.length === 0;
   for (const row of rows) {
     const tr = document.createElement("tr");
@@ -483,7 +486,7 @@ function renderEvents(result) {
     $("#result-meta").textContent = rows.length
       ? `本页 ${rows.length} 条 · ${state.queryLimit} 条/页${tierCopy}${exactCopy}`
       : `0 条${tierCopy}${exactCopy}`;
-    if ((result.tiers_used || []).includes("raw-event-index")) {
+    if (indexedResult) {
       const query = state.activeQuery || {};
       const start = query.startEpochUs ?? query.start_epoch_us;
       const end = query.endEpochUs ?? query.end_epoch_us;

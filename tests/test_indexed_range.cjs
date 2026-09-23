@@ -257,6 +257,9 @@ test('empty indexed results identify the executed interval, not all history', ()
     renderEvents({rows: [], tiers_used: ['raw-event-index']});`);
   assert.match(node('result-meta').textContent, /0 条.*仅查询.*其他时间未检索/);
   assert.ok(node('result-meta').textContent.includes(run('formatTime(1789956949000000)')));
+  assert.equal(node('event-empty strong').textContent, '所查区间没有匹配记录');
+  assert.match(node('event-empty span').textContent, /其他历史尚未查询/);
+  assert.ok(!node('event-empty span').textContent.includes('同步'));
 });
 
 test('empty coverage never substitutes wall clock', () => {
