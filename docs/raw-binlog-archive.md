@@ -73,15 +73,45 @@ or archives. Registered missing files and incomplete overlapping files subtract
 from coverage. Envelope-proven irrelevant tables can be pruned. Opaque files use
 decoded timestamp bounds only after complete indexing, never epoch-to-infinity.
 The certificate covers the registered source catalog, not undiscovered history.
+Query-time catalog reads exclude raw manifests whose known bounds do not overlap
+the requested interval before fetching their summary/descriptor JSON. Legacy and
+unknown bounds are retained conservatively; invalid raw bounds fail closed.
+Reversed or unknown legacy timestamps may use the existing completed Parquet
+manifest for **time pruning only**: `done` without error, source SHA256 and fully
+downloaded size, unique nonempty part identities, valid part hashes/ranges, and
+summed part rows equal to the positive completed source count are all required.
+Absent any evidence, retain an all-time unknown gap. This neither reads Parquet/OSS
+nor serves those legacy rows, modifies the original timestamps, or certifies
+undiscovered sources. Each recovery/unknown-gap decision logs its reason.
+The interval selector still reads the full registered catalog; no TTL cache or
+stale coverage certificate is introduced.
 
 The recommended UI requires one instance and complete database/table names.
 Primary-key history is the most selective lookup. Time shortcuts end at the most
 recent continuous certified interval, clip to it without crossing holes, and
 never substitute wall-clock time when no interval exists. A custom interval is
-revalidated at execution; no automatic widening, clipping, or raw-scan fallback.
+narrowed before submission to the most recent continuous certified segment
+**inside the requested window**, with the actual dates written back into the form
+and the old/new ranges explained. No overlap blocks submission, not a move to a
+different date. Execution revalidates coverage; no raw-scan fallback is allowed.
+Result captions identify the executed interval and state that other dates were
+not searched, including when the result is empty.
 Binlog keyword, status, account and connection filters read the same covering
-index, with the raw decoder's matching semantics. Ordered cursors stop after a
-page plus one lookahead; they do not count all matches or build another index.
+index, with the raw decoder's matching semantics for available fields. A requested
+execution-status filter requires a stored status certificate for every structural
+candidate (scope/time/operation/transaction/PK), including candidates beyond the
+requested page. Missing status or a legacy index without this certificate raises
+`INDEX_FILTER_UNAVAILABLE` before decoding payloads, not a successful empty page.
+The API does not silently remove an explicitly submitted filter. Following the
+user-authorized fast-query policy, the Binlog UI clears and hides execution-status,
+account and connection inputs before both GET and POST serialization, and visibly
+states that it searches recorded row changes without these unavailable audit
+fields. Other sources retain their filters. No binlog row is inferred to have
+`execution_status=success`, and keywords are never guessed to be primary keys.
+Existing index files remain readable without the status filter; a write/rebuild
+adds the nullable status column without fabricating values for old rows.
+Ordered payload cursors stop after a page plus one lookahead; they do not count all
+matches or build another keyword index.
 Two query-local decoded blocks are cached (at most 64 MiB), discarded at request
 end; misses load the committed SQLite payload, never an archive. Broad negative
 keywords may still traverse all scoped indexed rows and require measurement.

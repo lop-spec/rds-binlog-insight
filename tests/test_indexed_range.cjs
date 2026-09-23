@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { indexedQuickRange } = require('../web/indexed-range.js');
+const { indexedQuickRange, indexedCustomRange } = require('../web/indexed-range.js');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
@@ -17,8 +17,8 @@ function uiFixture() {
     return nodes.get(key);
   }};
   const requests = [];
-  const ctx = vm.createContext({ document, console, URLSearchParams, Date, indexedQuickRange,
-    fetch(url) { return new Promise(resolve => requests.push({ url, resolve: data => resolve({ok: true, json: async () => ({ok: true, data})}) })); }
+  const ctx = vm.createContext({ document, console, URLSearchParams, Date, indexedQuickRange, indexedCustomRange,
+    fetch(url, options) { return new Promise(resolve => requests.push({ url, options, resolve: data => resolve({ok: true, json: async () => ({ok: true, data})}) })); }
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8'), ctx);
   const run = code => vm.runInContext(code, ctx);
@@ -104,21 +104,23 @@ test('stale interval response cannot overwrite a newer scope or custom input', a
   assert.equal(node('filter-end').value, '2026-09-19T01:02:03');
 });
 
-test('primary-key mode forbids scan fallback and preserves explicit filters', async () => {
+test('primary-key mode forbids scan fallback and removes unavailable audit filters visibly', async () => {
   const {run, node, requests} = uiFixture();
   node('filter-query-mode').value = 'primary-key';
   node('filter-keyword').value = '5917';
   node('filter-account').value = 'old account';
   run('syncQueryMode()');
-  assert.equal(node('filter-account').value, 'old account');
-  assert.equal(node('filter-account').disabled, false);
+  assert.equal(node('filter-account').value, '');
+  assert.equal(node('filter-account').disabled, true);
+  assert.equal(node('filter-account-field').hidden, true);
+  assert.equal(node('binlog-query-policy').hidden, false);
   const pending = run('setQuickRange("24h")');
   requests[0].resolve({intervals: [[1_790_000_000_000_000, 1_790_000_010_000_000]], pendingFiles: 0});
   await pending;
   assert.equal(run('eventQueryPayload().exact.fallback'), 'error');
 });
 
-test('keyword query is index-only, retains user filters and never selects scan mode', async () => {
+test('keyword query keeps the keyword but clears unsupported audit filters in form and request', async () => {
   const {run, node, requests} = uiFixture();
   node('filter-query-mode').value = 'keyword';
   node('filter-keyword').value = '157683';
@@ -131,7 +133,10 @@ test('keyword query is index-only, retains user filters and never selects scan m
   assert.equal(payload.indexedOnly, true);
   assert.equal(payload.source, 'binlog');
   assert.equal(payload.keyword, '157683');
-  assert.equal(payload.status, 'success');
+  assert.equal(payload.status, '');
+  assert.equal(node('filter-status').value, '');
+  assert.equal(node('filter-status').disabled, true);
+  assert.equal(node('filter-status-field').hidden, true);
   assert.equal(node('filter-keyword-mode').disabled, false);
   assert.equal(node('filter-value-field').hidden, false);
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
@@ -143,11 +148,115 @@ test('other source keyword searches retain their own query route', () => {
   node('filter-query-mode').value = 'keyword';
   node('filter-source').value = 'slowlog';
   node('filter-keyword').value = 'SELECT';
+  node('filter-status').value = 'success';
+  node('filter-account').value = 'reader';
+  node('filter-connection').value = 'prod';
   run('syncQueryMode()');
   const payload = run('eventQueryPayload()');
   assert.equal(payload.source, 'slowlog');
   assert.equal(payload.keyword, 'SELECT');
   assert.equal(payload.indexedOnly, undefined);
+  assert.equal(payload.status, 'success');
+  assert.equal(payload.account, 'reader');
+  assert.equal(payload.connection, 'prod');
+  assert.equal(node('filter-status').disabled, false);
+  assert.equal(node('filter-status-field').hidden, false);
+  assert.equal(node('binlog-query-policy').hidden, true);
+});
+
+test('custom ranges select one intersecting segment, never cross holes or shift dates', () => {
+  const intervals = [[1_000_001, 5_999_999], [10_000_000, 20_000_000]];
+  assert.deepEqual(indexedCustomRange(intervals, 1000, 15000), {start: 10000, end: 15000, clipped: true});
+  assert.deepEqual(indexedCustomRange(intervals, 3000, 4000), {start: 3000, end: 4000, clipped: false});
+  assert.deepEqual(indexedCustomRange(intervals, 1000, 9000), {start: 2000, end: 5000, clipped: true});
+  assert.deepEqual(indexedCustomRange(intervals, 10000, 10000), {start: 10000, end: 10000, clipped: false});
+  assert.equal(indexedCustomRange(intervals, 6000, 9000), null);
+  assert.equal(indexedCustomRange(intervals, NaN, 9000), null);
+  assert.equal(indexedCustomRange(intervals, 9000, 1000), null);
+});
+
+function customForm(fixture) {
+  const {run, node} = fixture;
+  node('filter-query-mode').value = 'keyword';
+  node('filter-keyword').value = '157683';
+  node('filter-status').value = 'success';
+  node('filter-account').value = 'stale account';
+  node('filter-connection').value = 'stale connection';
+  node('audit-range').value = 'custom';
+  node('filter-start').value = run('toLocalInput(new Date(1789006589000))');
+  node('filter-end').value = run('toLocalInput(new Date(1789956989000))');
+}
+
+test('actual submit converts the broad custom form before POST and keeps the keyword', async () => {
+  const fixture = uiFixture();
+  const {run, node, requests} = fixture;
+  customForm(fixture);
+  run('refreshQueryTasks = async () => {}; state.status = {summary: {latestEpochUs: 1}};');
+  const pending = run('runQuery()');
+  assert.match(requests[0].url, /^\/api\/index-coverage\?/);
+  requests[0].resolve({intervals: [[1789956949000000, 1789956986999999]], pendingFiles: 100});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests[1].url, '/api/query-tasks');
+  const payload = JSON.parse(requests[1].options.body);
+  assert.equal(payload.startEpochUs, 1789956949000000);
+  assert.equal(payload.endEpochUs, 1789956986000000);
+  assert.equal(payload.keyword, '157683');
+  assert.equal(payload.exact, undefined);
+  assert.equal(payload.source, 'binlog');
+  assert.equal(payload.indexedOnly, true);
+  for (const key of ['status', 'account', 'connection']) {
+    assert.equal(payload[key], '');
+    assert.equal(node('filter-' + key).value, '');
+    assert.equal(node('filter-' + key).disabled, true);
+  }
+  assert.equal(new Date(node('filter-start').value).getTime() * 1000, payload.startEpochUs);
+  assert.equal(new Date(node('filter-end').value).getTime() * 1000, payload.endEpochUs);
+  assert.match(node('indexed-range-hint').textContent, /原选.*已收窄.*实际查询.*未检索/);
+  requests[1].resolve({taskId: 'fixture-task'});
+  await pending;
+});
+
+test('custom submit without intersecting coverage creates no task and keeps requested dates', async () => {
+  const fixture = uiFixture();
+  const {run, node, requests} = fixture;
+  customForm(fixture);
+  const before = node('filter-start').value;
+  const pending = run('runQuery()');
+  const rejected = assert.rejects(pending, /没有完整可查区间/);
+  requests[0].resolve({intervals: [[1000000, 9000000]], pendingFiles: 100});
+  await rejected;
+  assert.equal(requests.length, 1);
+  assert.equal(node('filter-start').value, before);
+});
+
+test('custom coverage cannot overwrite edited scope or dates', async () => {
+  for (const field of ['database', 'start']) {
+    const fixture = uiFixture();
+    const {run, node, requests} = fixture;
+    customForm(fixture);
+    const pending = run('alignCustomIndexedRange()');
+    const rejected = assert.rejects(pending, /条件已变化/);
+    node('filter-' + field).value = 'changed';
+    requests[0].resolve({intervals: [[1789956949000000, 1789956986999999]]});
+    await rejected;
+    assert.equal(node('filter-' + field).value, 'changed');
+  }
+});
+
+test('GET serialization also clears restored unsupported filters, not only POST', () => {
+  const fixture = uiFixture();
+  customForm(fixture);
+  const params = new URLSearchParams(fixture.run('eventQueryString()'));
+  for (const key of ['status', 'account', 'connection']) assert.equal(params.has(key), false);
+  assert.equal(params.get('keyword'), '157683');
+});
+
+test('empty indexed results identify the executed interval, not all history', () => {
+  const {run, node} = uiFixture();
+  run(`state.activeQuery = {start_epoch_us: 1789956949000000, end_epoch_us: 1789956986000000};
+    renderEvents({rows: [], tiers_used: ['raw-event-index']});`);
+  assert.match(node('result-meta').textContent, /0 条.*仅查询.*其他时间未检索/);
+  assert.ok(node('result-meta').textContent.includes(run('formatTime(1789956949000000)')));
 });
 
 test('empty coverage never substitutes wall clock', () => {

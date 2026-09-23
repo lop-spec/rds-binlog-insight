@@ -205,6 +205,127 @@ class RawEventIndexTests(unittest.TestCase):
                 self.assertEqual(result['has_more'], len(expected)>offset+3)
                 self.assertEqual(result['range_requests'], 0)
 
+    def test_missing_status_is_not_reported_as_successful_zero_matches(self):
+        file_id = self.add_raw(1)
+        index = self.index()
+        self.build(index, file_id)
+        with patch.object(index, '_payload_block', side_effect=AssertionError('must reject before decoding')):
+            with self.assertRaises(RawBinlogError) as caught:
+                self.query(index, keyword='157683', status='success')
+        self.assertEqual(caught.exception.code, 'INDEX_FILTER_UNAVAILABLE')
+        self.assertEqual(len(self.query(index)['rows']), 20)
+
+    def test_status_proof_covers_rows_beyond_the_requested_page(self):
+        file_id = self.add_raw(1)
+        index = self.index()
+        rows = list(self.rows(file_id))
+        for row in rows[1:]:
+            row['execution_status'] = 'success'
+        self.build(index, file_id, rows)
+        with self.assertRaises(RawBinlogError) as caught:
+            self.query(index, status='success', limit=1)
+        self.assertEqual(caught.exception.code, 'INDEX_FILTER_UNAVAILABLE')
+        # Missing fields outside an exact PK/time/operation candidate set do not
+        # invalidate a predicate on records whose status actually is known.
+        self.assertEqual(self.query(index, exact={'value':'119'}, status='success')['rows'], [rows[19]])
+        self.assertEqual(self.query(index, status='success', operations=['DELETE'])['rows'], [])
+
+    def test_legacy_index_is_readable_but_not_a_status_certificate(self):
+        file_id = self.add_raw(1)
+        index = self.index()
+        self.build(index, file_id)
+        with index.connection(write=True) as conn:
+            conn.execute('ALTER TABLE events DROP COLUMN execution_status')
+            conn.commit()
+        self.assertEqual(len(self.query(index)['rows']), 20)
+        with self.assertRaises(RawBinlogError) as caught:
+            self.query(index, status='success')
+        self.assertEqual(caught.exception.code, 'INDEX_FILTER_UNAVAILABLE')
+        # A subsequent bounded rebuild adds the column; no existing index file
+        # is deleted or assumed to contain status values during read-only use.
+        rows = [{**r, 'execution_status':'success'} for r in self.rows(file_id)]
+        self.build(index, file_id, rows)
+        self.assertEqual(len(self.query(index, status='success')['rows']), 20)
+
+    def test_query_catalog_does_not_decode_outside_range_descriptors(self):
+        one, outside = self.add_raw(1), self.add_raw(2)
+        index = self.index()
+        self.build(index, one)
+        with self.metadata.connection() as conn:
+            conn.execute("UPDATE raw_binlog_archives SET lo=201,hi=300,summary='not read',descriptor='not read' WHERE file_id=?", (outside,))
+        self.assertEqual(len(self.query(index)['rows']), 20)
+        # Inclusive overlap at the boundary is not silently pruned.
+        with self.assertRaises(json.JSONDecodeError):
+            index.catalog({'instance':'test'}, start=200, end=201)
+
+    def test_catalog_keeps_unknown_bounds_and_legacy_holes(self):
+        one, unknown, legacy = self.add_raw(1), self.add_raw(2), self.add_raw(3)
+        index = self.index()
+        self.build(index, one)
+        with self.metadata.connection() as conn:
+            conn.execute('UPDATE raw_binlog_archives SET lo=0,hi=? WHERE file_id=?', (2**63-1, unknown))
+            conn.execute('DELETE FROM raw_binlog_archives WHERE file_id=?', (legacy,))
+            conn.execute("UPDATE binlog_files SET log_begin_utc='unknown',log_end_utc='unknown' WHERE id=?", (legacy,))
+        self.assertEqual({r[0] for r in index.catalog({'instance':'test'}, start=100, end=200)}, {one, unknown, legacy})
+        with self.assertRaises(RawBinlogError) as caught:
+            self.query(index)
+        self.assertEqual(caught.exception.code, 'INDEX_COVERAGE_INCOMPLETE')
+
+    def test_legacy_manifest_recovers_pruning_bounds_only_with_complete_evidence(self):
+        one = self.add_raw(1)
+        index = self.index()
+        self.build(index, one)
+        def legacy(n):
+            fid = self.add_raw(n)
+            with self.metadata.connection() as conn:
+                conn.execute('DELETE FROM raw_binlog_archives WHERE file_id=?', (fid,))
+                conn.execute("UPDATE binlog_files SET state='done',event_count=20,downloaded_bytes=file_size,local_sha256=?,log_begin_utc='bad',log_end_utc='bad' WHERE id=?", ('a'*64, fid))
+                for part in range(2):
+                    conn.execute('''INSERT INTO parquet_parts
+                        (path,binlog_id,logical_part_id,event_date,row_count,min_event_epoch_us,max_event_epoch_us,
+                         size_bytes,sha256,object_sha256,created_at,updated_at)
+                        VALUES(?,?,?,'1970-01-01',10,300,399,100,?,?,'now','now')''',
+                        (fid+str(part),fid,fid+':'+str(part),'b'*64,'c'*64))
+            return fid
+        good = legacy(2)
+        self.assertEqual(index._legacy_bounds(good), (300,399))
+        self.assertEqual(len(self.query(index)['rows']), 20)
+        # The manifest can exclude a different time, not serve its own rows.
+        with self.assertRaises(RawBinlogError) as caught:
+            index.query({'instance':'test','database':'db','table':'one','source':'binlog'},300,399)
+        self.assertEqual(caught.exception.code, 'INDEX_COVERAGE_INCOMPLETE')
+        self.assertEqual(self.metadata.file_record(good)['log_begin_utc'], 'bad')
+        mutations = [
+            "UPDATE binlog_files SET state='stored' WHERE id=?",
+            'UPDATE binlog_files SET event_count=21 WHERE id=?',
+            "UPDATE binlog_files SET local_sha256='' WHERE id=?",
+            "UPDATE binlog_files SET local_sha256=replace(local_sha256,'a','z') WHERE id=?",
+            'UPDATE binlog_files SET downloaded_bytes=1 WHERE id=?',
+            "UPDATE parquet_parts SET sha256='' WHERE binlog_id=?",
+            "UPDATE parquet_parts SET sha256=replace(sha256,'b','z') WHERE binlog_id=?",
+            'UPDATE parquet_parts SET min_event_epoch_us=400 WHERE binlog_id=?',
+            "UPDATE parquet_parts SET logical_part_id='' WHERE path=(SELECT MIN(path) FROM parquet_parts WHERE binlog_id=?)",
+        ]
+        for n, sql in enumerate(mutations, 3):
+            with self.subTest(mutation=sql):
+                fid = legacy(n)
+                with self.metadata.connection() as conn:
+                    conn.execute(sql, (fid,))
+                self.assertIsNone(index._legacy_bounds(fid))
+        with self.assertRaises(RawBinlogError) as caught:
+            self.query(index)
+        self.assertEqual(caught.exception.code, 'INDEX_COVERAGE_INCOMPLETE')
+
+    def test_invalid_raw_time_bounds_cannot_disappear_as_irrelevant(self):
+        one, bad = self.add_raw(1), self.add_raw(2)
+        index = self.index()
+        self.build(index, one)
+        with self.metadata.connection() as conn:
+            conn.execute('UPDATE raw_binlog_archives SET lo=300,hi=50 WHERE file_id=?', (bad,))
+        with self.assertRaises(RawBinlogError) as caught:
+            self.query(index)
+        self.assertEqual(caught.exception.code, 'RAW_INDEX_BOUNDS_INVALID')
+
     def test_filtered_primary_key_uses_index_and_preserves_status(self):
         file_id = self.add_raw(1)
         index = self.index()
@@ -348,6 +469,20 @@ class RawEventIndexTests(unittest.TestCase):
             self.assertEqual(detail, first)
             direct = json.loads(request('/api/events?source=binlog&instance=test&database=db&table=one&keyword=payload&startEpochUs=100&endEpochUs=200&limit=10'))['data']
             self.assertEqual(direct['rows'], state['result']['rows'])
+            bad = json.loads(request('/api/query-tasks', {'source':'binlog','instance':'test',
+                'database':'db','table':'one','keyword':'157683','status':'success',
+                'startEpochUs':100,'endEpochUs':200}))['data']
+            deadline = time.monotonic()+5
+            while True:
+                rejected = json.loads(request('/api/query-task?id='+bad['taskId']))['data']
+                if rejected['status'] not in {'queued','running'}:
+                    break
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+            self.assertEqual(rejected['status'], 'failed')
+            self.assertEqual(rejected['error_code'], 'INDEX_FILTER_UNAVAILABLE')
+            self.assertIsNone(rejected['result'])
+            self.assertEqual(list(manager.result_dir.glob(bad['taskId']+'*')), [])
             forbidden.assert_not_called()
 
     def test_supported_order_uses_index_not_temp_sort(self):

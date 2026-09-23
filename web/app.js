@@ -202,6 +202,36 @@ async function setQuickRange(range) {
   hint.textContent = "其他来源按已有事件水位选择；Binlog 只查询完整已索引区间。";
 }
 
+async function alignCustomIndexedRange() {
+  if (!isIndexedBinlogQuery() || $("#audit-range").value !== "custom") return;
+  const startText = $("#filter-start").value, endText = $("#filter-end").value;
+  const start = new Date(startText).getTime(), end = new Date(endText).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) throw new Error("请填写有效的开始、结束时间");
+  const request = ++indexedRangeRequest;
+  const params = new URLSearchParams();
+  for (const key of ["instance", "database", "table"]) {
+    const value = $("#filter-" + key).value.trim();
+    if (!value) throw new Error("索引快查需要选择实例并填写完整库名、表名");
+    params.set(key, value);
+  }
+  const coverage = await api("/api/index-coverage?" + params);
+  if (request !== indexedRangeRequest || !isIndexedBinlogQuery() || $("#audit-range").value !== "custom"
+      || $("#filter-start").value !== startText || $("#filter-end").value !== endText
+      || [...params].some(([key, value]) => $("#filter-" + key).value.trim() !== value)) {
+    throw new Error("查询条件已变化，请重新查询");
+  }
+  const selected = indexedCustomRange(coverage.intervals || [], start, end);
+  if (!selected) {
+    const message = "所选时间没有完整可查区间；请使用“最近可查”时间项。不会扫描原档，也未查询其他时间。";
+    $("#indexed-range-hint").textContent = message;
+    throw new Error(message);
+  }
+  $("#filter-start").value = toLocalInput(new Date(selected.start));
+  $("#filter-end").value = toLocalInput(new Date(selected.end));
+  $("#filter-end").setCustomValidity("");
+  $("#indexed-range-hint").textContent = `${selected.clipped ? `原选 ${formatTime(start * 1000)} — ${formatTime(end * 1000)}，已收窄至其中最近的完整索引段` : "自定义区间已通过索引检查"} · 实际查询 ${formatTime(selected.start * 1000)} — ${formatTime(selected.end * 1000)}；区间外历史未检索。`;
+}
+
 function setDefaultSyncWindow() {
   if ($("#sync-start-time").value && $("#sync-end-time").value) return;
   const now = new Date();
@@ -221,6 +251,8 @@ function syncWindowPayload() {
 }
 
 function eventQueryString(includePage = true) {
+  // Normalize visible controls before serializing, including stale restored forms.
+  syncQueryMode();
   const params = new URLSearchParams();
   const start = $("#filter-start").value;
   const end = $("#filter-end").value;
@@ -294,8 +326,12 @@ function syncQueryMode() {
   $("#filter-keyword").disabled = mode === "indexed-time";
   $("#filter-value-field").hidden = mode === "indexed-time";
   for (const id of ["connection", "account", "status"]) {
-    $("#filter-" + id).disabled = false;
+    const input = $("#filter-" + id);
+    if (fast) input.value = "";
+    input.disabled = fast;
+    $("#filter-" + id + "-field").hidden = fast;
   }
+  $("#binlog-query-policy").hidden = !fast;
   $("#filter-value-label").textContent = exact ? "主键值" : "关键词";
   $("#filter-keyword").placeholder = exact ? "例如 3521" : "SQL、行值、GTID 或文件名";
   $("#filter-keyword-mode").disabled = mode !== "keyword";
@@ -316,7 +352,7 @@ function validateEventRange() {
     throw new Error("结束时间必须晚于或等于开始时间");
   }
   const latestEpochUs = Number(state.status?.summary?.latestEpochUs || 0);
-  if (end && latestEpochUs > 0 && end.getTime() * 1000 > latestEpochUs) {
+  if (!isIndexedBinlogQuery() && end && latestEpochUs > 0 && end.getTime() * 1000 > latestEpochUs) {
     const latestText = formatTime(latestEpochUs);
     const message = `结束时间超出已有数据范围；当前已解析数据只到 ${latestText}`;
     endInput.setCustomValidity(message);
@@ -447,6 +483,12 @@ function renderEvents(result) {
     $("#result-meta").textContent = rows.length
       ? `本页 ${rows.length} 条 · ${state.queryLimit} 条/页${tierCopy}${exactCopy}`
       : `0 条${tierCopy}${exactCopy}`;
+    if ((result.tiers_used || []).includes("raw-event-index")) {
+      const query = state.activeQuery || {};
+      const start = query.startEpochUs ?? query.start_epoch_us;
+      const end = query.endEpochUs ?? query.end_epoch_us;
+      $("#result-meta").textContent += ` · 仅查询 ${start != null && end != null ? `${formatTime(start)} — ${formatTime(end)}` : "当前完整索引区间"}；其他时间未检索`;
+    }
   }
 }
 
@@ -579,6 +621,7 @@ async function runQuery(queryOverride = null) {
   if (!queryOverride) validateEventRange();
   const button = $("#query-submit");
   state.queryPromise = withBusy(button, async () => {
+    if (!queryOverride) await alignCustomIndexedRange();
     const query = queryOverride || eventQueryPayload();
     const created = await api("/api/query-tasks", {
       method: "POST",
@@ -2071,7 +2114,7 @@ function bindEvents() {
     if (event.target.value !== "custom") setQuickRange(event.target.value);
     else {
       $("#filter-end").setCustomValidity("");
-      $("#indexed-range-hint").textContent = "自定义区间仍须通过完整索引检查；不会返回缺失部分的残页。";
+      $("#indexed-range-hint").textContent = "Binlog 自定义区间将在提交时收窄到其中最近的完整索引段；实际时间会回填到表单，不跨缺口。";
     }
   });
   for (const name of ["start", "end"]) {
@@ -2079,7 +2122,7 @@ function bindEvents() {
       ++indexedRangeRequest;
       $("#audit-range").value = "custom";
       $("#filter-end").setCustomValidity("");
-      $("#indexed-range-hint").textContent = "自定义区间：提交时检查完整索引覆盖，不自动扫描原档。";
+      $("#indexed-range-hint").textContent = "Binlog 自定义区间将在提交时对齐其中最近的完整索引段；不会扫描原档或查询所选时间之外的数据。";
     });
   }
   $("#analytics-range").addEventListener("change", (event) => { if (event.target.value !== "custom") setAnalyticsRange(event.target.value); });
@@ -2132,11 +2175,13 @@ function bindEvents() {
     $("#filter-end").setCustomValidity("");
   });
   $("#filter-query-mode").addEventListener("change", () => {
+    ++indexedRangeRequest;
     syncQueryMode();
     if ($("#audit-range").value !== "custom") setQuickRange($("#audit-range").value);
   });
   for (const name of ["instance", "database", "table", "source"]) {
     $("#filter-" + name).addEventListener("change", () => {
+      ++indexedRangeRequest;
       syncQueryMode();
       if ($("#audit-range").value !== "custom") setQuickRange($("#audit-range").value);
     });

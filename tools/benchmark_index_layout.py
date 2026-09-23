@@ -286,6 +286,7 @@ def benchmark_raw_events(path, root):
     from app.raw_binlog import RawBinlogStore
     from app.raw_event_index import RawEventIndex
     from app.raw_binlog_query import matches
+    from app.binlog_lite import RawBinlogError
     from app.exact_index import ExactIndex
     from app.rds_api import RemoteBinlog
     from app.config import Settings
@@ -328,10 +329,25 @@ def benchmark_raw_events(path, root):
         ('keyword-page', {**scope, 'keyword': 'id', 'offset': 10}),
         ('keyword-filtered', {**scope, 'keyword': 'id', 'status': 'success', 'operations': ['UPDATE']})]:
         start = time.perf_counter()
-        filtered = [r for r in rows if r['database_name'] == query['database'] and r['table_name'] == query['table']
-            and matches(None, r, {**query, 'exact': None}, lo, hi, {})
+        structural = [r for r in rows if r['database_name'] == query['database'] and r['table_name'] == query['table']
+            and matches(None, r, {**query, 'exact': None, 'keyword':'', 'status':'', 'account':'', 'connection':''}, lo, hi, {})
             and (not query.get('exact') or any(json.loads(r[column]).get('id') == query['exact']['value'] for column in ('before_json', 'after_json')))]
+        if query.get('status') and any(not r.get('execution_status') for r in structural):
+            # Missing source fields are not a fast successful negative query.
+            for _ in range(3):
+                try:
+                    index.query(query, lo, hi)
+                except RawBinlogError as exc:
+                    assert exc.code == 'INDEX_FILTER_UNAVAILABLE', (name, exc.code)
+                else:
+                    raise AssertionError('unknown status was reported as a successful query')
+            results.append({'case':name, 'outcome':'rejected', 'error_code':'INDEX_FILTER_UNAVAILABLE',
+                            'counts_as_successful_latency_acceptance':False})
+            continue
+        filtered = [r for r in structural if matches(None, r, {**query, 'exact': None}, lo, hi, {})]
         expected, more = page(filtered, query)
+        if name in ('pk-positive', 'keyword-positive'):
+            assert expected, name+' must contain real matching rows'
         oracle_seconds = time.perf_counter()-start
         timings = []
         for _ in range(3):

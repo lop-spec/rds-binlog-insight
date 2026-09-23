@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS events (
  instance TEXT NOT NULL, db TEXT COLLATE NOCASE NOT NULL, tbl TEXT COLLATE NOCASE NOT NULL,
  stamp INTEGER NOT NULL, filename TEXT NOT NULL, position INTEGER NOT NULL, ordinal INTEGER NOT NULL,
  operation TEXT NOT NULL, txn TEXT NOT NULL, gtid TEXT NOT NULL, pk_state TEXT NOT NULL,
- payload_id INTEGER NOT NULL REFERENCES payloads ON DELETE CASCADE, payload_ordinal INTEGER NOT NULL
+ payload_id INTEGER NOT NULL REFERENCES payloads ON DELETE CASCADE, payload_ordinal INTEGER NOT NULL,
+ execution_status TEXT
 );
 CREATE INDEX IF NOT EXISTS event_file ON events(file_id);
 CREATE INDEX IF NOT EXISTS event_time ON events(instance,db,tbl,stamp DESC,filename DESC,position DESC,ordinal DESC,event_id DESC);
@@ -121,6 +122,9 @@ class RawEventIndex:
             conn.execute('PRAGMA synchronous=FULL')
             conn.execute('PRAGMA foreign_keys=ON')
             conn.executescript(SCHEMA)
+            if 'execution_status' not in {r[1] for r in conn.execute('PRAGMA table_info(events)')}:
+                # Existing rows remain uncertified, not fabricated as successful.
+                conn.execute('ALTER TABLE events ADD COLUMN execution_status TEXT')
         else:
             conn = sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro', uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
@@ -129,30 +133,74 @@ class RawEventIndex:
         finally:
             conn.close()
 
-    def catalog(self, query, *, control=None):
+    def _legacy_bounds(self, file_id, *, control=None):
+        """Pruning-only bounds from an already completed legacy conversion.
+
+        Do not open Parquet/OSS or treat this manifest as a serving-row index.
+        Completion, source identity, unique parts and row conservation must agree.
+        """
+        with self.metadata.connection(control=control) as conn:
+            row = conn.execute('''SELECT b.state,b.error_code,b.local_sha256,b.file_size,
+                b.downloaded_bytes,b.event_count,COUNT(p.path) AS parts,
+                COUNT(DISTINCT p.logical_part_id) AS identities,SUM(p.row_count) AS rows,
+                MIN(p.min_event_epoch_us) AS lo,MAX(p.max_event_epoch_us) AS hi,
+                SUM(CASE WHEN length(p.sha256)!=64 OR p.sha256 GLOB '*[^0-9A-Fa-f]*'
+                    OR p.logical_part_id='' OR p.row_count<=0
+                    OR p.min_event_epoch_us<=0 OR p.min_event_epoch_us>p.max_event_epoch_us
+                    OR p.max_event_epoch_us>=? THEN 1 ELSE 0 END) AS invalid
+                FROM binlog_files b LEFT JOIN parquet_parts p ON p.binlog_id=b.id
+                WHERE b.id=? GROUP BY b.id''', (MAX_TIME, file_id)).fetchone()
+        if (row and row['state'] == 'done' and not row['error_code']
+                and len(row['local_sha256']) == 64
+                and set(row['local_sha256'].lower()).issubset('0123456789abcdef') and row['file_size'] > 0
+                and row['downloaded_bytes'] == row['file_size'] and row['parts'] > 0
+                and row['parts'] == row['identities'] and not row['invalid']
+                and row['rows'] == row['event_count'] and row['event_count'] > 0):
+            return int(row['lo']), int(row['hi'])
+        return None
+
+    def catalog(self, query, *, control=None, start=None, end=None):
         """One source snapshot, including registered holes and legacy files.
 
         Discovery cannot prove that historical source logs still exist. These
         intervals certify the registered source catalog, not unknown history.
         """
         instance = str(query.get('instance') or '')
-        with self.metadata.connection(control=control) as conn:
-            rows = conn.execute('''SELECT b.id,b.log_begin_utc,b.log_end_utc,b.state,
+        sql = '''SELECT b.id,b.log_begin_utc,b.log_end_utc,b.state,
                 r.lo,r.hi,r.summary,r.descriptor FROM binlog_files b
                 LEFT JOIN raw_binlog_archives r ON r.file_id=b.id
-                WHERE b.log_file_name LIKE 'mysql-bin.%' AND b.instance_id=?''', (instance,)).fetchall()
+                WHERE b.log_file_name LIKE 'mysql-bin.%' AND b.instance_id=?'''
+        args = [instance]
+        if start is not None and end is not None:
+            # Do not fetch/decode every historical table directory per query.
+            # Legacy/unknown bounds remain blockers, not negative evidence.
+            sql += ''' AND (r.file_id IS NULL OR r.lo IS NULL OR r.hi IS NULL
+                OR r.lo>r.hi OR (r.lo<=? AND r.hi>=?))'''
+            args.extend((end, start))
+        with self.metadata.connection(control=control) as conn:
+            rows = conn.execute(sql, args).fetchall()
         result = []
         for row in rows:
             if control is not None:
                 control.check_cancelled()
             if row['descriptor']:
+                if row['lo'] is None or row['hi'] is None or int(row['lo']) > int(row['hi']):
+                    raise RawBinlogError('原档目录时间边界无效，不能证明完整覆盖', 'RAW_INDEX_BOUNDS_INVALID')
                 summary = json.loads(row['summary'])
                 relevant = allows(summary, query, 0, MAX_TIME)
                 entry = json.loads(row['descriptor'])
                 result.append((row['id'], int(row['lo']), int(row['hi']), self.binding(entry), relevant))
             else:
-                result.append((row['id'], epoch(row['log_begin_utc'], 0),
-                               epoch(row['log_end_utc'], MAX_TIME), '', True))
+                lo, hi = epoch(row['log_begin_utc'], 0), epoch(row['log_end_utc'], MAX_TIME)
+                if lo > hi or lo == 0 or hi == MAX_TIME:
+                    recovered = self._legacy_bounds(row['id'], control=control)
+                    LOGGER.warning('RAW_INDEX_LEGACY_TIME_UNCERTAIN file=%s begin=%s end=%s action=%s bounds=%s',
+                                   row['id'], row['log_begin_utc'], row['log_end_utc'],
+                                   'completed_manifest_bounds' if recovered else 'keep_unknown_gap', recovered)
+                    lo, hi = recovered or (0, MAX_TIME)
+                if start is not None and end is not None and (hi < start or lo > end):
+                    continue
+                result.append((row['id'], lo, hi, '', True))
         return result
 
     def coverage(self, query, *, conn=None, catalog=None):
@@ -255,8 +303,8 @@ class RawEventIndex:
                         str(row.get('table_name') or '').lower(), int(row.get('event_epoch_us') or 0), row['source_file_name'],
                         int(row.get('end_position') or 0), int(row.get('row_index') or 0), row['operation'],
                         str(row.get('transaction_id') or ''), str(row.get('gtid') or ''), context['state'],
-                        payload_id, len(payload_rows))
-                    conn.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', values)
+                        payload_id, len(payload_rows), str(row.get('execution_status') or '').lower() or None)
+                    conn.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', values)
                     payload_rows.append(encoded)
                     if context['state'] == 'supported':
                         type_id = int(context['type_id'])
@@ -367,7 +415,8 @@ class RawEventIndex:
             if time.monotonic() >= until:
                 raise RawBinlogError('索引查询超过50秒，未返回不完整结果', 'QUERY_DEADLINE_EXCEEDED')
         check()
-        catalog = self.catalog({**query, 'exact': query.get('exact') or {'kind': 'SCOPE'}}, control=SimpleNamespace(check_cancelled=check))
+        catalog = self.catalog({**query, 'exact': query.get('exact') or {'kind': 'SCOPE'}},
+                               control=SimpleNamespace(check_cancelled=check), start=start, end=end)
         check()
         limit, offset = min(max(int(query.get('limit') or 100), 1), 1000), int(query.get('offset') or 0)
         if offset < 0 or offset+limit+1 > 2000:
@@ -399,6 +448,18 @@ class RawEventIndex:
                 if query.get('transaction'):
                     where += ' AND (e.txn=? OR e.gtid=?)'
                     args.extend([query['transaction']]*2)
+                status_column = 'execution_status' in {r[1] for r in conn.execute('PRAGMA table_info(events)')}
+                def certify_status(sql, values):
+                    if not query.get('status'):
+                        return
+                    # Certify the entire structural candidate set before LIMIT:
+                    # an unknown status after page one must not look complete.
+                    unknown = ' AND (e.execution_status IS NULL OR e.execution_status=\'\')' if status_column else ''
+                    if conn.execute(sql+unknown+' LIMIT 1', values).fetchone():
+                        raise RawBinlogError(
+                            '所选记录或旧索引缺少可验证的执行状态；不能把状态未知当作无匹配。'
+                            '条件未被删除；请明确选择“全部状态”，或使用包含执行状态的审计来源。',
+                            'INDEX_FILTER_UNAVAILABLE')
                 exact = query.get('exact')
                 if exact:
                     if conn.execute('SELECT 1 FROM events e WHERE '+where+' AND e.pk_state=\'unknown\' LIMIT 1', args).fetchone():
@@ -411,11 +472,15 @@ class RawEventIndex:
                             raise RawBinlogError('主键值与历史字段类型不匹配', 'EXACT_SCHEMA_UNKNOWN')
                         sql = '''SELECT e.* FROM keys k JOIN events e ON e.event_id=k.event_id
                             WHERE k.instance=? AND k.db=? AND k.tbl=? AND k.type_id=? AND k.value=? AND k.stamp BETWEEN ? AND ? AND '''+where
+                        values = [*scope[:3], type_id, key, start, end, *args]
+                        certify_status(sql, values)
                         sql += ' ORDER BY '+','.join('k.'+piece.strip() for piece in ORDER.split(','))
-                        streams.append(conn.execute(sql, [*scope[:3], type_id, key, start, end, *args]))
+                        streams.append(conn.execute(sql, values))
                     candidates = heapq.merge(*streams, key=lambda r: (r['stamp'], r['filename'], r['position'], r['ordinal'], r['event_id']), reverse=True)
                 else:
-                    sql = 'SELECT e.* FROM events e INDEXED BY event_time WHERE '+where+' ORDER BY '+','.join('e.'+p.strip() for p in ORDER.split(','))
+                    sql = 'SELECT e.* FROM events e INDEXED BY event_time WHERE '+where
+                    certify_status(sql, args)
+                    sql += ' ORDER BY '+','.join('e.'+p.strip() for p in ORDER.split(','))
                     candidates = conn.execute(sql, args)
                 # Stream an already scoped, ordered index. Never enumerate all
                 # matches, decode the archive, or rebuild indexes on demand.
