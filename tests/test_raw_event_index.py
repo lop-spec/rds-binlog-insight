@@ -179,10 +179,118 @@ class RawEventIndexTests(unittest.TestCase):
             self.query(index, offset=2000)
         self.assertEqual(caught.exception.code, 'RAW_QUERY_PAGE_LIMIT')
 
-    def test_no_keyword_silent_scan(self):
+    def test_keyword_without_coverage_never_scans_or_returns_empty_success(self):
         with self.assertRaises(RawBinlogError) as caught:
-            self.query(self.index(), keyword='123')
-        self.assertEqual(caught.exception.code, 'INDEX_QUERY_UNSUPPORTED')
+            self.query(self.index(), keyword='157683')
+        self.assertEqual(caught.exception.code, 'INDEX_COVERAGE_INCOMPLETE')
+
+    def test_keyword_and_filters_match_raw_oracle_all_fields_and_pages(self):
+        from app.raw_binlog_query import matches
+        file_id = self.add_raw(1)
+        index = self.index()
+        rows = list(self.rows(file_id))
+        for i, row in enumerate(rows):
+            row.update(sql_text='用户 157683 foo' if i % 3 else '用户 bar',
+                       execution_status='success' if i % 2 else 'failed',
+                       connection_name='prod', database_account='reader')
+        self.build(index, file_id, rows)
+        for filters in ({'keyword': '157683'}, {'keyword': '157683 foo'},
+                        {'keyword': '157683 bar', 'keyword_mode': 'OR'},
+                        {'keyword': '用户'}, {'keyword': 'F'}, {'keyword': 'missing'},
+                        {'keyword': '157683', 'status': 'success', 'account': 'read', 'connection': 'prod'}):
+            expected = [r for r in reversed(rows) if matches(None, r, filters, 100, 200, {})]
+            for offset in (0, 3, 9):
+                result = self.query(index, **filters, limit=3, offset=offset)
+                self.assertEqual(result['rows'], expected[offset:offset+3], (filters, offset))
+                self.assertEqual(result['has_more'], len(expected)>offset+3)
+                self.assertEqual(result['range_requests'], 0)
+
+    def test_filtered_primary_key_uses_index_and_preserves_status(self):
+        file_id = self.add_raw(1)
+        index = self.index()
+        rows = list(self.rows(file_id))
+        rows[3]['execution_status'] = 'success'
+        self.build(index, file_id, rows)
+        self.assertEqual(self.query(index, exact={'value': '103'}, status='success')['rows'], [rows[3]])
+        self.assertEqual(self.query(index, exact={'value': '103'}, status='failed')['rows'], [])
+
+    def test_keyword_stops_after_page_and_one_lookahead_not_full_count(self):
+        file_id = self.add_raw(1)
+        index = self.index()
+        self.build(index, file_id)
+        from app.raw_binlog_query import matches
+        with patch('app.raw_binlog_query.matches', wraps=matches) as predicate:
+            result = self.query(index, keyword='payload', limit=3)
+        self.assertEqual(predicate.call_count, 4)
+        self.assertTrue(result['has_more'])
+        self.assertEqual(len(result['rows']), 3)
+
+    def test_keyword_deadline_never_returns_partial_page(self):
+        from app.query_tasks import QueryControl, QueryDeadlineExceeded
+        file_id = self.add_raw(1)
+        index = self.index()
+        self.build(index, file_id)
+        control = QueryControl('fixture', self.metadata, deadline=float('inf'))
+        from app.raw_binlog_query import matches
+        def expire(*args):
+            control.deadline = 0
+            return matches(*args)
+        with patch('app.raw_binlog_query.matches', side_effect=expire):
+            with self.assertRaises(QueryDeadlineExceeded):
+                index.query({'instance':'test','database':'db','table':'one','source':'binlog','keyword':'payload'}, 100, 200, control=control)
+
+    def test_binlog_http_parsers_require_index_even_for_legacy_clients(self):
+        from app.server import _event_query, _event_query_payload
+        self.assertTrue(_event_query({'source':['binlog']})['indexed_only'])
+        self.assertTrue(_event_query_payload({'source':'binlog','keyword':'157683'})['indexed_only'])
+        with self.assertRaisesRegex(ValueError, '不允许退回'):
+            _event_query_payload({'source':'binlog','indexedOnly':False})
+        self.assertFalse(_event_query_payload({'source':'slowlog'})['indexed_only'])
+
+    def test_indexed_request_does_not_queue_behind_busy_worker(self):
+        import threading
+        from app.query_tasks import QueryTaskManager, QueryBusy
+        ready, release = threading.Event(), threading.Event()
+        def query(*args, **kwargs):
+            ready.set()
+            release.wait(5)
+            return {'rows': []}
+        storage = Mock(query_events_tiered=query)
+        manager = QueryTaskManager(self.metadata, storage, settings_loader=lambda: None,
+                                   archive_loader=Mock(), max_workers=1)
+        try:
+            manager.submit({'indexed_only': True})
+            self.assertTrue(ready.wait(2))
+            with self.assertRaises(QueryBusy):
+                manager.submit({'indexed_only': True})
+        finally:
+            release.set()
+            manager.shutdown()
+
+    def test_deadline_after_result_write_never_publishes_or_leaks_result(self):
+        import time
+        from app.query_tasks import QueryTaskManager
+        manager = QueryTaskManager(self.metadata, Mock(query_events_tiered=Mock(return_value={'rows': []})),
+                                   settings_loader=lambda: None, archive_loader=Mock())
+        self.addCleanup(manager.shutdown)
+        write = manager._write_result
+        def expire(task_id, result):
+            output = write(task_id, result)
+            manager._controls[task_id].deadline = 0
+            return output
+        with patch.object(manager, '_write_result', side_effect=expire):
+            task_id = manager.submit({'indexed_only': True})
+            until = time.monotonic()+5
+            while True:
+                task = manager.get(task_id)
+                if task['status'] not in {'queued', 'running'}:
+                    break
+                self.assertLess(time.monotonic(), until)
+                time.sleep(.01)
+        self.assertEqual(task['status'], 'failed')
+        self.assertEqual(task['error_code'], 'QUERY_DEADLINE_EXCEEDED')
+        self.assertIsNone(task['result'])
+        self.assertEqual(list(manager.result_dir.glob('*.json.gz')), [])
 
     def test_http_fast_query_coverage_assets_and_detail_need_no_oss(self):
         import threading
@@ -223,7 +331,7 @@ class RawEventIndexTests(unittest.TestCase):
             self.assertEqual(coverage['intervals'], [[100, 200]])
             self.assertNotIn('_valid_files', coverage)
             task = json.loads(request('/api/query-tasks', {'indexedOnly': True, 'source': 'binlog', 'instance': 'test',
-                'database': 'db', 'table': 'one', 'startEpochUs': 100, 'endEpochUs': 200, 'limit': 10}))['data']
+                'database': 'db', 'table': 'one', 'keyword': 'payload', 'startEpochUs': 100, 'endEpochUs': 200, 'limit': 10}))['data']
             deadline = time.monotonic()+10
             while True:
                 state = json.loads(request('/api/query-task?id='+task['taskId']))['data']
@@ -238,6 +346,8 @@ class RawEventIndexTests(unittest.TestCase):
             detail = json.loads(request('/api/event?'+urllib.parse.urlencode({
                 'id': first['event_id'], 'locator': first['event_locator'], 'instance': 'test'})))['data']
             self.assertEqual(detail, first)
+            direct = json.loads(request('/api/events?source=binlog&instance=test&database=db&table=one&keyword=payload&startEpochUs=100&endEpochUs=200&limit=10'))['data']
+            self.assertEqual(direct['rows'], state['result']['rows'])
             forbidden.assert_not_called()
 
     def test_supported_order_uses_index_not_temp_sort(self):

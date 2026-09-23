@@ -104,18 +104,50 @@ test('stale interval response cannot overwrite a newer scope or custom input', a
   assert.equal(node('filter-end').value, '2026-09-19T01:02:03');
 });
 
-test('primary-key mode forbids scan fallback and disables unrelated filters', async () => {
+test('primary-key mode forbids scan fallback and preserves explicit filters', async () => {
   const {run, node, requests} = uiFixture();
   node('filter-query-mode').value = 'primary-key';
   node('filter-keyword').value = '5917';
   node('filter-account').value = 'old account';
   run('syncQueryMode()');
-  assert.equal(node('filter-account').value, '');
-  assert.equal(node('filter-account').disabled, true);
+  assert.equal(node('filter-account').value, 'old account');
+  assert.equal(node('filter-account').disabled, false);
   const pending = run('setQuickRange("24h")');
   requests[0].resolve({intervals: [[1_790_000_000_000_000, 1_790_000_010_000_000]], pendingFiles: 0});
   await pending;
   assert.equal(run('eventQueryPayload().exact.fallback'), 'error');
+});
+
+test('keyword query is index-only, retains user filters and never selects scan mode', async () => {
+  const {run, node, requests} = uiFixture();
+  node('filter-query-mode').value = 'keyword';
+  node('filter-keyword').value = '157683';
+  node('filter-status').value = 'success';
+  run('syncQueryMode()');
+  const pending = run('setQuickRange("24h")');
+  requests[0].resolve({intervals: [[1_790_000_000_000_000, 1_790_000_010_000_000]], pendingFiles: 0});
+  await pending;
+  const payload = run('eventQueryPayload()');
+  assert.equal(payload.indexedOnly, true);
+  assert.equal(payload.source, 'binlog');
+  assert.equal(payload.keyword, '157683');
+  assert.equal(payload.status, 'success');
+  assert.equal(node('filter-keyword-mode').disabled, false);
+  assert.equal(node('filter-value-field').hidden, false);
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  assert.ok(!html.includes('可能扫描原档'));
+});
+
+test('other source keyword searches retain their own query route', () => {
+  const {run, node} = uiFixture();
+  node('filter-query-mode').value = 'keyword';
+  node('filter-source').value = 'slowlog';
+  node('filter-keyword').value = 'SELECT';
+  run('syncQueryMode()');
+  const payload = run('eventQueryPayload()');
+  assert.equal(payload.source, 'slowlog');
+  assert.equal(payload.keyword, 'SELECT');
+  assert.equal(payload.indexedOnly, undefined);
 });
 
 test('empty coverage never substitutes wall clock', () => {

@@ -285,6 +285,7 @@ def benchmark_raw_events(path, root):
     from app.metadata import MetadataStore
     from app.raw_binlog import RawBinlogStore
     from app.raw_event_index import RawEventIndex
+    from app.raw_binlog_query import matches
     from app.exact_index import ExactIndex
     from app.rds_api import RemoteBinlog
     from app.config import Settings
@@ -321,9 +322,14 @@ def benchmark_raw_events(path, root):
     results = []
     for name, query in [('time', scope), ('page', {**scope, 'offset': 10}),
         ('pk-positive', {**scope, 'exact': {'value': json.loads(selected['after_json'])['id']}}),
-        ('pk-negative', {**scope, 'exact': {'value': -9999}})]:
+        ('pk-negative', {**scope, 'exact': {'value': -9999}}),
+        ('keyword-positive', {**scope, 'keyword': str(json.loads(selected['after_json'])['id'])}),
+        ('keyword-negative', {**scope, 'keyword': 'no-such-index-token-8372'}),
+        ('keyword-page', {**scope, 'keyword': 'id', 'offset': 10}),
+        ('keyword-filtered', {**scope, 'keyword': 'id', 'status': 'success', 'operations': ['UPDATE']})]:
         start = time.perf_counter()
         filtered = [r for r in rows if r['database_name'] == query['database'] and r['table_name'] == query['table']
+            and matches(None, r, {**query, 'exact': None}, lo, hi, {})
             and (not query.get('exact') or any(json.loads(r[column]).get('id') == query['exact']['value'] for column in ('before_json', 'after_json')))]
         expected, more = page(filtered, query)
         oracle_seconds = time.perf_counter()-start
@@ -332,6 +338,7 @@ def benchmark_raw_events(path, root):
             start = time.perf_counter()
             result = index.query(query, lo, hi)
             timings.append(time.perf_counter()-start)
+            assert timings[-1] < 60, 'indexed query missed one-minute budget'
             assert result['rows'] == expected and result['has_more'] == more, name
             assert result['range_requests'] == 0
         results.append({'case': name, 'oracle_seconds': oracle_seconds, 'indexed_seconds': timings,

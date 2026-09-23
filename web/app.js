@@ -157,14 +157,18 @@ function switchView(name) {
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
+function isIndexedBinlogQuery() {
+  return $("#filter-query-mode").value !== "keyword" || ["", "binlog"].includes($("#filter-source").value);
+}
+
 let indexedRangeRequest = 0;
 async function setQuickRange(range) {
   const request = ++indexedRangeRequest;
   const units = { "15m": 15 * 60_000, "1h": 60 * 60_000, "24h": 24 * 60 * 60_000, "7d": 7 * 24 * 60 * 60_000, "30d": 30 * 24 * 60 * 60_000 };
   $("#audit-range").value = range;
-  const fast = $("#filter-query-mode").value !== "keyword";
+  const fast = isIndexedBinlogQuery();
   const hint = $("#indexed-range-hint");
-  if (fast || $("#filter-source").value === "binlog") {
+  if (fast) {
     $("#filter-start").value = "";
     $("#filter-end").value = "";
     $("#filter-end").setCustomValidity("正在读取已索引区间");
@@ -195,7 +199,7 @@ async function setQuickRange(range) {
   $("#filter-end").value = toLocalInput(end);
   $("#filter-end").setCustomValidity("");
   $("#filter-start").value = toLocalInput(new Date(end.getTime() - units[range]));
-  hint.textContent = "高级查询：时间按已有事件水位选择，不承诺使用 Binlog 精确索引。";
+  hint.textContent = "其他来源按已有事件水位选择；Binlog 只查询完整已索引区间。";
 }
 
 function setDefaultSyncWindow() {
@@ -264,7 +268,7 @@ function eventQueryPayload() {
   };
   if (params.has("startEpochUs")) payload.startEpochUs = Number(params.get("startEpochUs"));
   if (params.has("endEpochUs")) payload.endEpochUs = Number(params.get("endEpochUs"));
-  const fast = $("#filter-query-mode").value !== "keyword";
+  const fast = isIndexedBinlogQuery();
   if (fast) {
     if (!payload.instance || !payload.database || !payload.table) throw new Error("索引快查需要选择实例并填写完整库名、表名");
     if (!params.has("startEpochUs") || !params.has("endEpochUs")) throw new Error("请先选择可用的已索引区间");
@@ -284,23 +288,22 @@ function eventQueryPayload() {
 function syncQueryMode() {
   const mode = $("#filter-query-mode").value;
   const exact = mode === "primary-key";
-  const fast = mode !== "keyword";
+  const fast = isIndexedBinlogQuery();
   if (fast) $("#filter-source").value = "binlog";
-  $("#filter-source").disabled = fast;
+  $("#filter-source").disabled = mode !== "keyword";
   $("#filter-keyword").disabled = mode === "indexed-time";
   $("#filter-value-field").hidden = mode === "indexed-time";
   for (const id of ["connection", "account", "status"]) {
-    $("#filter-" + id).disabled = fast;
-    if (fast) $("#filter-" + id).value = "";
+    $("#filter-" + id).disabled = false;
   }
   $("#filter-value-label").textContent = exact ? "主键值" : "关键词";
   $("#filter-keyword").placeholder = exact ? "例如 3521" : "SQL、行值、GTID 或文件名";
-  $("#filter-keyword-mode").disabled = fast;
-  $("#filter-keyword-mode-field").classList.toggle("is-disabled", fast);
+  $("#filter-keyword-mode").disabled = mode !== "keyword";
+  $("#filter-keyword-mode-field").classList.toggle("is-disabled", mode !== "keyword");
   $("#filter-database").placeholder = fast ? "完整数据库名" : "支持片段匹配";
   $("#filter-table").placeholder = fast ? "完整表名" : "支持片段匹配";
   $("#query-export").disabled = fast;
-  $("#query-export").title = fast ? "索引结果请在任务列表中查看；批量导出使用高级查询" : "导出 CSV";
+  $("#query-export").title = fast ? "索引结果请在任务列表中查看，不会为导出扫描原档" : "导出 CSV";
 }
 
 function validateEventRange() {
@@ -932,8 +935,8 @@ async function saveSettings() {
 }
 
 async function downloadExport() {
-  if ($("#filter-query-mode").value === "primary-key") {
-    throw new Error("主键精确结果请直接在查询任务中查看详情");
+  if (isIndexedBinlogQuery()) {
+    throw new Error("索引结果请直接在查询任务中查看详情；不会为导出扫描原档");
   }
   const button = $("#query-export");
   await withBusy(button, async () => {
@@ -2134,6 +2137,7 @@ function bindEvents() {
   });
   for (const name of ["instance", "database", "table", "source"]) {
     $("#filter-" + name).addEventListener("change", () => {
+      syncQueryMode();
       if ($("#audit-range").value !== "custom") setQuickRange($("#audit-range").value);
     });
   }
@@ -2160,7 +2164,7 @@ function bindEvents() {
     $("#filter-account").value = "";
     $("#filter-status").value = "";
     $("#filter-keyword-mode").value = "AND";
-    $("#filter-query-mode").value = "indexed-time";
+    $("#filter-query-mode").value = "keyword";
     syncQueryMode();
     $$(".operation-filter input").forEach((item) => { item.checked = false; });
     setQuickRange("24h");

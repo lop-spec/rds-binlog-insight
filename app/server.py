@@ -149,6 +149,9 @@ def _event_query(query: dict[str, list[str]]) -> dict[str, Any]:
         value = _query_value(query, source)
         if value:
             result[target] = int(value)
+    if result['source'].lower() == 'binlog':
+        result['source'] = 'binlog'
+        result['indexed_only'] = True
     return result
 
 
@@ -247,9 +250,14 @@ def _event_query_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("limit 必须在 1 到 1000 之间")
     if not 0 <= result["offset"] <= 100_000:
         raise ValueError("offset 必须在 0 到 100000 之间")
-    indexed_only = payload.get('indexedOnly', payload.get('indexed_only', False))
+    binlog_only = result['source'].lower() == 'binlog'
+    indexed_only = payload.get('indexedOnly', payload.get('indexed_only', binlog_only))
     if not isinstance(indexed_only, bool):
         raise ValueError('indexedOnly 必须是布尔值')
+    if binlog_only and not indexed_only:
+        raise ValueError('Binlog 查询只允许完整已索引区间，不允许退回原档扫描')
+    if binlog_only:
+        result['source'] = 'binlog'
     result['indexed_only'] = indexed_only
     exact_value = payload.get("exact")
     if exact_value is not None:
@@ -856,7 +864,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     archive_options["archive_factory"] = (
                         lambda: self.app.sync.archive_for_settings(settings)
                     )
-                else:
+                elif not event_query.get('indexed_only'):
                     archive = self.app.sync.archive_for_settings(settings)
                 result = self.app.storage.query_events_tiered(
                     event_query,
@@ -936,7 +944,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/export":
                 settings = self.app.metadata.load_settings()
                 event_query = _event_query(query)
-                archive = self.app.sync.archive_for_settings(settings)
+                archive = None if event_query.get('indexed_only') else self.app.sync.archive_for_settings(settings)
                 try:
                     path, count = self.app.storage.export_csv_tiered(
                         event_query,

@@ -79,19 +79,39 @@ Primary-key history is the most selective lookup. Time shortcuts end at the most
 recent continuous certified interval, clip to it without crossing holes, and
 never substitute wall-clock time when no interval exists. A custom interval is
 revalidated at execution; no automatic widening, clipping, or raw-scan fallback.
-Advanced queries retain the previous bounded raw/legacy path. Fast queries and
-cached details do not initialize OSS. Fast execution has a 10-second deadline,
-a 32 MiB result budget and pagination depth 2,000; failure returns no partial page.
+Binlog keyword, status, account and connection filters read the same covering
+index, with the raw decoder's matching semantics. Ordered cursors stop after a
+page plus one lookahead; they do not count all matches or build another index.
+Two query-local decoded blocks are cached (at most 64 MiB), discarded at request
+end; misses load the committed SQLite payload, never an archive. Broad negative
+keywords may still traverse all scoped indexed rows and require measurement.
+
+The UI has no raw-scan mode. Binlog GET and POST default to indexed-only, and POST
+rejects explicit `indexedOnly=false`. Other source types retain their existing route.
+Indexed queries and cached details do not initialize OSS. Execution has a
+50-second deadline and tasks a 55-second submission budget, leaving room for
+result delivery within the **60-second acceptance target**. Busy execution slots
+reject new indexed tasks instead of queueing them behind long scans. A timeout
+or busy response is a failure, not evidence that the target was achieved. The
+32 MiB result budget and pagination depth 2,000 remain; failure returns no partial
+page. No historical source data, checksums or legacy indexes are removed.
 
 Before production adoption, measure original-file throughput and tail latency
 with/without the worker under identical limits, index bytes/event, ongoing source
-rate, and backlog. Check both cold and warm equal-content queries over at least
-1 TB; the small fixture below does not establish that target or 100× speedup.
+rate, and backlog. For the current acceptance target, measure submission through
+visible result delivery within 60 seconds, retaining the user's filters and
+restricting queries to certified indexed intervals. Include positive, negative,
+pagination and concurrent requests. Small fixtures and deadline settings do not
+establish this production target. Earlier 100× / 1 TB measurements likewise must
+not be claimed from the fixture.
 Disable the archive switch **only on the indexer** to stop this new work without
 changing collection. The older raw-aware query image can still read every original
 archive; keep the derived file for investigation/reuse, rather than deleting data.
 
-## Query safety and compatibility
+## Legacy raw engine safety and compatibility
+
+The following bounded engine remains for internal compatibility and recovery;
+it is not the Binlog GET/POST indexed-only query route or a UI scan option.
 
 - Snapshot the union of legacy physical source IDs and eligible raw IDs once at
   execution. One task reads sequential batches of at most **16 files and 8 GiB**;

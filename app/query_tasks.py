@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import os
 import threading
 import time
@@ -11,13 +12,23 @@ from typing import Any, Callable
 
 from .metadata import MetadataStore
 
+LOGGER = logging.getLogger(__name__)
+
 
 class QueryCancelled(RuntimeError):
     code = "QUERY_CANCELLED"
 
 
+class QueryBusy(RuntimeError):
+    code = 'QUERY_BUSY'
+
+
+class QueryDeadlineExceeded(RuntimeError):
+    code = 'QUERY_DEADLINE_EXCEEDED'
+
+
 class QueryControl:
-    def __init__(self, task_id: str, metadata: MetadataStore):
+    def __init__(self, task_id: str, metadata: MetadataStore, *, deadline: float | None = None):
         self.task_id = task_id
         self.metadata = metadata
         self._cancelled = threading.Event()
@@ -25,6 +36,7 @@ class QueryControl:
         self._completed_parts = 0
         self._scanned_bytes = 0
         self._last_flush = 0.0
+        self.deadline = deadline
 
     def cancel(self) -> None:
         self._cancelled.set()
@@ -32,6 +44,8 @@ class QueryControl:
     def check_cancelled(self) -> None:
         if self._cancelled.is_set():
             raise QueryCancelled("查询已取消")
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise QueryDeadlineExceeded('索引查询总耗时超过55秒（含排队），未返回不完整结果')
 
     def set_plan(
         self,
@@ -156,11 +170,14 @@ class QueryTaskManager:
         )
 
     def submit(self, query: dict[str, Any]) -> str:
+        deadline = time.monotonic()+55 if query.get('indexed_only') else None
         with self._lock:
             if self._closing:
                 raise RuntimeError("查询任务管理器正在停止")
+            if query.get('indexed_only') and len(self._controls) >= self.max_workers:
+                raise QueryBusy('查询执行槽已满，请稍后重试；索引查询不会排队等待原档扫描')
             task_id = self.metadata.create_query_task(dict(query))
-            control = QueryControl(task_id, self.metadata)
+            control = QueryControl(task_id, self.metadata, deadline=deadline)
             self._controls[task_id] = control
             self._futures[task_id] = self._executor.submit(
                 self._run,
@@ -202,6 +219,14 @@ class QueryTaskManager:
             control.check_cancelled()
             control.flush()
             result_path, result_bytes = self._write_result(task_id, result)
+            try:
+                control.check_cancelled()
+            except (QueryCancelled, QueryDeadlineExceeded):
+                try:
+                    (self.result_dir / result_path).unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.exception('Failed to remove unpublished result for task %s', task_id)
+                raise
             self.metadata.finish_query_task(
                 task_id,
                 "succeeded",

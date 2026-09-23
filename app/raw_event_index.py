@@ -6,6 +6,8 @@ separately from covering keys, so ordered LIMIT does not decode discarded rows.
 from __future__ import annotations
 
 import hashlib
+import heapq
+from functools import lru_cache
 import json
 import logging
 import sqlite3
@@ -354,16 +356,16 @@ class RawEventIndex:
         for name in ('instance', 'database', 'table'):
             if not str(query.get(name) or '').strip():
                 raise RawBinlogError('索引快查要求单实例、完整库名和表名', 'INDEX_QUERY_SCOPE_REQUIRED')
-        if str(query.get('source') or '') != 'binlog' or any(query.get(k) for k in ('keyword', 'connection', 'account', 'status', 'fingerprint')):
-            raise RawBinlogError('此条件不支持索引快查；请显式选择高级扫描', 'INDEX_QUERY_UNSUPPORTED')
+        if str(query.get('source') or '') != 'binlog' or query.get('fingerprint'):
+            raise RawBinlogError('此条件不支持行级索引查询；不会扫描原档', 'INDEX_QUERY_UNSUPPORTED')
         if not self.path.exists():
             raise RawBinlogError('后台尚未完成事件索引', 'INDEX_COVERAGE_INCOMPLETE')
-        until = time.monotonic()+10
+        until = time.monotonic()+50
         def check():
             if control is not None:
                 control.check_cancelled()
             if time.monotonic() >= until:
-                raise RawBinlogError('索引查询超过10秒，未返回不完整结果', 'QUERY_DEADLINE_EXCEEDED')
+                raise RawBinlogError('索引查询超过50秒，未返回不完整结果', 'QUERY_DEADLINE_EXCEEDED')
         check()
         catalog = self.catalog({**query, 'exact': query.get('exact') or {'kind': 'SCOPE'}}, control=SimpleNamespace(check_cancelled=check))
         check()
@@ -401,35 +403,56 @@ class RawEventIndex:
                 if exact:
                     if conn.execute('SELECT 1 FROM events e WHERE '+where+' AND e.pk_state=\'unknown\' LIMIT 1', args).fetchone():
                         raise RawBinlogError('区间内存在无法验证的历史主键schema', 'EXACT_SCHEMA_UNKNOWN')
-                    candidates = []
+                    streams = []
                     type_ids = [r[0] for r in conn.execute('SELECT DISTINCT type_id FROM types WHERE db=? AND tbl=? AND file_id IN (SELECT id FROM eligible)', (scope[1], scope[2]))]
                     for type_id in type_ids:
                         key = canonical_value(exact['value'], type_id, query=True)
                         if key is None:
                             raise RawBinlogError('主键值与历史字段类型不匹配', 'EXACT_SCHEMA_UNKNOWN')
-                        sql = '''SELECT e.event_id,e.stamp,e.filename,e.position,e.ordinal FROM keys k JOIN events e ON e.event_id=k.event_id
+                        sql = '''SELECT e.* FROM keys k JOIN events e ON e.event_id=k.event_id
                             WHERE k.instance=? AND k.db=? AND k.tbl=? AND k.type_id=? AND k.value=? AND k.stamp BETWEEN ? AND ? AND '''+where
-                        sql += ' ORDER BY '+','.join('k.'+piece.strip() for piece in ORDER.split(','))+' LIMIT ?'
-                        candidates.extend(conn.execute(sql, [*scope[:3], type_id, key, start, end, *args, offset+limit+1]).fetchall())
+                        sql += ' ORDER BY '+','.join('k.'+piece.strip() for piece in ORDER.split(','))
+                        streams.append(conn.execute(sql, [*scope[:3], type_id, key, start, end, *args]))
+                    candidates = heapq.merge(*streams, key=lambda r: (r['stamp'], r['filename'], r['position'], r['ordinal'], r['event_id']), reverse=True)
                 else:
-                    sql = 'SELECT e.event_id,e.stamp,e.filename,e.position,e.ordinal FROM events e WHERE '+where+' ORDER BY '+','.join('e.'+p.strip() for p in ORDER.split(','))+' LIMIT ?'
-                    candidates = conn.execute(sql, [*args, offset+limit+1]).fetchall()
-                unique = {r['event_id']: r for r in candidates}
-                ordered = sorted(unique.values(), key=lambda r: (r['stamp'], r['filename'], r['position'], r['ordinal'], r['event_id']), reverse=True)
-                rows, size, block_id, block = [], 0, None, []
-                for record in ordered[offset:offset+limit]:
+                    sql = 'SELECT e.* FROM events e INDEXED BY event_time WHERE '+where+' ORDER BY '+','.join('e.'+p.strip() for p in ORDER.split(','))
+                    candidates = conn.execute(sql, args)
+                # Stream an already scoped, ordered index. Never enumerate all
+                # matches, decode the archive, or rebuild indexes on demand.
+                # Two query-local blocks bound cache memory to 64 MiB; source
+                # eligibility and payloads share this SQLite read snapshot.
+                from .raw_binlog_query import matches
+                block = lru_cache(maxsize=2)(lambda block_id: self._payload_block(conn, block_id))
+                filters = {**query, 'exact': None}  # PK is verified by keys above.
+                filtered = any(query.get(k) for k in ('keyword', 'connection', 'account', 'status'))
+                rows, size, matched, seen = [], 0, 0, set()
+                try:
+                    for record in candidates:
+                        check()
+                        if record['event_id'] in seen:
+                            continue
+                        plain = row = None
+                        if filtered:
+                            plain = block(record['payload_id'])[record['payload_ordinal']]
+                            row = json.loads(plain)
+                            if not matches(None, row, filters, start, end, {}):
+                                continue
+                        seen.add(record['event_id'])
+                        matched += 1
+                        if matched > offset+limit:
+                            break
+                        if matched <= offset:
+                            continue
+                        if plain is None:
+                            plain = block(record['payload_id'])[record['payload_ordinal']]
+                        size += len(plain)
+                        if size > 32*1024**2:
+                            raise RawBinlogError('索引结果超过32MiB预算', 'RAW_QUERY_RESULT_LIMIT')
+                        rows.append(row if row is not None else json.loads(plain))
                     check()
-                    payload = conn.execute('SELECT payload_id,payload_ordinal FROM events WHERE event_id=?', (record['event_id'],)).fetchone()
-                    if block_id != payload['payload_id']:
-                        block = self._payload_block(conn, payload['payload_id'])
-                        block_id = payload['payload_id']
-                    plain = block[payload['payload_ordinal']]
-                    size += len(plain)
-                    if size > 32*1024**2:
-                        raise RawBinlogError('索引结果超过32MiB预算', 'RAW_QUERY_RESULT_LIMIT')
-                    rows.append(json.loads(plain))
-                check()
-                return {'rows': rows, 'has_more': len(ordered)>offset+limit,
+                finally:
+                    block.cache_clear()
+                return {'rows': rows, 'has_more': matched>offset+limit,
                     'limit': limit, 'offset': offset, 'tiers_used': ['raw-event-index'],
                     'range_requests': 0, 'range_bytes': 0, 'exact_index_complete': True,
                     'coverage_found': True, 'range_start_epoch_us': start, 'range_end_epoch_us': end,

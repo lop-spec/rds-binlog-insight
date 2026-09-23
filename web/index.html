@@ -90,12 +90,12 @@
       <section id="view-audit" class="view is-active">
         <div class="query-panel">
           <div class="panel-heading">
-            <div><h2>查询条件</h2><p>优先按完整库表＋主键查记录历史，或按库表＋时间浏览变更。采集不等待后台索引；快查只返回索引完整区间，支持取消。</p></div>
+            <div><h2>查询条件</h2><p>按完整库表＋关键词查询，或用主键查记录历史。Binlog 只查完整已索引区间，不扫描原档；采集不等待后台索引，查询支持取消。</p></div>
             <label class="range-picker">时间范围<select id="audit-range" aria-label="查询时间范围"><option value="15m">最近可查 15 分钟</option><option value="1h">最近可查 1 小时</option><option value="24h" selected>最近可查 24 小时</option><option value="7d">最近可查 7 天</option><option value="30d">最近可查 30 天</option><option value="custom">自定义</option></select></label>
           </div>
 
           <form id="query-form" class="query-grid">
-            <label class="field span-2"><span>查询方式</span><select id="filter-query-mode"><option value="indexed-time" selected>已索引变更 · 推荐</option><option value="primary-key">主键历史 · 精确</option><option value="keyword">高级查询 · 可能扫描原档</option></select></label>
+            <label class="field span-2"><span>查询方式</span><select id="filter-query-mode"><option value="keyword" selected>关键词 · 仅已索引 Binlog</option><option value="indexed-time">已索引变更</option><option value="primary-key">主键历史 · 精确</option></select></label>
             <label class="field span-2"><span>实例</span><select id="filter-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
             <label class="field span-2"><span>数据库</span><input id="filter-database" type="text" placeholder="完整数据库名"></label>
             <label class="field span-2"><span>表名</span><input id="filter-table" type="text" placeholder="完整表名"></label>
@@ -134,7 +134,7 @@
 
         <section class="query-tasks" aria-labelledby="query-task-title">
           <div class="section-heading query-task-heading">
-            <div><h2 id="query-task-title">查询任务</h2><span>每次查询独立运行；可同时排队、切换结果或停止</span></div>
+            <div><h2 id="query-task-title">查询任务</h2><span>每次查询独立运行；可切换结果或停止，索引查询不排队等待原档扫描</span></div>
             <span id="query-task-summary" class="query-task-summary">暂无任务</span>
           </div>
           <div id="query-task-list" class="query-task-list"></div>
@@ -143,7 +143,7 @@
 
         <div class="notice info compact-notice">
           <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg>
-          <span><span id="indexed-range-hint" role="status" aria-live="polite">选择实例和完整库表后，时间快捷项会对齐已索引区间。</span> 主键历史要求可验证的历史 schema；缺失或不支持时明确报错。高级查询保留原档分批扫描，不会在快查失败时自动启动。</span>
+          <span><span id="indexed-range-hint" role="status" aria-live="polite">选择实例和完整库表后，时间快捷项会对齐已索引区间。</span> 主键历史要求可验证的历史 schema；缺失或不支持时明确报错。Binlog 关键词查询同样只读完整已索引区间；缺失区间明确提示，不扫描原档、不返回成功残页。</span>
         </div>
 
         <div class="result-section">
