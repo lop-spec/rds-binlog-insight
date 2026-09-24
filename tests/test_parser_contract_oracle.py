@@ -40,6 +40,19 @@ class ParserContractOracleTests(unittest.TestCase):
             self.assertEqual(proof['fields'], 47)
             self.assertTrue(proof['transport_equal'])
             self.assertFalse(proof['native_arrow_producer'])
+            self.assertEqual(proof['transport_fields'], 41)
+            native = compare_columnar(source, root / 'compare-native', 'f' * 64,
+                                      native_arrow=root / 'compare/input.arrow')
+            self.assertTrue(native['transport_equal'])
+            self.assertTrue(native['native_arrow_producer'])
+            self.assertEqual(native['arrow_record_batches'], 2)
+            changed = root / 'changed.ndjson'
+            changed_rows = json.loads(json.dumps(rows))
+            changed_rows[0]['operation'] = 'UPDATE'
+            changed.write_text('\n'.join(json.dumps(row) for row in changed_rows), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'native Arrow values'):
+                compare_columnar(changed, root / 'compare-mismatch', 'f' * 64,
+                                 native_arrow=root / 'compare/input.arrow')
 
     def test_identity_failure_retains_a_failed_report(self):
         with tempfile.TemporaryDirectory() as directory:

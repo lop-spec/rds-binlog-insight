@@ -30,6 +30,23 @@ event types and duplicate FDE are rejected, and each rows event must reference
 an observed TableMap ID. Contract runs additionally require GTID and (for ROW)
 TableMap coverage.
 
+`--arrow-output PATH` bypasses the NDJSON encoder and writes the parser's exact
+41-field transport schema as an uncompressed Arrow IPC file. The eleven
+collector/audit-only fields are typed nulls; the storage layer still adds the
+six source/time fields and applies the same normalization to produce the final
+47-field rows. Record batches are bounded by row count and estimated decoded
+bytes (defaults: 4096 rows and 32 MiB), while the complete IPC file has a hard
+128 MiB default and maximum matching the current reader contract. Unsigned
+values that cannot fit a signed transport field fail closed.
+
+The Arrow file is written exclusively to `PATH.part`, file-synced, then
+published without overwrite by a same-directory hard link; Linux directory
+metadata is synced before and after staging-link removal. Parse, checksum,
+context, bound, close, or publication failure removes staging output and never
+publishes a partial final file. The current option deliberately produces one
+bounded IPC file for candidate contracts. It is not yet the collector's
+chunk/ACK interface and is not selected in production.
+
 Build and test with the digest-pinned builder without publishing an image:
 
 ```sh

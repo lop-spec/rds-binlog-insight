@@ -90,16 +90,31 @@ def check_values(rows):
     return failures
 
 
-def compare_columnar(ndjson: Path, output: Path, source_id: str):
-    """Full 47-field/order/type/catalog transport check, not a native producer."""
+def compare_columnar(ndjson: Path, output: Path, source_id: str, *, native_arrow: Path | None = None):
+    """Compare parser transport and final 47 fields; native Arrow must match all 41 inputs."""
     rows = [json.loads(line) for line in ndjson.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not rows or any(set(row) - set(PARSER_JSON_COLUMNS) for row in rows):
         raise ValueError("empty or unknown native parser fields")
     output.mkdir(exist_ok=False)
-    table = pa.Table.from_pylist(rows, schema=parser_schema(PARSER_JSON_COLUMNS))
-    ipc = output / "input.arrow"
-    with pa.OSFile(str(ipc), "wb") as sink, pa.ipc.new_file(sink, table.schema) as writer:
-        writer.write_table(table, max_chunksize=2)
+    expected = pa.Table.from_pylist(rows, schema=parser_schema(PARSER_JSON_COLUMNS))
+    if native_arrow is None:
+        ipc = output / "input.arrow"
+        with pa.OSFile(str(ipc), "wb") as sink, pa.ipc.new_file(sink, expected.schema) as writer:
+            writer.write_table(expected, max_chunksize=2)
+        record_batches = None
+    else:
+        ipc = native_arrow
+        if not ipc.is_file():
+            raise ValueError("native Arrow parser output is missing")
+        with pa.memory_map(str(ipc), "r") as source:
+            reader = pa.ipc.open_file(source)
+            record_batches = reader.num_record_batches
+            direct = reader.read_all()
+        if (direct.column_names != list(PARSER_JSON_COLUMNS)
+                or not direct.schema.equals(expected.schema, check_metadata=True)):
+            raise ValueError("native Arrow producer changed the strict 41-field parser schema")
+        if not direct.equals(expected, check_metadata=True):
+            raise ValueError("native Arrow values or row order differ from candidate NDJSON")
     tables, catalogs = [], []
     for mode in ("ndjson", "arrow"):
         storage = EventStorage.__new__(EventStorage)
@@ -117,8 +132,11 @@ def compare_columnar(ndjson: Path, output: Path, source_id: str):
         tables.append(actual); catalogs.append([p["catalog"] for p in parts])
     if not tables[0].equals(tables[1], check_metadata=True) or catalogs[0] != catalogs[1]:
         raise ValueError("Arrow/NDJSON values, order, types or catalogs differ")
-    return dict(rows=len(rows), fields=len(EVENT_COLUMNS), transport_equal=True,
-                native_arrow_producer=False, independent_value_oracle=False)
+    return dict(rows=len(rows), transport_fields=len(PARSER_JSON_COLUMNS), fields=len(EVENT_COLUMNS),
+                transport_equal=True, native_arrow_producer=native_arrow is not None,
+                arrow_record_batches=record_batches, arrow_bytes=ipc.stat().st_size,
+                arrow_sha256=hashlib.sha256(ipc.read_bytes()).hexdigest(),
+                independent_value_oracle=False)
 
 
 def compare_decoders(legacy: Path, candidate: Path, output: Path, source_id: str, *, require_binary_repair=False):
@@ -180,18 +198,28 @@ def verify(root: Path):
     if report.exists():
         raise FileExistsError("retain existing oracle evidence; use a separate fixture directory")
     try:
+        candidate_binary = root / "candidate-binlog-parser-linux-amd64"
+        if (not candidate_binary.is_file()
+                or hashlib.sha256(candidate_binary.read_bytes()).hexdigest()
+                != contract["candidate_native_sha256"]):
+            raise ValueError("candidate binary evidence identity mismatch")
         for mode in ("STATEMENT", "ROW"):
             case = contract["cases"][mode]; directory = root / mode.lower()
             legacy = directory / "legacy.ndjson"
             candidate = directory / "candidate.ndjson"
+            candidate_arrow = directory / "candidate.arrow"
             for path, wanted in ((directory / "source.binlog", case["raw_sha256"]),
                                  (legacy, case["legacy_sha256"]),
-                                 (candidate, case["candidate_sha256"])):
+                                 (candidate, case["candidate_sha256"]),
+                                 (candidate_arrow, case["candidate_arrow_sha256"])):
                 if hashlib.sha256(path.read_bytes()).hexdigest() != wanted:
                     raise ValueError("frozen fixture identity mismatch: " + path.name)
+            if candidate_arrow.stat().st_size != case["candidate_arrow_bytes"]:
+                raise ValueError("native Arrow parser output size changed")
             result["transport"][mode] = {
                 "legacy": compare_columnar(legacy, directory / "legacy-columnar", case["source_id"]),
-                "candidate": compare_columnar(candidate, directory / "candidate-columnar", case["source_id"]),
+                "candidate": compare_columnar(candidate, directory / "candidate-columnar", case["source_id"],
+                                                native_arrow=candidate_arrow),
             }
             result["decoder_differential"][mode] = compare_decoders(
                 legacy, candidate, directory / "decoder-differential", case["source_id"],

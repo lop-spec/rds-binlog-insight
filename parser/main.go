@@ -110,8 +110,26 @@ type columnDescription struct {
 	PrimaryKey    bool   `json:"primary_key"`
 }
 
+type eventEncoder interface {
+	Encode(outputEvent) error
+}
+
+type jsonEventEncoder struct {
+	encoder *json.Encoder
+}
+
+func newJSONEventEncoder(writer io.Writer) *jsonEventEncoder {
+	encoder := json.NewEncoder(writer)
+	encoder.SetEscapeHTML(false)
+	return &jsonEventEncoder{encoder: encoder}
+}
+
+func (e *jsonEventEncoder) Encode(event outputEvent) error {
+	return e.encoder.Encode(event)
+}
+
 type extractor struct {
-	encoder            *json.Encoder
+	encoder            eventEncoder
 	afterEncode        func() error
 	sourceFileID       string
 	flavor             string
@@ -149,10 +167,12 @@ func truncateRunes(value string, limit int) string {
 	return value
 }
 
-func newExtractor(writer io.Writer, sourceFileID, flavor string) *extractor {
-	encoder := json.NewEncoder(writer)
-	encoder.SetEscapeHTML(false)
+func newExtractorWithEncoder(encoder eventEncoder, sourceFileID, flavor string) *extractor {
 	return &extractor{encoder: encoder, sourceFileID: sourceFileID, flavor: flavor}
+}
+
+func newExtractor(writer io.Writer, sourceFileID, flavor string) *extractor {
+	return newExtractorWithEncoder(newJSONEventEncoder(writer), sourceFileID, flavor)
 }
 
 func (x *extractor) resetStreamState() {
@@ -231,11 +251,11 @@ func (x *extractor) emit(record outputEvent) error {
 	sum := sha256.Sum256([]byte(stable))
 	record.EventID = hex.EncodeToString(sum[:])
 	if err := x.encoder.Encode(record); err != nil {
-		return fmt.Errorf("write JSONL event: %w", err)
+		return fmt.Errorf("write parser event: %w", err)
 	}
 	if x.afterEncode != nil {
 		if err := x.afterEncode(); err != nil {
-			return fmt.Errorf("publish JSONL event: %w", err)
+			return fmt.Errorf("publish parser event: %w", err)
 		}
 	}
 	x.emitted++
@@ -1357,6 +1377,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	outputDir := flags.String("output-dir", "", "publish atomic NDJSON chunks and emit manifests")
 	chunkMaxLines := flags.Int("chunk-max-lines", 200_000, "maximum records per NDJSON chunk")
 	chunkMaxBytes := flags.Int64("chunk-max-bytes", 384*1024*1024, "maximum bytes per NDJSON chunk")
+	arrowOutputPath := flags.String("arrow-output", "", "write one bounded, atomic Arrow IPC file instead of NDJSON")
+	arrowBatchRows := flags.Int("arrow-batch-rows", defaultArrowBatchRows, "maximum records per Arrow record batch")
+	arrowBatchBytes := flags.Int64("arrow-batch-bytes", defaultArrowBatchBytes, "maximum estimated bytes per Arrow record batch")
+	arrowMaxFileBytes := flags.Int64("arrow-max-file-bytes", defaultArrowMaxFileBytes, "hard maximum Arrow IPC file bytes")
 	slim := flags.Bool("slim", false, "row-store output: omit pseudo SQL, column metadata, base64 SQL and transaction boundaries; cut row_query to 65536 code points")
 	requireGTID := flags.Bool("require-gtid", false, "reject a stream that contains no GTID context")
 	requireTableMap := flags.Bool("require-table-map", false, "reject a stream that contains no TableMap context")
@@ -1384,30 +1408,56 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		fmt.Fprintln(stderr, "--input and --source-file-id are required")
 		return 2
 	}
+	if strings.TrimSpace(*arrowOutputPath) != "" && strings.TrimSpace(*outputDir) != "" {
+		fmt.Fprintln(stderr, "--arrow-output and --output-dir are mutually exclusive")
+		return 2
+	}
+	if err := validateArrowLimits(*arrowBatchRows, *arrowBatchBytes, *arrowMaxFileBytes); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	normalizedFlavor := strings.ToLower(strings.TrimSpace(*flavor))
 	if normalizedFlavor != "mysql" && normalizedFlavor != "mariadb" {
 		fmt.Fprintln(stderr, "--flavor must be mysql or mariadb")
 		return 2
 	}
 	var output *chunkedOutput
+	var arrowOutput *atomicArrowOutput
+	var encoder eventEncoder
 	writer := stdout
-	if strings.TrimSpace(*outputDir) != "" {
+	if strings.TrimSpace(*arrowOutputPath) != "" {
 		var err error
-		output, err = newChunkedOutput(
-			*outputDir,
-			*sourceFileID,
-			*chunkMaxLines,
-			*chunkMaxBytes,
-			stdout,
-			stdin,
+		arrowOutput, err = newAtomicArrowOutput(
+			*arrowOutputPath,
+			*arrowBatchRows,
+			*arrowBatchBytes,
+			*arrowMaxFileBytes,
 		)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 2
 		}
-		writer = output
+		encoder = arrowOutput
+	} else {
+		if strings.TrimSpace(*outputDir) != "" {
+			var err error
+			output, err = newChunkedOutput(
+				*outputDir,
+				*sourceFileID,
+				*chunkMaxLines,
+				*chunkMaxBytes,
+				stdout,
+				stdin,
+			)
+			if err != nil {
+				fmt.Fprintln(stderr, err)
+				return 2
+			}
+			writer = output
+		}
+		encoder = newJSONEventEncoder(writer)
 	}
-	extractor := newExtractor(writer, *sourceFileID, normalizedFlavor)
+	extractor := newExtractorWithEncoder(encoder, *sourceFileID, normalizedFlavor)
 	extractor.slim = *slim
 	extractor.requireGTID = *requireGTID
 	extractor.requireTableMap = *requireTableMap
@@ -1418,12 +1468,21 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		if output != nil {
 			output.Abort()
 		}
+		if arrowOutput != nil {
+			arrowOutput.Abort()
+		}
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
 	if output != nil {
 		if err := output.Close(); err != nil {
 			output.Abort()
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
+	if arrowOutput != nil {
+		if err := arrowOutput.Close(); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}

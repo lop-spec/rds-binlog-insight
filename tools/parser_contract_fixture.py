@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import struct
 import subprocess
 import time
@@ -124,9 +125,24 @@ def verify_negative_streams(root, binary, raw, source_id):
         if marker.lower() not in stderr.lower():
             raise RuntimeError(f"candidate {name} failure lacks {marker!r}: {stderr[-1000:]}")
         if output_dir.exists() and any(output_dir.iterdir()):
-            raise RuntimeError(f"candidate published partial output for {name}")
+            raise RuntimeError(f"candidate published partial NDJSON output for {name}")
+
+        arrow_output = negative / f"{name}.arrow"
+        arrow_result = subprocess.run(candidate_command(binary, source, source_id, "ROW")
+                                      + ["--arrow-output", str(arrow_output)],
+                                      capture_output=True, timeout=20)
+        arrow_stderr = arrow_result.stderr.decode("utf-8", "replace")
+        (negative / f"{name}.arrow.stderr").write_text(arrow_stderr, encoding="utf-8")
+        if arrow_result.returncode == 0:
+            raise RuntimeError(f"candidate Arrow producer accepted corrupt stream {name}")
+        if marker.lower() not in arrow_stderr.lower():
+            raise RuntimeError(f"candidate Arrow {name} failure lacks {marker!r}: {arrow_stderr[-1000:]}")
+        if arrow_output.exists() or arrow_output.with_name(arrow_output.name + ".part").exists():
+            raise RuntimeError(f"candidate published partial Arrow output for {name}")
         proof[name] = {"returncode": result.returncode, "stderr_marker": marker,
-                       "published_files": 0, "sha256": hashlib.sha256(content).hexdigest()}
+                       "published_files": 0, "arrow_returncode": arrow_result.returncode,
+                       "arrow_stderr_marker": marker, "arrow_published_files": 0,
+                       "sha256": hashlib.sha256(content).hexdigest()}
     return proof
 
 
@@ -142,6 +158,9 @@ def prepare(root):
     if not build_info.is_file():
         raise RuntimeError("candidate build identity is missing: " + str(build_info))
     (root / "candidate-build-info.txt").write_bytes(build_info.read_bytes())
+    candidate_evidence = root / "candidate-binlog-parser-linux-amd64"
+    shutil.copyfile(candidate, candidate_evidence)
+    candidate_evidence.chmod(0o555)
     binary.chmod(0o555)
     candidate.chmod(0o555)
     source_id = hashlib.sha256(b"sql-insight synthetic parser ABI").hexdigest()
@@ -205,6 +224,13 @@ DELETE FROM rows_abi WHERE id=2;"""
             (case_dir / "legacy.ndjson").write_bytes(output)
             candidate_output = run(candidate_command(candidate, raw_path, source_id, mode), seconds=20)
             (case_dir / "candidate.ndjson").write_bytes(candidate_output)
+            candidate_arrow = case_dir / "candidate.arrow"
+            arrow_stdout = run(candidate_command(candidate, raw_path, source_id, mode)
+                               + ["--arrow-output", str(candidate_arrow)], seconds=20)
+            if arrow_stdout.strip():
+                raise RuntimeError("candidate Arrow producer leaked NDJSON to stdout")
+            if not candidate_arrow.is_file() or candidate_arrow.with_name(candidate_arrow.name + ".part").exists():
+                raise RuntimeError("candidate Arrow producer did not atomically publish its IPC file")
             parsed = [json.loads(line) for line in output.splitlines() if line.strip()]
             candidate_parsed = [json.loads(line) for line in candidate_output.splitlines() if line.strip()]
             if not parsed or not candidate_parsed:
@@ -228,7 +254,9 @@ DELETE FROM rows_abi WHERE id=2;"""
                                source_id=source_id, header_events=headers, emitted_rows=len(parsed),
                                candidate_rows=len(candidate_parsed),
                                legacy_sha256=hashlib.sha256(output).hexdigest(),
-                               candidate_sha256=hashlib.sha256(candidate_output).hexdigest())
+                               candidate_sha256=hashlib.sha256(candidate_output).hexdigest(),
+                               candidate_arrow_bytes=candidate_arrow.stat().st_size,
+                               candidate_arrow_sha256=hashlib.sha256(candidate_arrow.read_bytes()).hexdigest())
             if mode == "ROW":
                 cases[mode]["negative_streams"] = verify_negative_streams(
                     root, candidate, raw, source_id)
