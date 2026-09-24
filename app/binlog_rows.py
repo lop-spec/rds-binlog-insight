@@ -47,6 +47,18 @@ SEARCH_EXPR = "replaceRegexpAll(" + RAW_EXPR + ", '[^\\\\x00-\\\\x7f]+', ' ')"
 NON_BINLOG_HOSTS = ("slow-log", "tabularis", "general-log")
 QUERY_DEADLINE_SECONDS = 100
 PAGE_DEPTH_LIMIT = 2000
+DAY_US = 86_400_000_000
+
+
+def day_slices(start: int, end: int) -> list[tuple[int, int]]:
+    """UTC day slices (partitions are per event_date), newest first, covering [start, end] exactly."""
+    slices: list[tuple[int, int]] = []
+    hi = int(end)
+    while hi >= start:
+        lo = max(int(start), (hi // DAY_US) * DAY_US)
+        slices.append((lo, hi))
+        hi = lo - 1
+    return slices
 # Rows kept in the table store: anything bound to a table, plus DDL (no table name, kept for audit).
 ROW_STORE_FILTER = "(table_name != '' OR operation = 'DDL')"
 TOKEN = re.compile(r"[a-z0-9]+")
@@ -381,8 +393,7 @@ def build_query(query: dict[str, Any], start: int, end: int, *, row_image_key: s
         if clause:
             where.append(clause)
     sql = (f"SELECT {', '.join(RESULT_COLUMNS)} FROM {ROWS_TABLE} WHERE " + " AND ".join(where)
-           + " ORDER BY event_epoch_us DESC, end_position DESC, row_index DESC"
-           + f" LIMIT {limit + 1} OFFSET {offset}")
+           + " ORDER BY event_epoch_us DESC, end_position DESC, row_index DESC")
     return sql, params, limit, offset
 
 
@@ -575,12 +586,31 @@ class BinlogRows:
             control.check_cancelled()
         started = time.monotonic()
         summary = self.coverage(str(query.get("instance") or "").strip(), start, end)
-        query_id = f"binlog-rows-{int(time.time() * 1000)}-{os.getpid()}"
-        settings = {"max_threads": 8, "max_execution_time": QUERY_DEADLINE_SECONDS, "max_memory_usage": 1_200_000_000,
-                    "timeout_overflow_mode": "throw", "log_comment": "binlog-rows-query"}
+        # Newest-first day slices: each touches one day's partitions (bounded memory) and the scan stops as
+        # soon as offset + limit + 1 rows exist, so common keywords over long ranges return quickly.
+        wanted = offset + limit + 1
+        rows: list[dict[str, Any]] = []
+        deadline = time.monotonic() + QUERY_DEADLINE_SECONDS
         try:
-            rows = self.ch.rows(sql, params=params, settings=settings, timeout=QUERY_DEADLINE_SECONDS + 15,
-                                query_id=query_id)
+            for lo, hi in day_slices(start, end):
+                remaining = deadline - time.monotonic()
+                if remaining <= 1:
+                    raise RawBinlogError("TIMEOUT_EXCEEDED across day slices", "CLICKHOUSE_BINLOG_ROWS_UNAVAILABLE")
+                if control is not None:
+                    control.check_cancelled()
+                slice_params = dict(params, lo=lo, hi=hi,
+                                    d0=datetime.fromtimestamp(lo / 1e6, UTC).date().isoformat(),
+                                    d1=datetime.fromtimestamp(hi / 1e6, UTC).date().isoformat())
+                # Wide row images: reading in-order across many parts keeps one block per part in memory;
+                # 8192-row blocks keep a heavy table's full day under ~0.9 GB (default 65409 exceeds 1.2 GB).
+                settings = {"max_threads": 4, "max_block_size": 8192, "max_execution_time": max(1, int(remaining)),
+                            "max_memory_usage": 1_200_000_000, "timeout_overflow_mode": "throw",
+                            "log_comment": "binlog-rows-query"}
+                rows += self.ch.rows(sql + f" LIMIT {wanted - len(rows)}", params=slice_params, settings=settings,
+                                     timeout=int(remaining) + 15,
+                                     query_id=f"binlog-rows-{int(time.time() * 1000)}-{os.getpid()}")
+                if len(rows) >= wanted:
+                    break
         except RawBinlogError as exc:
             if "TIMEOUT_EXCEEDED" in str(exc) or "Timeout exceeded" in str(exc):
                 raise RawBinlogError(
@@ -588,6 +618,7 @@ class BinlogRows:
                     + ("中文/无英文数字的关键词只能逐行扫描，请缩短时间或改用 ID/英文关键词" if keyword_uses_scan(query)
                        else "请缩短时间范围"), "QUERY_DEADLINE_EXCEEDED") from exc
             raise
+        rows = rows[offset:]
         has_more = len(rows) > limit
         rows = rows[:limit]
         statements = self._statements(rows)

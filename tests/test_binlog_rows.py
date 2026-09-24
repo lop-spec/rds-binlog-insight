@@ -70,7 +70,7 @@ class BuildQueryTests(unittest.TestCase):
                          "database_name = {db:String}", "table_name = {tbl:String}",
                          "event_date BETWEEN toDate({d0:String}) AND toDate({d1:String})",
                          "event_epoch_us BETWEEN {lo:Int64} AND {hi:Int64}", "has({ops:Array(String)}, operation)",
-                         "ORDER BY event_epoch_us DESC", "LIMIT 51 OFFSET 100"):
+                         "ORDER BY event_epoch_us DESC"):
             self.assertIn(fragment, sql)
         self.assertEqual((limit, offset), (50, 100))
         self.assertEqual(params["ops"], "['UPDATE','DELETE']")
@@ -418,3 +418,38 @@ class Release1293Tests(unittest.TestCase):
             (worker.inflight_dir() / "f2.json").write_text(json.dumps({"instance_id": "i", "file_id": "f2", "part_keys": ["raw:f2"]}))
             self.assertEqual(worker.recover_inflight(), 0)
             worker.ch.execute.assert_not_called()
+
+
+class Release1294Tests(unittest.TestCase):
+    def test_day_slices_cover_range_newest_first(self):
+        day = br.DAY_US
+        start, end = 3 * day + 5, 5 * day + 7
+        self.assertEqual(br.day_slices(start, end), [(5 * day, 5 * day + 7), (4 * day, 5 * day - 1), (start, 4 * day - 1)])
+        self.assertEqual(br.day_slices(10, 20), [(10, 20)])
+
+    def _backend(self, pages):
+        backend = br.BinlogRows(object(), mock.Mock())
+        backend.coverage = mock.Mock(return_value={"intervals": [], "gaps": [], "covered_us": 0, "requested_us": 1})
+        backend.ch.rows.side_effect = pages
+        return backend
+
+    def row(self, i):
+        return {"event_id": f"e{i}", "event_epoch_us": START + i, "instance_id": "rm-1", "database_name": "shop",
+                "table_name": "customer_profile", "operation": "UPDATE", "before_json": "{}", "after_json": "{}",
+                "row_query_hash": 0, "sql_kind": "PSEUDO"}
+
+    def test_stops_after_the_first_slice_that_fills_the_page(self):
+        backend = self._backend([[self.row(i) for i in range(3)]])
+        result = backend.query(scoped(limit=2), START, START + 5 * br.DAY_US)
+        self.assertEqual(backend.ch.rows.call_count, 1)
+        self.assertIn("LIMIT 3", backend.ch.rows.call_args.args[0])
+        self.assertTrue(result["has_more"])
+        self.assertEqual([r["event_id"] for r in result["rows"]], ["e0", "e1"])
+
+    def test_offset_spans_slices(self):
+        backend = self._backend([[self.row(0)], [self.row(1), self.row(2)], [self.row(3), self.row(4)]])
+        result = backend.query(scoped(limit=2, offset=1), START, START + 3 * br.DAY_US)
+        self.assertEqual([r["event_id"] for r in result["rows"]], ["e1", "e2"])
+        self.assertTrue(result["has_more"])
+        limits = [c.args[0].rsplit("LIMIT ", 1)[1] for c in backend.ch.rows.call_args_list]
+        self.assertEqual(limits, ["4", "3", "1"])
