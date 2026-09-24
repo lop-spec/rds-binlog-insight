@@ -70,6 +70,10 @@ def check_values(rows):
                     if name == "payload":
                         if isinstance(found, dict) and set(found) == {"$bytes_base64"}:
                             found = base64.b64decode(found["$bytes_base64"], validate=True)
+                        elif isinstance(found, dict) and set(found) == {"$binary_base64", "$length"}:
+                            found = base64.b64decode(found["$binary_base64"], validate=True)
+                            if type(decoded[name]["$length"]) is not int or decoded[name]["$length"] != len(found):
+                                raise ValueError("binary length does not match decoded bytes")
                         elif isinstance(found, str):
                             found = found.encode("utf-8", "strict")
                         else:
@@ -117,24 +121,88 @@ def compare_columnar(ndjson: Path, output: Path, source_id: str):
                 native_arrow_producer=False, independent_value_oracle=False)
 
 
+def compare_decoders(legacy: Path, candidate: Path, output: Path, source_id: str, *, require_binary_repair=False):
+    """Compare every stored field, allowing only independently checked byte-body repairs."""
+    output.mkdir(exist_ok=False)
+    tables, catalogs = {}, {}
+    for label, ndjson in (("legacy", legacy), ("candidate", candidate)):
+        storage = EventStorage.__new__(EventStorage)
+        storage.paths = ensure_data_dirs(output / label)
+        storage._part_body_locks = [threading.RLock() for _ in range(256)]
+        count, parts = storage.ingest_ndjson_file(
+            ndjson_path=ndjson, file_id=source_id, instance_id="synthetic-fixture",
+            host_instance_id="fixture-host", source_file_name="mysql-bin.fixture",
+            publish_metadata=False, append=True)
+        table = pa.concat_tables([pq.ParquetFile(part["path"]).read() for part in parts])
+        if count != table.num_rows or table.column_names != list(EVENT_COLUMNS):
+            raise ValueError(label + " decoder did not materialize the complete 47-field schema")
+        tables[label] = table
+        catalogs[label] = [part["catalog"] for part in parts]
+    if tables["legacy"].schema != tables["candidate"].schema:
+        raise ValueError("legacy/candidate stored schemas differ")
+    if catalogs["legacy"] != catalogs["candidate"]:
+        raise ValueError("legacy/candidate semantic catalogs differ")
+    legacy_rows = tables["legacy"].to_pylist()
+    candidate_rows = tables["candidate"].to_pylist()
+    if len(legacy_rows) != len(candidate_rows):
+        raise ValueError("legacy/candidate row counts differ")
+    allowed = {"before_json", "after_json", "sql_text"}
+    differing = set()
+    for index, (old, new) in enumerate(zip(legacy_rows, candidate_rows)):
+        for field in EVENT_COLUMNS:
+            if old[field] == new[field]:
+                continue
+            differing.add(field)
+            if field not in allowed:
+                raise ValueError(f"decoder drift at row {index} field {field}: {old[field]!r} != {new[field]!r}")
+        if "\ufffd" in str(new["before_json"]) + str(new["after_json"]) + str(new["sql_text"]):
+            raise ValueError(f"candidate retained a Unicode replacement character at row {index}")
+    expected_differences = allowed if require_binary_repair else set()
+    if differing != expected_differences:
+        raise ValueError(f"candidate differences are not the intended binary body repair: {sorted(differing)}")
+    if require_binary_repair:
+        mutation_sql = [str(row["sql_text"]) for row in candidate_rows
+                        if row["operation"] in {"INSERT", "UPDATE", "DELETE"}]
+        if not mutation_sql or not all("FROM_BASE64(" in sql for sql in mutation_sql):
+            raise ValueError("candidate pseudo SQL does not preserve binary values")
+    return {"rows": len(candidate_rows), "fields": len(EVENT_COLUMNS),
+            "identity_fields_equal": True, "semantic_catalog_equal": True,
+            "only_intended_value_differences": True,
+            "differing_fields": sorted(differing)}
+
+
 def verify(root: Path):
     contract = json.loads((root / "contract.json").read_text(encoding="utf-8"))
     result = {"scope": "synthetic fixture only", "source_sha": contract["source_sha"],
-              "transport": {}, "independent_values_equal": False, "failures": []}
+              "transport": {}, "decoder_differential": {},
+              "independent_values_equal": False, "failures": [], "legacy_failures": []}
     report = root / "independent-oracle.json"
     if report.exists():
         raise FileExistsError("retain existing oracle evidence; use a separate fixture directory")
     try:
         for mode in ("STATEMENT", "ROW"):
             case = contract["cases"][mode]; directory = root / mode.lower()
-            ndjson = directory / "legacy.ndjson"
+            legacy = directory / "legacy.ndjson"
+            candidate = directory / "candidate.ndjson"
             for path, wanted in ((directory / "source.binlog", case["raw_sha256"]),
-                                 (ndjson, case["legacy_sha256"])):
+                                 (legacy, case["legacy_sha256"]),
+                                 (candidate, case["candidate_sha256"])):
                 if hashlib.sha256(path.read_bytes()).hexdigest() != wanted:
                     raise ValueError("frozen fixture identity mismatch: " + path.name)
-            result["transport"][mode] = compare_columnar(ndjson, directory / "columnar-oracle", case["source_id"])
+            result["transport"][mode] = {
+                "legacy": compare_columnar(legacy, directory / "legacy-columnar", case["source_id"]),
+                "candidate": compare_columnar(candidate, directory / "candidate-columnar", case["source_id"]),
+            }
+            result["decoder_differential"][mode] = compare_decoders(
+                legacy, candidate, directory / "decoder-differential", case["source_id"],
+                require_binary_repair=mode == "ROW")
             if mode == "ROW":
-                result["failures"] = check_values([json.loads(line) for line in ndjson.read_text(encoding="utf-8").splitlines() if line.strip()])
+                legacy_rows = [json.loads(line) for line in legacy.read_text(encoding="utf-8").splitlines() if line.strip()]
+                candidate_rows = [json.loads(line) for line in candidate.read_text(encoding="utf-8").splitlines() if line.strip()]
+                result["legacy_failures"] = check_values(legacy_rows)
+                result["failures"] = check_values(candidate_rows)
+                if len(result["legacy_failures"]) != 3:
+                    raise ValueError("legacy oracle sensitivity changed; expected three known byte-loss failures")
         result["independent_values_equal"] = not result["failures"]
         return result
     except BaseException as exc:

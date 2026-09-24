@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.parser_contract_oracle import check_values, compare_columnar, expected_images, verify
+from tools.parser_contract_oracle import (
+    check_values,
+    compare_columnar,
+    compare_decoders,
+    expected_images,
+    verify,
+)
 
 
 def faithful_rows():
@@ -40,7 +46,8 @@ class ParserContractOracleTests(unittest.TestCase):
             root = Path(directory); (root / 'statement').mkdir()
             (root / 'statement/source.binlog').write_bytes(b'corrupt')
             contract = {'source_sha': 'candidate', 'cases': {'STATEMENT':
-                        {'raw_sha256': '0' * 64, 'legacy_sha256': '0' * 64}}}
+                        {'raw_sha256': '0' * 64, 'legacy_sha256': '0' * 64,
+                         'candidate_sha256': '0' * 64}}}
             (root / 'contract.json').write_text(json.dumps(contract), encoding='utf-8')
             with self.assertRaisesRegex(ValueError, 'identity'):
                 verify(root)
@@ -52,6 +59,24 @@ class ParserContractOracleTests(unittest.TestCase):
 
     def test_exact_bytes_and_full_known_images_pass(self):
         self.assertEqual(check_values(faithful_rows()), [])
+        rows = faithful_rows()
+        for row in rows:
+            for field in ('before_json', 'after_json'):
+                if not row[field]:
+                    continue
+                image = json.loads(row[field])
+                raw = base64.b64decode(image['payload'].pop('$bytes_base64'))
+                image['payload'] = {'$binary_base64': base64.b64encode(raw).decode('ascii'),
+                                    '$length': len(raw)}
+                row[field] = json.dumps(image)
+        self.assertEqual(check_values(rows), [])
+
+    def test_recovered_binary_representation_requires_exact_length(self):
+        rows = faithful_rows(); image = json.loads(rows[0]['after_json'])
+        encoded = image['payload'].pop('$bytes_base64')
+        image['payload'] = {'$binary_base64': encoded, '$length': 99}
+        rows[0]['after_json'] = json.dumps(image)
+        self.assertEqual(check_values(rows)[0]['field'], 'after_json.payload')
 
     def test_legacy_binary_replacement_is_rejected_in_all_three_images(self):
         rows = faithful_rows()
@@ -81,6 +106,33 @@ class ParserContractOracleTests(unittest.TestCase):
         rows = faithful_rows(); image = json.loads(rows[1]['after_json'])
         image['document'] = '[null,1,0]'; rows[1]['after_json'] = json.dumps(image)
         self.assertEqual(check_values(rows)[0]['field'], 'after_json.document')
+
+    def test_full_decoder_differential_allows_only_binary_body_repairs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); candidate = faithful_rows()
+            legacy = json.loads(json.dumps(candidate))
+            for index, (new, old) in enumerate(zip(candidate, legacy)):
+                new.update(event_id=f'event-{index}', event_epoch_us=1789906364540116,
+                           start_position=100 + index * 10, end_position=110 + index * 10,
+                           sql_text="SELECT FROM_BASE64('AP/+')")
+                old.update(event_id=new['event_id'], event_epoch_us=new['event_epoch_us'],
+                           start_position=new['start_position'], end_position=new['end_position'],
+                           sql_text='legacy lossy pseudo SQL')
+                for field in ('before_json', 'after_json'):
+                    if not old[field]:
+                        continue
+                    image = json.loads(old[field])
+                    raw = base64.b64decode(image['payload']['$bytes_base64'])
+                    image['payload'] = raw.decode('utf-8', 'replace')
+                    old[field] = json.dumps(image)
+            legacy_path = root / 'legacy.ndjson'; candidate_path = root / 'candidate.ndjson'
+            legacy_path.write_text('\n'.join(json.dumps(row) for row in legacy), encoding='utf-8')
+            candidate_path.write_text('\n'.join(json.dumps(row) for row in candidate), encoding='utf-8')
+            proof = compare_decoders(legacy_path, candidate_path, root / 'compare', 'f' * 64,
+                                     require_binary_repair=True)
+            self.assertEqual(proof['fields'], 47)
+            self.assertTrue(proof['identity_fields_equal'])
+            self.assertEqual(proof['differing_fields'], ['after_json', 'before_json', 'sql_text'])
 
     def test_invalid_binary_encoding_and_added_fields_fail_closed(self):
         rows = faithful_rows(); image = json.loads(rows[0]['after_json'])

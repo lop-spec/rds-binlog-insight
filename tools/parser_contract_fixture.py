@@ -55,12 +55,95 @@ def read_headers(raw):
     return rows
 
 
+def split_events(raw):
+    headers = read_headers(raw)
+    return [bytearray(raw[row["start"]:row["end"]]) for row in headers]
+
+
+def rewrite_events(events):
+    """Rebuild positions and CRCs after deleting a context event."""
+    output = bytearray(b"\xfebin")
+    for source in events:
+        event = bytearray(source)
+        struct.pack_into("<I", event, 13, len(output) + len(event))
+        struct.pack_into("<I", event, len(event) - 4, zlib.crc32(event[:-4]))
+        output.extend(event)
+    read_headers(bytes(output))
+    return bytes(output)
+
+
+def negative_streams(raw):
+    events = split_events(raw)
+    without_fde = rewrite_events([event for event in events if event[4] != 15])
+    without_table_map = rewrite_events([event for event in events if event[4] != 19])
+    without_gtid = rewrite_events([event for event in events if event[4] not in {33, 34}])
+    unknown_events = [bytearray(event) for event in events]
+    unknown_events[-1][4] = 0x7f
+    unknown = rewrite_events(unknown_events)
+    bad_crc = bytearray(raw); bad_crc[-5] ^= 0x01
+    bad_size = bytearray(raw); struct.pack_into("<I", bad_size, 4 + 9, 18)
+    bad_position = bytearray(raw); struct.pack_into("<I", bad_position, 4 + 13,
+                                                    struct.unpack_from("<I", bad_position, 4 + 13)[0] + 1)
+    return {
+        "missing-fde": (without_fde, "FormatDescriptionEvent"),
+        "missing-table-map": (without_table_map, "table map"),
+        "missing-gtid": (without_gtid, "GTID context"),
+        "unknown-event": (unknown, "unknown binlog event"),
+        "partial-header": (raw + b"\x00" * 7, "partial binlog event header"),
+        "partial-body": (raw[:-1], "partial binlog event body"),
+        "bad-crc": (bytes(bad_crc), "checksum"),
+        "bad-size": (bytes(bad_size), "invalid binlog event size"),
+        "bad-position": (bytes(bad_position), "position mismatch"),
+    }
+
+
+def candidate_command(binary, raw_path, source_id, mode):
+    command = [str(binary), "--input", str(raw_path), "--source-file-id", source_id,
+               "--flavor", "mysql", "--require-gtid"]
+    if mode == "ROW":
+        command.append("--require-table-map")
+    return command
+
+
+def verify_negative_streams(root, binary, raw, source_id):
+    negative = root / "negative"
+    negative.mkdir()
+    proof = {}
+    for name, (content, marker) in negative_streams(raw).items():
+        source = negative / f"{name}.binlog"
+        source.write_bytes(content)
+        output_dir = negative / f"{name}-output"
+        output_dir.mkdir()
+        result = subprocess.run(candidate_command(binary, source, source_id, "ROW")
+                                + ["--output-dir", str(output_dir)],
+                                capture_output=True, timeout=20)
+        stderr = result.stderr.decode("utf-8", "replace")
+        (negative / f"{name}.stderr").write_text(stderr, encoding="utf-8")
+        if result.returncode == 0:
+            raise RuntimeError(f"candidate accepted corrupt stream {name}")
+        if marker.lower() not in stderr.lower():
+            raise RuntimeError(f"candidate {name} failure lacks {marker!r}: {stderr[-1000:]}")
+        if output_dir.exists() and any(output_dir.iterdir()):
+            raise RuntimeError(f"candidate published partial output for {name}")
+        proof[name] = {"returncode": result.returncode, "stderr_marker": marker,
+                       "published_files": 0, "sha256": hashlib.sha256(content).hexdigest()}
+    return proof
+
+
 def prepare(root):
     if os.environ.get("GITHUB_ACTIONS") != "true":
         raise RuntimeError("synthetic parser fixture requires disposable cloud CI")
     root.mkdir(exist_ok=False)
     binary = Path("tools/binlog-parser-linux-amd64").resolve()
+    candidate = Path(os.environ.get("PARSER_CANDIDATE", "parser/build/binlog-parser-linux-amd64")).resolve()
+    build_info = Path("parser/candidate-build-info.txt").resolve()
+    if not candidate.is_file():
+        raise RuntimeError("candidate parser binary is missing: " + str(candidate))
+    if not build_info.is_file():
+        raise RuntimeError("candidate build identity is missing: " + str(build_info))
+    (root / "candidate-build-info.txt").write_bytes(build_info.read_bytes())
     binary.chmod(0o555)
+    candidate.chmod(0o555)
     source_id = hashlib.sha256(b"sql-insight synthetic parser ABI").hexdigest()
     name = "parser-contract-" + uuid.uuid4().hex[:12]
     run(["docker", "pull", "mysql:8.0"], seconds=240)
@@ -120,29 +203,43 @@ DELETE FROM rows_abi WHERE id=2;"""
             output = run([str(binary), "--input", str(raw_path), "--source-file-id", source_id,
                           "--flavor", "mysql"], seconds=20)
             (case_dir / "legacy.ndjson").write_bytes(output)
+            candidate_output = run(candidate_command(candidate, raw_path, source_id, mode), seconds=20)
+            (case_dir / "candidate.ndjson").write_bytes(candidate_output)
             parsed = [json.loads(line) for line in output.splitlines() if line.strip()]
-            if not parsed:
-                raise RuntimeError("legacy parser emitted no fixture rows")
+            candidate_parsed = [json.loads(line) for line in candidate_output.splitlines() if line.strip()]
+            if not parsed or not candidate_parsed:
+                raise RuntimeError("native parser emitted no fixture rows")
             bounds = {(r["start"], r["end"]) for r in headers}
             if any((r["start_position"], r["end_position"]) not in bounds for r in parsed):
                 raise RuntimeError("native emitted positions outside independent event bounds")
             if len({r["event_id"] for r in parsed}) != len(parsed):
                 raise RuntimeError("native fixture contains duplicate identities")
+            if len({r["event_id"] for r in candidate_parsed}) != len(candidate_parsed):
+                raise RuntimeError("candidate fixture contains duplicate identities")
             if not {"INSERT", "UPDATE", "DELETE"}.issubset({r["operation"] for r in parsed}):
                 raise RuntimeError("native fixture lost a mutation operation")
+            if any((r["start_position"], r["end_position"]) not in bounds for r in candidate_parsed):
+                raise RuntimeError("candidate emitted positions outside independent event bounds")
             from tools.benchmark_raw_cache import measure
             measure(raw_path, case_dir / "cache-mechanisms", sha256=hashlib.sha256(raw).hexdigest(),
                     source_id=source_id, source_size=len(raw), physical_budget=16 * 1024 * 1024,
                     deadline_seconds=30)
             cases[mode] = dict(raw_bytes=len(raw), raw_sha256=hashlib.sha256(raw).hexdigest(),
                                source_id=source_id, header_events=headers, emitted_rows=len(parsed),
-                               legacy_sha256=hashlib.sha256(output).hexdigest())
+                               candidate_rows=len(candidate_parsed),
+                               legacy_sha256=hashlib.sha256(output).hexdigest(),
+                               candidate_sha256=hashlib.sha256(candidate_output).hexdigest())
+            if mode == "ROW":
+                cases[mode]["negative_streams"] = verify_negative_streams(
+                    root, candidate, raw, source_id)
         proof = dict(cases=cases, source_sha=os.environ["GITHUB_SHA"],
                      native_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                     candidate_native_sha256=hashlib.sha256(candidate.read_bytes()).hexdigest(),
                      limitation="Synthetic semantic fixture only; not a throughput or production coverage gate")
         (root / "contract.json").write_text(json.dumps(proof, indent=2), encoding="utf-8")
         print(json.dumps({"fixture": "native-parser-contract", "cases": {
-            k: {a: v[a] for a in ("raw_bytes", "emitted_rows", "raw_sha256")} for k, v in cases.items()}}))
+            k: {a: v[a] for a in ("raw_bytes", "emitted_rows", "candidate_rows", "raw_sha256")}
+            for k, v in cases.items()}}))
     finally:
         details = json.loads(run(["docker", "inspect", name]))[0]
         if details["Config"]["Labels"].get("scope") != SCOPE:

@@ -3,7 +3,13 @@ import unittest
 import zlib
 from unittest.mock import patch
 
-from tools.parser_contract_fixture import mysql_query, read_headers
+from tools.parser_contract_fixture import (
+    mysql_query,
+    negative_streams,
+    read_headers,
+    rewrite_events,
+    split_events,
+)
 
 
 class ParserContractFixtureTests(unittest.TestCase):
@@ -44,6 +50,25 @@ class ParserContractFixtureTests(unittest.TestCase):
     def test_wrong_positions_rejected_even_with_valid_crc(self):
         with self.assertRaisesRegex(ValueError, 'bounds'):
             read_headers(b'\xfebin' + self.event(start=5))
+
+    def test_negative_context_streams_rewrite_positions_and_crc(self):
+        events = []
+        start = 4
+        for kind in (15, 33, 19, 30, 16):
+            event = bytearray(self.event(start=start)); event[4] = kind
+            event[-4:] = struct.pack('<I', zlib.crc32(event[:-4]))
+            events.append(bytes(event)); start += len(event)
+        raw = b'\xfebin' + b''.join(events)
+        self.assertEqual(len(split_events(raw)), 5)
+        rebuilt = rewrite_events([events[0], events[-1]])
+        self.assertEqual(len(read_headers(rebuilt)), 2)
+        variants = negative_streams(raw)
+        self.assertEqual(set(variants), {'missing-fde', 'missing-table-map', 'missing-gtid',
+                                         'unknown-event', 'partial-header', 'partial-body',
+                                         'bad-crc', 'bad-size', 'bad-position'})
+        for name in ('missing-fde', 'missing-table-map', 'missing-gtid', 'unknown-event'):
+            with self.subTest(name=name):
+                read_headers(variants[name][0])
 
     def test_bad_magic_rejected(self):
         with self.assertRaisesRegex(ValueError, 'magic'):
