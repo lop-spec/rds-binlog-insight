@@ -350,7 +350,6 @@ def verify_negative_streams(root, binary, raw, source_id):
         source = negative / f"{name}.binlog"
         source.write_bytes(content)
         output_dir = negative / f"{name}-output"
-        output_dir.mkdir()
         result, ndjson_chunk_proof, ndjson_acks = run_failed_chunk_transport(
             binary, source, source_id, "ROW", output_dir, chunk_format="ndjson"
         )

@@ -1,6 +1,9 @@
 import struct
+import subprocess
+import tempfile
 import unittest
 import zlib
+from pathlib import Path
 from unittest.mock import patch
 
 from tools.parser_contract_fixture import (
@@ -9,6 +12,7 @@ from tools.parser_contract_fixture import (
     read_headers,
     rewrite_events,
     split_events,
+    verify_negative_streams,
 )
 
 
@@ -69,6 +73,51 @@ class ParserContractFixtureTests(unittest.TestCase):
         for name in ('missing-fde', 'missing-table-map', 'missing-gtid', 'unknown-event'):
             with self.subTest(name=name):
                 read_headers(variants[name][0])
+
+    def test_negative_chunk_transport_owns_output_directory_creation(self):
+        calls = []
+
+        def failed_transport(binary, source, source_id, mode, output_dir,
+                             *, chunk_format):
+            self.assertFalse(output_dir.exists())
+            output_dir.mkdir()
+            calls.append((output_dir.name, chunk_format))
+            return (
+                subprocess.CompletedProcess([], 1, stdout=b'', stderr=b'boom'),
+                {
+                    'acknowledged_files': 0,
+                    'manifests_sha256': 'manifest',
+                    'acks_sha256': 'ack',
+                },
+                b'',
+            )
+
+        direct_failure = subprocess.CompletedProcess(
+            [], 1, stdout=b'', stderr=b'boom'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch(
+                'tools.parser_contract_fixture.negative_streams',
+                return_value={'bad-stream': (b'raw', 'boom')},
+            ), patch(
+                'tools.parser_contract_fixture.run_failed_chunk_transport',
+                side_effect=failed_transport,
+            ), patch(
+                'tools.parser_contract_fixture.subprocess.run',
+                return_value=direct_failure,
+            ):
+                proof = verify_negative_streams(
+                    Path(temporary), Path('candidate'), b'raw', 'source-id'
+                )
+
+        self.assertEqual(
+            calls,
+            [
+                ('bad-stream-output', 'ndjson'),
+                ('bad-stream-arrow-chunk-output', 'arrow'),
+            ],
+        )
+        self.assertEqual(set(proof), {'bad-stream'})
 
     def test_bad_magic_rejected(self):
         with self.assertRaisesRegex(ValueError, 'magic'):
