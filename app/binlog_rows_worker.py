@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -120,13 +121,17 @@ class LineCountingStream:
 
 
 class Claims:
+    """In-process ownership. A committed file is never handed out again, even to a lane whose
+    candidate list was computed before the commit."""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._ids: set[str] = set()
+        self._done: set[str] = set()
 
     def take(self, file_id: str) -> bool:
         with self._lock:
-            if file_id in self._ids:
+            if file_id in self._ids or file_id in self._done:
                 return False
             self._ids.add(file_id)
             return True
@@ -134,6 +139,11 @@ class Claims:
     def release(self, file_id: str) -> None:
         with self._lock:
             self._ids.discard(file_id)
+
+    def finish(self, file_id: str) -> None:
+        with self._lock:
+            self._ids.discard(file_id)
+            self._done.add(file_id)
 
 
 class Worker:
@@ -171,9 +181,9 @@ class Worker:
             self._archive_at = time.monotonic()
         return self._archive
 
-    def ingested(self, instance: str) -> set[str]:
+    def ingested(self, instance: str, *, fresh: bool = False) -> set[str]:
         cached = self._ingested.get(instance)
-        if cached and time.monotonic() - cached[0] < 60:
+        if cached and not fresh and time.monotonic() - cached[0] < 60:
             return cached[1]
         text = self.ch.execute("SELECT file_id FROM insight.binlog_rows_files_v1 FINAL WHERE instance_id = {i:String} FORMAT TSV",
                                params={"i": instance}, settings={"max_execution_time": 60}, timeout=80)
@@ -194,6 +204,44 @@ class Worker:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.status, ensure_ascii=False, sort_keys=True))
             os.replace(tmp, path)
+
+    def inflight_dir(self) -> Path:
+        path = self.storage.paths["index"] / "binlog-rows-inflight"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def commit(self, ingestor: RowsIngestor, entry: dict[str, Any], part_keys: list[str], rows: int, source: str,
+               rq_complete: bool, lane: int) -> None:
+        """Move + manifest behind a durable marker, so an interrupted move is purged on the next start."""
+        marker = self.inflight_dir() / f"{entry['file_id']}.json"
+        tmp = marker.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
+                                   "part_keys": part_keys, "file": entry["source_file_name"]}))
+        os.replace(tmp, marker)
+        ingestor.move(part_keys, f"binlog-rows-l{lane}")  # purges its own partial rows on failure
+        ingestor.record(entry, rows, source, rq_complete)
+        marker.unlink(missing_ok=True)
+
+    def recover_inflight(self) -> int:
+        """Purge rows of moves that never reached the manifest (crash, kill, container stop)."""
+        purged = 0
+        for marker in sorted(self.inflight_dir().glob("*.json")):
+            try:
+                info = json.loads(marker.read_text())
+            except ValueError:
+                LOGGER.error("BINLOG_ROWS_INFLIGHT_UNREADABLE marker=%s", marker.name)
+                continue
+            if info["file_id"] in self.ingested(info["instance_id"], fresh=True):
+                marker.unlink(missing_ok=True)
+                continue
+            LOGGER.warning("BINLOG_ROWS_INFLIGHT_PURGE file=%s parts=%s", info.get("file"), len(info["part_keys"]))
+            self.ch.execute("DELETE FROM insight.binlog_rows_v1 WHERE _source_part_key IN "
+                            "(SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))",
+                            params={"k": json.dumps(info["part_keys"])},
+                            settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
+            marker.unlink(missing_ok=True)
+            purged += 1
+        return purged
 
     def collector_lag_seconds(self) -> int:
         with self.metadata.connection() as conn:
@@ -318,8 +366,7 @@ class Worker:
         if buffered != total:
             ingestor.truncate()
             raise RawBinlogError(f"缓冲行数 {buffered} 与解析行数 {total} 不一致", "BINLOG_ROWS_VERIFY_FAILED")
-        ingestor.move(["raw:" + entry["file_id"]], f"binlog-rows-l{lane}")
-        ingestor.record(entry, total, "raw", True)
+        self.commit(ingestor, entry, ["raw:" + entry["file_id"]], total, "raw", True, lane)
         ingestor.truncate()
         return total
 
@@ -364,8 +411,7 @@ class Worker:
         if got != expect:
             ingestor.truncate()
             raise RawBinlogError("Parquet 行数与元数据不一致", "BINLOG_ROWS_VERIFY_FAILED")
-        ingestor.move(list(expect), f"binlog-rows-l{lane}")
-        ingestor.record(entry, sum(expect.values()), "parquet", rq_complete)
+        self.commit(ingestor, entry, list(expect), sum(expect.values()), "parquet", rq_complete, lane)
         ingestor.truncate()
         return sum(expect.values())
 
@@ -389,11 +435,16 @@ class Worker:
                     break
                 if not self.claims.take(entry["file_id"]):
                     continue
+                if entry["file_id"] in self.ingested(entry["instance_id"]):
+                    self.claims.finish(entry["file_id"])  # committed by another lane after this list was built
+                    continue
                 started = time.monotonic()
+                committed = False
                 try:
                     self.publish(lane, state="running", file=entry["source_file_name"], kind=entry["kind"])
                     rows = (self.ingest_raw if entry["kind"] == "raw" else self.ingest_parquet)(ingestor, entry, lane)
                     self.mark_ingested(entry["instance_id"], entry["file_id"])
+                    committed = True
                     seconds = round(time.monotonic() - started, 1)
                     LOGGER.info("BINLOG_ROWS_INGESTED lane=%s file=%s kind=%s rows=%s seconds=%s",
                                 lane, entry["source_file_name"], entry["kind"], rows, seconds)
@@ -410,11 +461,14 @@ class Worker:
                         pass
                     self.stop.wait(10)
                 finally:
-                    self.claims.release(entry["file_id"])
+                    (self.claims.finish if committed else self.claims.release)(entry["file_id"])
                 if self.lane_specs[lane][0] == "live":
                     break  # re-rank so the newest unclaimed file is always next
 
     def run(self) -> None:
+        purged = self.recover_inflight()
+        if purged:
+            LOGGER.warning("BINLOG_ROWS_INFLIGHT_RECOVERED files=%s", purged)
         threads = [threading.Thread(target=self.run_lane, args=(lane,), name=f"lane-{lane}", daemon=True)
                    for lane in range(self.lanes)]
         for thread in threads:
@@ -438,8 +492,11 @@ def main() -> int:
         raise SystemExit(f"at most {WORKER_LANES_MAX} lanes (live + backfill windows)")
     worker = Worker(args.data_dir, lanes=live, backfill=backfill,
                     external_parquet=_env_windows(os.environ.get("RDS_BINLOG_ROWS_EXTERNAL_PARQUET_WINDOWS", "")))
+    # docker stop: finish the move in progress (bounded by stop_grace_period), start nothing new.
+    signal.signal(signal.SIGTERM, lambda _signum, _frame: worker.stop.set())
     LOGGER.info("BINLOG_ROWS_WORKER_START live_lanes=%s backfill=%s", live, backfill)
     worker.run()
+    LOGGER.info("BINLOG_ROWS_WORKER_STOPPED")
     return 0
 
 

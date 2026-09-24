@@ -362,3 +362,59 @@ class Release1292Tests(unittest.TestCase):
 
         backend = br.BinlogRows(Meta(), mock.Mock())
         self.assertEqual([f["id"] for f in backend._files("i", None, None)], ["a"])
+
+
+class Release1293Tests(unittest.TestCase):
+    def _worker(self, tmp, manifest):
+        from pathlib import Path
+        from app import binlog_rows_worker as worker_module
+
+        worker = worker_module.Worker.__new__(worker_module.Worker)
+        worker.storage = mock.Mock(paths={"index": Path(tmp)})
+        worker.ch = mock.Mock()
+        worker.ingested = mock.Mock(return_value=set(manifest))
+        return worker
+
+    def test_committed_file_is_never_claimed_again(self):
+        from app.binlog_rows_worker import Claims
+
+        claims = Claims()
+        self.assertTrue(claims.take("f"))
+        self.assertFalse(claims.take("f"))
+        claims.finish("f")
+        self.assertFalse(claims.take("f"))
+        self.assertTrue(claims.take("g"))
+        claims.release("g")
+        self.assertTrue(claims.take("g"))
+
+    def test_commit_marker_survives_until_manifest_and_recovery_purges_orphans(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._worker(tmp, manifest=[])
+            ingestor = mock.Mock()
+            entry = {"file_id": "f1", "instance_id": "i", "source_file_name": "mysql-bin.1"}
+            ingestor.record.side_effect = RuntimeError("killed before manifest")
+            with self.assertRaises(RuntimeError):
+                worker.commit(ingestor, entry, ["raw:f1"], 10, "raw", True, 0)
+            marker = Path(tmp) / "binlog-rows-inflight" / "f1.json"
+            self.assertTrue(marker.exists())
+            self.assertEqual(worker.recover_inflight(), 1)
+            sql = worker.ch.execute.call_args.args[0]
+            self.assertIn("DELETE FROM insight.binlog_rows_v1", sql)
+            self.assertEqual(json.loads(worker.ch.execute.call_args.kwargs["params"]["k"]), ["raw:f1"])
+            self.assertFalse(marker.exists())
+
+    def test_recovery_keeps_committed_files(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._worker(tmp, manifest=["f2"])
+            ingestor = mock.Mock()
+            worker.commit(ingestor, {"file_id": "f2", "instance_id": "i", "source_file_name": "b"}, ["raw:f2"], 5,
+                          "raw", True, 0)
+            self.assertEqual(list((worker.inflight_dir()).glob("*.json")), [])
+            (worker.inflight_dir() / "f2.json").write_text(json.dumps({"instance_id": "i", "file_id": "f2", "part_keys": ["raw:f2"]}))
+            self.assertEqual(worker.recover_inflight(), 0)
+            worker.ch.execute.assert_not_called()
