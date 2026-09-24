@@ -38,10 +38,13 @@ BUCKETS = 8
 RETENTION_DAYS = 62
 STATEMENT_MAX_BYTES = 65536
 TIER = "clickhouse-binlog-rows"
-# Must stay byte-identical to the ``search`` index expression, otherwise the
-# text index is silently not used and every keyword query scans the table.
-SEARCH_EXPR = "lower(concat(before_json, ' ', after_json, ' ', transaction_id, ' ', source_file_name))"
-NON_BINLOG_HOSTS = ("slow-log", "tabularis")
+# Lower-cased searchable text; exact-sequence checks run on it.
+RAW_EXPR = "lower(concat(before_json, ' ', after_json, ' ', transaction_id, ' ', source_file_name))"
+# Index text: non-ASCII runs become spaces so a token is exactly a maximal [a-z0-9] run (splitByNonAlpha alone
+# glues digits to adjacent CJK characters: '订单157683' would not contain the token '157683').
+# Must stay byte-identical to the ``search`` index expression, otherwise the text index is silently not used.
+SEARCH_EXPR = "replaceRegexpAll(" + RAW_EXPR + ", '[^\\\\x00-\\\\x7f]+', ' ')"
+NON_BINLOG_HOSTS = ("slow-log", "tabularis", "general-log")
 QUERY_DEADLINE_SECONDS = 100
 PAGE_DEPTH_LIMIT = 2000
 # Rows kept in the table store: anything bound to a table, plus DDL (no table name, kept for audit).
@@ -295,9 +298,9 @@ def keyword_conditions(query: dict[str, Any], params: dict[str, Any]) -> str:
     """Terms are whitespace separated (max 20), case-insensitive, AND/OR by keyword_mode.
 
     - pure [a-z0-9] term: whole-token match served by the text index;
-    - ASCII term with separators (``shop_id``): index prefilter on its tokens plus
-      the exact substring;
-    - term without any ASCII token (e.g. Chinese): bounded substring scan.
+    - term with separators or non-ASCII characters that still contains [a-z0-9] runs
+      (``shop_id``, ``订单157683``): index prefilter on those tokens plus the exact sequence;
+    - term without any [a-z0-9] run (e.g. pure Chinese): bounded substring scan.
     """
     terms = str(query.get("keyword") or "").strip().lower().split()[:20]
     if not terms:
@@ -309,13 +312,13 @@ def keyword_conditions(query: dict[str, Any], params: dict[str, Any]) -> str:
         tokens = TOKEN.findall(term)
         if TOKEN.fullmatch(term):
             clauses.append(f"hasToken({SEARCH_EXPR}, {{{name}:String}})")
-        elif tokens and term.isascii():
+        elif tokens:
             params[name + "t"] = ch_array(tokens)
             clauses.append(
                 f"(hasAllTokens({SEARCH_EXPR}, {{{name}t:Array(String)}}) "
-                f"AND position({SEARCH_EXPR}, {{{name}:String}}) > 0)")
+                f"AND position({RAW_EXPR}, {{{name}:String}}) > 0)")
         else:
-            clauses.append(f"position({SEARCH_EXPR}, {{{name}:String}}) > 0")
+            clauses.append(f"position({RAW_EXPR}, {{{name}:String}}) > 0")
     joiner = " OR " if str(query.get("keyword_mode") or "").upper() == "OR" else " AND "
     return "(" + joiner.join(clauses) + ")"
 
@@ -520,7 +523,7 @@ class BinlogRows:
 
     # -- coverage -------------------------------------------------------------
     def _files(self, instance: str, start: int | None, end: int | None) -> list[dict[str, Any]]:
-        sql = ("SELECT id, host_instance_id, log_begin_utc, log_end_utc, state FROM binlog_files "
+        sql = ("SELECT id, host_instance_id, log_file_name, log_begin_utc, log_end_utc, state FROM binlog_files "
                "WHERE instance_id = ?")
         args: list[Any] = [instance]
         if start is not None and end is not None:
@@ -531,7 +534,7 @@ class BinlogRows:
         out = []
         with self.metadata.connection() as conn:
             for row in conn.execute(sql, args):
-                if row["host_instance_id"] in NON_BINLOG_HOSTS:
+                if row["host_instance_id"] in NON_BINLOG_HOSTS or "/" in str(row["log_file_name"] or ""):
                     continue
                 try:
                     lo_us, hi_us = _epoch_us(row["log_begin_utc"]), _epoch_us(row["log_end_utc"])

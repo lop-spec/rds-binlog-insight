@@ -198,7 +198,8 @@ class Worker:
     def collector_lag_seconds(self) -> int:
         with self.metadata.connection() as conn:
             row = conn.execute(
-                "SELECT max(log_end_utc) AS e FROM binlog_files WHERE state = 'done' AND host_instance_id NOT IN (?, ?) "
+                "SELECT max(log_end_utc) AS e FROM binlog_files WHERE state = 'done' AND host_instance_id NOT IN ("
+                + ", ".join("?" * len(NON_BINLOG_HOSTS)) + ") AND instr(log_file_name, '/') = 0 "
                 "AND log_begin_utc >= ?", (*NON_BINLOG_HOSTS,
                                           (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))
             ).fetchone()
@@ -238,7 +239,8 @@ class Worker:
         kind, window = self.lane_specs[lane]
         sql = ("SELECT b.id, b.instance_id, b.host_instance_id, b.log_file_name, b.log_begin_utc, b.log_end_utc, "
                "r.descriptor AS raw_descriptor FROM binlog_files b LEFT JOIN raw_binlog_archives r ON r.file_id = b.id "
-               "WHERE b.state = 'done' AND b.host_instance_id NOT IN (?, ?) AND b.log_end_utc >= ?")
+               "WHERE b.state = 'done' AND b.host_instance_id NOT IN (" + ", ".join("?" * len(NON_BINLOG_HOSTS)) + ") "
+               "AND instr(b.log_file_name, '/') = 0 AND b.log_end_utc >= ?")
         args: list[Any] = [*NON_BINLOG_HOSTS, floor]
         if window:
             sql += " AND b.instance_id = ? AND b.log_end_utc >= ? AND b.log_begin_utc < ?"

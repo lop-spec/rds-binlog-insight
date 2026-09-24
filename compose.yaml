@@ -15,7 +15,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local/rds-binlog-insight:1.29.1-rawoss
+    image: local/rds-binlog-insight:1.29.2-rawoss
     container_name: rds-binlog-insight
     restart: unless-stopped
     logging: *runtime-logging
@@ -129,7 +129,7 @@ services:
     stop_grace_period: 90s
 
   indexer:
-    image: local/rds-binlog-insight:1.29.1-rawoss
+    image: local/rds-binlog-insight:1.29.2-rawoss
     container_name: rds-binlog-insight-indexer
     restart: unless-stopped
     logging: *runtime-logging
@@ -209,7 +209,7 @@ services:
         condition: service_healthy
 
   slowlog-indexer:
-    image: local/rds-binlog-insight:1.29.1-rawoss
+    image: local/rds-binlog-insight:1.29.2-rawoss
     container_name: rds-binlog-insight-slowlog-indexer
     restart: unless-stopped
     logging: *runtime-logging
@@ -287,7 +287,7 @@ services:
         condition: service_healthy
 
   clickhouse:
-    image: ghcr.io/lop-spec/rds-binlog-insight:clickhouse-1.29.1-rawoss
+    image: ghcr.io/lop-spec/rds-binlog-insight:clickhouse-1.29.2-rawoss
     container_name: rds-binlog-insight-clickhouse
     restart: unless-stopped
     logging: *runtime-logging
@@ -339,7 +339,7 @@ services:
     stop_grace_period: 60s
 
   clickhouse-ingester:
-    image: local/rds-binlog-insight:1.29.1-rawoss
+    image: local/rds-binlog-insight:1.29.2-rawoss
     container_name: rds-binlog-insight-clickhouse-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -414,7 +414,7 @@ services:
 
   clickhouse-oss-ingester:
     profiles: ["clickhouse-oss"]
-    image: local/rds-binlog-insight:1.29.1-rawoss
+    image: local/rds-binlog-insight:1.29.2-rawoss
     container_name: rds-binlog-insight-clickhouse-oss-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -497,7 +497,7 @@ services:
 
   clickhouse-raw-oss-worker:
     profiles: ["clickhouse-raw-oss"]
-    image: local/rds-binlog-insight:1.29.1-rawoss
+    image: local/rds-binlog-insight:1.29.2-rawoss
     container_name: rds-binlog-insight-clickhouse-raw-oss-worker
     restart: unless-stopped
     logging: *runtime-logging
@@ -570,7 +570,7 @@ services:
 
   binlog-rows-worker:
     profiles: ["binlog-rows"]
-    image: local/rds-binlog-insight:1.29.1-rawoss
+    image: local/rds-binlog-insight:1.29.2-rawoss
     container_name: rds-binlog-insight-rows-worker
     restart: unless-stopped
     logging: *runtime-logging
@@ -628,7 +628,7 @@ services:
         condition: service_healthy
 
   clickhouse-slowlog-ingester:
-    image: local/rds-binlog-insight:1.29.1-rawoss
+    image: local/rds-binlog-insight:1.29.2-rawoss
     container_name: rds-binlog-insight-clickhouse-slowlog-ingester
     restart: unless-stopped
     logging: *runtime-logging

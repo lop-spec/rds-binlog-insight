@@ -36,7 +36,7 @@ class KeywordTests(unittest.TestCase):
     def test_non_ascii_term_is_a_bounded_scan(self):
         params = {}
         clause = br.keyword_conditions({"keyword": "虫草花"}, params)
-        self.assertEqual(clause, f"(position({br.SEARCH_EXPR}, {{kw0:String}}) > 0)")
+        self.assertEqual(clause, f"(position({br.RAW_EXPR}, {{kw0:String}}) > 0)")
         self.assertTrue(br.keyword_uses_scan({"keyword": "虫草花"}))
 
     def test_or_mode_and_term_limit(self):
@@ -328,3 +328,37 @@ class Release1291Tests(unittest.TestCase):
                 worker._parser_warned = False
                 self.assertEqual(worker.parser_command(), [str(Path("/full"))])
             self.assertIn("BINLOG_ROWS_SLIM_PARSER_MISSING", logs.output[0])
+
+
+class Release1292Tests(unittest.TestCase):
+    def test_index_text_splits_tokens_at_non_ascii_runs(self):
+        self.assertEqual(br.SEARCH_EXPR, "replaceRegexpAll(" + br.RAW_EXPR + ", '[^\\\\x00-\\\\x7f]+', ' ')")
+        self.assertIn(f"INDEX search {br.SEARCH_EXPR} TYPE text", br.build_schema()[0])
+
+    def test_mixed_cjk_term_uses_token_prefilter_and_exact_sequence(self):
+        params = {}
+        clause = br.keyword_conditions({"keyword": "订单157683"}, params)
+        self.assertIn(f"hasAllTokens({br.SEARCH_EXPR}, {{kw0t:Array(String)}})", clause)
+        self.assertIn(f"position({br.RAW_EXPR}, {{kw0:String}}) > 0", clause)
+        self.assertEqual(params["kw0t"], "['157683']")
+
+    def test_coverage_ignores_virtual_non_binlog_files(self):
+        import sqlite3
+        from contextlib import contextmanager
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE binlog_files (id, instance_id, host_instance_id, log_file_name, log_begin_utc, log_end_utc, state)")
+        rows = [("a", "i", "100", "mysql-bin.1", "2026-09-20T00:00:00Z", "2026-09-20T00:10:00Z", "done"),
+                ("g", "i", "general-log", "general-log/i/1-2", "2026-09-20T00:10:00Z", "2026-09-20T00:20:00Z", "done"),
+                ("s", "i", "slow-log", "slow-log/i/n/1-2", "2026-09-20T00:10:00Z", "2026-09-20T00:20:00Z", "done"),
+                ("x", "i", "999", "odd/virtual", "2026-09-20T00:10:00Z", "2026-09-20T00:20:00Z", "done")]
+        conn.executemany("INSERT INTO binlog_files VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+
+        class Meta:
+            @contextmanager
+            def connection(self):
+                yield conn
+
+        backend = br.BinlogRows(Meta(), mock.Mock())
+        self.assertEqual([f["id"] for f in backend._files("i", None, None)], ["a"])
