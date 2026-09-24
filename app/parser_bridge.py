@@ -18,8 +18,16 @@ NATIVE_CHUNK_MAX_LINES = 200_000
 NATIVE_CHUNK_MAX_BYTES = 128 * 1024 * 1024
 NATIVE_CHUNK_PREFETCH = 1
 NATIVE_CHUNK_MAX_OUTSTANDING = NATIVE_CHUNK_PREFETCH + 1
-# Shared by primary/secondary managers in the collector process. Leave headroom
-# in the 1 GiB tmpfs for an oversized final record and parser manifests.
+NATIVE_MANIFEST_MAX_BYTES = 64 * 1024
+PARSER_TRANSPORT_NDJSON = "ndjson"
+PARSER_TRANSPORT_ARROW = "arrow"
+PARSER_CHUNK_PROTOCOL = "parser-chunk-v1"
+PARSER_ARROW_MANIFEST_FORMAT = "arrow-ipc-file-v1"
+PARSER_NDJSON_MANIFEST_FORMAT = "ndjson-v1"
+PARSER_ARROW_ACK_PROTOCOL = "parser-chunk-ack-v1"
+# Shared by primary/secondary managers in the collector process. Physical and
+# decoded chunk sizes are both bounded; the remaining tmpfs capacity covers
+# manifests, stderr, DuckDB scratch and atomic-publication overlap.
 NATIVE_STAGING_BUDGET_BYTES = 768 * 1024 * 1024
 _NATIVE_STAGING_LOCK = threading.Condition()
 _NATIVE_STAGING_ACTIVE: dict[Path, dict[str, int]] = {}
@@ -38,7 +46,9 @@ def _cleanup_native_chunk_artifacts(
         suffix = next(
             (
                 value
-                for value in (".ndjson.part", ".ndjson")
+                for value in (
+                    ".ndjson.part", ".arrow.part", ".ndjson", ".arrow"
+                )
                 if name.endswith(value)
             ),
             "",
@@ -67,6 +77,50 @@ class ParserError(RuntimeError):
         self.code = code
 
 
+def _validate_chunk_source_file_id(source_file_id: str) -> str:
+    value = str(source_file_id)
+    safe_characters = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    )
+    if (
+        not 1 <= len(value) <= 128
+        or value != value.strip()
+        or value in {".", ".."}
+        or Path(value).name != value
+        or any(character not in safe_characters for character in value)
+    ):
+        raise ParserError(
+            "解析器源文件标识不能用于安全的分块路径",
+            "PARSER_SOURCE_FILE_ID_INVALID",
+        )
+    return value
+
+
+@dataclass(slots=True, frozen=True)
+class ParserChunk:
+    path: Path
+    transport_format: str
+    sequence: int
+    rows: int
+    size_bytes: int
+    decoded_bytes: int | None = None
+
+
+def parser_transport_format(value: str | None = None) -> str:
+    selected = (
+        value
+        if value is not None
+        else os.environ.get("RDS_BINLOG_PARSER_TRANSPORT", PARSER_TRANSPORT_ARROW)
+    )
+    normalized = str(selected).strip().lower()
+    if normalized not in {PARSER_TRANSPORT_NDJSON, PARSER_TRANSPORT_ARROW}:
+        raise ParserError(
+            "解析器传输格式必须是 arrow 或 ndjson",
+            "PARSER_TRANSPORT_INVALID",
+        )
+    return normalized
+
+
 @dataclass(slots=True, frozen=True)
 class NativeChecksumResult:
     size_bytes: int
@@ -91,6 +145,7 @@ def _parser_command(
     flavor: str,
     *,
     output_dir: Path | None = None,
+    chunk_format: str = PARSER_TRANSPORT_NDJSON,
     max_lines: int = NATIVE_CHUNK_MAX_LINES,
     max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
 ) -> list[str]:
@@ -104,10 +159,15 @@ def _parser_command(
         flavor,
     ]
     if output_dir is not None:
+        selected_format = parser_transport_format(chunk_format)
+        command.extend(["--output-dir", str(output_dir)])
+        # Omit the new flag for NDJSON so the explicit rollback path can still
+        # operate an older deployed parser; the exact legacy manifest is gated
+        # separately below. New parser builds also default to NDJSON.
+        if selected_format == PARSER_TRANSPORT_ARROW:
+            command.extend(["--chunk-format", selected_format])
         command.extend(
             [
-                "--output-dir",
-                str(output_dir),
                 "--chunk-max-lines",
                 str(max_lines),
                 "--chunk-max-bytes",
@@ -463,19 +523,22 @@ def parse_ndjson_chunks(
                 time.sleep(0.05)
 
 
-def parse_native_ndjson_chunks(
+def parse_native_parser_chunks(
     path: Path,
     source_file_id: str,
     staging_dir: Path,
     flavor: str = "mysql",
     *,
+    chunk_format: str = PARSER_TRANSPORT_ARROW,
     max_lines: int = NATIVE_CHUNK_MAX_LINES,
     max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
     cancel_event: threading.Event | None = None,
     no_progress_seconds: float | None = None,
-) -> Iterator[Path]:
-    """Consume Go-published chunks without routing individual events through Python."""
+) -> Iterator[ParserChunk]:
+    """Consume atomic Go-published chunks under the manifest/ACK protocol."""
 
+    selected_format = parser_transport_format(chunk_format)
+    source_file_id = _validate_chunk_source_file_id(source_file_id)
     staging_dir.mkdir(parents=True, exist_ok=True)
     staging_root = staging_dir.resolve(strict=True)
     stderr_path = staging_root / f"{source_file_id}.native.stderr"
@@ -507,6 +570,7 @@ def parse_native_ndjson_chunks(
                     source_file_id,
                     flavor,
                     output_dir=staging_root,
+                    chunk_format=selected_format,
                     max_lines=max_lines,
                     max_bytes=max_bytes,
                 ),
@@ -521,9 +585,17 @@ def parse_native_ndjson_chunks(
 
             def read_stdout() -> None:
                 try:
-                    for value in iter(process.stdout.readline, b""):
-                        if stdout_cancel.is_set():
+                    while not stdout_cancel.is_set():
+                        value = process.stdout.readline(NATIVE_MANIFEST_MAX_BYTES + 1)
+                        if value == b"":
                             break
+                        if (
+                            len(value) > NATIVE_MANIFEST_MAX_BYTES
+                            or not value.endswith(b"\n")
+                        ):
+                            raise ValueError(
+                                "parser manifest exceeds its line bound or is not line framed"
+                            )
                         enqueue_stdout("manifest", value)
                 except BaseException as exc:
                     enqueue_stdout("error", exc)
@@ -566,9 +638,18 @@ def parse_native_ndjson_chunks(
                 last_progress = time.monotonic()
                 try:
                     manifest = json.loads(raw_value.decode("utf-8"))
+                    if not isinstance(manifest, dict):
+                        raise TypeError("manifest must be an object")
                     candidate = Path(str(manifest["path"]))
                     rows = int(manifest["rows"])
                     bytes_written = int(manifest["bytes"])
+                    strict_protocol = "protocol" in manifest
+                    sequence = int(manifest.get("sequence", expected_index))
+                    decoded_bytes = (
+                        int(manifest["decoded_bytes"])
+                        if "decoded_bytes" in manifest
+                        else None
+                    )
                 except (
                     KeyError,
                     TypeError,
@@ -579,14 +660,71 @@ def parse_native_ndjson_chunks(
                     raise ParserError(
                         "Binlog 分块清单无效", "PARSER_CHUNK_MANIFEST_INVALID"
                     ) from exc
-                expected_name = f"{source_file_id}-{expected_index:06d}.ndjson"
+                suffix = (
+                    ".arrow"
+                    if selected_format == PARSER_TRANSPORT_ARROW
+                    else ".ndjson"
+                )
+                expected_name = f"{source_file_id}-{expected_index:06d}{suffix}"
+                expected_manifest_format = (
+                    PARSER_ARROW_MANIFEST_FORMAT
+                    if selected_format == PARSER_TRANSPORT_ARROW
+                    else PARSER_NDJSON_MANIFEST_FORMAT
+                )
+                if selected_format == PARSER_TRANSPORT_ARROW:
+                    expected_keys = {
+                        "protocol", "format", "sequence", "path", "rows",
+                        "bytes", "decoded_bytes",
+                    }
+                    protocol_valid = (
+                        set(manifest) == expected_keys
+                        and manifest.get("protocol") == PARSER_CHUNK_PROTOCOL
+                        and manifest.get("format") == expected_manifest_format
+                        and isinstance(manifest.get("path"), str)
+                        and all(
+                            type(manifest.get(key)) is int
+                            for key in ("sequence", "rows", "bytes", "decoded_bytes")
+                        )
+                        and decoded_bytes is not None
+                        and 0 < decoded_bytes <= max_bytes
+                    )
+                elif strict_protocol:
+                    expected_keys = {
+                        "protocol", "format", "sequence", "path", "rows", "bytes"
+                    }
+                    protocol_valid = (
+                        set(manifest) == expected_keys
+                        and manifest.get("protocol") == PARSER_CHUNK_PROTOCOL
+                        and manifest.get("format") == expected_manifest_format
+                        and isinstance(manifest.get("path"), str)
+                        and all(
+                            type(manifest.get(key)) is int
+                            for key in ("sequence", "rows", "bytes")
+                        )
+                        and decoded_bytes is None
+                    )
+                else:
+                    # Keep only the exact pre-v1 three-field NDJSON protocol
+                    # available for rollback; do not turn it into an extension
+                    # point that bypasses the versioned manifest contract.
+                    protocol_valid = (
+                        set(manifest) == {"path", "rows", "bytes"}
+                        and isinstance(manifest.get("path"), str)
+                        and all(
+                            type(manifest.get(key)) is int
+                            for key in ("rows", "bytes")
+                        )
+                        and decoded_bytes is None
+                    )
                 if (
-                    not isinstance(manifest, dict)
+                    not protocol_valid
+                    or sequence != expected_index
                     or not candidate.is_absolute()
                     or candidate.name != expected_name
                     or rows <= 0
                     or rows > max_lines
                     or bytes_written <= 0
+                    or bytes_written > max_bytes
                 ):
                     raise ParserError(
                         "Binlog 分块清单越界", "PARSER_CHUNK_MANIFEST_INVALID"
@@ -594,6 +732,7 @@ def parse_native_ndjson_chunks(
                 try:
                     resolved = candidate.resolve(strict=True)
                     resolved.relative_to(staging_root)
+                    actual_size = resolved.stat().st_size
                 except (OSError, ValueError) as exc:
                     raise ParserError(
                         "Binlog 分块路径不在暂存目录内",
@@ -602,18 +741,40 @@ def parse_native_ndjson_chunks(
                 if (
                     resolved.parent != staging_root
                     or not resolved.is_file()
-                    or resolved.stat().st_size != bytes_written
+                    or actual_size != bytes_written
                 ):
                     raise ParserError(
                         "Binlog 分块文件与清单不一致",
                         "PARSER_CHUNK_MANIFEST_INVALID",
                     )
-                yield resolved
+                yield ParserChunk(
+                    path=resolved,
+                    transport_format=selected_format,
+                    sequence=sequence,
+                    rows=rows,
+                    size_bytes=bytes_written,
+                    decoded_bytes=decoded_bytes,
+                )
                 if cancel_event is not None and cancel_event.is_set():
                     raise ParserError("Binlog 解析已取消", "PARSER_CANCELLED")
                 try:
-                    process.stdin.write(b"ok\n")
+                    if selected_format == PARSER_TRANSPORT_ARROW:
+                        ack = json.dumps(
+                            {
+                                "protocol": PARSER_ARROW_ACK_PROTOCOL,
+                                "sequence": expected_index,
+                                "status": "ok",
+                            },
+                            separators=(",", ":"),
+                        ).encode("utf-8") + b"\n"
+                        process.stdin.write(ack)
+                    else:
+                        # Keep the deployed line ACK byte-for-byte compatible.
+                        process.stdin.write(b"ok\n")
                     process.stdin.flush()
+                    # Consumer time belongs to the acknowledged chunk, not to
+                    # the parser's next-chunk no-progress window.
+                    last_progress = time.monotonic()
                 except (BrokenPipeError, OSError) as exc:
                     raise ParserError(
                         f"确认 Binlog 分块失败：{exc}", "PARSER_CHUNK_ACK_FAILED"
@@ -667,7 +828,7 @@ def parse_native_ndjson_chunks(
                 time.sleep(0.05)
 
 
-def _parse_ndjson_chunks_buffered(
+def parse_native_ndjson_chunks(
     path: Path,
     source_file_id: str,
     staging_dir: Path,
@@ -675,9 +836,37 @@ def _parse_ndjson_chunks_buffered(
     *,
     max_lines: int = NATIVE_CHUNK_MAX_LINES,
     max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
-    max_prefetch: int = NATIVE_CHUNK_PREFETCH,
+    cancel_event: threading.Event | None = None,
     no_progress_seconds: float | None = None,
 ) -> Iterator[Path]:
+    """Compatibility wrapper for the legacy NDJSON chunk transport."""
+
+    for chunk in parse_native_parser_chunks(
+        path,
+        source_file_id,
+        staging_dir,
+        flavor,
+        chunk_format=PARSER_TRANSPORT_NDJSON,
+        max_lines=max_lines,
+        max_bytes=max_bytes,
+        cancel_event=cancel_event,
+        no_progress_seconds=no_progress_seconds,
+    ):
+        yield chunk.path
+
+
+def _parse_parser_chunks_buffered(
+    path: Path,
+    source_file_id: str,
+    staging_dir: Path,
+    flavor: str = "mysql",
+    *,
+    chunk_format: str,
+    max_lines: int = NATIVE_CHUNK_MAX_LINES,
+    max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
+    max_prefetch: int = NATIVE_CHUNK_PREFETCH,
+    no_progress_seconds: float | None = None,
+) -> Iterator[ParserChunk]:
     messages: queue.Queue[tuple[str, object]] = queue.Queue(
         maxsize=max(1, int(max_prefetch))
     )
@@ -700,11 +889,12 @@ def _parse_ndjson_chunks_buffered(
         return False
 
     def produce() -> None:
-        chunks = parse_native_ndjson_chunks(
+        chunks = parse_native_parser_chunks(
             path,
             source_file_id,
             staging_dir,
             flavor,
+            chunk_format=chunk_format,
             max_lines=max_lines,
             max_bytes=max_bytes,
             cancel_event=cancel,
@@ -713,22 +903,26 @@ def _parse_ndjson_chunks_buffered(
         try:
             while acquire_outstanding_slot():
                 try:
-                    chunk_path = next(chunks)
+                    chunk = next(chunks)
                 except StopIteration:
                     outstanding.release()
                     break
                 except BaseException:
                     outstanding.release()
                     raise
-                if not enqueue("path", chunk_path):
-                    chunk_path.unlink(missing_ok=True)
+                if not enqueue("chunk", chunk):
+                    chunk.path.unlink(missing_ok=True)
                     outstanding.release()
                     break
         except BaseException as exc:
             if not cancel.is_set():
                 enqueue("error", exc)
         finally:
-            chunks.close()
+            try:
+                chunks.close()
+            except BaseException as exc:
+                if not cancel.is_set():
+                    enqueue("error", exc)
             if not cancel.is_set():
                 enqueue("done", None)
 
@@ -741,10 +935,14 @@ def _parse_ndjson_chunks_buffered(
     try:
         while True:
             kind, value = messages.get()
-            if kind == "path":
+            if kind == "chunk":
+                assert isinstance(value, ParserChunk)
                 try:
-                    yield Path(value)
+                    yield value
                 finally:
+                    # Releasing this slot means the caller finished the chunk
+                    # body. The producer may ACK/admit one successor, while the
+                    # total ready + in-flight set remains bounded.
                     outstanding.release()
                 continue
             if kind == "error":
@@ -759,13 +957,41 @@ def _parse_ndjson_chunks_buffered(
                 kind, value = messages.get_nowait()
             except queue.Empty:
                 break
-            if kind == "path":
-                Path(value).unlink(missing_ok=True)
+            if kind == "chunk":
+                assert isinstance(value, ParserChunk)
+                value.path.unlink(missing_ok=True)
                 outstanding.release()
         if producer.is_alive():
             raise ParserError(
                 "解析预取线程未能安全停止", "PARSER_PREFETCH_STOP_TIMEOUT"
             )
+
+
+def _parse_ndjson_chunks_buffered(
+    path: Path,
+    source_file_id: str,
+    staging_dir: Path,
+    flavor: str = "mysql",
+    *,
+    max_lines: int = NATIVE_CHUNK_MAX_LINES,
+    max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
+    max_prefetch: int = NATIVE_CHUNK_PREFETCH,
+    no_progress_seconds: float | None = None,
+) -> Iterator[Path]:
+    """Compatibility wrapper over the single buffered chunk implementation."""
+
+    for chunk in _parse_parser_chunks_buffered(
+        path,
+        source_file_id,
+        staging_dir,
+        flavor,
+        chunk_format=PARSER_TRANSPORT_NDJSON,
+        max_lines=max_lines,
+        max_bytes=max_bytes,
+        max_prefetch=max_prefetch,
+        no_progress_seconds=no_progress_seconds,
+    ):
+        yield chunk.path
 
 
 def parse_ndjson_chunks_buffered(
@@ -779,6 +1005,36 @@ def parse_ndjson_chunks_buffered(
     max_prefetch: int = NATIVE_CHUNK_PREFETCH,
     no_progress_seconds: float | None = None,
 ) -> Iterator[Path]:
+    """Compatibility wrapper preserving the deployed NDJSON call contract."""
+
+    for chunk in parse_parser_chunks_buffered(
+        path,
+        source_file_id,
+        staging_dir,
+        flavor,
+        chunk_format=PARSER_TRANSPORT_NDJSON,
+        max_lines=max_lines,
+        max_bytes=max_bytes,
+        max_prefetch=max_prefetch,
+        no_progress_seconds=no_progress_seconds,
+    ):
+        yield chunk.path
+
+
+def parse_parser_chunks_buffered(
+    path: Path,
+    source_file_id: str,
+    staging_dir: Path,
+    flavor: str = "mysql",
+    *,
+    chunk_format: str | None = None,
+    max_lines: int = NATIVE_CHUNK_MAX_LINES,
+    max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
+    max_prefetch: int = NATIVE_CHUNK_PREFETCH,
+    no_progress_seconds: float | None = None,
+) -> Iterator[ParserChunk]:
+    selected_format = parser_transport_format(chunk_format)
+    source_file_id = _validate_chunk_source_file_id(source_file_id)
     staging_dir.mkdir(parents=True, exist_ok=True)
     staging_root = staging_dir.resolve(strict=True)
     reservation = max_bytes * (max(1, int(max_prefetch)) + 1)
@@ -786,22 +1042,23 @@ def parse_ndjson_chunks_buffered(
         raise ParserError("解析分块预取超出暂存预算", "PARSER_STAGING_BUDGET")
     with _NATIVE_STAGING_LOCK:
         active = _NATIVE_STAGING_ACTIVE.setdefault(staging_root, {})
-        # Two lanes total, including secondary instances. This lock is held only
-        # for admission/cleanup, never while parsing or consuming a yielded chunk.
         _NATIVE_STAGING_LOCK.wait_for(
             lambda: source_file_id not in active
             and len(active) < 2
             and sum(active.values()) + reservation <= NATIVE_STAGING_BUDGET_BYTES
         )
+        # Clean both formats so a crash followed by a transport rollback cannot
+        # retain an unowned chunk. Same-file admission is serialized above.
         _cleanup_native_chunk_artifacts(staging_root, keep_source_ids=set(active))
         active[source_file_id] = reservation
     completed = False
     try:
-        yield from _parse_ndjson_chunks_buffered(
+        yield from _parse_parser_chunks_buffered(
             path,
             source_file_id,
             staging_root,
             flavor,
+            chunk_format=selected_format,
             max_lines=max_lines,
             max_bytes=max_bytes,
             max_prefetch=max_prefetch,

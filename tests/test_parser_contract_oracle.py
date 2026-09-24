@@ -1,11 +1,17 @@
 import base64
+import hashlib
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
+import pyarrow as pa
+
+from app.columnar_input import parser_schema
+from app.storage import PARSER_JSON_COLUMNS
 from tools.parser_contract_oracle import (
     check_values,
+    compare_chunked_arrow,
     compare_columnar,
     compare_decoders,
     expected_images,
@@ -53,6 +59,84 @@ class ParserContractOracleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'native Arrow values'):
                 compare_columnar(changed, root / 'compare-mismatch', 'f' * 64,
                                  native_arrow=root / 'compare/input.arrow')
+
+    def test_retained_arrow_chunk_transcript_replays_all_41_and_47_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_id = "f" * 64
+            rows = faithful_rows()
+            for index, row in enumerate(rows):
+                row.update(
+                    event_id=f"event-{index}",
+                    event_epoch_us=1789906364540116,
+                    start_position=100 + index * 10,
+                    end_position=110 + index * 10,
+                )
+            ndjson = root / "candidate.ndjson"
+            ndjson.write_text(
+                "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+            )
+            table = pa.Table.from_pylist(
+                rows, schema=parser_schema(PARSER_JSON_COLUMNS)
+            )
+            chunk_dir = root / "candidate-arrow-chunks"
+            chunk_dir.mkdir()
+            chunks = []
+            manifests = bytearray()
+            acknowledgements = bytearray()
+            for sequence, batch in enumerate((table.slice(0, 3), table.slice(3, 1))):
+                name = f"{source_id}-{sequence:06d}.arrow"
+                path = chunk_dir / name
+                with pa.OSFile(str(path), "wb") as sink:
+                    with pa.ipc.new_file(sink, table.schema) as writer:
+                        writer.write_table(batch)
+                size = path.stat().st_size
+                retained = {
+                    "sequence": sequence,
+                    "name": name,
+                    "rows": batch.num_rows,
+                    "bytes": size,
+                    "decoded_bytes": 100 + sequence,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+                chunks.append(retained)
+                manifests.extend((json.dumps({
+                    "protocol": "parser-chunk-v1",
+                    "format": "arrow-ipc-file-v1",
+                    "sequence": sequence,
+                    "path": str(path.resolve()),
+                    "rows": batch.num_rows,
+                    "bytes": size,
+                    "decoded_bytes": 100 + sequence,
+                }, separators=(",", ":")) + "\n").encode())
+                acknowledgements.extend((json.dumps({
+                    "protocol": "parser-chunk-ack-v1",
+                    "sequence": sequence,
+                    "status": "ok",
+                }, separators=(",", ":")) + "\n").encode())
+            (root / "candidate-arrow-chunks.manifests.ndjson").write_bytes(manifests)
+            (root / "candidate-arrow-chunks.acks.ndjson").write_bytes(
+                acknowledgements
+            )
+            stderr = b"parsed 4 audit records\n"
+            (root / "candidate-arrow-chunks.stderr").write_bytes(stderr)
+            contract = {
+                "protocol": "parser-chunk-v1",
+                "format": "arrow-ipc-file-v1",
+                "ack_protocol": "parser-chunk-ack-v1",
+                "manifests_sha256": hashlib.sha256(manifests).hexdigest(),
+                "acks_sha256": hashlib.sha256(acknowledgements).hexdigest(),
+                "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                "chunks": chunks,
+            }
+            proof = compare_chunked_arrow(
+                ndjson, root, root / "chunk-compare", source_id, contract
+            )
+            self.assertEqual(proof["chunks"], 2)
+            self.assertEqual(proof["rows"], 4)
+            self.assertEqual(proof["transport_fields"], 41)
+            self.assertEqual(proof["fields"], 47)
+            self.assertTrue(proof["materialization_equal"])
 
     def test_identity_failure_retains_a_failed_report(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -39,13 +39,25 @@ bytes (defaults: 4096 rows and 32 MiB), while the complete IPC file has a hard
 128 MiB default and maximum matching the current reader contract. Unsigned
 values that cannot fit a signed transport field fail closed.
 
-The Arrow file is written exclusively to `PATH.part`, file-synced, then
-published without overwrite by a same-directory hard link; Linux directory
-metadata is synced before and after staging-link removal. Parse, checksum,
-context, bound, close, or publication failure removes staging output and never
-publishes a partial final file. The current option deliberately produces one
-bounded IPC file for candidate contracts. It is not yet the collector's
-chunk/ACK interface and is not selected in production.
+The Arrow file is written exclusively to `PATH.part`, file-synced, then published without overwrite by a same-directory hard link; Linux directory metadata is synced before and after staging-link removal. Parse, checksum, context, bound, close, or publication failure removes staging output and never publishes a partial final file. `--arrow-output` deliberately produces one bounded IPC file for candidate contracts.
+
+The collector interface is `--output-dir DIR --chunk-format arrow`. It writes one independently readable Arrow IPC file per chunk and emits exactly one `parser-chunk-v1` JSON manifest after atomic publication:
+
+```json
+{"protocol":"parser-chunk-v1","format":"arrow-ipc-file-v1","sequence":0,"path":"/absolute/staging/source-000000.arrow","rows":4096,"bytes":123456,"decoded_bytes":789012}
+```
+
+The parser waits for an exact sequence-bound ACK before advancing:
+
+```json
+{"protocol":"parser-chunk-ack-v1","sequence":0,"status":"ok"}
+```
+
+Rows, decoded estimate and physical IPC size are independently limited; the configured maximum cannot exceed 128 MiB. Manifests and ACKs reject missing, unknown or trailing JSON fields/data. Each chunk uses exclusive `.part` creation, file sync and no-overwrite publication. Manifest/ACK failure removes the unaccepted final; parse, bound or close failure removes partial output. Existing final or `.part` paths fail closed rather than being deleted or overwritten.
+
+`--chunk-format ndjson` remains an explicit rollback transport. It now uses the same no-overwrite publication and emits versioned `ndjson-v1` manifests, while retaining line ACKs for the existing rollback reader. A complete encoded NDJSON record is checked before writing, so neither one oversized record nor a boundary crossing can publish an over-limit chunk.
+
+The collector owns an ACKed file and may prefetch only within its separate outstanding-slot budget; parser ACK does not mean Parquet publication, metadata progress or archive completion. This candidate protocol is selected by default only in this branch and is not deployed in production.
 
 Build and test with the digest-pinned builder without publishing an image:
 

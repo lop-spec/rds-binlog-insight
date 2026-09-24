@@ -39,7 +39,13 @@ class ParserCapacityTests(unittest.TestCase):
                     first_entered.set()
                     if not release.wait(3):
                         raise AssertionError('second parser remained serialized')
-                    yield chunk
+                    yield parser.ParserChunk(
+                        path=chunk,
+                        transport_format="ndjson",
+                        sequence=0,
+                        rows=1,
+                        size_bytes=chunk.stat().st_size,
+                    )
                 else:
                     self.assertTrue(live.is_file())
                     raise parser.ParserError('forced failure')
@@ -48,7 +54,7 @@ class ParserCapacityTests(unittest.TestCase):
                 return list(parser.parse_ndjson_chunks_buffered(
                     root / 'input', file_id, root))
 
-            with patch.object(parser, '_parse_ndjson_chunks_buffered', fake), \
+            with patch.object(parser, '_parse_parser_chunks_buffered', fake), \
                     ThreadPoolExecutor(max_workers=2) as executor:
                 first = executor.submit(consume, 'live')
                 try:
@@ -62,7 +68,7 @@ class ParserCapacityTests(unittest.TestCase):
                     release.set()
                 self.assertEqual(first.result(timeout=2), [live])
             # Failure released its capacity; a retry does not hang.
-            with patch.object(parser, '_parse_ndjson_chunks_buffered', return_value=iter(())):
+            with patch.object(parser, '_parse_parser_chunks_buffered', return_value=iter(())):
                 self.assertEqual(consume('failed'), [])
 
     def _check_blocked(self, *, same_id=False, byte_limited=False):
@@ -87,7 +93,7 @@ class ParserCapacityTests(unittest.TestCase):
                     max_bytes=(384 if byte_limited else 128) * 1024**2))
 
             admitted = 1 if same_id or byte_limited else 2
-            with patch.object(parser, '_parse_ndjson_chunks_buffered', fake), \
+            with patch.object(parser, '_parse_parser_chunks_buffered', fake), \
                     ThreadPoolExecutor(max_workers=3) as executor:
                 futures = [executor.submit(consume, i) for i in range(admitted)]
                 try:
@@ -113,7 +119,7 @@ class ParserCapacityTests(unittest.TestCase):
 
     def test_impossible_reservation_fails_before_parser_start(self):
         with tempfile.TemporaryDirectory() as directory, \
-                patch.object(parser, '_parse_ndjson_chunks_buffered') as native:
+                patch.object(parser, '_parse_parser_chunks_buffered') as native:
             with self.assertRaises(parser.ParserError) as raised:
                 list(parser.parse_ndjson_chunks_buffered(
                     Path(directory) / 'input', 'file', Path(directory),

@@ -139,6 +139,165 @@ def compare_columnar(ndjson: Path, output: Path, source_id: str, *, native_arrow
                 independent_value_oracle=False)
 
 
+def compare_chunked_arrow(ndjson: Path, case_dir: Path, output: Path, source_id: str,
+                          contract: dict):
+    """Independently decode the retained strict manifests, ACKs and IPC chunks."""
+    required_contract = {
+        "protocol", "format", "ack_protocol", "manifests_sha256",
+        "acks_sha256", "stderr_sha256", "chunks",
+    }
+    if set(contract) != required_contract:
+        raise ValueError("Arrow chunk contract fields changed")
+    if (contract["protocol"] != "parser-chunk-v1"
+            or contract["format"] != "arrow-ipc-file-v1"
+            or contract["ack_protocol"] != "parser-chunk-ack-v1"
+            or not isinstance(contract["chunks"], list)
+            or not contract["chunks"]):
+        raise ValueError("Arrow chunk contract identity changed")
+    manifests_raw = (case_dir / "candidate-arrow-chunks.manifests.ndjson").read_bytes()
+    acknowledgements_raw = (case_dir / "candidate-arrow-chunks.acks.ndjson").read_bytes()
+    stderr_raw = (case_dir / "candidate-arrow-chunks.stderr").read_bytes()
+    if (hashlib.sha256(manifests_raw).hexdigest() != contract["manifests_sha256"]
+            or hashlib.sha256(acknowledgements_raw).hexdigest()
+            != contract["acks_sha256"]
+            or hashlib.sha256(stderr_raw).hexdigest() != contract["stderr_sha256"]):
+        raise ValueError("Arrow chunk transcript identity mismatch")
+    if not manifests_raw.endswith(b"\n") or not acknowledgements_raw.endswith(b"\n"):
+        raise ValueError("Arrow chunk transcript is not line framed")
+    try:
+        manifests = [json.loads(line) for line in manifests_raw.splitlines()]
+        acknowledgements = [json.loads(line) for line in acknowledgements_raw.splitlines()]
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Arrow chunk transcript is malformed") from exc
+    if not (len(manifests) == len(acknowledgements) == len(contract["chunks"])):
+        raise ValueError("Arrow chunk transcript length mismatch")
+    if stderr_raw.decode("utf-8", "strict").strip() != (
+            f"parsed {sum(chunk['rows'] for chunk in contract['chunks'])} audit records"):
+        raise ValueError("Arrow chunk completion record changed")
+
+    rows = [json.loads(line) for line in ndjson.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    expected = pa.Table.from_pylist(rows, schema=parser_schema(PARSER_JSON_COLUMNS))
+    chunk_tables = []
+    manifest_fields = {
+        "protocol", "format", "sequence", "path", "rows", "bytes",
+        "decoded_bytes",
+    }
+    contract_fields = {"sequence", "name", "rows", "bytes", "decoded_bytes", "sha256"}
+    for sequence, (manifest, acknowledgement, retained) in enumerate(
+            zip(manifests, acknowledgements, contract["chunks"])):
+        if (not isinstance(manifest, dict) or set(manifest) != manifest_fields
+                or not isinstance(acknowledgement, dict)
+                or set(acknowledgement) != {"protocol", "sequence", "status"}
+                or not isinstance(retained, dict) or set(retained) != contract_fields):
+            raise ValueError("Arrow chunk transcript has unknown or missing fields")
+        if (manifest["protocol"] != contract["protocol"]
+                or manifest["format"] != contract["format"]
+                or acknowledgement["protocol"] != contract["ack_protocol"]
+                or acknowledgement["status"] != "ok"
+                or type(manifest["sequence"]) is not int
+                or type(acknowledgement["sequence"]) is not int
+                or type(retained["sequence"]) is not int
+                or manifest["sequence"] != sequence
+                or acknowledgement["sequence"] != sequence
+                or retained["sequence"] != sequence
+                or type(manifest["path"]) is not str
+                or not Path(manifest["path"]).is_absolute()):
+            raise ValueError("Arrow chunk transcript sequence or identity mismatch")
+        for field in ("rows", "bytes", "decoded_bytes"):
+            if (type(manifest[field]) is not int or type(retained[field]) is not int
+                    or manifest[field] != retained[field] or manifest[field] <= 0):
+                raise ValueError("Arrow chunk bounds are malformed")
+        if (manifest["rows"] > 3 or manifest["bytes"] > 128 * 1024 * 1024
+                or manifest["decoded_bytes"] > 128 * 1024 * 1024):
+            raise ValueError("Arrow chunk exceeded its retained hard bounds")
+        name = retained["name"]
+        if (type(name) is not str or Path(name).name != name
+                or Path(manifest["path"]).name != name
+                or name != f"{source_id}-{sequence:06d}.arrow"
+                or type(retained["sha256"]) is not str):
+            raise ValueError("Arrow chunk path binding changed")
+        chunk = case_dir / "candidate-arrow-chunks" / name
+        content = chunk.read_bytes()
+        if (len(content) != manifest["bytes"]
+                or hashlib.sha256(content).hexdigest() != retained["sha256"]):
+            raise ValueError("Arrow chunk byte identity mismatch")
+        with pa.OSFile(str(chunk), "rb") as source:
+            reader = pa.ipc.open_file(source)
+            table = reader.read_all()
+            del reader
+        if (table.column_names != list(PARSER_JSON_COLUMNS)
+                or not table.schema.equals(expected.schema, check_metadata=True)
+                or table.num_rows != manifest["rows"]):
+            raise ValueError("Arrow chunk schema or manifest row count changed")
+        chunk_tables.append(table)
+    combined = pa.concat_tables(chunk_tables)
+    if not combined.equals(expected, check_metadata=True):
+        raise ValueError("Arrow chunks changed parser values or row order")
+
+    output.mkdir(exist_ok=False)
+    materialized = []
+    storage = EventStorage.__new__(EventStorage)
+    storage.paths = ensure_data_dirs(output / "chunks")
+    storage._part_body_locks = [threading.RLock() for _ in range(256)]
+    common = dict(file_id=source_id, instance_id="synthetic-fixture",
+                  host_instance_id="fixture-host", source_file_name="mysql-bin.fixture",
+                  publish_metadata=False, append=True)
+    count = 0
+    for sequence, retained in enumerate(contract["chunks"]):
+        rows_written, parts = storage.ingest_arrow_file(
+            arrow_path=case_dir / "candidate-arrow-chunks" / retained["name"],
+            expected_rows=retained["rows"],
+            part_key=f"{sequence:06d}",
+            **common,
+        )
+        count += rows_written
+        materialized.extend(pq.ParquetFile(part["path"]).read() for part in parts)
+    actual = pa.concat_tables(materialized)
+    baseline_storage = EventStorage.__new__(EventStorage)
+    baseline_storage.paths = ensure_data_dirs(output / "ndjson")
+    baseline_storage._part_body_locks = [threading.RLock() for _ in range(256)]
+    baseline_count, baseline_parts = baseline_storage.ingest_ndjson_file(
+        ndjson_path=ndjson, **common
+    )
+    baseline = pa.concat_tables([
+        pq.ParquetFile(part["path"]).read() for part in baseline_parts
+    ])
+    expected_ids = [row["event_id"] for row in rows]
+
+    def parser_order(table):
+        actual_ids = table["event_id"].to_pylist()
+        positions = {event_id: index for index, event_id in enumerate(actual_ids)}
+        if (len(positions) != len(actual_ids)
+                or set(positions) != set(expected_ids)):
+            raise ValueError("47-field materialization changed event identities")
+        return table.take(pa.array([positions[event_id] for event_id in expected_ids]))
+
+    actual = parser_order(actual)
+    baseline = parser_order(baseline)
+    if (count != len(rows) or baseline_count != len(rows)
+            or actual.column_names != list(EVENT_COLUMNS)
+            or not actual.equals(baseline, check_metadata=True)):
+        differing = [
+            name for name in EVENT_COLUMNS
+            if not actual[name].equals(baseline[name])
+        ] if actual.num_rows == baseline.num_rows else []
+        raise ValueError(
+            "Arrow chunks changed the final 47-field materialization: "
+            + ",".join(differing[:10])
+        )
+    return {
+        "protocol": contract["protocol"],
+        "ack_protocol": contract["ack_protocol"],
+        "chunks": len(chunk_tables),
+        "rows": len(rows),
+        "transport_fields": len(PARSER_JSON_COLUMNS),
+        "fields": len(EVENT_COLUMNS),
+        "transport_equal": True,
+        "materialization_equal": True,
+    }
+
+
 def compare_decoders(legacy: Path, candidate: Path, output: Path, source_id: str, *, require_binary_repair=False):
     """Compare every stored field, allowing only independently checked byte-body repairs."""
     output.mkdir(exist_ok=False)
@@ -220,6 +379,13 @@ def verify(root: Path):
                 "legacy": compare_columnar(legacy, directory / "legacy-columnar", case["source_id"]),
                 "candidate": compare_columnar(candidate, directory / "candidate-columnar", case["source_id"],
                                                 native_arrow=candidate_arrow),
+                "candidate_arrow_chunks": compare_chunked_arrow(
+                    candidate,
+                    directory,
+                    directory / "candidate-arrow-chunks-columnar",
+                    case["source_id"],
+                    case["candidate_arrow_chunks"],
+                ),
             }
             result["decoder_differential"][mode] = compare_decoders(
                 legacy, candidate, directory / "decoder-differential", case["source_id"],

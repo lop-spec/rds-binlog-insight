@@ -24,7 +24,7 @@ from .maintenance_status import SUPERVISOR_STATUS_NAME, read_json_status
 from .metadata import MetadataStore
 from .sync_lifecycle import PauseControl, sync_health
 from .oss_store import OSS_PACK_TARGET_BYTES, OssArchive, OssArchiveError
-from .parser_bridge import ParserError, parse_ndjson_chunks_buffered
+from .parser_bridge import ParserError, parse_parser_chunks_buffered
 from .rds_api import RdsApiError, RdsRpcClient, RemoteBinlog
 from .storage import EventStorage, StorageError, ingest_ndjson_file_detached
 
@@ -1114,7 +1114,9 @@ class SyncManager:
             "archive_wait_seconds", "metadata_seconds",
         ), 0.0)
         chunks = 0
+        transport_bytes = 0
         ndjson_bytes = 0
+        transport_formats: set[str] = set()
 
         def submit_archive_buffer(*, force: bool) -> None:
             nonlocal archive_buffer, archive_buffer_bytes
@@ -1148,8 +1150,8 @@ class SyncManager:
 
         try:
             native_wait_since = time.monotonic()
-            for chunk_index, ndjson_path in enumerate(
-                parse_ndjson_chunks_buffered(
+            for chunk_index, chunk in enumerate(
+                parse_parser_chunks_buffered(
                     path,
                     file_id,
                     self.storage.paths["staging"],
@@ -1157,19 +1159,39 @@ class SyncManager:
                 )
             ):
                 timings["native_wait_seconds"] += time.monotonic() - native_wait_since
+                if chunk.sequence != chunk_index:
+                    raise ParserError(
+                        "解析器分块顺序发生变化",
+                        "PARSER_CHUNK_SEQUENCE_MISMATCH",
+                    )
                 chunks += 1
-                ndjson_bytes += ndjson_path.stat().st_size
+                transport_bytes += chunk.size_bytes
+                transport_formats.add(chunk.transport_format)
+                if chunk.transport_format == "ndjson":
+                    ndjson_bytes += chunk.size_bytes
+                cleanup_error: OSError | None = None
                 try:
                     transform_started = time.monotonic()
                     if transform_submitter is None:
-                        chunk_count, parts = self.storage.ingest_ndjson_file(
+                        ingest = (
+                            self.storage.ingest_arrow_file
+                            if chunk.transport_format == "arrow"
+                            else self.storage.ingest_ndjson_file
+                        )
+                        path_argument = (
+                            {"arrow_path": chunk.path}
+                            if chunk.transport_format == "arrow"
+                            else {"ndjson_path": chunk.path}
+                        )
+                        chunk_count, parts = ingest(
                             file_id=file_id,
                             instance_id=settings.db_instance_id,
                             host_instance_id=item.host_instance_id,
                             source_file_name=item.log_file_name,
-                            ndjson_path=ndjson_path,
                             part_key=f"{chunk_index:06d}",
                             append=True,
+                            expected_rows=chunk.rows,
+                            **path_argument,
                         )
                         timings["transform_wait_seconds"] += time.monotonic() - transform_started
                     else:
@@ -1180,11 +1202,18 @@ class SyncManager:
                                 "instance_id": settings.db_instance_id,
                                 "host_instance_id": item.host_instance_id,
                                 "source_file_name": item.log_file_name,
-                                "ndjson_path": str(ndjson_path),
+                                "parser_path": str(chunk.path),
+                                "parser_format": chunk.transport_format,
+                                "expected_rows": chunk.rows,
                                 "part_key": f"{chunk_index:06d}",
                             }
                         ).result()
                         timings["transform_wait_seconds"] += time.monotonic() - transform_started
+                        if chunk_count != chunk.rows:
+                            raise ParserError(
+                                "解析器分块持久化行数与清单不一致",
+                                "PARSER_CHUNK_ROW_COUNT_MISMATCH",
+                            )
                         publish_started = time.monotonic()
                         self.storage.publish_ingested_parts(
                             file_id,
@@ -1192,12 +1221,27 @@ class SyncManager:
                             append=True,
                         )
                         timings["publish_seconds"] += time.monotonic() - publish_started
+                    if chunk_count != chunk.rows:
+                        raise ParserError(
+                            "解析器分块持久化行数与清单不一致",
+                            "PARSER_CHUNK_ROW_COUNT_MISMATCH",
+                        )
                 finally:
-                    if ndjson_path.exists():
+                    if chunk.path.exists():
                         try:
-                            ndjson_path.unlink()
-                        except OSError:
-                            pass
+                            chunk.path.unlink()
+                        except OSError as exc:
+                            cleanup_error = exc
+                            LOGGER.error(
+                                "PARSER_CHUNK_CLEANUP_FAILED path=%s error=%s",
+                                chunk.path,
+                                exc,
+                            )
+                if cleanup_error is not None:
+                    raise ParserError(
+                        f"清理解析器分块失败：{chunk.path.name}：{cleanup_error}",
+                        "PARSER_CHUNK_CLEANUP_FAILED",
+                    ) from cleanup_error
                 count += chunk_count
                 keep_paths.update(str(part["path"]) for part in parts)
                 if archive is not None:
@@ -1258,6 +1302,12 @@ class SyncManager:
         timings["other_seconds"] = max(parse_seconds - sum(timings.values()), 0.0)
         LOGGER.info("FILE_STAGE_TIMINGS %s", json.dumps({
             "file": item.log_file_name, "chunks": chunks,
+            "parser_transport": (
+                next(iter(transport_formats))
+                if len(transport_formats) == 1
+                else ("empty" if not transport_formats else "mixed")
+            ),
+            "parser_transport_bytes": transport_bytes,
             "ndjson_bytes": ndjson_bytes, "events": count,
             "prepared_seconds": round(parse_seconds, 6),
             "transform_mode": "detached" if transform_submitter else "inline-with-publish",

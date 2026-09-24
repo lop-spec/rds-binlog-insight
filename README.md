@@ -25,10 +25,13 @@
   合计按源文件大小预留最多 2 GiB；超过预算的单文件仅独占准入。
   一个文件按顺序提交或明确记为不可用后即可补槽，不再等待整批结束；隐藏的
   后续文件即使解析完成仍占用配额。暂停或关闭时停止补槽，完成已准入的处理通道。
-  OSS 使用 4 个 I/O 线程。Go 解析器按 200,000 条或 128 MiB（先到者）
-  发布 NDJSON 批，Python 用 ACK 控制背压；每通道预取 1 批，连同写入中临时批
-  预留 384 MiB，两个通道共享 768 MiB 预算，位于 1 GiB 暂存盘内。
-  DuckDB 批量导入后删除该批 NDJSON 和中间文件。
+  OSS 使用 4 个 I/O 线程。候选 Go 解析器默认发布41字段 Arrow IPC chunk，
+  每批最多200,000条，decoded estimate与物理文件分别硬限128 MiB；Python以
+  sequence-bound ACK控制背压，ACK只表示collector有界接管，不表示持久化完成。
+  每通道预取1批、最多2个outstanding文件，即预留256 MiB；两个通道最多
+  512 MiB，768 MiB共享准入预算在1 GiB暂存盘内另留256 MiB余量。
+  DuckDB按同一47字段规范化路径导入并核对manifest行数，成功消费后删除IPC。
+  `RDS_BINLOG_PARSER_TRANSPORT=ndjson`保留显式回滚路径。
 - 保存 INSERT / UPDATE / DELETE 行前后值、DDL/Query、GTID、事务、位置、服务端 ID 等。
 - 新写入与最近 1 天的 Parquet 使用 ZSTD 1；确认同步已追平、没有待处理
   Binlog 且没有查询压力后，后台才单线程、一次一个分片转换为 ZSTD 9。
@@ -453,8 +456,10 @@ GUI 的“服务设置”页可以停止后台服务。关闭应用窗口不会�
 
 ## Linux / Docker 部署
 
-仓库已包含 `Dockerfile`、`compose.yaml` 和 Linux amd64 解析器。当前生产
-Compose 按需求将 `8769` 发布到服务器公网地址；必须继续在阿里云安全组中
+仓库已包含 `Dockerfile`、`compose.yaml` 和可复现的 Go 解析器源码；候选
+Dockerfile在摘要固定的Go 1.26.5 builder中执行模块校验、单测并构建Linux amd64
+解析器，不再把旧预编译本体装入候选镜像。当前生产仍是既有已发布镜像。
+生产Compose按需求将 `8769` 发布到服务器公网地址；必须继续在阿里云安全组中
 只放行可信来源 IP。
 
 1. 将 `.env.example` 复制为 `.env` 并把文件权限设为 `0600`。RDS

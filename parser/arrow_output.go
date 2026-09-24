@@ -219,7 +219,10 @@ func (a *atomicArrowOutput) Encode(event outputEvent) error {
 	if err != nil {
 		return err
 	}
-	errorCode := int32(event.ErrorCode)
+	errorCode, err := checkedInt32("error_code", int(event.ErrorCode))
+	if err != nil {
+		return err
+	}
 	recordBytes := arrowEventBytes(event)
 	if recordBytes > a.batchBytes {
 		return fmt.Errorf("Arrow record estimate %d exceeds %d-byte batch limit", recordBytes, a.batchBytes)

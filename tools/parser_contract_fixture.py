@@ -8,9 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import shutil
 import struct
 import subprocess
+import threading
 import time
 import uuid
 import zlib
@@ -106,6 +108,240 @@ def candidate_command(binary, raw_path, source_id, mode):
     return command
 
 
+def run_candidate_arrow_chunks(binary, raw_path, source_id, mode, case_dir):
+    """Exercise the real manifest/ACK transport and retain byte-for-byte evidence."""
+    output_dir = (case_dir / "candidate-arrow-chunks").resolve()
+    output_dir.mkdir()
+    manifest_path = case_dir / "candidate-arrow-chunks.manifests.ndjson"
+    ack_path = case_dir / "candidate-arrow-chunks.acks.ndjson"
+    stderr_path = case_dir / "candidate-arrow-chunks.stderr"
+    command = candidate_command(binary, raw_path, source_id, mode) + [
+        "--output-dir", str(output_dir),
+        "--chunk-format", "arrow",
+        "--chunk-max-lines", "3",
+        "--chunk-max-bytes", str(128 * 1024 * 1024),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    if process.stdin is None or process.stdout is None or process.stderr is None:
+        process.kill()
+        raise RuntimeError("candidate Arrow chunk pipes are unavailable")
+    stdout_items = queue.Queue()
+
+    def read_stdout():
+        try:
+            for line in process.stdout:
+                stdout_items.put(line)
+        except BaseException as exc:
+            stdout_items.put(exc)
+        finally:
+            stdout_items.put(None)
+
+    stdout_thread = threading.Thread(
+        target=read_stdout,
+        name="parser-contract-arrow-manifests",
+        daemon=True,
+    )
+    stdout_thread.start()
+    manifests = bytearray()
+    acknowledgements = bytearray()
+    chunks = []
+    expected_sequence = 0
+    deadline = time.monotonic() + 30
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("candidate Arrow chunk protocol timed out")
+            try:
+                item = stdout_items.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise TimeoutError("candidate Arrow chunk manifest stalled") from exc
+            if item is None:
+                break
+            if isinstance(item, BaseException):
+                raise RuntimeError("candidate Arrow manifest reader failed") from item
+            line = item
+            manifests.extend(line)
+            try:
+                manifest = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("candidate emitted malformed Arrow manifest") from exc
+            expected_fields = {
+                "protocol", "format", "sequence", "path", "rows", "bytes",
+                "decoded_bytes",
+            }
+            if not isinstance(manifest, dict) or set(manifest) != expected_fields:
+                raise RuntimeError("candidate emitted a non-strict Arrow manifest")
+            if (manifest["protocol"] != "parser-chunk-v1"
+                    or manifest["format"] != "arrow-ipc-file-v1"
+                    or type(manifest["sequence"]) is not int
+                    or manifest["sequence"] != expected_sequence
+                    or type(manifest["path"]) is not str
+                    or type(manifest["rows"]) is not int
+                    or not 0 < manifest["rows"] <= 3
+                    or type(manifest["bytes"]) is not int
+                    or not 0 < manifest["bytes"] <= 128 * 1024 * 1024
+                    or type(manifest["decoded_bytes"]) is not int
+                    or not 0 < manifest["decoded_bytes"] <= 128 * 1024 * 1024):
+                raise RuntimeError("candidate Arrow manifest violates its bounded protocol")
+            chunk = Path(manifest["path"])
+            if (not chunk.is_absolute() or chunk.parent != output_dir
+                    or chunk.name != f"{source_id}-{expected_sequence:06d}.arrow"
+                    or not chunk.is_file()
+                    or chunk.stat().st_size != manifest["bytes"]):
+                raise RuntimeError("candidate Arrow manifest does not bind its publication")
+            content = chunk.read_bytes()
+            chunks.append({
+                "sequence": expected_sequence,
+                "name": chunk.name,
+                "rows": manifest["rows"],
+                "bytes": manifest["bytes"],
+                "decoded_bytes": manifest["decoded_bytes"],
+                "sha256": hashlib.sha256(content).hexdigest(),
+            })
+            acknowledgement = (json.dumps({
+                "protocol": "parser-chunk-ack-v1",
+                "sequence": expected_sequence,
+                "status": "ok",
+            }, separators=(",", ":")) + "\n").encode("utf-8")
+            acknowledgements.extend(acknowledgement)
+            process.stdin.write(acknowledgement)
+            process.stdin.flush()
+            expected_sequence += 1
+        process.stdin.close()
+        stderr_bytes = process.stderr.read()
+        stderr = stderr_bytes.decode("utf-8", "replace")
+        returncode = process.wait(timeout=max(deadline - time.monotonic(), 0.1))
+        if returncode:
+            raise RuntimeError(
+                f"candidate Arrow chunk producer failed {returncode}: {stderr[-3000:]}"
+            )
+        expected_stderr = f"parsed {sum(chunk['rows'] for chunk in chunks)} audit records"
+        if stderr.strip() != expected_stderr:
+            raise RuntimeError("candidate Arrow chunk completion record changed")
+        if not chunks:
+            raise RuntimeError("candidate Arrow chunk producer emitted no chunks")
+        if list(output_dir.glob("*.part")):
+            raise RuntimeError("candidate Arrow chunk producer retained partial files")
+        manifest_path.write_bytes(manifests)
+        ack_path.write_bytes(acknowledgements)
+        stderr_path.write_bytes(stderr_bytes)
+        return {
+            "protocol": "parser-chunk-v1",
+            "format": "arrow-ipc-file-v1",
+            "ack_protocol": "parser-chunk-ack-v1",
+            "manifests_sha256": hashlib.sha256(manifests).hexdigest(),
+            "acks_sha256": hashlib.sha256(acknowledgements).hexdigest(),
+            "stderr_sha256": hashlib.sha256(stderr_bytes).hexdigest(),
+            "chunks": chunks,
+        }
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        raise
+    finally:
+        stdout_thread.join(timeout=5)
+
+
+def run_failed_chunk_transport(
+    binary, source, source_id, mode, output_dir, *, chunk_format
+):
+    """ACK every published one-row chunk, then clean collector-owned files."""
+    output_dir.mkdir()
+    command = candidate_command(binary, source, source_id, mode) + [
+        "--output-dir", str(output_dir),
+        "--chunk-max-lines", "1",
+        "--chunk-max-bytes", str(128 * 1024 * 1024),
+    ]
+    if chunk_format == "arrow":
+        command += ["--chunk-format", "arrow"]
+        supplied_acknowledgements = [
+            (json.dumps({
+                "protocol": "parser-chunk-ack-v1",
+                "sequence": sequence,
+                "status": "ok",
+            }, separators=(",", ":")) + "\n").encode("utf-8")
+            for sequence in range(256)
+        ]
+        expected_fields = {
+            "protocol", "format", "sequence", "path", "rows", "bytes",
+            "decoded_bytes",
+        }
+        suffix = ".arrow"
+    elif chunk_format == "ndjson":
+        supplied_acknowledgements = [b"ok\n"] * 256
+        expected_fields = {
+            "protocol", "format", "sequence", "path", "rows", "bytes",
+        }
+        suffix = ".ndjson"
+    else:
+        raise ValueError("unsupported failed chunk transport")
+
+    result = subprocess.run(
+        command,
+        input=b"".join(supplied_acknowledgements),
+        capture_output=True,
+        timeout=20,
+    )
+    raw_lines = result.stdout.splitlines(keepends=True)
+    if any(not line.endswith(b"\n") for line in raw_lines):
+        raise RuntimeError("failed chunk manifest transcript is not line framed")
+    for sequence, line in enumerate(raw_lines):
+        try:
+            manifest = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("failed chunk manifest transcript is malformed") from exc
+        expected_format = (
+            "arrow-ipc-file-v1" if chunk_format == "arrow" else "ndjson-v1"
+        )
+        if (
+            not isinstance(manifest, dict)
+            or set(manifest) != expected_fields
+            or manifest.get("protocol") != "parser-chunk-v1"
+            or manifest.get("format") != expected_format
+            or type(manifest.get("sequence")) is not int
+            or manifest["sequence"] != sequence
+            or type(manifest.get("path")) is not str
+            or type(manifest.get("rows")) is not int
+            or manifest["rows"] != 1
+            or type(manifest.get("bytes")) is not int
+            or not 0 < manifest["bytes"] <= 128 * 1024 * 1024
+        ):
+            raise RuntimeError("failed chunk manifest violates its strict contract")
+        if chunk_format == "arrow" and (
+            type(manifest.get("decoded_bytes")) is not int
+            or not 0 < manifest["decoded_bytes"] <= 128 * 1024 * 1024
+        ):
+            raise RuntimeError("failed Arrow chunk decoded bound is malformed")
+        chunk = Path(manifest["path"])
+        if (
+            not chunk.is_absolute()
+            or chunk.parent != output_dir.resolve()
+            or chunk.name != f"{source_id}-{sequence:06d}{suffix}"
+            or not chunk.is_file()
+            or chunk.stat().st_size != manifest["bytes"]
+        ):
+            raise RuntimeError("failed chunk manifest does not bind its publication")
+        # Every manifest was followed by the corresponding pre-supplied ACK;
+        # after the later parse failure these finals belong to the collector.
+        chunk.unlink()
+    if any(output_dir.iterdir()):
+        raise RuntimeError("failed chunk transport retained final or partial output")
+    acknowledged = b"".join(supplied_acknowledgements[:len(raw_lines)])
+    return result, {
+        "acknowledged_files": len(raw_lines),
+        "manifests_sha256": hashlib.sha256(result.stdout).hexdigest(),
+        "acks_sha256": hashlib.sha256(acknowledged).hexdigest(),
+    }, acknowledged
+
+
 def verify_negative_streams(root, binary, raw, source_id):
     negative = root / "negative"
     negative.mkdir()
@@ -115,9 +351,13 @@ def verify_negative_streams(root, binary, raw, source_id):
         source.write_bytes(content)
         output_dir = negative / f"{name}-output"
         output_dir.mkdir()
-        result = subprocess.run(candidate_command(binary, source, source_id, "ROW")
-                                + ["--output-dir", str(output_dir)],
-                                capture_output=True, timeout=20)
+        result, ndjson_chunk_proof, ndjson_acks = run_failed_chunk_transport(
+            binary, source, source_id, "ROW", output_dir, chunk_format="ndjson"
+        )
+        (negative / f"{name}.ndjson-chunk.manifests.ndjson").write_bytes(
+            result.stdout
+        )
+        (negative / f"{name}.ndjson-chunk.acks.ndjson").write_bytes(ndjson_acks)
         stderr = result.stderr.decode("utf-8", "replace")
         (negative / f"{name}.stderr").write_text(stderr, encoding="utf-8")
         if result.returncode == 0:
@@ -139,10 +379,67 @@ def verify_negative_streams(root, binary, raw, source_id):
             raise RuntimeError(f"candidate Arrow {name} failure lacks {marker!r}: {arrow_stderr[-1000:]}")
         if arrow_output.exists() or arrow_output.with_name(arrow_output.name + ".part").exists():
             raise RuntimeError(f"candidate published partial Arrow output for {name}")
-        proof[name] = {"returncode": result.returncode, "stderr_marker": marker,
-                       "published_files": 0, "arrow_returncode": arrow_result.returncode,
-                       "arrow_stderr_marker": marker, "arrow_published_files": 0,
-                       "sha256": hashlib.sha256(content).hexdigest()}
+
+        arrow_chunk_output = negative / f"{name}-arrow-chunk-output"
+        arrow_chunk_result, arrow_chunk_proof, arrow_chunk_acks = (
+            run_failed_chunk_transport(
+                binary,
+                source,
+                source_id,
+                "ROW",
+                arrow_chunk_output,
+                chunk_format="arrow",
+            )
+        )
+        (negative / f"{name}.arrow-chunk.manifests.ndjson").write_bytes(
+            arrow_chunk_result.stdout
+        )
+        (negative / f"{name}.arrow-chunk.acks.ndjson").write_bytes(
+            arrow_chunk_acks
+        )
+        arrow_chunk_stderr = arrow_chunk_result.stderr.decode("utf-8", "replace")
+        (negative / f"{name}.arrow-chunk.stderr").write_text(
+            arrow_chunk_stderr, encoding="utf-8"
+        )
+        if arrow_chunk_result.returncode == 0:
+            raise RuntimeError(
+                f"candidate Arrow chunk producer accepted corrupt stream {name}"
+            )
+        if marker.lower() not in arrow_chunk_stderr.lower():
+            raise RuntimeError(
+                f"candidate Arrow chunk {name} failure lacks {marker!r}: "
+                f"{arrow_chunk_stderr[-1000:]}"
+            )
+        if any(arrow_chunk_output.iterdir()):
+            raise RuntimeError(
+                f"candidate retained Arrow chunk output for {name}"
+            )
+        proof[name] = {
+            "returncode": result.returncode,
+            "stderr_marker": marker,
+            "published_files": 0,
+            "ndjson_chunk_acknowledged_files": ndjson_chunk_proof[
+                "acknowledged_files"
+            ],
+            "ndjson_chunk_manifests_sha256": ndjson_chunk_proof[
+                "manifests_sha256"
+            ],
+            "ndjson_chunk_acks_sha256": ndjson_chunk_proof["acks_sha256"],
+            "arrow_returncode": arrow_result.returncode,
+            "arrow_stderr_marker": marker,
+            "arrow_published_files": 0,
+            "arrow_chunk_returncode": arrow_chunk_result.returncode,
+            "arrow_chunk_stderr_marker": marker,
+            "arrow_chunk_published_files": 0,
+            "arrow_chunk_acknowledged_files": arrow_chunk_proof[
+                "acknowledged_files"
+            ],
+            "arrow_chunk_manifests_sha256": arrow_chunk_proof[
+                "manifests_sha256"
+            ],
+            "arrow_chunk_acks_sha256": arrow_chunk_proof["acks_sha256"],
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
     return proof
 
 
@@ -231,6 +528,9 @@ DELETE FROM rows_abi WHERE id=2;"""
                 raise RuntimeError("candidate Arrow producer leaked NDJSON to stdout")
             if not candidate_arrow.is_file() or candidate_arrow.with_name(candidate_arrow.name + ".part").exists():
                 raise RuntimeError("candidate Arrow producer did not atomically publish its IPC file")
+            chunk_contract = run_candidate_arrow_chunks(
+                candidate, raw_path, source_id, mode, case_dir
+            )
             parsed = [json.loads(line) for line in output.splitlines() if line.strip()]
             candidate_parsed = [json.loads(line) for line in candidate_output.splitlines() if line.strip()]
             if not parsed or not candidate_parsed:
@@ -256,7 +556,8 @@ DELETE FROM rows_abi WHERE id=2;"""
                                legacy_sha256=hashlib.sha256(output).hexdigest(),
                                candidate_sha256=hashlib.sha256(candidate_output).hexdigest(),
                                candidate_arrow_bytes=candidate_arrow.stat().st_size,
-                               candidate_arrow_sha256=hashlib.sha256(candidate_arrow.read_bytes()).hexdigest())
+                               candidate_arrow_sha256=hashlib.sha256(candidate_arrow.read_bytes()).hexdigest(),
+                               candidate_arrow_chunks=chunk_contract)
             if mode == "ROW":
                 cases[mode]["negative_streams"] = verify_negative_streams(
                     root, candidate, raw, source_id)

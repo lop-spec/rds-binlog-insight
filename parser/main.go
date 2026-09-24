@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/base64"
@@ -262,10 +263,27 @@ func (x *extractor) emit(record outputEvent) error {
 	return nil
 }
 
+const (
+	chunkManifestProtocol = "parser-chunk-v1"
+	ndjsonChunkFormat     = "ndjson-v1"
+	arrowChunkFormat      = "arrow-ipc-file-v1"
+	arrowChunkACKProtocol = "parser-chunk-ack-v1"
+)
+
 type chunkManifest struct {
-	Path  string `json:"path"`
-	Rows  int    `json:"rows"`
-	Bytes int64  `json:"bytes"`
+	Protocol     string `json:"protocol"`
+	Format       string `json:"format"`
+	Sequence     int    `json:"sequence"`
+	Path         string `json:"path"`
+	Rows         int    `json:"rows"`
+	Bytes        int64  `json:"bytes"`
+	DecodedBytes int64  `json:"decoded_bytes,omitempty"`
+}
+
+type arrowChunkACK struct {
+	Protocol string `json:"protocol"`
+	Sequence int    `json:"sequence"`
+	Status   string `json:"status"`
 }
 
 type chunkedOutput struct {
@@ -280,9 +298,37 @@ type chunkedOutput struct {
 	buffered        *bufio.Writer
 	partialPath     string
 	finalPath       string
+	publishedPath   string
 	rows            int
 	bytes           int64
 	closed          bool
+}
+
+func validateChunkDestination(outputDir string, sourceFileID string) (string, string, error) {
+	absoluteDir, err := filepath.Abs(strings.TrimSpace(outputDir))
+	if err != nil {
+		return "", "", fmt.Errorf("resolve chunk output directory: %w", err)
+	}
+	stat, err := os.Stat(absoluteDir)
+	if err != nil {
+		return "", "", fmt.Errorf("stat chunk output directory: %w", err)
+	}
+	if !stat.IsDir() {
+		return "", "", errors.New("chunk output path must be a directory")
+	}
+	if len(sourceFileID) < 1 || len(sourceFileID) > 128 ||
+		sourceFileID == "." || sourceFileID == ".." {
+		return "", "", errors.New("source file identifier is not safe for chunk paths")
+	}
+	for _, character := range []byte(sourceFileID) {
+		if !((character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			strings.ContainsRune("._-", rune(character))) {
+			return "", "", errors.New("source file identifier is not safe for chunk paths")
+		}
+	}
+	return absoluteDir, sourceFileID, nil
 }
 
 func newChunkedOutput(
@@ -293,34 +339,22 @@ func newChunkedOutput(
 	manifestWriter io.Writer,
 	ackReader io.Reader,
 ) (*chunkedOutput, error) {
-	absoluteDir, err := filepath.Abs(strings.TrimSpace(outputDir))
+	absoluteDir, safeSourceFileID, err := validateChunkDestination(outputDir, sourceFileID)
 	if err != nil {
-		return nil, fmt.Errorf("resolve chunk output directory: %w", err)
-	}
-	stat, err := os.Stat(absoluteDir)
-	if err != nil {
-		return nil, fmt.Errorf("stat chunk output directory: %w", err)
-	}
-	if !stat.IsDir() {
-		return nil, errors.New("chunk output path must be a directory")
-	}
-	sourceFileID = strings.TrimSpace(sourceFileID)
-	if sourceFileID == "" ||
-		sourceFileID == "." ||
-		sourceFileID == ".." ||
-		filepath.Base(sourceFileID) != sourceFileID ||
-		strings.ContainsAny(sourceFileID, `/\`) {
-		return nil, errors.New("source file identifier is not safe for chunk paths")
+		return nil, err
 	}
 	if maxLines <= 0 || maxBytes <= 0 {
 		return nil, errors.New("chunk limits must be positive")
+	}
+	if maxBytes > maximumArrowOutputBytes {
+		return nil, fmt.Errorf("chunk bytes must not exceed %d", maximumArrowOutputBytes)
 	}
 	if manifestWriter == nil || ackReader == nil {
 		return nil, errors.New("chunk manifest writer and ACK reader are required")
 	}
 	return &chunkedOutput{
 		outputDir:       absoluteDir,
-		sourceFileID:    sourceFileID,
+		sourceFileID:    safeSourceFileID,
 		maxLines:        maxLines,
 		maxBytes:        maxBytes,
 		manifestEncoder: json.NewEncoder(manifestWriter),
@@ -338,39 +372,76 @@ func (c *chunkedOutput) openChunk() error {
 	filename := fmt.Sprintf("%s-%06d.ndjson", c.sourceFileID, c.index)
 	c.finalPath = filepath.Join(c.outputDir, filename)
 	c.partialPath = c.finalPath + ".part"
-	for _, path := range []string{c.partialPath, c.finalPath} {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove stale chunk %q: %w", path, err)
-		}
-	}
 	file, err := os.OpenFile(c.partialPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return fmt.Errorf("create chunk %q: %w", c.partialPath, err)
+		return fmt.Errorf("exclusively create chunk %q: %w", c.partialPath, err)
 	}
 	c.file = file
 	c.buffered = bufio.NewWriterSize(file, 1<<20)
 	return nil
 }
 
-func (c *chunkedOutput) Write(value []byte) (int, error) {
-	if err := c.openChunk(); err != nil {
-		return 0, err
+func encodeJSONEvent(event outputEvent) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(event); err != nil {
+		return nil, err
 	}
-	count, err := c.buffered.Write(value)
-	c.bytes += int64(count)
-	if err == nil && count != len(value) {
-		err = io.ErrShortWrite
-	}
-	return count, err
+	return buffer.Bytes(), nil
 }
 
-func (c *chunkedOutput) recordComplete() error {
-	if c.file == nil {
-		return errors.New("record completed before chunk data was written")
+func (c *chunkedOutput) Encode(event outputEvent) error {
+	if c.closed {
+		return errors.New("chunk output is closed")
+	}
+	encoded, err := encodeJSONEvent(event)
+	if err != nil {
+		return fmt.Errorf("encode NDJSON chunk record: %w", err)
+	}
+	recordBytes := int64(len(encoded))
+	if recordBytes > c.maxBytes {
+		return fmt.Errorf("NDJSON record requires %d bytes, above chunk limit %d", recordBytes, c.maxBytes)
+	}
+	if c.rows > 0 && (c.rows >= c.maxLines || c.bytes > c.maxBytes-recordBytes) {
+		if err := c.publish(); err != nil {
+			return err
+		}
+	}
+	if err := c.openChunk(); err != nil {
+		return err
+	}
+	count, err := c.buffered.Write(encoded)
+	c.bytes += int64(count)
+	if err != nil {
+		return fmt.Errorf("write NDJSON chunk: %w", err)
+	}
+	if count != len(encoded) {
+		return io.ErrShortWrite
 	}
 	c.rows++
 	if c.rows >= c.maxLines || c.bytes >= c.maxBytes {
 		return c.publish()
+	}
+	return nil
+}
+
+func publishChunkFile(partialPath string, finalPath string) error {
+	if err := os.Link(partialPath, finalPath); err != nil {
+		return fmt.Errorf("publish chunk without overwrite: %w", err)
+	}
+	parent := filepath.Dir(finalPath)
+	if err := syncArrowDirectory(parent); err != nil {
+		_ = os.Remove(finalPath)
+		return fmt.Errorf("sync published chunk directory: %w", err)
+	}
+	if err := os.Remove(partialPath); err != nil {
+		_ = os.Remove(finalPath)
+		return fmt.Errorf("remove chunk staging link: %w", err)
+	}
+	if err := syncArrowDirectory(parent); err != nil {
+		_ = os.Remove(finalPath)
+		return fmt.Errorf("sync chunk staging cleanup: %w", err)
 	}
 	return nil
 }
@@ -393,29 +464,43 @@ func (c *chunkedOutput) publish() error {
 	}
 	c.file = nil
 	c.buffered = nil
-	if err := os.Rename(c.partialPath, c.finalPath); err != nil {
-		return fmt.Errorf("publish chunk: %w", err)
+	if err := publishChunkFile(c.partialPath, c.finalPath); err != nil {
+		return err
 	}
+	c.publishedPath = c.finalPath
 	stat, err := os.Stat(c.finalPath)
 	if err != nil {
+		removeFailedPublishedChunk(c.finalPath)
 		return fmt.Errorf("stat published chunk: %w", err)
 	}
-	manifest := chunkManifest{Path: c.finalPath, Rows: c.rows, Bytes: stat.Size()}
-	c.index++
-	c.partialPath = ""
-	c.finalPath = ""
-	c.rows = 0
-	c.bytes = 0
+	publishedPath := c.finalPath
+	manifest := chunkManifest{
+		Protocol: chunkManifestProtocol,
+		Format:   ndjsonChunkFormat,
+		Sequence: c.index,
+		Path:     publishedPath,
+		Rows:     c.rows,
+		Bytes:    stat.Size(),
+	}
 	if err := c.manifestEncoder.Encode(manifest); err != nil {
+		removeFailedPublishedChunk(publishedPath)
 		return fmt.Errorf("write chunk manifest: %w", err)
 	}
 	ack, err := c.ackReader.ReadString('\n')
 	if err != nil {
+		removeFailedPublishedChunk(publishedPath)
 		return fmt.Errorf("wait for chunk ACK: %w", err)
 	}
 	if strings.TrimSpace(ack) != "ok" {
+		removeFailedPublishedChunk(publishedPath)
 		return fmt.Errorf("unexpected chunk ACK %q", strings.TrimSpace(ack))
 	}
+	c.index++
+	c.partialPath = ""
+	c.finalPath = ""
+	c.publishedPath = ""
+	c.rows = 0
+	c.bytes = 0
 	return nil
 }
 
@@ -423,8 +508,11 @@ func (c *chunkedOutput) Close() error {
 	if c.closed {
 		return nil
 	}
-	defer func() { c.closed = true }()
-	return c.publish()
+	if err := c.publish(); err != nil {
+		return err
+	}
+	c.closed = true
+	return nil
 }
 
 func (c *chunkedOutput) Abort() {
@@ -438,6 +526,8 @@ func (c *chunkedOutput) Abort() {
 	if c.partialPath != "" {
 		_ = os.Remove(c.partialPath)
 	}
+	removeFailedPublishedChunk(c.publishedPath)
+	c.publishedPath = ""
 	c.file = nil
 	c.buffered = nil
 }
@@ -1374,9 +1464,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	input := flags.String("input", "", "path to a MySQL binlog or compressed archive")
 	sourceFileID := flags.String("source-file-id", "", "stable source-file identifier")
 	flavor := flags.String("flavor", "mysql", "binlog flavor: mysql or mariadb")
-	outputDir := flags.String("output-dir", "", "publish atomic NDJSON chunks and emit manifests")
-	chunkMaxLines := flags.Int("chunk-max-lines", 200_000, "maximum records per NDJSON chunk")
-	chunkMaxBytes := flags.Int64("chunk-max-bytes", 384*1024*1024, "maximum bytes per NDJSON chunk")
+	outputDir := flags.String("output-dir", "", "publish atomic parser chunks and emit manifests")
+	chunkFormat := flags.String("chunk-format", "ndjson", "output-dir transport: ndjson or arrow")
+	chunkMaxLines := flags.Int("chunk-max-lines", 200_000, "maximum records per parser chunk")
+	chunkMaxBytes := flags.Int64("chunk-max-bytes", 128*1024*1024, "maximum encoded/physical bytes and Arrow decoded estimate per parser chunk")
 	arrowOutputPath := flags.String("arrow-output", "", "write one bounded, atomic Arrow IPC file instead of NDJSON")
 	arrowBatchRows := flags.Int("arrow-batch-rows", defaultArrowBatchRows, "maximum records per Arrow record batch")
 	arrowBatchBytes := flags.Int64("arrow-batch-bytes", defaultArrowBatchBytes, "maximum estimated bytes per Arrow record batch")
@@ -1412,6 +1503,15 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		fmt.Fprintln(stderr, "--arrow-output and --output-dir are mutually exclusive")
 		return 2
 	}
+	normalizedChunkFormat := strings.ToLower(strings.TrimSpace(*chunkFormat))
+	if normalizedChunkFormat != "ndjson" && normalizedChunkFormat != "arrow" {
+		fmt.Fprintln(stderr, "--chunk-format must be ndjson or arrow")
+		return 2
+	}
+	if strings.TrimSpace(*outputDir) == "" && normalizedChunkFormat != "ndjson" {
+		fmt.Fprintln(stderr, "--chunk-format requires --output-dir")
+		return 2
+	}
 	if err := validateArrowLimits(*arrowBatchRows, *arrowBatchBytes, *arrowMaxFileBytes); err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
@@ -1421,10 +1521,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		fmt.Fprintln(stderr, "--flavor must be mysql or mariadb")
 		return 2
 	}
-	var output *chunkedOutput
+	var ndjsonChunks *chunkedOutput
+	var arrowChunks *chunkedArrowOutput
 	var arrowOutput *atomicArrowOutput
 	var encoder eventEncoder
-	writer := stdout
 	if strings.TrimSpace(*arrowOutputPath) != "" {
 		var err error
 		arrowOutput, err = newAtomicArrowOutput(
@@ -1438,10 +1538,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 			return 2
 		}
 		encoder = arrowOutput
-	} else {
-		if strings.TrimSpace(*outputDir) != "" {
-			var err error
-			output, err = newChunkedOutput(
+	} else if strings.TrimSpace(*outputDir) != "" {
+		var err error
+		if normalizedChunkFormat == "arrow" {
+			arrowChunks, err = newChunkedArrowOutput(
 				*outputDir,
 				*sourceFileID,
 				*chunkMaxLines,
@@ -1449,24 +1549,35 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 				stdout,
 				stdin,
 			)
-			if err != nil {
-				fmt.Fprintln(stderr, err)
-				return 2
-			}
-			writer = output
+			encoder = arrowChunks
+		} else {
+			ndjsonChunks, err = newChunkedOutput(
+				*outputDir,
+				*sourceFileID,
+				*chunkMaxLines,
+				*chunkMaxBytes,
+				stdout,
+				stdin,
+			)
+			encoder = ndjsonChunks
 		}
-		encoder = newJSONEventEncoder(writer)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+	} else {
+		encoder = newJSONEventEncoder(stdout)
 	}
 	extractor := newExtractorWithEncoder(encoder, *sourceFileID, normalizedFlavor)
 	extractor.slim = *slim
 	extractor.requireGTID = *requireGTID
 	extractor.requireTableMap = *requireTableMap
-	if output != nil {
-		extractor.afterEncode = output.recordComplete
-	}
 	if err := extractor.parsePath(*input); err != nil {
-		if output != nil {
-			output.Abort()
+		if ndjsonChunks != nil {
+			ndjsonChunks.Abort()
+		}
+		if arrowChunks != nil {
+			arrowChunks.Abort()
 		}
 		if arrowOutput != nil {
 			arrowOutput.Abort()
@@ -1474,9 +1585,16 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if output != nil {
-		if err := output.Close(); err != nil {
-			output.Abort()
+	if ndjsonChunks != nil {
+		if err := ndjsonChunks.Close(); err != nil {
+			ndjsonChunks.Abort()
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
+	if arrowChunks != nil {
+		if err := arrowChunks.Close(); err != nil {
+			arrowChunks.Abort()
 			fmt.Fprintln(stderr, err)
 			return 1
 		}

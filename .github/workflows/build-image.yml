@@ -47,7 +47,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -62,19 +62,43 @@ jobs:
         run: |
           test -z "$(gofmt -l parser/*.go)"
           mkdir -p parser/build
-          (cd parser && go test ./... -v)
-          (cd parser && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o build/binlog-parser-linux-amd64 .)
+          (cd parser && go mod verify && go test ./... -v)
+          (cd parser && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o build/binlog-parser-linux-amd64 .)
           {
             go version
             go version -m parser/build/binlog-parser-linux-amd64
-            sha256sum parser/main.go parser/arrow_output.go parser/go.mod parser/go.sum parser/build/binlog-parser-linux-amd64
+            sha256sum parser/*.go parser/go.mod parser/go.sum parser/build/binlog-parser-linux-amd64
           } > parser/candidate-build-info.txt
           parser/build/binlog-parser-linux-amd64 --help 2>&1 | grep -q -- "-require-gtid"
           parser/build/binlog-parser-linux-amd64 --help 2>&1 | grep -q -- "-arrow-output"
+          parser/build/binlog-parser-linux-amd64 --help 2>&1 | grep -q -- "-chunk-format"
+      - name: Validate the root Docker parser source stage without publishing
+        run: |
+          image="local/rds-binlog-parser-contract:${GITHUB_SHA}"
+          docker build --target parser-builder --tag "$image" .
+          container="$(docker create "$image")"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/out/binlog-parser" parser/build/binlog-parser-from-root-dockerfile
+          chmod 0555 parser/build/binlog-parser-from-root-dockerfile
+          cmp parser/build/binlog-parser-linux-amd64 parser/build/binlog-parser-from-root-dockerfile
+          printf '' | parser/build/binlog-parser-from-root-dockerfile --checksum-stdin >/dev/null
+          sha256sum parser/build/binlog-parser-from-root-dockerfile >> parser/candidate-build-info.txt
+          docker rm "$container" >/dev/null
+          trap - EXIT
       - name: Install locked application dependencies
         run: python -m pip install -r requirements.txt
-      - name: Cache recovery and full-field columnar differential tests
-        run: python -m unittest tests.test_raw_cache tests.test_columnar_input tests.test_parser_contract_fixture tests.test_parser_contract_oracle -v
+      - name: Cache, bounded collector and full-field columnar differential tests
+        run: >-
+          python -m unittest
+          tests.test_raw_cache
+          tests.test_columnar_input
+          tests.test_parser_buffering
+          tests.test_pipeline_capacity
+          tests.test_pipeline_stage_timing
+          tests.test_parser_contract_fixture
+          tests.test_parser_contract_oracle
+          tests.test_public_config
+          -v
       - name: Generate native statement and row decoder contracts
         run: python -u -m tools.parser_contract_fixture
       - name: Require independent source values and full-field columnar equivalence

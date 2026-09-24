@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import time
@@ -10,8 +11,12 @@ from unittest.mock import patch
 from app.parser_bridge import (
     NATIVE_CHUNK_MAX_BYTES,
     NATIVE_CHUNK_MAX_OUTSTANDING,
+    PARSER_TRANSPORT_ARROW,
     ParserError,
+    _parser_command,
     parse_ndjson_chunks_buffered,
+    parse_parser_chunks_buffered,
+    parser_transport_format,
 )
 
 
@@ -43,7 +48,10 @@ class ParserBufferingTests(unittest.TestCase):
                     " payload = (json.dumps({'value': index}) + '\\n').encode()\n"
                     " partial.write_bytes(payload)\n"
                     " os.replace(partial, final)\n"
-                    " print(json.dumps({'path': str(final.resolve()), 'rows': 1, 'bytes': len(payload)}), flush=True)\n"
+                    " manifest = {'protocol': 'parser-chunk-v1', 'format': 'ndjson-v1', "
+                    "'sequence': index, 'path': str(final.resolve()), 'rows': 1, "
+                    "'bytes': len(payload)}\n"
+                    " print(json.dumps(manifest), flush=True)\n"
                     " if sys.stdin.readline().strip() != 'ok': raise SystemExit(2)\n"
                 ),
             ]
@@ -86,9 +94,13 @@ class ParserBufferingTests(unittest.TestCase):
             staging.mkdir()
             stale_final = staging / "older-file-000005.ndjson"
             stale_partial = staging / "older-file-000006.ndjson.part"
+            stale_arrow = staging / "older-file-000007.arrow"
+            stale_arrow_partial = staging / "older-file-000008.arrow.part"
             unrelated = staging / "keep-me.ndjson"
             stale_final.write_bytes(b"stale")
             stale_partial.write_bytes(b"partial")
+            stale_arrow.write_bytes(b"stale-arrow")
+            stale_arrow_partial.write_bytes(b"partial-arrow")
             unrelated.write_bytes(b"keep")
             command = [
                 sys.executable,
@@ -123,6 +135,8 @@ class ParserBufferingTests(unittest.TestCase):
 
             self.assertFalse(stale_final.exists())
             self.assertFalse(stale_partial.exists())
+            self.assertFalse(stale_arrow.exists())
+            self.assertFalse(stale_arrow_partial.exists())
             self.assertTrue(unrelated.exists())
             self.assertEqual([path.name for path in chunks], ["file-retry-000000.ndjson"])
             for path in chunks:
@@ -165,6 +179,305 @@ class ParserBufferingTests(unittest.TestCase):
                 )
 
             self.assertEqual(list(staging.glob("*-??????.ndjson*")), [])
+
+    def test_arrow_chunks_use_strict_manifest_ack_and_same_outstanding_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.binlog"
+            source.write_bytes(b"test")
+            staging = root / "staging"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json, os, sys\n"
+                    "from pathlib import Path\n"
+                    f"root = Path({str(staging.resolve())!r})\n"
+                    "root.mkdir(parents=True, exist_ok=True)\n"
+                    "for index in range(3):\n"
+                    " final = root / f'file-arrow-{index:06d}.arrow'\n"
+                    " partial = Path(str(final) + '.part')\n"
+                    " payload = b'ARROW' + bytes([index])\n"
+                    " partial.write_bytes(payload)\n"
+                    " os.replace(partial, final)\n"
+                    " manifest = {'protocol': 'parser-chunk-v1', 'format': 'arrow-ipc-file-v1', "
+                    "'sequence': index, 'path': str(final.resolve()), 'rows': 1, "
+                    "'bytes': len(payload), 'decoded_bytes': 100}\n"
+                    " print(json.dumps(manifest, separators=(',', ':')), flush=True)\n"
+                    " ack = json.loads(sys.stdin.readline())\n"
+                    " expected = {'protocol': 'parser-chunk-ack-v1', 'sequence': index, 'status': 'ok'}\n"
+                    " if ack != expected: raise SystemExit(2)\n"
+                ),
+            ]
+            with patch("app.parser_bridge._parser_command", return_value=command):
+                chunks = parse_parser_chunks_buffered(
+                    source,
+                    "file-arrow",
+                    staging,
+                    chunk_format="arrow",
+                    max_lines=1,
+                    max_bytes=1024,
+                    max_prefetch=1,
+                )
+                first = next(chunks)
+                second = staging / "file-arrow-000001.arrow"
+                third = staging / "file-arrow-000002.arrow"
+                deadline = time.monotonic() + 2
+                while not second.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(second.is_file())
+                time.sleep(0.1)
+                third_started_early = third.exists()
+                remaining = list(chunks)
+
+            self.assertFalse(third_started_early)
+            actual = [first, *remaining]
+            self.assertEqual([chunk.sequence for chunk in actual], [0, 1, 2])
+            self.assertTrue(all(chunk.transport_format == "arrow" for chunk in actual))
+            self.assertEqual([chunk.rows for chunk in actual], [1, 1, 1])
+            for chunk in actual:
+                chunk.path.unlink(missing_ok=True)
+
+    def test_arrow_parser_failure_after_ack_cleans_final_and_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.binlog"
+            source.write_bytes(b"test")
+            staging = root / "staging"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json, sys\n"
+                    "from pathlib import Path\n"
+                    f"root = Path({str(staging.resolve())!r})\n"
+                    "root.mkdir(parents=True, exist_ok=True)\n"
+                    "final = root / 'file-mid-failure-000000.arrow'\n"
+                    "payload = b'ARROW'\n"
+                    "final.write_bytes(payload)\n"
+                    "manifest = {'protocol': 'parser-chunk-v1', "
+                    "'format': 'arrow-ipc-file-v1', 'sequence': 0, "
+                    "'path': str(final.resolve()), 'rows': 1, "
+                    "'bytes': len(payload), 'decoded_bytes': 100}\n"
+                    "print(json.dumps(manifest), flush=True)\n"
+                    "json.loads(sys.stdin.readline())\n"
+                    "(root / 'file-mid-failure-000001.arrow.part').write_bytes(b'partial')\n"
+                    "print('forced parser failure after ACK', file=sys.stderr)\n"
+                    "raise SystemExit(3)\n"
+                ),
+            ]
+            with patch("app.parser_bridge._parser_command", return_value=command):
+                with self.assertRaises(ParserError) as raised:
+                    list(parse_parser_chunks_buffered(
+                        source,
+                        "file-mid-failure",
+                        staging,
+                        chunk_format="arrow",
+                        max_lines=1,
+                        max_bytes=1024,
+                    ))
+            self.assertEqual(raised.exception.code, "PARSER_FAILED")
+            self.assertEqual(
+                list(staging.glob("file-mid-failure-*.arrow*")), []
+            )
+
+    def test_arrow_consumer_close_cancels_parser_and_cleans_owned_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.binlog"
+            source.write_bytes(b"test")
+            staging = root / "staging"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json, sys\n"
+                    "from pathlib import Path\n"
+                    f"root = Path({str(staging.resolve())!r})\n"
+                    "root.mkdir(parents=True, exist_ok=True)\n"
+                    "for index in range(100):\n"
+                    " final = root / f'file-close-{index:06d}.arrow'\n"
+                    " payload = b'ARROW' + bytes([index % 256])\n"
+                    " final.write_bytes(payload)\n"
+                    " manifest = {'protocol': 'parser-chunk-v1', "
+                    "'format': 'arrow-ipc-file-v1', 'sequence': index, "
+                    "'path': str(final.resolve()), 'rows': 1, "
+                    "'bytes': len(payload), 'decoded_bytes': 100}\n"
+                    " print(json.dumps(manifest), flush=True)\n"
+                    " ack = json.loads(sys.stdin.readline())\n"
+                    " if ack.get('sequence') != index: raise SystemExit(2)\n"
+                ),
+            ]
+            with patch("app.parser_bridge._parser_command", return_value=command):
+                chunks = parse_parser_chunks_buffered(
+                    source,
+                    "file-close",
+                    staging,
+                    chunk_format="arrow",
+                    max_lines=1,
+                    max_bytes=1024,
+                    max_prefetch=1,
+                )
+                first = next(chunks)
+                self.assertEqual(first.sequence, 0)
+                deadline = time.monotonic() + 2
+                second = staging / "file-close-000001.arrow"
+                while not second.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(second.exists())
+                chunks.close()
+
+            self.assertEqual(list(staging.glob("file-close-*.arrow*")), [])
+
+    def test_manifest_stream_is_line_framed_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.binlog"
+            source.write_bytes(b"test")
+            staging = root / "staging"
+            command = [
+                sys.executable,
+                "-c",
+                "import sys; sys.stdout.buffer.write(b'x' * 65537); sys.stdout.flush()",
+            ]
+            with patch("app.parser_bridge._parser_command", return_value=command):
+                with self.assertRaises(ParserError) as raised:
+                    list(parse_parser_chunks_buffered(
+                        source,
+                        "file-line-bound",
+                        staging,
+                        chunk_format="arrow",
+                        max_lines=1,
+                        max_bytes=1024,
+                    ))
+            self.assertEqual(raised.exception.code, "PARSER_OUTPUT_READ_FAILED")
+            self.assertEqual(list(staging.glob("file-line-bound-*.arrow*")), [])
+
+    def test_arrow_manifest_rejects_unknown_fields_and_cleans_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.binlog"
+            source.write_bytes(b"test")
+            staging = root / "staging"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json, sys\n"
+                    "from pathlib import Path\n"
+                    f"root = Path({str(staging.resolve())!r})\n"
+                    "root.mkdir(parents=True, exist_ok=True)\n"
+                    "final = root / 'file-invalid-000000.arrow'\n"
+                    "final.write_bytes(b'ARROW')\n"
+                    "manifest = {'protocol': 'parser-chunk-v1', 'format': 'arrow-ipc-file-v1', "
+                    "'sequence': 0, 'path': str(final.resolve()), 'rows': 1, 'bytes': 5, "
+                    "'decoded_bytes': 100, 'unexpected': True}\n"
+                    "print(json.dumps(manifest), flush=True)\n"
+                    "sys.stdin.readline()\n"
+                ),
+            ]
+            with patch("app.parser_bridge._parser_command", return_value=command):
+                with self.assertRaises(ParserError) as raised:
+                    list(parse_parser_chunks_buffered(
+                        source,
+                        "file-invalid",
+                        staging,
+                        chunk_format="arrow",
+                        max_lines=1,
+                        max_bytes=1024,
+                    ))
+            self.assertEqual(raised.exception.code, "PARSER_CHUNK_MANIFEST_INVALID")
+            self.assertEqual(list(staging.glob("file-invalid-*.arrow*")), [])
+
+    def test_unversioned_ndjson_manifest_requires_exact_legacy_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.binlog"
+            source.write_bytes(b"test")
+            staging = root / "staging"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json, sys\n"
+                    "from pathlib import Path\n"
+                    f"root = Path({str(staging.resolve())!r})\n"
+                    "root.mkdir(parents=True, exist_ok=True)\n"
+                    "final = root / 'file-legacy-invalid-000000.ndjson'\n"
+                    "final.write_bytes(b'{}\\n')\n"
+                    "manifest = {'path': str(final.resolve()), 'rows': 1, "
+                    "'bytes': 3, 'unexpected': True}\n"
+                    "print(json.dumps(manifest), flush=True)\n"
+                    "sys.stdin.readline()\n"
+                ),
+            ]
+            with patch("app.parser_bridge._parser_command", return_value=command):
+                with self.assertRaises(ParserError) as raised:
+                    list(parse_ndjson_chunks_buffered(
+                        source,
+                        "file-legacy-invalid",
+                        staging,
+                        max_lines=1,
+                        max_bytes=1024,
+                    ))
+            self.assertEqual(raised.exception.code, "PARSER_CHUNK_MANIFEST_INVALID")
+            self.assertEqual(list(staging.glob("file-legacy-invalid-*.ndjson*")), [])
+
+    def test_source_file_id_cannot_escape_the_staging_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.binlog"
+            source.write_bytes(b"test")
+            staging = root / "staging"
+            invalid_values = (
+                "../escape", "C:escape", "bad\nid", "设备", "..",
+                " trailing", "x" * 129,
+            )
+            with patch("app.parser_bridge._parser_command") as command:
+                for value in invalid_values:
+                    with self.subTest(value=value):
+                        with self.assertRaises(ParserError) as raised:
+                            list(parse_parser_chunks_buffered(
+                                source,
+                                value,
+                                staging,
+                                chunk_format="arrow",
+                                max_lines=1,
+                                max_bytes=1024,
+                            ))
+                        self.assertEqual(
+                            raised.exception.code, "PARSER_SOURCE_FILE_ID_INVALID"
+                        )
+            command.assert_not_called()
+            self.assertFalse(staging.exists())
+            self.assertFalse((root / "escape.native.stderr").exists())
+
+    def test_ndjson_rollback_command_remains_compatible_with_legacy_binary(self) -> None:
+        parser = Path("/fixture/binlog-parser")
+        source = Path("/fixture/source.binlog")
+        output = Path("/fixture/staging")
+        with patch("app.parser_bridge.parser_executable", return_value=parser):
+            ndjson = _parser_command(
+                source, "file", "mysql", output_dir=output,
+                chunk_format="ndjson", max_lines=1, max_bytes=1024,
+            )
+            arrow = _parser_command(
+                source, "file", "mysql", output_dir=output,
+                chunk_format="arrow", max_lines=1, max_bytes=1024,
+            )
+        self.assertNotIn("--chunk-format", ndjson)
+        position = arrow.index("--chunk-format")
+        self.assertEqual(arrow[position + 1], "arrow")
+
+    def test_collector_defaults_to_arrow_with_explicit_ndjson_rollback(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RDS_BINLOG_PARSER_TRANSPORT", None)
+            self.assertEqual(parser_transport_format(), PARSER_TRANSPORT_ARROW)
+        with patch.dict(os.environ, {"RDS_BINLOG_PARSER_TRANSPORT": "ndjson"}):
+            self.assertEqual(parser_transport_format(), "ndjson")
+        with self.assertRaises(ParserError) as raised:
+            parser_transport_format("csv")
+        self.assertEqual(raised.exception.code, "PARSER_TRANSPORT_INVALID")
 
 
 if __name__ == "__main__":

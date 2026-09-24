@@ -1,3 +1,14 @@
+FROM golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd AS parser-builder
+
+WORKDIR /src
+COPY parser/go.mod parser/go.sum ./
+RUN go mod download && go mod verify
+COPY parser/*.go ./
+RUN go test ./... \
+    && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+        -trimpath -buildvcs=false -ldflags="-s -w" -o /out/binlog-parser . \
+    && printf '' | /out/binlog-parser --checksum-stdin >/dev/null
+
 FROM python:3.12-slim-bookworm@sha256:b64e9d3a71eddaa1b3f80c04abf292b3139e3b7c4dd272d19c31dc1f91194d1b AS sqlite-builder
 
 ARG SQLITE_AUTOCONF_VERSION=3530400
@@ -68,8 +79,9 @@ COPY tools/clickhouse_oss_backfill.py /app/tools/clickhouse_oss_backfill.py
 COPY tools/clickhouse_oss_verify.py /app/tools/clickhouse_oss_verify.py
 COPY tools/clickhouse_poc_benchmark.py /app/tools/clickhouse_poc_benchmark.py
 COPY tools/clickhouse_slowlog_verify.py /app/tools/clickhouse_slowlog_verify.py
-COPY tools/binlog-parser-linux-amd64 /app/tools/binlog-parser
-RUN chmod 0555 /app/tools/binlog-parser
+COPY --from=parser-builder /out/binlog-parser /app/tools/binlog-parser
+RUN chmod 0555 /app/tools/binlog-parser \
+    && printf '' | /app/tools/binlog-parser --checksum-stdin >/dev/null
 
 EXPOSE 8769
 

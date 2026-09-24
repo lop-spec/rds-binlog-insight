@@ -27,6 +27,7 @@ from app import __version__
 from app.analytics_index import AnalyticsIndex
 import app.storage as storage_module
 from app.checksum import crc64_xz_update
+from app.columnar_input import parser_schema
 from app.config import (
     APP_VERSION,
     Settings,
@@ -46,6 +47,7 @@ from app.metadata import MetadataStore
 from app.oss_store import OssArchive, OssArchiveError, OssRangeReader
 from app.parser_bridge import (
     NativeChecksumResult,
+    ParserChunk,
     ParserError,
     parse_ndjson_chunks,
     parse_ndjson_chunks_buffered,
@@ -1617,43 +1619,66 @@ class StorageBulkIngestTests(unittest.TestCase):
             file_id, _ = store.upsert_remote(settings, item)
             storage = EventStorage(store, data_root)
             epoch_us = int(time.time() * 1_000_000)
+            record = {
+                "event_id": "event-detached",
+                "event_epoch_us": epoch_us,
+                "operation": "INSERT",
+                "database_name": "audit_db",
+                "table_name": "orders",
+                "start_position": 1,
+                "end_position": 2,
+            }
             ndjson_path = storage.paths["staging"] / "detached.ndjson"
             ndjson_path.write_text(
-                json.dumps(
-                    {
-                        "event_id": "event-detached",
-                        "event_epoch_us": epoch_us,
-                        "operation": "INSERT",
-                        "database_name": "audit_db",
-                        "table_name": "orders",
-                        "start_position": 1,
-                        "end_position": 2,
-                    },
-                    separators=(",", ":"),
-                )
-                + "\n",
+                json.dumps(record, separators=(",", ":")) + "\n",
                 encoding="utf-8",
             )
+            arrow_path = storage.paths["staging"] / "detached.arrow"
+            parser_table = pa.Table.from_pylist(
+                [record], schema=parser_schema(storage_module.PARSER_JSON_COLUMNS)
+            )
+            with pa.OSFile(str(arrow_path), "wb") as sink:
+                with pa.ipc.new_file(sink, parser_table.schema) as writer:
+                    writer.write_table(parser_table)
 
-            payload = {
+            common_payload = {
                 "data_dir": str(data_root),
                 "file_id": file_id,
                 "instance_id": settings.db_instance_id,
                 "host_instance_id": item.host_instance_id,
                 "source_file_name": item.log_file_name,
-                "ndjson_path": str(ndjson_path),
-                "part_key": "000000",
+                "expected_rows": 1,
             }
+            payloads = [
+                {
+                    **common_payload,
+                    "parser_path": str(ndjson_path),
+                    "parser_format": "ndjson",
+                    "part_key": "000000",
+                },
+                {
+                    **common_payload,
+                    "parser_path": str(arrow_path),
+                    "parser_format": "arrow",
+                    "part_key": "000001",
+                },
+            ]
             with ProcessPoolExecutor(
                 max_workers=1,
                 mp_context=multiprocessing.get_context("spawn"),
             ) as executor:
-                count, parts = executor.submit(
-                    storage_module.ingest_ndjson_file_detached,
-                    payload,
-                ).result(timeout=30)
+                results = [
+                    executor.submit(
+                        storage_module.ingest_ndjson_file_detached,
+                        payload,
+                    ).result(timeout=30)
+                    for payload in payloads
+                ]
 
-            self.assertEqual(count, 1)
+            self.assertEqual([count for count, _ in results], [1, 1])
+            ndjson_table = pq.ParquetFile(results[0][1][0]["path"]).read()
+            arrow_table = pq.ParquetFile(results[1][1][0]["path"]).read()
+            self.assertTrue(ndjson_table.equals(arrow_table, check_metadata=True))
             self.assertEqual(
                 store.parts_in_range(
                     start_epoch_us=epoch_us - 1,
@@ -1661,7 +1686,7 @@ class StorageBulkIngestTests(unittest.TestCase):
                 ),
                 [],
             )
-            storage.publish_ingested_parts(file_id, parts, append=True)
+            storage.publish_ingested_parts(file_id, results[1][1], append=True)
             self.assertEqual(
                 len(
                     store.parts_in_range(
@@ -5130,6 +5155,16 @@ class PipelinePrefetchTests(unittest.TestCase):
             ]
             for path in ndjson_paths:
                 path.write_text("{}\n", encoding="utf-8")
+            parser_chunks = [
+                ParserChunk(
+                    path=path,
+                    transport_format="ndjson",
+                    sequence=index,
+                    rows=1,
+                    size_bytes=path.stat().st_size,
+                )
+                for index, path in enumerate(ndjson_paths)
+            ]
             first_archive = Future()
             second_archive = Future()
             second_archive.set_result(1)
@@ -5170,8 +5205,8 @@ class PipelinePrefetchTests(unittest.TestCase):
             try:
                 with (
                     patch(
-                        "app.pipeline.parse_ndjson_chunks_buffered",
-                        return_value=iter(ndjson_paths),
+                        "app.pipeline.parse_parser_chunks_buffered",
+                        return_value=iter(parser_chunks),
                     ),
                     patch.object(
                         storage,

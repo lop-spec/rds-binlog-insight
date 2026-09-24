@@ -132,6 +132,44 @@ class RuntimeIdentifierConfigTests(unittest.TestCase):
         self.assertIn(f"local/rds-binlog-insight:{APP_VERSION}", compose)
         self.assertIn(f"app.js?v={APP_VERSION}", index)
 
+    def test_candidate_image_builds_the_parser_from_complete_pinned_source(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+        parser_dockerfile = (root / "parser" / "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        workflow = (root / ".github" / "workflows" / "build-image.yml").read_text(
+            encoding="utf-8"
+        )
+        pinned_builder = (
+            "golang:1.26.5-bookworm@sha256:"
+            "53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd"
+        )
+        for candidate in (dockerfile, parser_dockerfile):
+            with self.subTest(file="root" if candidate is dockerfile else "parser"):
+                self.assertIn(pinned_builder, candidate)
+                self.assertIn("go mod verify", candidate)
+                self.assertIn("COPY ", candidate)
+                self.assertIn("*.go", candidate)
+                self.assertIn("go test ./...", candidate)
+                self.assertIn("-buildvcs=false", candidate)
+        self.assertIn(
+            "COPY --from=parser-builder /out/binlog-parser /app/tools/binlog-parser",
+            dockerfile,
+        )
+        self.assertNotIn(
+            "COPY tools/binlog-parser-linux-amd64 /app/tools/binlog-parser",
+            dockerfile,
+        )
+        self.assertIn("/out/binlog-parser --checksum-stdin", dockerfile)
+        self.assertIn("-trimpath -buildvcs=false", workflow)
+        self.assertIn("docker build --target parser-builder", workflow)
+        self.assertIn(
+            "cmp parser/build/binlog-parser-linux-amd64 "
+            "parser/build/binlog-parser-from-root-dockerfile",
+            workflow,
+        )
+
     def test_sqlite_indexers_do_not_inherit_clickhouse_serving_routes(self) -> None:
         compose = (
             Path(__file__).resolve().parents[1] / "compose.yaml"

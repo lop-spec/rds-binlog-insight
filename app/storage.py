@@ -1023,6 +1023,7 @@ class EventStorage:
         part_key: str = "",
         append: bool = False,
         publish_metadata: bool = True,
+        expected_rows: int | None = None,
     ) -> tuple[int, list[dict[str, Any]]]:
         if not parser_path.is_file():
             raise StorageError(
@@ -1115,6 +1116,12 @@ class EventStorage:
             ).fetchone()
             count = int(counts[0])
             invalid_count = int(counts[1])
+            if expected_rows is not None and count != int(expected_rows):
+                raise StorageError(
+                    "解析器分块行数与清单不一致："
+                    f"manifest={int(expected_rows)} decoded={count}",
+                    "PARSER_CHUNK_ROW_COUNT_MISMATCH",
+                )
             if invalid_count:
                 raise StorageError(
                     f"解析记录中有 {invalid_count} 条缺少有效事件时间",
@@ -4967,20 +4974,37 @@ class EventStorage:
         return copy.deepcopy(snapshot)
 
 
-def ingest_ndjson_file_detached(
+def ingest_parser_file_detached(
     payload: dict[str, Any],
 ) -> tuple[int, list[dict[str, Any]]]:
     """Transform one parser chunk without touching shared SQLite metadata."""
     storage = EventStorage.__new__(EventStorage)
     storage.paths = ensure_data_dirs(Path(str(payload["data_dir"])))
     storage._part_body_locks = [threading.RLock() for _ in range(256)]
-    return storage.ingest_ndjson_file(
+    parser_format = str(payload.get("parser_format") or "ndjson")
+    parser_path_value = payload.get("parser_path", payload.get("ndjson_path"))
+    if parser_path_value is None:
+        raise StorageError("解析器输出路径缺失", "PARSER_OUTPUT_MISSING")
+    return storage._ingest_parser_file(
         file_id=str(payload["file_id"]),
         instance_id=str(payload["instance_id"]),
         host_instance_id=str(payload["host_instance_id"]),
         source_file_name=str(payload["source_file_name"]),
-        ndjson_path=Path(str(payload["ndjson_path"])),
+        parser_path=Path(str(parser_path_value)),
+        parser_format=parser_format,
         part_key=str(payload.get("part_key") or ""),
         append=True,
         publish_metadata=False,
+        expected_rows=(
+            int(payload["expected_rows"])
+            if payload.get("expected_rows") is not None
+            else None
+        ),
     )
+
+
+def ingest_ndjson_file_detached(
+    payload: dict[str, Any],
+) -> tuple[int, list[dict[str, Any]]]:
+    """Compatibility entry point used by existing spawned worker contracts."""
+    return ingest_parser_file_detached(payload)

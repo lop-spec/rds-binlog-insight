@@ -11,7 +11,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from app.columnar_input import open_parser_arrow, parser_schema
-from app.storage import EVENT_COLUMNS, PARSER_JSON_COLUMNS, EventStorage, ensure_data_dirs
+from app.storage import (
+    EVENT_COLUMNS,
+    PARSER_JSON_COLUMNS,
+    EventStorage,
+    StorageError,
+    ensure_data_dirs,
+    ingest_parser_file_detached,
+)
 
 
 def write_ipc(path, rows, schema=None, batch_size=2):
@@ -42,17 +49,15 @@ class ColumnarInputTests(unittest.TestCase):
         self.assertEqual(actual[1], dict.fromkeys(PARSER_JSON_COLUMNS))
         self.assertEqual(actual[2], row)
 
-    def test_old_schema_missing_fields_become_null(self):
-        write_ipc(self.path, [{"sql_text": "SELECT 1"}], pa.schema([("sql_text", pa.string())]))
-        actual = self.read().to_pylist()[0]
-        self.assertEqual(actual["sql_text"], "SELECT 1")
-        self.assertIsNone(actual["commit_epoch_us"])
-        self.assertEqual(set(actual), set(PARSER_JSON_COLUMNS))
-
-    def test_unknown_duplicate_or_wrong_typed_fields_fail_closed(self):
-        for schema in (pa.schema([("future_field", pa.string())]),
-                       pa.schema([("sql_text", pa.string()), ("sql_text", pa.string())]),
-                       pa.schema([("table_map_id", pa.int64())])):
+    def test_missing_reordered_unknown_duplicate_or_wrong_schema_fails_closed(self):
+        exact = parser_schema(PARSER_JSON_COLUMNS)
+        for schema in (
+            pa.schema([("sql_text", pa.string())]),
+            pa.schema(list(reversed(exact))),
+            pa.schema([("future_field", pa.string())]),
+            pa.schema([("sql_text", pa.string()), ("sql_text", pa.string())]),
+            pa.schema([("table_map_id", pa.int64())]),
+        ):
             with self.subTest(schema=schema):
                 write_ipc(self.path, [], schema)
                 with self.assertRaises(ValueError):
@@ -72,14 +77,69 @@ class ColumnarInputTests(unittest.TestCase):
         self.assertEqual(self.read().num_rows, 0)
         self.assertEqual(self.read().schema, parser_schema(PARSER_JSON_COLUMNS))
 
-    def test_decoded_missing_columns_are_counted_in_budget(self):
-        # The file is tiny but supplying absent fixed-width columns costs memory.
-        table = pa.table({"sql_text": pa.nulls(20000, pa.string())})
-        with pa.OSFile(str(self.path), "wb") as sink, pa.ipc.new_file(sink, table.schema) as writer:
-            writer.write_table(table)
+    def test_decoded_columns_are_independently_counted_in_budget(self):
+        schema = parser_schema(PARSER_JSON_COLUMNS)
+        arrays = [
+            pa.array(["x" * 100] * 20000, type=field.type)
+            if field.name == "sql_text"
+            else pa.nulls(20000, type=field.type)
+            for field in schema
+        ]
+        table = pa.Table.from_arrays(arrays, schema=schema)
+        options = pa.ipc.IpcWriteOptions(compression="zstd")
+        with pa.OSFile(str(self.path), "wb") as sink:
+            with pa.ipc.new_file(sink, table.schema, options=options) as writer:
+                writer.write_table(table)
         limit = self.path.stat().st_size + 1024
+        self.assertGreater(table.nbytes, limit)
         with self.assertRaisesRegex(ValueError, "decoded columns"):
             self.read(max_bytes=limit)
+
+    def test_manifest_row_count_is_checked_before_parquet_publication(self):
+        row = dict.fromkeys(PARSER_JSON_COLUMNS)
+        row.update(event_id="row-count", event_epoch_us=1789607092576176,
+                   operation="INSERT")
+        write_ipc(self.path, [row])
+        storage = EventStorage.__new__(EventStorage)
+        storage.paths = ensure_data_dirs(Path(self.root.name) / "row-count")
+        storage._part_body_locks = [threading.RLock() for _ in range(256)]
+        with self.assertRaises(StorageError) as raised:
+            storage.ingest_arrow_file(
+                arrow_path=self.path,
+                file_id="fixture-source",
+                instance_id="rm-test000001",
+                host_instance_id="fixture-host",
+                source_file_name="mysql-bin.fixture",
+                expected_rows=2,
+                publish_metadata=False,
+                append=True,
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "PARSER_CHUNK_ROW_COUNT_MISMATCH",
+        )
+        self.assertEqual(list(storage.paths["events"].rglob("*.parquet")), [])
+
+    def test_detached_transform_accepts_arrow_chunk_contract(self):
+        row = dict.fromkeys(PARSER_JSON_COLUMNS)
+        row.update(event_id="detached-arrow", event_epoch_us=1789607092576176,
+                   operation="UPDATE", database_name="fixture")
+        write_ipc(self.path, [row])
+        data_root = Path(self.root.name) / "detached-arrow"
+        count, parts = ingest_parser_file_detached({
+            "data_dir": str(data_root),
+            "file_id": "fixture-source",
+            "instance_id": "rm-test000001",
+            "host_instance_id": "fixture-host",
+            "source_file_name": "mysql-bin.fixture",
+            "parser_path": str(self.path),
+            "parser_format": "arrow",
+            "expected_rows": 1,
+            "part_key": "000000",
+        })
+        self.assertEqual(count, 1)
+        self.assertTrue(parts)
+        self.assertTrue(all(Path(part["path"]).is_file() for part in parts))
 
     def test_ndjson_and_arrow_have_identical_47_field_parquet_and_catalog(self):
         row = {name: ("" if kind == "VARCHAR" else 0)
