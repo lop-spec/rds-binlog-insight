@@ -44,6 +44,8 @@ SEARCH_EXPR = "lower(concat(before_json, ' ', after_json, ' ', transaction_id, '
 NON_BINLOG_HOSTS = ("slow-log", "tabularis")
 QUERY_DEADLINE_SECONDS = 100
 PAGE_DEPTH_LIMIT = 2000
+# Rows kept in the table store: anything bound to a table, plus DDL (no table name, kept for audit).
+ROW_STORE_FILTER = "(table_name != '' OR operation = 'DDL')"
 TOKEN = re.compile(r"[a-z0-9]+")
 
 STAGE_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -78,7 +80,7 @@ PARSER_INPUT_STRUCTURE = ", ".join((
     "server_id Nullable(Int64)", "thread_id Nullable(Int64)", "transaction_id Nullable(String)",
     "gtid Nullable(String)", "start_position Nullable(Int64)", "end_position Nullable(Int64)",
     "row_index Nullable(Int32)", "execution_time_ms Nullable(Int64)", "error_code Nullable(Int32)",
-    "sql_kind Nullable(String)", "before_json Nullable(String)", "after_json Nullable(String)",
+    "sql_kind Nullable(String)", "sql_text Nullable(String)", "before_json Nullable(String)", "after_json Nullable(String)",
     "row_query Nullable(String)", "connection_id Nullable(String)", "connection_name Nullable(String)",
     "database_account Nullable(String)", "execution_status Nullable(String)", "error_message Nullable(String)",
     "affected_rows Nullable(Int64)", "started_epoch_us Nullable(Int64)", "finished_epoch_us Nullable(Int64)",
@@ -124,7 +126,8 @@ def parser_select_sql() -> str:
         "coalesce(sql_kind, '') AS sql_kind",
         "coalesce(before_json, '') AS before_json",
         "coalesce(after_json, '') AS after_json",
-        "toLowCardinality(coalesce(row_query, '')) AS row_query",
+        "toLowCardinality(if(coalesce(row_query, '') = '' AND coalesce(sql_kind, '') = 'ORIGINAL', "
+        "coalesce(sql_text, ''), coalesce(row_query, ''))) AS row_query",
         "coalesce(connection_id, '') AS connection_id",
         "coalesce(connection_name, '') AS connection_name",
         "coalesce(database_account, '') AS database_account",
@@ -216,6 +219,7 @@ def coverage_runs(files: Iterable[dict[str, Any]], ingested: set[str],
     intervals: list[list[int]] = []
     gaps: list[dict[str, Any]] = []
     run: list[int] | None = None
+    previous_was_gap = False
     for item in ordered:
         good = item["id"] in ingested
         if good:
@@ -223,16 +227,19 @@ def coverage_runs(files: Iterable[dict[str, Any]], ingested: set[str],
                 run = [item["lo"], item["hi"]]
             else:
                 run[1] = max(run[1], item["hi"])
+            previous_was_gap = False
             continue
         if run is not None:
             intervals.append(run)
             run = None
         reason = "source_missing" if item.get("state") == "unavailable" else "pending"
-        if gaps and gaps[-1]["reason"] == reason and item["lo"] <= gaps[-1]["end"] + 1_000_000:
+        # Only neighbouring missing files merge; a covered run in between always splits gaps.
+        if previous_was_gap and gaps[-1]["reason"] == reason:
             gaps[-1]["end"] = max(gaps[-1]["end"], item["hi"])
             gaps[-1]["files"] += 1
         else:
             gaps.append({"start": item["lo"], "end": item["hi"], "reason": reason, "files": 1})
+        previous_was_gap = True
     if run is not None:
         intervals.append(run)
     # A covered run wins where it overlaps a neighbouring gap's boundary second.
@@ -241,14 +248,14 @@ def coverage_runs(files: Iterable[dict[str, Any]], ingested: set[str],
         clipped = []
         for gap in gaps:
             lo, hi = max(gap["start"], start), min(gap["end"], end)
-            if lo <= hi:
+            if lo < hi:
                 clipped.append({**gap, "start": lo, "end": hi})
         gaps = clipped
         covered = sum(hi - lo for lo, hi in intervals)
         latest = max((f["hi"] for f in ordered), default=None)
         if latest is None:
             gaps.append({"start": start, "end": end, "reason": "no_data", "files": 0})
-        elif latest < end:
+        elif latest < end and max(latest, start) < end:
             gaps.append({"start": max(latest, start), "end": end, "reason": "not_collected_yet", "files": 0})
         return {"intervals": intervals, "gaps": gaps, "covered_us": covered, "requested_us": max(end - start, 0)}
     return {"intervals": intervals, "gaps": gaps}
@@ -676,7 +683,7 @@ class RowsIngestor:
 
     def move(self, part_keys: list[str], tag: str) -> None:
         try:
-            self.ch.execute(f"INSERT INTO {STAGE_TABLE} SELECT * FROM {self.buffer}",
+            self.ch.execute(f"INSERT INTO {STAGE_TABLE} SELECT * FROM {self.buffer} WHERE {ROW_STORE_FILTER}",
                             settings={"max_threads": 1, "max_insert_threads": 1, "max_block_size": 16384,
                                       "min_insert_block_size_rows": 16384, "min_insert_block_size_bytes": 16777216,
                                       "max_insert_block_size": 16384, "max_memory_usage": 1_200_000_000,

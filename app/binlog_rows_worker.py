@@ -83,6 +83,23 @@ def download_ranges(bucket: Any, key: str, size: int, path: Path, stop: threadin
             future.result()
 
 
+SLIM_PARSER_DEFAULT = "/app/tools/binlog-parser-slim"
+_parser_warned = False
+
+
+def parser_command() -> list[str]:
+    """Slim row-store parser (same event ids and row images as the collector parser, ~40% less CPU)."""
+    global _parser_warned
+    from .parser_bridge import parser_executable
+    slim = Path(os.environ.get("RDS_BINLOG_ROWS_PARSER", SLIM_PARSER_DEFAULT) or SLIM_PARSER_DEFAULT)
+    if slim.is_file() and os.access(slim, os.X_OK):
+        return [str(slim), "--slim"]
+    if not _parser_warned:
+        LOGGER.warning("BINLOG_ROWS_SLIM_PARSER_MISSING path=%s fallback=%s", slim, parser_executable())
+        _parser_warned = True
+    return [str(parser_executable())]
+
+
 class LineCountingStream:
     """File-like view of parser stdout that counts NDJSON records while ClickHouse reads it."""
 
@@ -256,7 +273,6 @@ class Worker:
     # -- ingestion ------------------------------------------------------------
     def ingest_raw(self, ingestor: RowsIngestor, entry: dict[str, Any], lane: int) -> int:
         from oss2.utils import Crc64
-        from .parser_bridge import parser_executable
         archive = self.archive()
         descriptor = entry["descriptor"]
         raw = descriptor["raw"]
@@ -281,7 +297,7 @@ class Worker:
             stderr_path = root / "parser.stderr"
             with stderr_path.open("wb") as stderr:
                 process = subprocess.Popen(
-                    [str(parser_executable()), "--input", str(source), "--source-file-id", entry["file_id"],
+                    [*parser_command(), "--input", str(source), "--source-file-id", entry["file_id"],
                      "--flavor", descriptor.get("flavor") or "mysql"],
                     stdout=subprocess.PIPE, stderr=stderr, stdin=subprocess.DEVNULL)
                 stream = LineCountingStream(process.stdout, self.stop)
@@ -309,6 +325,7 @@ class Worker:
         from .clickhouse_client import SOURCE_COLUMN_TYPES
         types = dict(SOURCE_COLUMN_TYPES)
         wanted = [n for n in STAGE_COLUMN_NAMES if n != "_source_part_key"]
+        sources = [*wanted, "sql_text"]
         settings = self.metadata.load_settings()
         base = f"https://{settings.oss_bucket.strip().lower()}.oss-{settings.oss_region_id.strip().lower()}-internal.aliyuncs.com/"
         keys = [k for k, _ in entry["parts"]]
@@ -319,9 +336,11 @@ class Worker:
         rq_complete = True
         ingestor.truncate()
         for with_rq in (True, False):
-            names = [n for n in wanted if with_rq or n != "row_query"]
+            names = [n for n in sources if with_rq or n != "row_query"]
             structure = ", ".join(f"{n} {PARQUET_STRUCTURE_OVERRIDES.get(n, types[n])}" for n in names)
-            select = ", ".join(n if (with_rq or n != "row_query") else "'' AS row_query" for n in wanted)
+            row_query = ("toLowCardinality(if(row_query = '' AND sql_kind = 'ORIGINAL', sql_text, row_query)) AS row_query"
+                         if with_rq else "toLowCardinality(if(sql_kind = 'ORIGINAL', sql_text, '')) AS row_query")
+            select = ", ".join(row_query if n == "row_query" else n for n in wanted)
             try:
                 ingestor.ch.execute(
                     f"INSERT INTO {ingestor.buffer} ({', '.join(STAGE_COLUMN_NAMES)}) SELECT {select}, _path "

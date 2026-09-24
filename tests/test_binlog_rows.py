@@ -289,3 +289,42 @@ class StreamCountTests(unittest.TestCase):
             while stream.read(3):
                 pass
             self.assertEqual(stream.lines, expected)
+
+
+class Release1291Tests(unittest.TestCase):
+    def test_boundary_touching_gaps_are_not_reported(self):
+        files = [{"id": "p1", "lo": 0, "hi": 10, "state": "done"}, {"id": "a", "lo": 10, "hi": 20, "state": "done"},
+                 {"id": "p2", "lo": 20, "hi": 30, "state": "done"}]
+        result = br.coverage_runs(files, {"a"}, 10, 20)
+        self.assertEqual(result["intervals"], [[10, 20]])
+        self.assertEqual(result["gaps"], [])
+        self.assertEqual(br.coverage_note(result), "所选区间已完整入库并检索")
+
+    def test_move_keeps_only_table_rows_and_ddl(self):
+        client = mock.Mock()
+        br.RowsIngestor(client).move(["raw:f"], "t")
+        sql = client.execute.call_args_list[0].args[0]
+        self.assertIn("WHERE (table_name != '' OR operation = 'DDL')", sql)
+
+    def test_original_sql_text_becomes_row_query(self):
+        select = br.parser_select_sql()
+        self.assertIn("coalesce(sql_kind, '') = 'ORIGINAL'", select)
+        self.assertIn("sql_text Nullable(String)", br.PARSER_INPUT_STRUCTURE)
+
+    def test_worker_prefers_slim_parser_and_falls_back_with_a_log(self):
+        import tempfile
+        from pathlib import Path
+        from app import binlog_rows_worker as worker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            slim = Path(tmp) / "slim"
+            slim.write_text("#!/bin/sh\n")
+            slim.chmod(0o755)
+            with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_PARSER": str(slim)}):
+                self.assertEqual(worker.parser_command(), [str(slim), "--slim"])
+            with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_PARSER": str(Path(tmp) / "missing")}), \
+                    mock.patch("app.parser_bridge.parser_executable", return_value=Path("/full")), \
+                    self.assertLogs("binlog_rows_worker", level="WARNING") as logs:
+                worker._parser_warned = False
+                self.assertEqual(worker.parser_command(), [str(Path("/full"))])
+            self.assertIn("BINLOG_ROWS_SLIM_PARSER_MISSING", logs.output[0])

@@ -1,3 +1,11 @@
+FROM golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd AS parser-slim
+WORKDIR /src
+COPY parser-slim/go.mod parser-slim/go.sum ./
+RUN go mod download
+COPY parser-slim/main.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/binlog-parser-slim . \
+    && /out/binlog-parser-slim --help 2>&1 | grep -q -- "-slim"
+
 FROM python:3.12-slim-bookworm@sha256:b64e9d3a71eddaa1b3f80c04abf292b3139e3b7c4dd272d19c31dc1f91194d1b AS sqlite-builder
 
 ARG SQLITE_AUTOCONF_VERSION=3530400
@@ -35,7 +43,7 @@ RUN python -m pip wheel --no-cache-dir --disable-pip-version-check --no-deps \
 FROM python:3.12-slim-bookworm@sha256:b64e9d3a71eddaa1b3f80c04abf292b3139e3b7c4dd272d19c31dc1f91194d1b
 
 LABEL org.opencontainers.image.title="RDS Binlog Insight" \
-      org.opencontainers.image.version="1.29.0-rawoss" \
+      org.opencontainers.image.version="1.29.1-rawoss" \
       org.opencontainers.image.sqlite.version="3.53.4"
 
 COPY --from=sqlite-builder /usr/local/lib/ /usr/local/lib/
@@ -70,6 +78,8 @@ COPY tools/clickhouse_poc_benchmark.py /app/tools/clickhouse_poc_benchmark.py
 COPY tools/clickhouse_slowlog_verify.py /app/tools/clickhouse_slowlog_verify.py
 COPY tools/binlog-parser-linux-amd64 /app/tools/binlog-parser
 RUN chmod 0555 /app/tools/binlog-parser
+COPY --from=parser-slim /out/binlog-parser-slim /app/tools/binlog-parser-slim
+RUN chmod 0555 /app/tools/binlog-parser-slim
 
 EXPOSE 8769
 

@@ -41,6 +41,18 @@ so the tables stay ALTER-able (inline dynamic disks cannot be altered on 26.3). 
 - Pauses (always logged as `BINLOG_ROWS_PAUSED`): ClickHouse memory above `RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB`,
   and for window lanes also collector lag above 20 minutes. Status: `data/index/binlog-rows-worker-status.json`.
 
-Measured on yy-ecs (4 vCPU): one 524 MB production binlog ≈ 74 s end to end (download 2.5 s, parser ≈ 44 s,
-the rest ClickHouse load + move). The parser emits ~12 KB/row, of which only ~12% (row images) is stored;
-`row_query` repeated per row is 59% of its output.
+Rows without a table (transaction boundaries: XID / BEGIN / COMMIT, ~41% of production records) are not
+kept; DDL is kept and its original text goes through the statements table (`sql_kind = ORIGINAL`).
+
+### Slim parser (`parser-slim/`, 1.29.1)
+
+The collector keeps using `tools/binlog-parser`. The rows worker uses `/app/tools/binlog-parser-slim --slim`
+(built from `parser-slim/` in the image; override with `RDS_BINLOG_ROWS_PARSER`, missing binary falls back to
+the full parser with a `BINLOG_ROWS_SLIM_PARSER_MISSING` log line). Slim mode omits pseudo SQL, column
+metadata and base64 SQL, cuts `row_query` to 65536 code points (what the store keeps) and does not write
+transaction-boundary records while still advancing the output sequence, so every emitted `event_id`,
+row image, position and `row_query` prefix is identical to the full parser. Verified on a production binlog:
+174,443 non-boundary records, 0 field differences; parser CPU 29.3 s → 17.9 s.
+
+Measured on the production host (4 vCPU): one 524 MB binlog ≈ 56 s end to end with the slim parser
+(74 s full parser streamed, 132 s with on-disk chunks); download 2.5 s with 4 ranged streams.
