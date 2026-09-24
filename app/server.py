@@ -803,6 +803,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "pid": os.getpid(),
                     }
                 )
+            elif parsed.path == "/api/index-coverage" and self.app.storage.binlog_rows is not None:
+                settings = self.app.metadata.load_settings()
+                floor, ceiling = self.app.storage._query_window({}, settings.retention_days)
+                coverage = self.app.storage.binlog_rows.coverage(_query_value(query, 'instance'), floor, ceiling)
+                from .binlog_rows_worker import STATUS_NAME
+                from .maintenance_status import read_json_status
+                coverage['worker'] = read_json_status(self.app.storage.paths['index'] / STATUS_NAME)
+                coverage['gaps'] = coverage.get('gaps', [])[-500:]
+                self._json({'ok': True, 'data': coverage})
             elif parsed.path == "/api/index-coverage":
                 scope = {key: _query_value(query, key) for key in ('instance', 'database', 'table')}
                 scope['exact'] = {'kind': 'SCOPE'}
@@ -885,6 +894,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     result = self.app.storage.slowlog_event_detail(
                         event_id, settings, instance
                     )
+                if result is None and locator.startswith('ch:') and self.app.storage.binlog_rows is not None:
+                    result = self.app.storage.binlog_rows.detail(locator)
                 if result is None and locator.startswith('raw:'):
                     result = self.app.storage.raw_event_index.detail(event_id, locator, instance)
                 if result is None:
@@ -1010,7 +1021,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 else 409
                 if code == "BINLOG_BACKFILL_QUEUED"
                 else 503
-                if code == "CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE"
+                if code in {"CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE", "CLICKHOUSE_BINLOG_ROWS_UNAVAILABLE"}
                 else 500
             )
             self._error(status, code, str(exc))

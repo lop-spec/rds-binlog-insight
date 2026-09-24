@@ -170,7 +170,11 @@ class QueryTaskManager:
         )
 
     def submit(self, query: dict[str, Any]) -> str:
-        deadline = time.monotonic()+55 if query.get('indexed_only') else None
+        from .binlog_rows import QUERY_DEADLINE_SECONDS, serving_enabled
+        # Table-row queries carry their own ClickHouse deadline; keep the task
+        # bound just above it and below the two-minute interactive budget.
+        indexed_budget = QUERY_DEADLINE_SECONDS + 18 if serving_enabled() else 55
+        deadline = time.monotonic()+indexed_budget if query.get('indexed_only') else None
         with self._lock:
             if self._closing:
                 raise RuntimeError("查询任务管理器正在停止")

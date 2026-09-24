@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { indexedQuickRange, indexedCustomRange } = require('../web/indexed-range.js');
+const { indexedQuickRange, indexedCustomRange, rowsQuickRange, gapsWithin } = require('../web/indexed-range.js');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
@@ -17,7 +17,7 @@ function uiFixture() {
     return nodes.get(key);
   }};
   const requests = [];
-  const ctx = vm.createContext({ document, console, URLSearchParams, Date, indexedQuickRange, indexedCustomRange,
+  const ctx = vm.createContext({ document, console, URLSearchParams, Date, indexedQuickRange, indexedCustomRange, rowsQuickRange, gapsWithin,
     fetch(url, options) { return new Promise(resolve => requests.push({ url, options, resolve: data => resolve({ok: true, json: async () => ({ok: true, data})}) })); }
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8'), ctx);
@@ -279,4 +279,22 @@ test('too short subsecond interval is not rounded outside coverage', () => {
 test('duration is preserved when the latest interval is long enough', () => {
   assert.deepEqual(indexedQuickRange([[1000000, 3601000000]], 60000),
     { start: 3541000, end: 3601000, clipped: false });
+});
+
+test('rows quick range keeps the requested duration and ends at the newest ingested second', () => {
+  const hour = 3600_000;
+  const range = rowsQuickRange([[1_000_000_000_000_000, 1_000_000_500_000_000], [1_000_001_000_000_000, 1_000_002_000_123_456]], hour);
+  assert.deepEqual(range, { start: 1_000_002_000_000 - hour, end: 1_000_002_000_000 });
+  assert.equal(rowsQuickRange([], hour), null);
+  assert.equal(rowsQuickRange([[1, 2]], 0), null);
+});
+
+test('gaps within a range are counted per reason and never outside the range', () => {
+  const gaps = [
+    { start: 10_000_000, end: 20_000_000, reason: 'source_missing' },
+    { start: 30_000_000, end: 40_000_000, reason: 'pending' },
+    { start: 90_000_000, end: 95_000_000, reason: 'pending' },
+  ];
+  assert.deepEqual(gapsWithin(gaps, 15_000, 35_000), { total: 2, counts: { source_missing: 1, pending: 1 } });
+  assert.deepEqual(gapsWithin(gaps, 50_000, 60_000), { total: 0, counts: {} });
 });

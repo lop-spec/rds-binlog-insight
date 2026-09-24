@@ -161,6 +161,14 @@ function isIndexedBinlogQuery() {
   return $("#filter-query-mode").value !== "keyword" || ["", "binlog"].includes($("#filter-source").value);
 }
 
+const GAP_LABELS = { source_missing: "源 Binlog 缺失", pending: "未入库", not_collected_yet: "尚未采集", no_data: "无数据" };
+function gapCopy(gaps, startMs, endMs) {
+  const { total, counts } = gapsWithin(gaps, startMs, endMs);
+  if (!total) return "所选时段已完整入库";
+  const detail = Object.entries(counts).map(([reason, count]) => `${GAP_LABELS[reason] || reason} ${count}`).join("、");
+  return `所选时段有 ${total} 段未覆盖（${detail}），查询结果会逐段标明`;
+}
+
 let indexedRangeRequest = 0;
 async function setQuickRange(range) {
   const request = ++indexedRangeRequest;
@@ -181,6 +189,15 @@ async function setQuickRange(range) {
       const worker = coverage.worker || {};
       const reasons = { "io-pressure": "磁盘繁忙", "memory-pressure": "内存压力", "cpu-pressure": "CPU 繁忙", "interactive-query-priority": "优先处理查询", "disk-reserve-below-20GiB": "保护磁盘余量" };
       const workerNote = worker.state === "paused" ? ` · 索引已让位：${reasons[worker.reason] || "资源检查未通过"}` : "";
+      if (coverage.mode === "binlog-rows") {
+        const rowsRange = rowsQuickRange(coverage.intervals || [], units[range]);
+        if (!rowsRange) throw new Error(coverage.reason || "该实例尚无已入库的 Binlog 区间");
+        $("#filter-start").value = toLocalInput(new Date(rowsRange.start));
+        $("#filter-end").value = toLocalInput(new Date(rowsRange.end));
+        $("#filter-end").setCustomValidity("");
+        hint.textContent = `已入库至 ${formatTime(rowsRange.end * 1000)} · ${gapCopy(coverage.gaps, rowsRange.start, rowsRange.end)}`;
+        return;
+      }
       const selected = indexedQuickRange(coverage.intervals || [], units[range]);
       if (!selected) throw new Error((coverage.reason || "没有可用的已索引区间") + workerNote);
       $("#filter-start").value = toLocalInput(new Date(selected.start));
@@ -219,6 +236,11 @@ async function alignCustomIndexedRange() {
       || $("#filter-start").value !== startText || $("#filter-end").value !== endText
       || [...params].some(([key, value]) => $("#filter-" + key).value.trim() !== value)) {
     throw new Error("查询条件已变化，请重新查询");
+  }
+  if (coverage.mode === "binlog-rows") {
+    $("#filter-end").setCustomValidity("");
+    $("#indexed-range-hint").textContent = `按所选时间完整查询 · ${gapCopy(coverage.gaps, start, end)}`;
+    return;
   }
   const selected = indexedCustomRange(coverage.intervals || [], start, end);
   if (!selected) {
@@ -402,9 +424,12 @@ function renderEvents(result) {
   tbody.innerHTML = "";
   const rows = result.rows || [];
   $("#event-empty").hidden = rows.length > 0;
-  const indexedResult = (result.tiers_used || []).includes("raw-event-index");
+  const rowsResult = (result.tiers_used || []).includes("clickhouse-binlog-rows");
+  const indexedResult = rowsResult || (result.tiers_used || []).includes("raw-event-index");
   $("#event-empty strong").textContent = indexedResult ? "所查区间没有匹配记录" : "还没有查询结果";
-  $("#event-empty span").textContent = indexedResult ? "仅检查结果标题显示的时间段；其他历史尚未查询。" : "完成一次同步，或调整上方时间范围后查询。";
+  $("#event-empty span").textContent = rowsResult
+    ? (result.coverage_note || "所选时段已检索")
+    : indexedResult ? "仅检查结果标题显示的时间段；其他历史尚未查询。" : "完成一次同步，或调整上方时间范围后查询。";
   $(".data-table", $("#view-audit")).hidden = rows.length === 0;
   for (const row of rows) {
     const tr = document.createElement("tr");
@@ -459,7 +484,7 @@ function renderEvents(result) {
   $("#page-prev").disabled = state.queryOffset === 0;
   $("#page-next").disabled = !state.hasMore;
   const tierNames = (result.tiers_used || []).map((tier) => (
-    tier === "raw-event-index" ? "Binlog 行级索引" : tier === "exact-index"
+    tier === "raw-event-index" ? "Binlog 行级索引" : tier === "clickhouse-binlog-rows" ? "Binlog 按表索引" : tier === "exact-index"
       ? "主键精确索引 · 0 OSS"
       : tier === "slowlog-index"
       ? "慢日志专用索引 · 0 OSS"
@@ -486,7 +511,17 @@ function renderEvents(result) {
     $("#result-meta").textContent = rows.length
       ? `本页 ${rows.length} 条 · ${state.queryLimit} 条/页${tierCopy}${exactCopy}`
       : `0 条${tierCopy}${exactCopy}`;
-    if (indexedResult) {
+    $("#result-meta").title = "";
+    if (rowsResult) {
+      const seconds = Number.isFinite(result.query_ms) ? ` · ${(result.query_ms / 1000).toFixed(1)} 秒` : "";
+      $("#result-meta").textContent += `${seconds} · ${result.coverage_note || "所选区间已完整检索"}`;
+      const gaps = result.coverage_gaps || [];
+      if (gaps.length) {
+        const lines = gaps.slice(0, 40).map((gap) => `${formatTime(gap.start)} — ${formatTime(gap.end)} · ${GAP_LABELS[gap.reason] || gap.reason}${gap.files ? `（${gap.files} 个文件）` : ""}`);
+        const more = (result.coverage_gap_count || gaps.length) > lines.length ? `\n…共 ${result.coverage_gap_count} 段` : "";
+        $("#result-meta").title = "未覆盖时段：\n" + lines.join("\n") + more;
+      }
+    } else if (indexedResult) {
       const query = state.activeQuery || {};
       const start = query.startEpochUs ?? query.start_epoch_us;
       const end = query.endEpochUs ?? query.end_epoch_us;

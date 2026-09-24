@@ -389,6 +389,10 @@ class EventStorage:
         self.exact_index = ExactIndex(self.paths["index"] / "exact-v1")
         from .raw_event_index import RawEventIndex
         self.raw_event_index = RawEventIndex(metadata, self.paths['index'], schema_sha=self.exact_index.registry_sha256)
+        from .binlog_rows import BinlogRows
+        # Table-ordered ClickHouse rows serve Binlog table queries when enabled;
+        # construction only reads env, it never creates tables.
+        self.binlog_rows = BinlogRows.from_env(metadata, registry=self._primary_key_image)
         self.analytics_index = AnalyticsIndex(
             self.paths["index"] / "analytics-v1",
             connect_duckdb=self._duckdb_connect,
@@ -3113,6 +3117,14 @@ class EventStorage:
         )
         return result
 
+    def _primary_key_image(self, database: str, table: str) -> str | None:
+        """Row-image key of a registered single-column primary key (``@1``), if any."""
+        wanted = (str(database or "").lower(), str(table or "").lower())
+        for (db, tbl, _signature), mapping in self.exact_index.schema_registry.items():
+            if (db, tbl) == wanted:
+                return str(mapping.get("row_image_key") or "") or None
+        return None
+
     def query_events_tiered(
         self, query: dict[str, Any], settings: Settings, archive: OssArchive | None,
         *, limit_cap: int = 1000, control: Any | None = None,
@@ -3127,6 +3139,8 @@ class EventStorage:
                 from .binlog_lite import RawBinlogError
                 raise RawBinlogError('快查需要保留窗口内的明确起止时间，不能自动截断范围', 'INDEX_COVERAGE_INCOMPLETE')
             with self.query_activity():
+                if self.binlog_rows is not None:
+                    return self.binlog_rows.query(query, start, end, control=control)
                 return self.raw_event_index.query(query, start, end, control=control)
         with self.raw_binlogs.plan(query, start, end, control) as plan:
             # Preserve the existing specialized/indexed routes for small legacy

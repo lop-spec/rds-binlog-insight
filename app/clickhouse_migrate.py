@@ -58,6 +58,14 @@ def main() -> int:
             "packed-object exception table used for direct raw OSS queries."
         ),
     )
+    parser.add_argument(
+        "--binlog-rows-tables",
+        action="store_true",
+        help=(
+            "Create the table-ordered Binlog row tables (binlog_rows_v1, statements, stage/buffers, "
+            "manifest, materialized views). Needs the 'binlog_rows' storage policy in the server config."
+        ),
+    )
     args = parser.parse_args()
 
     manifest_path = args.data_dir / "index" / "clickhouse" / "manifest.sqlite3"
@@ -167,6 +175,11 @@ def main() -> int:
                 ),
                 "packed": f"{config.database}.{raw_config.packed_table}",
             }
+        if args.binlog_rows_tables:
+            from .binlog_rows import build_schema as build_binlog_rows_schema
+            for statement in build_binlog_rows_schema():
+                client.query(statement, timeout=120)
+            result["binlog_rows_tables"] = True
         result.update(
             {
                 "clickhouse_version": client.ping(),
