@@ -505,7 +505,8 @@ function renderEvents(result) {
     }
   } else {
     state.lastBackfillMessage = "";
-    const exactCopy = result.exact_index_complete === false
+    // Table-row results report coverage themselves; the legacy "scanned exactly" copy would contradict it.
+    const exactCopy = !rowsResult && result.exact_index_complete === false
       ? " · 精确索引回填中，本次已准确扫描"
       : "";
     $("#result-meta").textContent = rows.length
