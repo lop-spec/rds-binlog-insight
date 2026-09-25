@@ -29,6 +29,7 @@ from typing import Any
 from .binlog_lite import RawBinlogError
 from .binlog_rows import (
     NON_BINLOG_HOSTS, STAGE_COLUMN_NAMES, WORKER_BUFFER_TABLE, WORKER_LANES_MAX, ChHttp, RowsIngestor, _epoch_us,
+    purge_file_rows,
 )
 from .config import data_root, ensure_data_dirs
 
@@ -246,11 +247,25 @@ class Worker:
         marker = self.inflight_dir() / f"{entry['file_id']}.json"
         tmp = marker.with_suffix(".tmp")
         tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
-                                   "part_keys": part_keys, "file": entry["source_file_name"]}))
+                                   "part_keys": part_keys, "file": entry["source_file_name"],
+                                   "lo": entry.get("lo"), "hi": entry.get("hi")}))
         os.replace(tmp, marker)
-        ingestor.move(part_keys, f"binlog-rows-l{lane}")  # purges its own partial rows on failure
+        # purges its own partial rows (bounded to the file's days) on failure
+        ingestor.move(part_keys, f"binlog-rows-l{lane}", lo_us=entry.get("lo"), hi_us=entry.get("hi"))
         ingestor.record(entry, rows, source, rq_complete)
         marker.unlink(missing_ok=True)
+
+    def file_span(self, file_id: str) -> tuple[int | None, int | None]:
+        """Event-time span of one binlog file from the metadata catalog (None, None when unknown)."""
+        try:
+            with self.metadata.connection() as conn:
+                row = conn.execute("SELECT log_begin_utc, log_end_utc FROM binlog_files WHERE id = ?",
+                                   (file_id,)).fetchone()
+            if row and row["log_begin_utc"] and row["log_end_utc"]:
+                return _epoch_us(row["log_begin_utc"]), _epoch_us(row["log_end_utc"])
+        except Exception as exc:  # recovery must still purge; the unbounded fallback is logged
+            LOGGER.warning("BINLOG_ROWS_FILE_SPAN_FAILED file_id=%s error=%s", file_id, exc)
+        return None, None
 
     def recover_inflight(self) -> int:
         """Purge rows of moves that never reached the manifest (crash, kill, container stop)."""
@@ -265,10 +280,10 @@ class Worker:
                 marker.unlink(missing_ok=True)
                 continue
             LOGGER.warning("BINLOG_ROWS_INFLIGHT_PURGE file=%s parts=%s", info.get("file"), len(info["part_keys"]))
-            self.ch.execute("DELETE FROM insight.binlog_rows_v1 WHERE _source_part_key IN "
-                            "(SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))",
-                            params={"k": json.dumps(info["part_keys"])},
-                            settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
+            lo, hi = info.get("lo"), info.get("hi")
+            if not (lo and hi):
+                lo, hi = self.file_span(info["file_id"])  # markers written before 1.29.11 carry no span
+            purge_file_rows(self.ch, info["part_keys"], lo, hi, reason="inflight-recovery")
             marker.unlink(missing_ok=True)
             purged += 1
         return purged

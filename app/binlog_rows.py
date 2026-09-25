@@ -16,7 +16,7 @@ import logging
 import os
 import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.parse import urlencode
@@ -220,6 +220,27 @@ FROM (SELECT any(event_date) AS event_date, leftUTF8(row_query, {STATEMENT_MAX_B
 
 
 # --------------------------------------------------------------------------- coverage
+
+def purge_file_rows(ch: Any, part_keys: list[str], lo_us: int | None = None, hi_us: int | None = None, *,
+                    reason: str = "") -> None:
+    """Delete one file's rows from the row store.
+
+    With the file's time span the lightweight delete is bounded to its event_date partitions (one day of
+    slack each side), so the mutation skips every other part. Unbounded, it scans _source_part_key in every
+    part of the table: on production such deletes ran for hours, held merge threads and, at worker start,
+    blocked every lane. The unbounded fallback is kept for spans that cannot be determined and is logged.
+    """
+    where = "_source_part_key IN (SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))"
+    params: dict[str, Any] = {"k": json.dumps(part_keys)}
+    if lo_us and hi_us:
+        params["d0"] = (datetime.fromtimestamp(int(lo_us) / 1e6, UTC).date() - timedelta(days=1)).isoformat()
+        params["d1"] = (datetime.fromtimestamp(int(hi_us) / 1e6, UTC).date() + timedelta(days=1)).isoformat()
+        where = "event_date BETWEEN {d0:Date} AND {d1:Date} AND " + where
+    else:
+        LOGGER.warning("BINLOG_ROWS_PURGE_UNBOUNDED parts=%s reason=%s", len(part_keys), reason or "no time span")
+    ch.execute(f"DELETE FROM {ROWS_TABLE} WHERE {where}", params=params,
+               settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
+
 
 def _epoch_us(text: str) -> int:
     return int(datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp() * 1_000_000)
@@ -718,7 +739,7 @@ class RowsIngestor:
         return int(self.ch.execute(f"SELECT count() FROM {self.buffer} FORMAT TSV",
                                    settings={"max_execution_time": 120}, timeout=140).strip() or 0)
 
-    def move(self, part_keys: list[str], tag: str) -> None:
+    def move(self, part_keys: list[str], tag: str, *, lo_us: int | None = None, hi_us: int | None = None) -> None:
         """Buffer -> stage, one table bucket per INSERT.
 
         A mixed block splits into up to BUCKETS partitions, one tiny part each (~220 parts of ~480 KiB per
@@ -735,10 +756,7 @@ class RowsIngestor:
                               "max_insert_block_size": 16384, "max_memory_usage": 1_200_000_000,
                               "max_execution_time": 0, "log_comment": tag + "-move"}, timeout=3600)
         except RawBinlogError:
-            self.ch.execute(f"DELETE FROM {ROWS_TABLE} WHERE _source_part_key IN "
-                            "(SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))",
-                            params={"k": json.dumps(part_keys)},
-                            settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
+            purge_file_rows(self.ch, part_keys, lo_us, hi_us, reason="move-failed")
             raise
 
     def record(self, entry: dict[str, Any], rows: int, source: str, rq_complete: bool) -> None:

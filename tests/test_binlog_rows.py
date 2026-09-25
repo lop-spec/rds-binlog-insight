@@ -579,3 +579,46 @@ class Release12910Tests(unittest.TestCase):
         self.assertEqual(throttled(force=True), 2)
         now[0] += 31
         self.assertEqual(throttled(), 3)
+
+
+class Release12911Tests(unittest.TestCase):
+    DAY = 86_400_000_000
+
+    def test_failed_move_purges_only_the_files_days(self):
+        client = mock.Mock()
+        client.execute.side_effect = [None, RawBinlogError("memory", "X"), None]
+        lo = 1789430400000000  # 2026-09-15T00:00Z
+        with self.assertRaises(RawBinlogError):
+            br.RowsIngestor(client).move(["raw:f"], "t", lo_us=lo, hi_us=lo + 3_600_000_000)
+        call = client.execute.call_args_list[-1]
+        self.assertIn("DELETE FROM insight.binlog_rows_v1 WHERE event_date BETWEEN {d0:Date} AND {d1:Date}", call.args[0])
+        self.assertEqual((call.kwargs["params"]["d0"], call.kwargs["params"]["d1"]), ("2026-09-14", "2026-09-16"))
+
+    def test_unbounded_purge_is_logged(self):
+        client = mock.Mock()
+        with self.assertLogs("app.binlog_rows", level="WARNING") as logs:
+            br.purge_file_rows(client, ["raw:f"], None, None, reason="test")
+        self.assertIn("BINLOG_ROWS_PURGE_UNBOUNDED", logs.output[0])
+        self.assertNotIn("event_date", client.execute.call_args.args[0])
+
+    def test_recovery_bounds_the_purge_with_the_marker_span(self):
+        import tempfile
+        from pathlib import Path
+        from app import binlog_rows_worker as worker_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = worker_module.Worker.__new__(worker_module.Worker)
+            worker.storage = mock.Mock(paths={"index": Path(tmp)})
+            worker.ch = mock.Mock()
+            worker.ingested = mock.Mock(return_value=set())
+            ingestor = mock.Mock()
+            ingestor.record.side_effect = RuntimeError("killed before manifest")
+            entry = {"file_id": "f9", "instance_id": "i", "source_file_name": "mysql-bin.9",
+                     "lo": 1789430400000000, "hi": 1789430460000000}
+            with self.assertRaises(RuntimeError):
+                worker.commit(ingestor, entry, ["raw:f9"], 1, "raw", True, 0)
+            self.assertEqual(ingestor.move.call_args.kwargs, {"lo_us": entry["lo"], "hi_us": entry["hi"]})
+            self.assertEqual(worker.recover_inflight(), 1)
+            call = worker.ch.execute.call_args
+            self.assertIn("event_date BETWEEN", call.args[0])
+            self.assertEqual(call.kwargs["params"]["d0"], "2026-09-14")
