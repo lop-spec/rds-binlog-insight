@@ -51,6 +51,13 @@ NON_BINLOG_HOSTS = ("slow-log", "tabularis", "general-log")
 QUERY_DEADLINE_SECONDS = 100
 PAGE_DEPTH_LIMIT = 2000
 DAY_US = 86_400_000_000
+# Newest-first reads merge every part that overlaps the slice at once (~26 MB per part on wide row images).
+# While backfill and live lanes write the same day, merged parts mix hours, so a heavy table's day can need
+# ~1 GB; a slice that hits the cap is split in halves (newest first) down to QUERY_SPLIT_MIN_US instead of
+# failing, and the lower cap keeps a query from pushing ingestion over the server memory limit.
+QUERY_MEMORY_BYTES = 800_000_000
+QUERY_SPLIT_MIN_US = 10 * 60 * 1_000_000
+DATE_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def day_slices(start: int, end: int) -> list[tuple[int, int]]:
@@ -221,18 +228,39 @@ FROM (SELECT any(event_date) AS event_date, leftUTF8(row_query, {STATEMENT_MAX_B
 
 # --------------------------------------------------------------------------- coverage
 
+def partition_filter(partitions: Iterable[Iterable[Any]]) -> str:
+    """``event_date IN (...) AND tbl_bucket IN (...)`` for (event_date, bucket) pairs; values are validated."""
+    dates, buckets = set(), set()
+    for day, bucket in partitions:
+        day, bucket = str(day), int(bucket)
+        if not DATE_TEXT.fullmatch(day) or not 0 <= bucket < BUCKETS:
+            raise ValueError(f"bad partition {day!r}/{bucket!r}")
+        dates.add(day)
+        buckets.add(bucket)
+    return (f"event_date IN ({', '.join(repr(d) for d in sorted(dates))}) "
+            f"AND tbl_bucket IN ({', '.join(str(b) for b in sorted(buckets))})")
+
+
 def purge_file_rows(ch: Any, part_keys: list[str], lo_us: int | None = None, hi_us: int | None = None, *,
-                    reason: str = "") -> None:
+                    partitions: list[tuple[str, int]] | None = None, reason: str = "") -> None:
     """Delete one file's rows from the row store.
 
-    With the file's time span the lightweight delete is bounded to its event_date partitions (one day of
-    slack each side), so the mutation skips every other part. Unbounded, it scans _source_part_key in every
-    part of the table: on production such deletes ran for hours, held merge threads and, at worker start,
-    blocked every lane. The unbounded fallback is kept for spans that cannot be determined and is logged.
+    The mutation still visits every part of the table (and waits behind merges for a pool slot), but parts
+    outside the predicate's partitions are skipped without reading data. ``partitions`` (the
+    (event_date, bucket) pairs the move could have written, from the buffer) leave ~40-150 parts whose
+    _source_part_key is read, against ~380 for the file's day span with one day of slack each side (the
+    fallback for markers without partitions). An empty list means nothing could have been written.
+    Unbounded, every part is read; that is kept only for spans that cannot be determined and is logged.
     """
     where = "_source_part_key IN (SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))"
     params: dict[str, Any] = {"k": json.dumps(part_keys)}
-    if lo_us and hi_us:
+    if partitions is not None:
+        if not partitions:
+            LOGGER.info("BINLOG_ROWS_PURGE_SKIPPED parts=%s reason=%s (no partition written)", len(part_keys),
+                        reason)
+            return
+        where = partition_filter(partitions) + " AND " + where
+    elif lo_us and hi_us:
         params["d0"] = (datetime.fromtimestamp(int(lo_us) / 1e6, UTC).date() - timedelta(days=1)).isoformat()
         params["d1"] = (datetime.fromtimestamp(int(hi_us) / 1e6, UTC).date() + timedelta(days=1)).isoformat()
         where = "event_date BETWEEN {d0:Date} AND {d1:Date} AND " + where
@@ -357,6 +385,12 @@ def keyword_conditions(query: dict[str, Any], params: dict[str, Any]) -> str:
             clauses.append(f"position({RAW_EXPR}, {{{name}:String}}) > 0")
     joiner = " OR " if str(query.get("keyword_mode") or "").upper() == "OR" else " AND "
     return "(" + joiner.join(clauses) + ")"
+
+
+def memory_limited(exc: BaseException) -> bool:
+    """ClickHouse MEMORY_LIMIT_EXCEEDED (per query or server total)."""
+    text = str(exc)
+    return "Code: 241" in text or "MEMORY_LIMIT_EXCEEDED" in text
 
 
 def keyword_uses_scan(query: dict[str, Any]) -> bool:
@@ -615,8 +649,10 @@ class BinlogRows:
         wanted = offset + limit + 1
         rows: list[dict[str, Any]] = []
         deadline = time.monotonic() + QUERY_DEADLINE_SECONDS
+        pending = day_slices(start, end)
         try:
-            for lo, hi in day_slices(start, end):
+            while pending:
+                lo, hi = pending.pop(0)
                 remaining = deadline - time.monotonic()
                 if remaining <= 1:
                     raise RawBinlogError("TIMEOUT_EXCEEDED across day slices", "CLICKHOUSE_BINLOG_ROWS_UNAVAILABLE")
@@ -626,13 +662,24 @@ class BinlogRows:
                                     d0=datetime.fromtimestamp(lo / 1e6, UTC).date().isoformat(),
                                     d1=datetime.fromtimestamp(hi / 1e6, UTC).date().isoformat())
                 # Wide row images: reading in-order across many parts keeps one block per part in memory;
-                # 8192-row blocks keep a heavy table's full day under ~0.9 GB (default 65409 exceeds 1.2 GB).
+                # 8192-row blocks and no per-part read-ahead buffering (read_in_order_use_buffering) keep it
+                # near 26 MB per overlapping part.
                 settings = {"max_threads": 4, "max_block_size": 8192, "max_execution_time": max(1, int(remaining)),
-                            "max_memory_usage": 1_200_000_000, "timeout_overflow_mode": "throw",
-                            "log_comment": "binlog-rows-query"}
-                rows += self.ch.rows(sql + f" LIMIT {wanted - len(rows)}", params=slice_params, settings=settings,
-                                     timeout=int(remaining) + 15,
-                                     query_id=f"binlog-rows-{int(time.time() * 1000)}-{os.getpid()}")
+                            "max_memory_usage": QUERY_MEMORY_BYTES, "read_in_order_use_buffering": 0,
+                            "timeout_overflow_mode": "throw", "log_comment": "binlog-rows-query"}
+                try:
+                    rows += self.ch.rows(sql + f" LIMIT {wanted - len(rows)}", params=slice_params,
+                                         settings=settings, timeout=int(remaining) + 15,
+                                         query_id=f"binlog-rows-{int(time.time() * 1000)}-{os.getpid()}")
+                except RawBinlogError as exc:
+                    if not memory_limited(exc) or hi - lo < 2 * QUERY_SPLIT_MIN_US:
+                        raise
+                    # a failed slice returned nothing; its halves keep the newest-first order
+                    mid = lo + (hi - lo) // 2
+                    LOGGER.warning("BINLOG_ROWS_QUERY_SPLIT table=%s.%s lo=%s hi=%s reason=%s",
+                                   database, table, lo, hi, "total" if "(total)" in str(exc) else "query")
+                    pending[0:0] = [(mid + 1, hi), (lo, mid)]
+                    continue
                 if len(rows) >= wanted:
                     break
         except RawBinlogError as exc:
@@ -739,13 +786,28 @@ class RowsIngestor:
         return int(self.ch.execute(f"SELECT count() FROM {self.buffer} FORMAT TSV",
                                    settings={"max_execution_time": 120}, timeout=140).strip() or 0)
 
-    def move(self, part_keys: list[str], tag: str, *, lo_us: int | None = None, hi_us: int | None = None) -> None:
+    def partitions(self) -> list[tuple[str, int]]:
+        """(event_date, bucket) pairs the buffered rows will land in; the purge bound for a failed move."""
+        text = self.ch.execute(
+            f"SELECT DISTINCT toString(event_date), toUInt8({BUCKET_EXPR}) FROM {self.buffer} "
+            f"WHERE {ROW_STORE_FILTER} ORDER BY 1, 2 FORMAT TSV", settings={"max_execution_time": 120}, timeout=140)
+        pairs = []
+        for line in text.splitlines():
+            if line.strip():
+                day, bucket = line.split("\t")
+                pairs.append((day, int(bucket)))
+        return pairs
+
+    def move(self, part_keys: list[str], tag: str, *, lo_us: int | None = None, hi_us: int | None = None,
+             partitions: list[tuple[str, int]] | None = None) -> None:
         """Buffer -> stage, one table bucket per INSERT.
 
         A mixed block splits into up to BUCKETS partitions, one tiny part each (~220 parts of ~480 KiB per
         500 MB binlog: an OSS object set each, then merges). Per-bucket blocks land as one part (~33 per
         binlog, ~2.9 MiB) with lower peak memory; bigger blocks instead exceed the 1.2 GB query limit.
+        A failed move purges only the partitions of the buckets it attempted (``partitions`` from the buffer).
         """
+        bucket = -1
         try:
             for bucket in range(BUCKETS):
                 self.ch.execute(
@@ -756,7 +818,8 @@ class RowsIngestor:
                               "max_insert_block_size": 16384, "max_memory_usage": 1_200_000_000,
                               "max_execution_time": 0, "log_comment": tag + "-move"}, timeout=3600)
         except RawBinlogError:
-            purge_file_rows(self.ch, part_keys, lo_us, hi_us, reason="move-failed")
+            attempted = None if partitions is None else [p for p in partitions if p[1] <= bucket]
+            purge_file_rows(self.ch, part_keys, lo_us, hi_us, partitions=attempted, reason="move-failed")
             raise
 
     def record(self, entry: dict[str, Any], rows: int, source: str, rq_complete: bool) -> None:

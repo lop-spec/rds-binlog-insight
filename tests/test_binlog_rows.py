@@ -397,6 +397,7 @@ class Release1293Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             worker = self._worker(tmp, manifest=[])
             ingestor = mock.Mock()
+            ingestor.partitions.return_value = [("2026-09-14", 0)]
             entry = {"file_id": "f1", "instance_id": "i", "source_file_name": "mysql-bin.1"}
             ingestor.record.side_effect = RuntimeError("killed before manifest")
             with self.assertRaises(RuntimeError):
@@ -415,6 +416,7 @@ class Release1293Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             worker = self._worker(tmp, manifest=["f2"])
             ingestor = mock.Mock()
+            ingestor.partitions.return_value = [("2026-09-14", 0)]
             worker.commit(ingestor, {"file_id": "f2", "instance_id": "i", "source_file_name": "b"}, ["raw:f2"], 5,
                           "raw", True, 0)
             self.assertEqual(list((worker.inflight_dir()).glob("*.json")), [])
@@ -612,12 +614,22 @@ class Release12911Tests(unittest.TestCase):
             worker.ch = mock.Mock()
             worker.ingested = mock.Mock(return_value=set())
             ingestor = mock.Mock()
+            ingestor.partitions.return_value = [("2026-09-15", 2), ("2026-09-15", 6)]
             ingestor.record.side_effect = RuntimeError("killed before manifest")
             entry = {"file_id": "f9", "instance_id": "i", "source_file_name": "mysql-bin.9",
                      "lo": 1789430400000000, "hi": 1789430460000000}
             with self.assertRaises(RuntimeError):
                 worker.commit(ingestor, entry, ["raw:f9"], 1, "raw", True, 0)
-            self.assertEqual(ingestor.move.call_args.kwargs, {"lo_us": entry["lo"], "hi_us": entry["hi"]})
+            self.assertEqual(ingestor.move.call_args.kwargs,
+                             {"lo_us": entry["lo"], "hi_us": entry["hi"],
+                              "partitions": [("2026-09-15", 2), ("2026-09-15", 6)]})
+            self.assertEqual(worker.recover_inflight(), 1)
+            call = worker.ch.execute.call_args
+            self.assertIn("event_date IN ('2026-09-15') AND tbl_bucket IN (2, 6)", call.args[0])
+            # a marker written before 1.29.14 has no partitions: the purge falls back to the file's days
+            marker = Path(tmp) / "binlog-rows-inflight" / "f8.json"
+            marker.write_text(json.dumps({"instance_id": "i", "file_id": "f8", "part_keys": ["raw:f8"],
+                                          "lo": entry["lo"], "hi": entry["hi"]}))
             self.assertEqual(worker.recover_inflight(), 1)
             call = worker.ch.execute.call_args
             self.assertIn("event_date BETWEEN", call.args[0])
@@ -641,3 +653,103 @@ class Release12912Tests(unittest.TestCase):
         # window starts at now - 3 days; p3 ends 1 us after it (kept), p4 ends a day before it (dropped)
         self.assertEqual([p["path"] for p in eligible], ["p0", "p1", "p2", "p3"])
         self.assertEqual(manifest.reconcile.call_args.kwargs["source_parts"], 5)
+
+
+class Release12914Tests(unittest.TestCase):
+    MEM = "ClickHouse 返回 500: Code: 241. DB::Exception: Query memory limit exceeded: would use 1.12 GiB"
+
+    def _rows(self, responder):
+        from app.binlog_rows import BinlogRows
+
+        store = BinlogRows.__new__(BinlogRows)
+        store.ch = mock.Mock()
+        store.ch.rows.side_effect = responder
+        store.registry = lambda db, tbl: None
+        store.coverage = lambda instance, start, end: {"intervals": [[start, end]], "gaps": []}
+        store._statements = lambda rows: {}
+        return store
+
+    def test_memory_limited_slice_is_split_newest_first(self):
+        from app import binlog_rows as br
+
+        day = br.DAY_US
+        start, end = 10 * day, 10 * day + day - 1
+        calls = []
+
+        def responder(sql, params, settings, timeout, query_id):
+            calls.append((params["lo"], params["hi"]))
+            self.assertEqual(settings["read_in_order_use_buffering"], 0)
+            self.assertEqual(settings["max_memory_usage"], br.QUERY_MEMORY_BYTES)
+            if params["hi"] - params["lo"] > day // 2:  # the full day fails, halves succeed
+                raise br.RawBinlogError(self.MEM, "CLICKHOUSE_BINLOG_ROWS_UNAVAILABLE")
+            n = int(sql.rsplit("LIMIT", 1)[1])
+            return [{"event_epoch_us": params["hi"] - i, "row_query_hash": 0} for i in range(min(n, 3))]
+
+        store = self._rows(responder)
+        with mock.patch.object(br, "present", side_effect=lambda r, s: r):
+            out = store.query({"instance": "i", "database": "d", "table": "t", "limit": 5}, start, end)
+        mid = start + (end - start) // 2
+        self.assertEqual(calls, [(start, end), (mid + 1, end), (start, mid)])
+        stamps = [r["event_epoch_us"] for r in out["rows"]]
+        self.assertEqual(stamps, sorted(stamps, reverse=True))
+        self.assertEqual(stamps[:3], [end, end - 1, end - 2])
+        self.assertEqual(len(stamps), 5)
+
+    def test_split_stops_at_minimum_slice_and_other_errors_propagate(self):
+        from app import binlog_rows as br
+
+        start = 10 * br.DAY_US
+        end = start + br.QUERY_SPLIT_MIN_US  # below 2 x minimum: no split
+        store = self._rows(lambda *a, **k: (_ for _ in ()).throw(br.RawBinlogError(self.MEM, "X")))
+        with self.assertRaises(br.RawBinlogError):
+            store.query({"instance": "i", "database": "d", "table": "t"}, start, end)
+        self.assertEqual(store.ch.rows.call_count, 1)
+        store = self._rows(lambda *a, **k: (_ for _ in ()).throw(br.RawBinlogError("Code: 62. syntax", "X")))
+        with self.assertRaises(br.RawBinlogError):
+            store.query({"instance": "i", "database": "d", "table": "t"}, 10 * br.DAY_US, 11 * br.DAY_US - 1)
+        self.assertEqual(store.ch.rows.call_count, 1)
+
+    def test_purge_is_bounded_to_partitions(self):
+        from app.binlog_rows import purge_file_rows
+
+        ch = mock.Mock()
+        purge_file_rows(ch, ["raw:a"], 1, 2, partitions=[("2026-09-23", 0), ("2026-09-23", 3), ("2026-09-24", 0)],
+                        reason="t")
+        sql = ch.execute.call_args.args[0]
+        self.assertIn("event_date IN ('2026-09-23', '2026-09-24') AND tbl_bucket IN (0, 3) AND _source_part_key", sql)
+        self.assertNotIn("BETWEEN", sql)
+        ch.reset_mock()
+        purge_file_rows(ch, ["raw:a"], 1, 2, partitions=[], reason="t")
+        ch.execute.assert_not_called()
+        with self.assertRaises(ValueError):
+            purge_file_rows(ch, ["raw:a"], partitions=[("2026-09-23') OR 1=1 --", 0)])
+        with self.assertRaises(ValueError):
+            purge_file_rows(ch, ["raw:a"], partitions=[("2026-09-23", 8)])
+
+    def test_failed_move_purges_only_attempted_buckets(self):
+        from app import binlog_rows as br
+
+        ing = br.RowsIngestor(mock.Mock(), buffer_table="insight.buf")
+        seen = []
+
+        def execute(sql, **kwargs):
+            seen.append(sql)
+            if "% 8 = 2" in sql:
+                raise br.RawBinlogError("Code: 241. memory", "X")
+            return ""
+
+        ing.ch.execute.side_effect = execute
+        parts = [("2026-09-23", b) for b in range(8)]
+        with self.assertRaises(br.RawBinlogError):
+            ing.move(["raw:a"], "t", lo_us=1, hi_us=2, partitions=parts)
+        purge = [s for s in seen if s.startswith("DELETE")]
+        self.assertEqual(len(purge), 1)
+        self.assertIn("tbl_bucket IN (0, 1, 2)", purge[0])
+
+    def test_partitions_read_from_buffer(self):
+        from app import binlog_rows as br
+
+        ing = br.RowsIngestor(mock.Mock(), buffer_table="insight.buf")
+        ing.ch.execute.return_value = "2026-09-23\t0\n2026-09-23\t5\n"
+        self.assertEqual(ing.partitions(), [("2026-09-23", 0), ("2026-09-23", 5)])
+        self.assertIn("FROM insight.buf", ing.ch.execute.call_args.args[0])

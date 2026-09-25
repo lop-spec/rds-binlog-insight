@@ -246,12 +246,14 @@ class Worker:
         """Move + manifest behind a durable marker, so an interrupted move is purged on the next start."""
         marker = self.inflight_dir() / f"{entry['file_id']}.json"
         tmp = marker.with_suffix(".tmp")
+        partitions = ingestor.partitions()
         tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
                                    "part_keys": part_keys, "file": entry["source_file_name"],
-                                   "lo": entry.get("lo"), "hi": entry.get("hi")}))
+                                   "lo": entry.get("lo"), "hi": entry.get("hi"), "partitions": partitions}))
         os.replace(tmp, marker)
-        # purges its own partial rows (bounded to the file's days) on failure
-        ingestor.move(part_keys, f"binlog-rows-l{lane}", lo_us=entry.get("lo"), hi_us=entry.get("hi"))
+        # purges its own partial rows (bounded to the partitions it attempted) on failure
+        ingestor.move(part_keys, f"binlog-rows-l{lane}", lo_us=entry.get("lo"), hi_us=entry.get("hi"),
+                      partitions=partitions)
         ingestor.record(entry, rows, source, rq_complete)
         marker.unlink(missing_ok=True)
 
@@ -283,7 +285,10 @@ class Worker:
             lo, hi = info.get("lo"), info.get("hi")
             if not (lo and hi):
                 lo, hi = self.file_span(info["file_id"])  # markers written before 1.29.11 carry no span
-            purge_file_rows(self.ch, info["part_keys"], lo, hi, reason="inflight-recovery")
+            partitions = info.get("partitions")  # markers written before 1.29.14 carry none
+            purge_file_rows(self.ch, info["part_keys"], lo, hi,
+                            partitions=None if partitions is None else [tuple(p) for p in partitions],
+                            reason="inflight-recovery")
             marker.unlink(missing_ok=True)
             purged += 1
         return purged
