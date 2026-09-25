@@ -68,12 +68,13 @@ func checksumReader(reader io.Reader) (checksumResult, error) {
 }
 
 type outputEvent struct {
-	EventID         string `json:"event_id"`
-	EventEpochUS    int64  `json:"event_epoch_us"`
-	RawEventType    string `json:"raw_event_type"`
-	Operation       string `json:"operation"`
-	DatabaseName    string `json:"database_name"`
-	TableName       string `json:"table_name"`
+	EventID      string `json:"event_id"`
+	EventEpochUS int64  `json:"event_epoch_us"`
+	RawEventType string `json:"raw_event_type"`
+	Operation    string `json:"operation"`
+	DatabaseName string `json:"database_name"`
+	TableName    string `json:"table_name"`
+	*TableIdentity
 	ServerID        uint32 `json:"server_id"`
 	ThreadID        uint32 `json:"thread_id"`
 	TransactionID   string `json:"transaction_id"`
@@ -91,7 +92,31 @@ type outputEvent struct {
 	AfterJSON       string `json:"after_json"`
 	ColumnsJSON     string `json:"columns_json"`
 	RowQuery        string `json:"row_query"`
+	*TxnTiming
 }
+
+// TableIdentity and TxnTiming are the full-output fields the row store does not
+// read. As embedded pointers encoding/json writes their fields in place when set
+// (full output) and omits them when nil (--slim).
+type TableIdentity struct {
+	TableMapID      uint64 `json:"table_map_id"`
+	SchemaVersionID string `json:"schema_version_id"`
+}
+
+type TxnTiming struct {
+	// 事件自身 header 时间戳（秒级×1e6）。EventEpochUS 在事务内会被 GTID 的
+	// commit 时刻统一覆盖，这里保留事件真实发生时刻用于估算事务耗时。
+	HeaderEpochUS int64 `json:"header_epoch_us"`
+	// 事务提交时刻，微秒精度（MySQL 8.0.1+ 的 GTID 事件）。
+	CommitEpochUS int64 `json:"commit_epoch_us"`
+	// 事务依赖跟踪与事务体量（MySQL 8.0.1+ / 8.0.2+）。
+	TxnLastCommitted  int64 `json:"txn_last_committed"`
+	TxnSequenceNumber int64 `json:"txn_sequence_number"`
+	TxnLengthBytes    int64 `json:"txn_length_bytes"`
+}
+
+// noTableIdentity is what non-row records carry in the full output (zero values).
+var noTableIdentity = &TableIdentity{}
 
 type columnDescription struct {
 	Index         int    `json:"index"`
@@ -116,12 +141,21 @@ type extractor struct {
 	currentRowQuery    string
 	transactionEpochUS int64
 	lastEpochUS        int64
+	// 事件自身 header 的时间戳（秒级）。事务内所有事件的 EventEpochUS 都会被
+	// GTID 的 commit 时刻覆盖，因此必须单独保留，否则事务时长恒为 0。
+	currentHeaderUS   int64
+	txnCommitUS       int64
+	txnLastCommitted  int64
+	txnSequenceNumber int64
+	txnLengthBytes    int64
 	// slim keeps only what the ClickHouse row store needs: no pseudo SQL,
-	// column metadata or base64 SQL, row_query cut to slimRowQueryRunes code
-	// points (the store keeps leftUTF8(row_query, 65536) anyway) and no
-	// transaction boundary records. Skipped records still advance
-	// outputSequence, so every emitted event_id equals the full output.
-	slim bool
+	// column metadata, base64 SQL, table identity or transaction timing,
+	// row_query cut to slimRowQueryRunes code points (the store keeps
+	// leftUTF8(row_query, 65536) anyway) and no transaction boundary records.
+	// Skipped records still advance outputSequence, so every emitted event_id
+	// equals the full output.
+	slim   bool
+	timing TxnTiming
 }
 
 const slimRowQueryRunes = 65536
@@ -149,6 +183,10 @@ func (x *extractor) resetStreamState() {
 	x.currentThreadID = 0
 	x.currentRowQuery = ""
 	x.transactionEpochUS = 0
+	x.txnCommitUS = 0
+	x.txnLastCommitted = 0
+	x.txnSequenceNumber = 0
+	x.txnLengthBytes = 0
 }
 
 func eventPositions(header *replication.EventHeader) (uint32, uint32) {
@@ -160,13 +198,19 @@ func eventPositions(header *replication.EventHeader) (uint32, uint32) {
 }
 
 func (x *extractor) epochUS(header *replication.EventHeader) int64 {
+	// 先记录事件自身的时间戳。它是秒级的，但代表该事件真正发生的时刻；
+	// 事务提交时刻另由 GTID 提供微秒精度，两者相减即事务耗时的上界估计。
+	if header.Timestamp > 0 {
+		x.currentHeaderUS = int64(header.Timestamp) * 1_000_000
+	} else {
+		x.currentHeaderUS = 0
+	}
 	if x.transactionEpochUS > 0 {
 		return x.transactionEpochUS
 	}
 	if header.Timestamp > 0 {
-		value := int64(header.Timestamp) * 1_000_000
-		x.lastEpochUS = value
-		return value
+		x.lastEpochUS = x.currentHeaderUS
+		return x.currentHeaderUS
 	}
 	return x.lastEpochUS
 }
@@ -185,11 +229,31 @@ func (x *extractor) clearTransaction() {
 	x.currentThreadID = 0
 	x.currentRowQuery = ""
 	x.transactionEpochUS = 0
+	x.txnCommitUS = 0
+	x.txnLastCommitted = 0
+	x.txnSequenceNumber = 0
+	x.txnLengthBytes = 0
 }
 
 func (x *extractor) emit(record outputEvent) error {
 	if record.EventEpochUS <= 0 {
 		return fmt.Errorf("event %s at position %d has no valid timestamp", record.RawEventType, record.StartPosition)
+	}
+	// 事务级元数据在所有记录构造点统一补齐：它们来自 GTID 事件，与具体记录
+	// 类型无关。epochUS 是每条记录时间戳的唯一来源，currentHeaderUS 由它维护。
+	if !x.slim {
+		// The encoder serialises before emit returns, so one timing block is reused.
+		x.timing = TxnTiming{
+			HeaderEpochUS:     x.currentHeaderUS,
+			CommitEpochUS:     x.txnCommitUS,
+			TxnLastCommitted:  x.txnLastCommitted,
+			TxnSequenceNumber: x.txnSequenceNumber,
+			TxnLengthBytes:    x.txnLengthBytes,
+		}
+		record.TxnTiming = &x.timing
+		if record.TableIdentity == nil {
+			record.TableIdentity = noTableIdentity
+		}
 	}
 	x.outputSequence++
 	if x.slim && record.Operation == "TRANSACTION" {
@@ -486,6 +550,14 @@ func compactJSON(value any) (string, error) {
 	return string(data), nil
 }
 
+func schemaVersionID(databaseName, tableName, columnsJSON string) string {
+	digest := sha256.Sum256([]byte(
+		strings.ToLower(databaseName) + "\x00" +
+			strings.ToLower(tableName) + "\x00" + columnsJSON,
+	))
+	return hex.EncodeToString(digest[:])
+}
+
 func columnNames(table *replication.TableMapEvent) []string {
 	count := int(table.ColumnCount)
 	names := table.ColumnNameString()
@@ -745,10 +817,15 @@ func (x *extractor) handleRows(
 		return err
 	}
 	columnsJSON := ""
+	var identity *TableIdentity
 	if !x.slim {
 		columnsJSON, err = compactJSON(descriptions)
 		if err != nil {
 			return fmt.Errorf("encode column metadata: %w", err)
+		}
+		identity = &TableIdentity{
+			TableMapID:      event.Table.TableID,
+			SchemaVersionID: schemaVersionID(databaseName, tableName, columnsJSON),
 		}
 	}
 	rowQuery := x.currentRowQuery
@@ -809,6 +886,7 @@ func (x *extractor) handleRows(
 			Operation:     operation,
 			DatabaseName:  databaseName,
 			TableName:     tableName,
+			TableIdentity: identity,
 			ServerID:      binlogEvent.Header.ServerID,
 			ThreadID:      x.currentThreadID,
 			TransactionID: transactionID,
@@ -851,6 +929,19 @@ func (x *extractor) handleEvent(
 		} else if header.Timestamp > 0 {
 			x.transactionEpochUS = int64(header.Timestamp) * 1_000_000
 		}
+		// 提交时刻取本实例的 immediate 值（原实例的 original 值用于主从对比）。
+		// MySQL 8.0.1+ 才有；缺失时回退到事件头的秒级时间戳。
+		if event.ImmediateCommitTimestamp > 0 {
+			x.txnCommitUS = int64(event.ImmediateCommitTimestamp)
+		} else if event.OriginalCommitTimestamp > 0 {
+			x.txnCommitUS = int64(event.OriginalCommitTimestamp)
+		} else if header.Timestamp > 0 {
+			x.txnCommitUS = int64(header.Timestamp) * 1_000_000
+		}
+		// 事务依赖跟踪：last_committed 相同的事务在源库可并行提交。
+		x.txnLastCommitted = event.LastCommitted
+		x.txnSequenceNumber = event.SequenceNumber
+		x.txnLengthBytes = int64(event.TransactionLength)
 	case *replication.MariadbGTIDEvent:
 		x.currentGTID = event.GTID.String()
 		x.currentTransaction = x.currentGTID
@@ -1186,7 +1277,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	outputDir := flags.String("output-dir", "", "publish atomic NDJSON chunks and emit manifests")
 	chunkMaxLines := flags.Int("chunk-max-lines", 200_000, "maximum records per NDJSON chunk")
 	chunkMaxBytes := flags.Int64("chunk-max-bytes", 384*1024*1024, "maximum bytes per NDJSON chunk")
-	slim := flags.Bool("slim", false, "row-store output: omit pseudo SQL, column metadata, base64 SQL and transaction boundaries; cut row_query to 65536 code points")
+	slim := flags.Bool("slim", false, "row-store output: omit pseudo SQL, column metadata, base64 SQL, table identity, transaction timing and transaction boundaries; cut row_query to 65536 code points")
 	checksumStdin := flags.Bool(
 		"checksum-stdin",
 		false,

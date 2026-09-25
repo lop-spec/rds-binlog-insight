@@ -74,6 +74,22 @@ SLOWLOG_RECONCILE_REFRESH_SECONDS = _env_int(
     3600,
 )
 SLOWLOG_INDEX_ENABLED = _env_bool("RDS_BINLOG_SLOWLOG_INDEX_ENABLED", True)
+INDEX_PHASES_ALL = ("catalog", "analytics", "select", "rollup", "exact", "structure", "index")
+
+
+def _env_phases(name: str) -> frozenset[str]:
+    """Maintenance phases to run; empty means all. Unknown names fail fast instead of silently skipping."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return frozenset(INDEX_PHASES_ALL)
+    chosen = frozenset(item.strip() for item in raw.split(",") if item.strip())
+    unknown = sorted(chosen - set(INDEX_PHASES_ALL))
+    if unknown:
+        raise SystemExit(f"{name}: unknown phases {unknown}; valid: {','.join(INDEX_PHASES_ALL)}")
+    return chosen
+
+
+INDEX_PHASES = _env_phases("RDS_BINLOG_INDEX_PHASES")
 
 
 def _bound_arrow() -> None:
@@ -620,21 +636,26 @@ def run_one(data_dir: Path, generation: str) -> int:
             result=snapshots(),
         )
         return IDLE_EXIT_CODE
-    metadata.reconcile_part_catalog_pending(
-        limit=CATALOG_RECONCILE_BATCH_SIZE
-    )
-    try:
-        metadata.backfill_catalog_store(
-            limit=CATALOG_STORE_BACKFILL_BATCH_SIZE
+    skipped_phases = [phase for phase in INDEX_PHASES_ALL if phase not in INDEX_PHASES]
+    if skipped_phases:
+        print(f"INDEX_PHASES_SKIPPED phases={','.join(skipped_phases)} reason=RDS_BINLOG_INDEX_PHASES",
+              file=sys.stderr, flush=True)
+    if "catalog" in INDEX_PHASES:
+        metadata.reconcile_part_catalog_pending(
+            limit=CATALOG_RECONCILE_BATCH_SIZE
         )
-    except Exception as exc:
-        traceback.print_exc()
-        publish(
-            "running",
-            phase="catalog-store-backfill",
-            token=f"{generation}:catalog-store-backfill-error",
-            error=str(exc),
-        )
+        try:
+            metadata.backfill_catalog_store(
+                limit=CATALOG_STORE_BACKFILL_BATCH_SIZE
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            publish(
+                "running",
+                phase="catalog-store-backfill",
+                token=f"{generation}:catalog-store-backfill-error",
+                error=str(exc),
+            )
     assert archive is not None
     # Only immutable, committed OSS objects are eligible. EventStorage still
     # opens a matching local body first, under the shared part lock, so the
@@ -649,7 +670,7 @@ def run_one(data_dir: Path, generation: str) -> int:
         part
         for part in metadata.missing_part_catalogs(limit=CATALOG_BATCH_SIZE)
         if str(part.get("oss_key") or "")
-    ]
+    ] if "catalog" in INDEX_PHASES else []
     if catalogs:
         totals = {"cataloged": 0, "rows": 0, "parts": 0}
         errors: list[str] = []
@@ -716,7 +737,11 @@ def run_one(data_dir: Path, generation: str) -> int:
     # 分析聚合排在 exact 之前：exact 阶段每轮都会 return，只要它还有积压，
     # 排在其后的阶段就永远拿不到调度，SQL / 事务 / 锁分析会被无限期饿死。
     # 单批只有 2 个分区，不会反过来饿死 exact。
-    analytics_parts = _missing_analytics_parts(metadata, storage)
+    analytics_parts = (
+        _missing_analytics_parts(metadata, storage)
+        if "analytics" in INDEX_PHASES
+        else []
+    )
     if analytics_parts:
         totals = {"parts": 0, "rows": 0, "transactions": 0, "degraded": 0}
         errors: list[str] = []
@@ -781,7 +806,7 @@ def run_one(data_dir: Path, generation: str) -> int:
     # SELECT 扫描行数估算：每周期一小批（有条数与秒数双预算），放在早期
     # 返回的 exact 阶段之前，保证积压期间也能持续推进。失败不阻塞索引。
     analytics = getattr(storage, "analytics_index", None)
-    if analytics is not None:
+    if analytics is not None and "select" in INDEX_PHASES:
         try:
             from .select_explain import SelectExplainWorker
 
@@ -791,7 +816,7 @@ def run_one(data_dir: Path, generation: str) -> int:
 
     # 时间桶 rollup：长窗口分析的数据源，同样是旁路，失败不阻塞索引。
     try:
-        rolled = _advance_rollup(metadata, storage)
+        rolled = _advance_rollup(metadata, storage) if "rollup" in INDEX_PHASES else 0
         if rolled:
             publish(
                 "completed",
@@ -805,7 +830,7 @@ def run_one(data_dir: Path, generation: str) -> int:
 
     exact_parts = (
         _missing_exact_parts(metadata, storage)
-        if getattr(storage, "exact_index", None) is not None
+        if getattr(storage, "exact_index", None) is not None and "exact" in INDEX_PHASES
         else []
     )
     if exact_parts:
@@ -867,7 +892,11 @@ def run_one(data_dir: Path, generation: str) -> int:
             raise RuntimeError("；".join(errors[:3]))
         # Continue into structural and full-text quotas in the same cycle.
 
-    structural = _missing_structural_parts(metadata, storage)
+    structural = (
+        _missing_structural_parts(metadata, storage)
+        if "structure" in INDEX_PHASES
+        else []
+    )
     if structural:
         totals = {
             "indexed": 0,
@@ -943,7 +972,7 @@ def run_one(data_dir: Path, generation: str) -> int:
         metadata,
         storage,
         limit=FULL_INDEX_BATCH_SIZE,
-    )
+    ) if "index" in INDEX_PHASES else []
     if missing:
         totals = {
             "indexed": 0,

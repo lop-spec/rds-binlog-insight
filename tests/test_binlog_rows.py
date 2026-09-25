@@ -311,23 +311,15 @@ class Release1291Tests(unittest.TestCase):
         self.assertIn("coalesce(sql_kind, '') = 'ORIGINAL'", select)
         self.assertIn("sql_text Nullable(String)", br.PARSER_INPUT_STRUCTURE)
 
-    def test_worker_prefers_slim_parser_and_falls_back_with_a_log(self):
-        import tempfile
+    def test_worker_runs_the_collector_parser_in_slim_mode(self):
         from pathlib import Path
         from app import binlog_rows_worker as worker
 
-        with tempfile.TemporaryDirectory() as tmp:
-            slim = Path(tmp) / "slim"
-            slim.write_text("#!/bin/sh\n")
-            slim.chmod(0o755)
-            with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_PARSER": str(slim)}):
-                self.assertEqual(worker.parser_command(), [str(slim), "--slim"])
-            with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_PARSER": str(Path(tmp) / "missing")}), \
-                    mock.patch("app.parser_bridge.parser_executable", return_value=Path("/full")), \
-                    self.assertLogs("binlog_rows_worker", level="WARNING") as logs:
-                worker._parser_warned = False
-                self.assertEqual(worker.parser_command(), [str(Path("/full"))])
-            self.assertIn("BINLOG_ROWS_SLIM_PARSER_MISSING", logs.output[0])
+        with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_PARSER": ""}), \
+                mock.patch("app.parser_bridge.parser_executable", return_value=Path("/app/tools/binlog-parser")):
+            self.assertEqual(worker.parser_command(), [str(Path("/app/tools/binlog-parser")), "--slim"])
+        with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_PARSER": "/opt/parser"}):
+            self.assertEqual(worker.parser_command(), ["/opt/parser", "--slim"])
 
 
 class Release1292Tests(unittest.TestCase):
@@ -453,3 +445,56 @@ class Release1294Tests(unittest.TestCase):
         self.assertTrue(result["has_more"])
         limits = [c.args[0].rsplit("LIMIT ", 1)[1] for c in backend.ch.rows.call_args_list]
         self.assertEqual(limits, ["4", "3", "1"])
+
+
+class Release1296Tests(unittest.TestCase):
+    def _worker(self, slice_bytes, ch_bytes=0):
+        import tempfile
+        from app import binlog_rows_worker as worker
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = f"{tmp.name}/memory.current"
+        if slice_bytes is not None:
+            with open(path, "w") as handle:
+                handle.write(str(slice_bytes))
+        w = worker.Worker.__new__(worker.Worker)
+        w.stop = mock.Mock()
+        w.stop.is_set.side_effect = [False, True]
+        w.lane_specs = [("live", None)]
+        w.publish = mock.Mock()
+        w.clickhouse_memory = mock.Mock(return_value=ch_bytes)
+        return w, path
+
+    def test_slice_memory_above_the_line_pauses(self):
+        w, path = self._worker(12 * 1024 ** 3)
+        env = {"RDS_BINLOG_ROWS_SLICE_MEMORY_FILE": path, "RDS_BINLOG_ROWS_SLICE_MEMORY_MAX_GIB": "11"}
+        with mock.patch.dict("os.environ", env), self.assertLogs("binlog_rows_worker", level="WARNING") as logs:
+            self.assertFalse(w.wait_for_capacity(0))
+        self.assertIn("reason=slice-memory", logs.output[0])
+        w.clickhouse_memory.assert_not_called()
+
+    def test_slice_memory_below_the_line_runs(self):
+        w, path = self._worker(10 * 1024 ** 3)
+        env = {"RDS_BINLOG_ROWS_SLICE_MEMORY_FILE": path, "RDS_BINLOG_ROWS_SLICE_MEMORY_MAX_GIB": "11"}
+        with mock.patch.dict("os.environ", env):
+            self.assertTrue(w.wait_for_capacity(0))
+
+    def test_unreadable_slice_file_pauses_with_its_reason(self):
+        w, path = self._worker(None)
+        with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_SLICE_MEMORY_FILE": path}), \
+                self.assertLogs("binlog_rows_worker", level="WARNING") as logs:
+            self.assertFalse(w.wait_for_capacity(0))
+        self.assertIn("slice-memory-unreadable", logs.output[0])
+
+    def test_index_phases_env(self):
+        from app import index_worker
+
+        with mock.patch.dict("os.environ", {"RDS_BINLOG_INDEX_PHASES": ""}):
+            self.assertEqual(index_worker._env_phases("RDS_BINLOG_INDEX_PHASES"), frozenset(index_worker.INDEX_PHASES_ALL))
+        with mock.patch.dict("os.environ", {"RDS_BINLOG_INDEX_PHASES": "analytics, select,rollup"}):
+            self.assertEqual(index_worker._env_phases("RDS_BINLOG_INDEX_PHASES"),
+                             frozenset({"analytics", "select", "rollup"}))
+        with mock.patch.dict("os.environ", {"RDS_BINLOG_INDEX_PHASES": "analytics,fulltext"}), \
+                self.assertRaises(SystemExit):
+            index_worker._env_phases("RDS_BINLOG_INDEX_PHASES")

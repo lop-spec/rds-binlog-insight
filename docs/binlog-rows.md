@@ -44,15 +44,20 @@ so the tables stay ALTER-able (inline dynamic disks cannot be altered on 26.3). 
 Rows without a table (transaction boundaries: XID / BEGIN / COMMIT, ~41% of production records) are not
 kept; DDL is kept and its original text goes through the statements table (`sql_kind = ORIGINAL`).
 
-### Slim parser (`parser-slim/`, 1.29.1)
+### One parser, two modes (`parser-go/`, v3 since 1.29.6)
 
-The collector keeps using `tools/binlog-parser`. The rows worker uses `/app/tools/binlog-parser-slim --slim`
-(built from `parser-slim/` in the image; override with `RDS_BINLOG_ROWS_PARSER`, missing binary falls back to
-the full parser with a `BINLOG_ROWS_SLIM_PARSER_MISSING` log line). Slim mode omits pseudo SQL, column
-metadata and base64 SQL, cuts `row_query` to 65536 code points (what the store keeps) and does not write
-transaction-boundary records while still advancing the output sequence, so every emitted `event_id`,
-row image, position and `row_query` prefix is identical to the full parser. Verified on a production binlog:
-174,443 non-boundary records, 0 field differences; parser CPU 29.3 s → 17.9 s.
+The image builds `/app/tools/binlog-parser` from `parser-go/`. The collector runs it in full mode; the rows
+worker runs the same binary with `--slim` (override the path with `RDS_BINLOG_ROWS_PARSER`).
+
+- Full mode is byte-identical to the former committed v2 binary (sha256 `b1b2fc7d…`): table identity
+  (`table_map_id`, `schema_version_id`) and transaction timing (`header_epoch_us`, `commit_epoch_us`,
+  `txn_*`) feed the exact-index registry and the analytics page.
+- `--slim` leaves those two groups out (embedded nil pointers, so JSON omits them), omits pseudo SQL, column
+  metadata and base64 SQL, cuts `row_query` to 65536 code points (what the store keeps) and does not write
+  transaction-boundary records while still advancing the output sequence, so every emitted `event_id`, row
+  image, position and `row_query` prefix is identical to full mode.
+- Acceptance (3 production binlogs, 524 MB each): full output sha256 equal to v2, `--slim` output sha256
+  equal to the 1.29.1–1.29.5 slim parser. Parser CPU in slim mode ≈ 60% of full mode.
 
 Measured on the production host (4 vCPU): one 524 MB binlog ≈ 56 s end to end with the slim parser
 (74 s full parser streamed, 132 s with on-disk chunks); download 2.5 s with 4 ranged streams.

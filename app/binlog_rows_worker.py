@@ -84,21 +84,30 @@ def download_ranges(bucket: Any, key: str, size: int, path: Path, stop: threadin
             future.result()
 
 
-SLIM_PARSER_DEFAULT = "/app/tools/binlog-parser-slim"
-_parser_warned = False
-
-
 def parser_command() -> list[str]:
-    """Slim row-store parser (same event ids and row images as the collector parser, ~40% less CPU)."""
-    global _parser_warned
+    """Row-store mode of the collector's parser: same event ids and row images, ~40% less CPU."""
     from .parser_bridge import parser_executable
-    slim = Path(os.environ.get("RDS_BINLOG_ROWS_PARSER", SLIM_PARSER_DEFAULT) or SLIM_PARSER_DEFAULT)
-    if slim.is_file() and os.access(slim, os.X_OK):
-        return [str(slim), "--slim"]
-    if not _parser_warned:
-        LOGGER.warning("BINLOG_ROWS_SLIM_PARSER_MISSING path=%s fallback=%s", slim, parser_executable())
-        _parser_warned = True
-    return [str(parser_executable())]
+    override = os.environ.get("RDS_BINLOG_ROWS_PARSER", "").strip()
+    return [override or str(parser_executable()), "--slim"]
+
+
+def slice_memory_limits() -> tuple[str, int]:
+    """memory.current of the cgroup slice that holds every service (host path bind-mounted read-only).
+
+    Past the slice's memory.high the kernel reclaims and refaults file pages of all services and the
+    disk read cap stalls the whole host, while host MemAvailable still looks fine (it counts that page
+    cache as available). Empty path disables the check, which is logged at start.
+    """
+    path = os.environ.get("RDS_BINLOG_ROWS_SLICE_MEMORY_FILE", "").strip()
+    limit = int(float(os.environ.get("RDS_BINLOG_ROWS_SLICE_MEMORY_MAX_GIB", "11") or 11) * 1024 ** 3)
+    return path, limit
+
+
+def read_slice_memory(path: str) -> int | None:
+    try:
+        return int(Path(path).read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
 class LineCountingStream:
@@ -262,14 +271,21 @@ class Worker:
 
     def wait_for_capacity(self, lane: int) -> bool:
         """Yield to the collector and interactive queries; every pause reason is logged."""
-        limit = int(float(os.environ.get("RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB", "2.8")) * 1024 ** 3)
+        limit = int(float(os.environ.get("RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB", "4.2")) * 1024 ** 3)
+        slice_path, slice_limit = slice_memory_limits()
         while not self.stop.is_set():
             reason = ""
-            try:
-                if self.clickhouse_memory() > limit:
-                    reason = "clickhouse-memory"
-            except RawBinlogError as exc:
-                reason = f"clickhouse-unavailable: {exc}"
+            used = read_slice_memory(slice_path) if slice_path else None
+            if slice_path and used is None:
+                reason = f"slice-memory-unreadable: {slice_path}"
+            elif used is not None and used > slice_limit:
+                reason = "slice-memory"
+            if not reason:
+                try:
+                    if self.clickhouse_memory() > limit:
+                        reason = "clickhouse-memory"
+                except RawBinlogError as exc:
+                    reason = f"clickhouse-unavailable: {exc}"
             if not reason and self.lane_specs[lane][0] == "window" and self.collector_lag_seconds() > 1200:
                 reason = "collector-lag"
             if not reason:
@@ -486,6 +502,11 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     ensure_data_dirs(args.data_dir)
+    slice_path, slice_limit = slice_memory_limits()
+    if slice_path:
+        LOGGER.info("BINLOG_ROWS_SLICE_GUARD path=%s max_bytes=%s", slice_path, slice_limit)
+    else:
+        LOGGER.warning("BINLOG_ROWS_SLICE_GUARD_OFF reason=RDS_BINLOG_ROWS_SLICE_MEMORY_FILE unset")
     backfill = _env_windows(os.environ.get("RDS_BINLOG_ROWS_BACKFILL_WINDOWS", ""))
     live = max(1, int(os.environ.get("RDS_BINLOG_ROWS_LIVE_LANES", "2") or 2))
     if live + len(backfill) > WORKER_LANES_MAX:
