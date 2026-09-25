@@ -237,6 +237,32 @@ class ClickHouseManifestTests(unittest.TestCase):
             ClickHouseManifest(path, run_migrations=True)
             self.assertTrue(path.is_file())
 
+    def test_full_reconcile_leaves_unchanged_parts_untouched(self):
+        # 1.29.12: a full pass writes only real changes; unchanged rows keep their updated_at_us,
+        # stay ready and are not swept, while an unseen row is still marked for deletion.
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = ClickHouseManifest(Path(temp) / "manifest.sqlite3", run_migrations=True)
+            kept = _part(Path(temp) / "kept.parquet", "kept-v1")
+            gone = _part(Path(temp) / "gone.parquet", "gone-v1")
+            now_us = int(kept["max_event_epoch_us"])
+            window = {"start_epoch_us": now_us - 3_600_000_000, "end_epoch_us": now_us}
+            manifest.reconcile([kept, gone], **window)
+            for part in (kept, gone):
+                manifest.claim_next()
+                manifest.mark_ready(str(part["path"]), str(part["logical_part_id"]), 3)
+            with manifest.connection() as connection:
+                before = connection.execute(
+                    "SELECT updated_at_us FROM clickhouse_parts WHERE logical_part_id = 'kept-v1'"
+                ).fetchone()[0]
+            result = manifest.reconcile([kept], **window)
+            with manifest.connection() as connection:
+                rows = dict(connection.execute(
+                    "SELECT logical_part_id, status || ':' || updated_at_us FROM clickhouse_parts"
+                ).fetchall())
+            self.assertEqual(rows["kept-v1"], f"ready:{before}")
+            self.assertTrue(rows["gone-v1"].startswith("delete_pending:"))
+            self.assertEqual((result["queued_parts"], result["missing_deletes"]), (0, 1))
+
     def test_reconcile_replacement_and_delete_are_persistent(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "manifest.sqlite3"

@@ -170,118 +170,168 @@ class ClickHouseManifest:
             generation = int(state["generation"] if state else 0) + 1
             queued = 0
             replacements = 0
+            # One read of the table, then only real changes are written. A full slow-log pass sends
+            # ~176k unchanged parts every 5 minutes; issuing SELECT + UPSERT + replacement UPDATE for
+            # each (~0.5M statements, ~90 s CPU) is what the per-row path cost. `rows` mirrors every
+            # status change made in this transaction so later decisions see what the old per-row
+            # SELECTs would have seen.
+            reset_states = ("delete_pending", "deleting", "delete_failed", "retired")
+            rows: dict[tuple[str, str], dict[str, Any]] = {}
+            ids_by_path: dict[str, set[str]] = {}
+            for row in connection.execute(
+                "SELECT part_path, logical_part_id, status, sha256, content_revision, "
+                "min_event_epoch_us, max_event_epoch_us, row_count, size_bytes "
+                "FROM clickhouse_parts"
+            ):
+                key = (str(row["part_path"]), str(row["logical_part_id"]))
+                rows[key] = {
+                    "status": str(row["status"]),
+                    "values": (
+                        str(row["sha256"] or ""),
+                        int(row["content_revision"] or 0),
+                        int(row["min_event_epoch_us"] or 0),
+                        int(row["max_event_epoch_us"] or 0),
+                        int(row["row_count"] or 0),
+                        int(row["size_bytes"] or 0),
+                    ),
+                }
+                ids_by_path.setdefault(key[0], set()).add(key[1])
+            seen: set[tuple[str, str]] = set()
             for part in parts:
                 identity = part_identity(part)
                 if not identity:
                     continue
                 path = str(part["path"])
-                existing = connection.execute(
-                    "SELECT status FROM clickhouse_parts "
-                    "WHERE part_path = ? AND logical_part_id = ?",
-                    (path, identity),
-                ).fetchone()
-                if existing is None or str(existing["status"]) not in {
-                    "pending", "loading", "ready", "load_failed"
-                }:
+                key = (path, identity)
+                seen.add(key)
+                current = rows.get(key)
+                status_now = current["status"] if current else None
+                if status_now not in ACTIVE_LOAD_STATES:
                     queued += 1
-                connection.execute(
-                    """
-                    INSERT INTO clickhouse_parts(
-                        part_path, logical_part_id, sha256, content_revision,
-                        min_event_epoch_us, max_event_epoch_us, row_count,
-                        size_bytes, status, attempts, next_retry_us,
-                        inserted_rows, last_error, first_seen_us,
-                        updated_at_us, ready_at_us, seen_generation
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0,
-                             0, '', ?, ?, 0, ?)
-                    ON CONFLICT(part_path, logical_part_id) DO UPDATE SET
-                        sha256 = excluded.sha256,
-                        content_revision = excluded.content_revision,
-                        min_event_epoch_us = excluded.min_event_epoch_us,
-                        max_event_epoch_us = excluded.max_event_epoch_us,
-                        row_count = excluded.row_count,
-                        size_bytes = excluded.size_bytes,
-                        status = CASE WHEN clickhouse_parts.status IN
-                            ('delete_pending', 'deleting', 'delete_failed', 'retired')
-                            THEN 'pending' ELSE clickhouse_parts.status END,
-                        attempts = CASE WHEN clickhouse_parts.status IN
-                            ('delete_pending', 'deleting', 'delete_failed', 'retired')
-                            THEN 0 ELSE clickhouse_parts.attempts END,
-                        next_retry_us = CASE WHEN clickhouse_parts.status IN
-                            ('delete_pending', 'deleting', 'delete_failed', 'retired')
-                            THEN 0 ELSE clickhouse_parts.next_retry_us END,
-                        inserted_rows = CASE WHEN clickhouse_parts.status IN
-                            ('delete_pending', 'deleting', 'delete_failed', 'retired')
-                            THEN 0 ELSE clickhouse_parts.inserted_rows END,
-                        last_error = CASE WHEN clickhouse_parts.status IN
-                            ('delete_pending', 'deleting', 'delete_failed', 'retired')
-                            THEN '' ELSE clickhouse_parts.last_error END,
-                        ready_at_us = CASE WHEN clickhouse_parts.status IN
-                            ('delete_pending', 'deleting', 'delete_failed', 'retired')
-                            THEN 0 ELSE clickhouse_parts.ready_at_us END,
-                        updated_at_us = excluded.updated_at_us,
-                        seen_generation = excluded.seen_generation
-                    """,
-                    (
-                        path,
-                        identity,
-                        str(part.get("sha256") or ""),
-                        int(part.get("content_revision") or 0),
-                        int(part.get("min_event_epoch_us") or 0),
-                        int(part.get("max_event_epoch_us") or 0),
-                        int(part.get("row_count") or 0),
-                        int(part.get("size_bytes") or 0),
-                        now_us,
-                        now_us,
-                        generation,
-                    ),
+                values = (
+                    str(part.get("sha256") or ""),
+                    int(part.get("content_revision") or 0),
+                    int(part.get("min_event_epoch_us") or 0),
+                    int(part.get("max_event_epoch_us") or 0),
+                    int(part.get("row_count") or 0),
+                    int(part.get("size_bytes") or 0),
                 )
-                cursor = connection.execute(
-                    """
-                    UPDATE clickhouse_parts
-                    SET status = CASE WHEN status = 'deleting'
-                                      THEN status ELSE 'delete_pending' END,
-                        next_retry_us = CASE WHEN status = 'deleting'
-                                             THEN next_retry_us ELSE 0 END,
-                        last_error = CASE WHEN status = 'deleting'
-                                          THEN last_error ELSE '' END,
-                        updated_at_us = ?
-                    WHERE part_path = ? AND logical_part_id != ?
-                      AND status != 'retired'
-                    """,
-                    (now_us, path, identity),
-                )
-                replacements += int(cursor.rowcount)
+                if current is None or status_now in reset_states or current["values"] != values:
+                    connection.execute(
+                        """
+                        INSERT INTO clickhouse_parts(
+                            part_path, logical_part_id, sha256, content_revision,
+                            min_event_epoch_us, max_event_epoch_us, row_count,
+                            size_bytes, status, attempts, next_retry_us,
+                            inserted_rows, last_error, first_seen_us,
+                            updated_at_us, ready_at_us, seen_generation
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0,
+                                 0, '', ?, ?, 0, ?)
+                        ON CONFLICT(part_path, logical_part_id) DO UPDATE SET
+                            sha256 = excluded.sha256,
+                            content_revision = excluded.content_revision,
+                            min_event_epoch_us = excluded.min_event_epoch_us,
+                            max_event_epoch_us = excluded.max_event_epoch_us,
+                            row_count = excluded.row_count,
+                            size_bytes = excluded.size_bytes,
+                            status = CASE WHEN clickhouse_parts.status IN
+                                ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                                THEN 'pending' ELSE clickhouse_parts.status END,
+                            attempts = CASE WHEN clickhouse_parts.status IN
+                                ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                                THEN 0 ELSE clickhouse_parts.attempts END,
+                            next_retry_us = CASE WHEN clickhouse_parts.status IN
+                                ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                                THEN 0 ELSE clickhouse_parts.next_retry_us END,
+                            inserted_rows = CASE WHEN clickhouse_parts.status IN
+                                ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                                THEN 0 ELSE clickhouse_parts.inserted_rows END,
+                            last_error = CASE WHEN clickhouse_parts.status IN
+                                ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                                THEN '' ELSE clickhouse_parts.last_error END,
+                            ready_at_us = CASE WHEN clickhouse_parts.status IN
+                                ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                                THEN 0 ELSE clickhouse_parts.ready_at_us END,
+                            updated_at_us = excluded.updated_at_us,
+                            seen_generation = excluded.seen_generation
+                        """,
+                        (path, identity, *values, now_us, now_us, generation),
+                    )
+                    rows[key] = {
+                        "status": "pending" if status_now is None or status_now in reset_states else status_now,
+                        "values": values,
+                    }
+                    ids_by_path.setdefault(path, set()).add(identity)
+                others = [
+                    other for other in ids_by_path.get(path, ())
+                    if other != identity and rows[(path, other)]["status"] != "retired"
+                ]
+                if others:
+                    cursor = connection.execute(
+                        """
+                        UPDATE clickhouse_parts
+                        SET status = CASE WHEN status = 'deleting'
+                                          THEN status ELSE 'delete_pending' END,
+                            next_retry_us = CASE WHEN status = 'deleting'
+                                                 THEN next_retry_us ELSE 0 END,
+                            last_error = CASE WHEN status = 'deleting'
+                                              THEN last_error ELSE '' END,
+                            updated_at_us = ?
+                        WHERE part_path = ? AND logical_part_id != ?
+                          AND status != 'retired'
+                        """,
+                        (now_us, path, identity),
+                    )
+                    replacements += int(cursor.rowcount)
+                    for other in others:
+                        entry = rows[(path, other)]
+                        if entry["status"] != "deleting":
+                            entry["status"] = "delete_pending"
 
             # A full sweep owns deletion/retirement. Incremental reconciles use
             # a short moving window and must never interpret unscanned history
-            # as deleted.
+            # as deleted. Unseen rows come from the set difference, so rows
+            # skipped above as unchanged are not swept.
             deleted = 0
             aged_out = 0
             if sweep_unseen:
-                deleted = connection.execute(
-                    """
-                    UPDATE clickhouse_parts
-                    SET status = CASE WHEN status = 'deleting'
-                                      THEN status ELSE 'delete_pending' END,
-                        next_retry_us = CASE WHEN status = 'deleting'
-                                             THEN next_retry_us ELSE 0 END,
-                        updated_at_us = ?
-                    WHERE seen_generation != ? AND max_event_epoch_us >= ?
-                      AND status != 'retired'
-                    """,
-                    (now_us, generation, int(start_epoch_us)),
-                ).rowcount
-                aged_out = connection.execute(
-                    """
-                    UPDATE clickhouse_parts
-                    SET status = 'retired', next_retry_us = 0,
-                        last_error = '', updated_at_us = ?
-                    WHERE seen_generation != ? AND max_event_epoch_us < ?
-                      AND status != 'retired'
-                    """,
-                    (now_us, generation, int(start_epoch_us)),
-                ).rowcount
+                unseen = [
+                    (key, entry) for key, entry in rows.items()
+                    if key not in seen and entry["status"] != "retired"
+                ]
+                delete_keys = [
+                    (now_us, key[0], key[1]) for key, entry in unseen
+                    if entry["values"][3] >= int(start_epoch_us)
+                ]
+                retire_keys = [
+                    (now_us, key[0], key[1]) for key, entry in unseen
+                    if entry["values"][3] < int(start_epoch_us)
+                ]
+                if delete_keys:
+                    deleted = connection.executemany(
+                        """
+                        UPDATE clickhouse_parts
+                        SET status = CASE WHEN status = 'deleting'
+                                          THEN status ELSE 'delete_pending' END,
+                            next_retry_us = CASE WHEN status = 'deleting'
+                                                 THEN next_retry_us ELSE 0 END,
+                            updated_at_us = ?
+                        WHERE part_path = ? AND logical_part_id = ?
+                          AND status != 'retired'
+                        """,
+                        delete_keys,
+                    ).rowcount
+                if retire_keys:
+                    aged_out = connection.executemany(
+                        """
+                        UPDATE clickhouse_parts
+                        SET status = 'retired', next_retry_us = 0,
+                            last_error = '', updated_at_us = ?
+                        WHERE part_path = ? AND logical_part_id = ?
+                          AND status != 'retired'
+                        """,
+                        retire_keys,
+                    ).rowcount
             if preserve_reconcile_state:
                 connection.execute(
                     """
