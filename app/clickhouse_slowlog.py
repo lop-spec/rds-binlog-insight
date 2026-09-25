@@ -1245,6 +1245,24 @@ class ClickHouseSlowLogQueryBackend:
         }
 
 
+class ThrottledCall:
+    """Reuse the last result of `fn` for `seconds` (monotonic clock) unless forced."""
+
+    def __init__(self, fn: Any, seconds: float, *, clock: Any = time.monotonic) -> None:
+        self.fn = fn
+        self.seconds = float(seconds)
+        self.clock = clock
+        self.at: float | None = None
+        self.value: Any = None
+
+    def __call__(self, *, force: bool = False) -> Any:
+        now = self.clock()
+        if force or self.at is None or now - self.at >= self.seconds:
+            self.value = self.fn()
+            self.at = now
+        return self.value
+
+
 class ClickHouseSlowLogWorker:
     def __init__(
         self,
@@ -1320,6 +1338,12 @@ class ClickHouseSlowLogWorker:
         last_reconcile = 0.0
         last_error = ""
         io_pressure_override_active = False
+        # Status-file statistics aggregate the whole clickhouse_parts table and the loop publishes two
+        # or three times per 2-second pass (~1.7% of host CPU), so refresh them at most every 30 s.
+        manifest_stats = ThrottledCall(
+            manifest.stats,
+            _int_env("RDS_BINLOG_CLICKHOUSE_SLOWLOG_STATS_SECONDS", 30, 1, 3600),
+        )
 
         def publish(
             state: str,
@@ -1340,7 +1364,7 @@ class ClickHouseSlowLogWorker:
                     "pid": os.getpid(),
                     "lastError": last_error,
                     "result": result or {},
-                    "stats": manifest.stats(),
+                    "stats": manifest_stats(force=state in {"starting", "stopped"}),
                 },
             )
 

@@ -541,3 +541,41 @@ class Release1299Tests(unittest.TestCase):
         with mock.patch.dict("os.environ", {**env, "RDS_BINLOG_ROWS_SLICE_STAT_FILE": path}), \
                 self.assertLogs("binlog_rows_worker", level="WARNING"):
             self.assertFalse(window.wait_for_capacity(0))
+
+
+class Release12910Tests(unittest.TestCase):
+    def test_ranged_bucket_turns_crc_off_on_a_copy_only(self):
+        from app import binlog_rows_worker as worker
+
+        class Bucket:
+            enable_crc = True
+
+        shared = Bucket()
+        view = worker.ranged_bucket(shared)
+        self.assertIsNot(view, shared)
+        self.assertFalse(view.enable_crc)
+        self.assertTrue(shared.enable_crc)
+        plain = Bucket()
+        plain.enable_crc = False
+        self.assertIs(worker.ranged_bucket(plain), plain)
+
+    def test_raw_verification_no_longer_uses_crc64(self):
+        import inspect
+        from app import binlog_rows_worker as worker
+
+        source = inspect.getsource(worker.Worker.ingest_raw)
+        self.assertNotIn("Crc64", source)
+        self.assertIn('digest.hexdigest() != raw["sha256"]', source)
+
+    def test_throttled_call_reuses_until_the_interval_passes(self):
+        from app.clickhouse_slowlog import ThrottledCall
+
+        now = [100.0]
+        calls = []
+        throttled = ThrottledCall(lambda: calls.append(1) or len(calls), 30, clock=lambda: now[0])
+        self.assertEqual(throttled(), 1)
+        now[0] += 10
+        self.assertEqual(throttled(), 1)
+        self.assertEqual(throttled(force=True), 2)
+        now[0] += 31
+        self.assertEqual(throttled(), 3)

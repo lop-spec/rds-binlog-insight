@@ -11,6 +11,7 @@ views and only then recorded in the manifest that proves coverage.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import logging
@@ -50,9 +51,24 @@ def _env_windows(value: str) -> list[tuple[str, str, str]]:
 DOWNLOAD_STREAMS = max(1, min(int(os.environ.get("RDS_BINLOG_ROWS_DOWNLOAD_STREAMS", "4") or 4), 8))
 
 
+def ranged_bucket(bucket: Any) -> Any:
+    """Bucket view for ranged GETs without oss2's per-stream CRC64.
+
+    A range cannot be checked against the object CRC, so with enable_crc oss2 hashes every stream for
+    nothing (about 4% of host CPU with seven lanes). The whole file is verified by size + SHA256 after
+    the download; the shared bucket object is left untouched.
+    """
+    if not getattr(bucket, "enable_crc", False):
+        return bucket
+    view = copy.copy(bucket)
+    view.enable_crc = False
+    return view
+
+
 def download_ranges(bucket: Any, key: str, size: int, path: Path, stop: threading.Event) -> None:
     """Parallel ranged GETs into a preallocated file; a single stream is ~11 MB/s on this network."""
     from concurrent.futures import ThreadPoolExecutor
+    bucket = ranged_bucket(bucket)
     with path.open("wb") as handle:
         handle.truncate(size)
     if size == 0:
@@ -348,7 +364,6 @@ class Worker:
 
     # -- ingestion ------------------------------------------------------------
     def ingest_raw(self, ingestor: RowsIngestor, entry: dict[str, Any], lane: int) -> int:
-        from oss2.utils import Crc64
         archive = self.archive()
         descriptor = entry["descriptor"]
         raw = descriptor["raw"]
@@ -361,14 +376,15 @@ class Worker:
             root = Path(scratch)
             source = root / "source.binlog"
             download_ranges(archive.bucket, raw["oss_key"], int(raw["size_bytes"]), source, self.stop)
-            digest, crc, size = hashlib.sha256(), Crc64(), 0
+            # SHA256 over the whole file already proves the bytes; a second CRC64 pass (pure-Python
+            # crcmod) cost about as much CPU as the parser's I/O and added no protection.
+            digest, size = hashlib.sha256(), 0
             with source.open("rb") as handle:
                 while chunk := handle.read(8 * 1024 ** 2):
                     size += len(chunk)
                     digest.update(chunk)
-                    crc(chunk)
-            if size != int(raw["size_bytes"]) or digest.hexdigest() != raw["sha256"] or str(crc.crc) != str(raw["crc64"]):
-                raise RawBinlogError("原档长度/SHA256/CRC64校验失败", "RAW_INDEX_VERIFY_FAILED")
+            if size != int(raw["size_bytes"]) or digest.hexdigest() != raw["sha256"]:
+                raise RawBinlogError("原档长度/SHA256校验失败", "RAW_INDEX_VERIFY_FAILED")
             ingestor.truncate()
             stderr_path = root / "parser.stderr"
             with stderr_path.open("wb") as stderr:
