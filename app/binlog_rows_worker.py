@@ -278,6 +278,11 @@ class Worker:
         """Yield to the collector and interactive queries; every pause reason is logged."""
         limit = int(float(os.environ.get("RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB", "4.2")) * 1024 ** 3)
         slice_path, slice_limit = slice_memory_limits()
+        if self.lane_specs[lane][0] == "live":
+            # live lanes keep headroom above both lines: under pressure window lanes pause first
+            headroom = int(float(os.environ.get("RDS_BINLOG_ROWS_LIVE_HEADROOM_GIB", "0.75") or 0) * 1024 ** 3)
+            limit += headroom
+            slice_limit += headroom
         while not self.stop.is_set():
             reason = ""
             used = read_slice_memory(slice_path) if slice_path else None

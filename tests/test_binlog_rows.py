@@ -510,3 +510,34 @@ class Release1296Tests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"RDS_BINLOG_INDEX_PHASES": "analytics,fulltext"}), \
                 self.assertRaises(SystemExit):
             index_worker._env_phases("RDS_BINLOG_INDEX_PHASES")
+
+
+class Release1299Tests(unittest.TestCase):
+    def _worker(self, kind, anon_bytes):
+        import tempfile
+        from app import binlog_rows_worker as worker
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = f"{tmp.name}/memory.stat"
+        with open(path, "w") as handle:
+            handle.write(f"anon {anon_bytes}\n")
+        w = worker.Worker.__new__(worker.Worker)
+        w.stop = mock.Mock()
+        w.stop.is_set.side_effect = [False, True]
+        w.lane_specs = [(kind, None if kind == "live" else ("rm-1", "a", "b"))]
+        w.publish = mock.Mock()
+        w.clickhouse_memory = mock.Mock(return_value=0)
+        w.collector_lag_seconds = mock.Mock(return_value=0)
+        return w, path
+
+    def test_live_lane_runs_where_a_window_lane_pauses(self):
+        env = {"RDS_BINLOG_ROWS_SLICE_ANON_MAX_GIB": "8", "RDS_BINLOG_ROWS_LIVE_HEADROOM_GIB": "0.75"}
+        anon = int(8.4 * 1024 ** 3)
+        live, path = self._worker("live", anon)
+        with mock.patch.dict("os.environ", {**env, "RDS_BINLOG_ROWS_SLICE_STAT_FILE": path}):
+            self.assertTrue(live.wait_for_capacity(0))
+        window, path = self._worker("window", anon)
+        with mock.patch.dict("os.environ", {**env, "RDS_BINLOG_ROWS_SLICE_STAT_FILE": path}), \
+                self.assertLogs("binlog_rows_worker", level="WARNING"):
+            self.assertFalse(window.wait_for_capacity(0))
