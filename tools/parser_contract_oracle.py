@@ -10,6 +10,7 @@ import argparse
 import base64
 import hashlib
 import json
+import struct
 import threading
 from pathlib import Path
 
@@ -139,8 +140,15 @@ def compare_columnar(ndjson: Path, output: Path, source_id: str, *, native_arrow
                 independent_value_oracle=False)
 
 
-def compare_chunked_arrow(ndjson: Path, case_dir: Path, output: Path, source_id: str,
-                          contract: dict):
+def compare_chunked_arrow(
+    ndjson: Path,
+    case_dir: Path,
+    output: Path,
+    source_id: str,
+    contract: dict,
+    *,
+    output_label="candidate-arrow-chunks",
+):
     """Independently decode the retained strict manifests, ACKs and IPC chunks."""
     required_contract = {
         "protocol", "format", "ack_protocol", "manifests_sha256",
@@ -154,9 +162,9 @@ def compare_chunked_arrow(ndjson: Path, case_dir: Path, output: Path, source_id:
             or not isinstance(contract["chunks"], list)
             or not contract["chunks"]):
         raise ValueError("Arrow chunk contract identity changed")
-    manifests_raw = (case_dir / "candidate-arrow-chunks.manifests.ndjson").read_bytes()
-    acknowledgements_raw = (case_dir / "candidate-arrow-chunks.acks.ndjson").read_bytes()
-    stderr_raw = (case_dir / "candidate-arrow-chunks.stderr").read_bytes()
+    manifests_raw = (case_dir / f"{output_label}.manifests.ndjson").read_bytes()
+    acknowledgements_raw = (case_dir / f"{output_label}.acks.ndjson").read_bytes()
+    stderr_raw = (case_dir / f"{output_label}.stderr").read_bytes()
     if (hashlib.sha256(manifests_raw).hexdigest() != contract["manifests_sha256"]
             or hashlib.sha256(acknowledgements_raw).hexdigest()
             != contract["acks_sha256"]
@@ -217,7 +225,7 @@ def compare_chunked_arrow(ndjson: Path, case_dir: Path, output: Path, source_id:
                 or name != f"{source_id}-{sequence:06d}.arrow"
                 or type(retained["sha256"]) is not str):
             raise ValueError("Arrow chunk path binding changed")
-        chunk = case_dir / "candidate-arrow-chunks" / name
+        chunk = case_dir / output_label / name
         content = chunk.read_bytes()
         if (len(content) != manifest["bytes"]
                 or hashlib.sha256(content).hexdigest() != retained["sha256"]):
@@ -246,7 +254,7 @@ def compare_chunked_arrow(ndjson: Path, case_dir: Path, output: Path, source_id:
     count = 0
     for sequence, retained in enumerate(contract["chunks"]):
         rows_written, parts = storage.ingest_arrow_file(
-            arrow_path=case_dir / "candidate-arrow-chunks" / retained["name"],
+            arrow_path=case_dir / output_label / retained["name"],
             expected_rows=retained["rows"],
             part_key=f"{sequence:06d}",
             **common,
@@ -348,6 +356,130 @@ def compare_decoders(legacy: Path, candidate: Path, output: Path, source_id: str
             "differing_fields": sorted(differing)}
 
 
+def verify_negative_raw_cache(root: Path, case: dict) -> dict:
+    """Independently reconstruct every retained RDSRAW1 mutation and failure."""
+    contract = case.get("negative_raw_cache")
+    expected_names = {
+        "truncated-header",
+        "bad-magic",
+        "unsupported-codec",
+        "wrong-identity",
+        "wrong-declared-size",
+        "wrong-expected-size-argument",
+        "bad-frame-marker",
+        "bad-frame-sha",
+        "bad-footer-marker",
+        "truncated-footer",
+        "bad-final-sha",
+        "trailing-data",
+    }
+    if set(contract or {}) != expected_names:
+        raise ValueError("raw-cache negative contract is incomplete")
+    directory = root / "negative" / "raw-cache"
+    valid = (root / "row" / "cache-mechanisms" / "zstd.cache").read_bytes()
+    expected_size = int(case["raw_bytes"])
+    if len(valid) < 141 or valid[:8] != b"RDSRAW1\n" or valid[53:57] != b"FRM1":
+        raise ValueError("raw-cache negative base is not canonical")
+    compressed_size = struct.unpack_from("<I", valid, 61)[0]
+    footer_at = 53 + 44 + compressed_size
+    if valid[footer_at : footer_at + 4] != b"END1" or footer_at + 44 != len(valid):
+        raise ValueError("raw-cache negative footer is not canonical")
+
+    def changed(offset: int, value: int) -> bytes:
+        content = bytearray(valid)
+        content[offset] = value
+        return bytes(content)
+
+    wrong_size = bytearray(valid)
+    struct.pack_into("<Q", wrong_size, 9, expected_size + 1)
+    bad_frame_marker = bytearray(valid)
+    bad_frame_marker[53:57] = b"BAD1"
+    bad_footer_marker = bytearray(valid)
+    bad_footer_marker[footer_at : footer_at + 4] = b"BAD1"
+    expected = {
+        "truncated-header": (valid[:52], expected_size, "header"),
+        "bad-magic": (changed(0, valid[0] ^ 0x01), expected_size, "magic"),
+        "unsupported-codec": (changed(8, 0x7F), expected_size, "codec"),
+        "wrong-identity": (changed(17, valid[17] ^ 0x01), expected_size, "identity"),
+        "wrong-declared-size": (bytes(wrong_size), expected_size, "expected size"),
+        "wrong-expected-size-argument": (valid, expected_size + 1, "expected size"),
+        "bad-frame-marker": (bytes(bad_frame_marker), expected_size, "frame marker"),
+        "bad-frame-sha": (changed(65, valid[65] ^ 0x01), expected_size, "size/SHA256"),
+        "bad-footer-marker": (bytes(bad_footer_marker), expected_size, "frame marker"),
+        "truncated-footer": (valid[:-1], expected_size, "record"),
+        "bad-final-sha": (changed(len(valid) - 1, valid[-1] ^ 0x01), expected_size, "final SHA256"),
+        "trailing-data": (valid + b"x", expected_size, "trailing data"),
+    }
+    fields = {
+        "cache_bytes",
+        "cache_sha256",
+        "expected_size_argument",
+        "stderr_marker",
+        "ndjson_returncode",
+        "ndjson_stderr_sha256",
+        "arrow_returncode",
+        "arrow_stderr_sha256",
+        "arrow_chunk_returncode",
+        "arrow_chunk_stderr_sha256",
+        "arrow_chunk_manifests_sha256",
+        "arrow_chunk_acks_sha256",
+        "arrow_chunk_acknowledged_files",
+        "published_files",
+    }
+    empty_sha = hashlib.sha256(b"").hexdigest()
+    for name, (content, supplied_size, marker) in expected.items():
+        record = contract[name]
+        if not isinstance(record, dict) or set(record) != fields:
+            raise ValueError(f"raw-cache negative record changed: {name}")
+        source = directory / f"{name}.cache"
+        if source.read_bytes() != content:
+            raise ValueError(f"raw-cache negative mutation changed: {name}")
+        if (
+            type(record["cache_bytes"]) is not int
+            or record["cache_bytes"] != len(content)
+            or record["cache_sha256"] != hashlib.sha256(content).hexdigest()
+            or type(record["expected_size_argument"]) is not int
+            or record["expected_size_argument"] != supplied_size
+            or record["stderr_marker"] != marker
+            or type(record["arrow_chunk_acknowledged_files"]) is not int
+            or record["arrow_chunk_acknowledged_files"] != 0
+            or type(record["published_files"]) is not int
+            or record["published_files"] != 0
+        ):
+            raise ValueError(f"raw-cache negative identity/boundary changed: {name}")
+        for transport in ("ndjson", "arrow", "arrow_chunk"):
+            returncode = record[f"{transport}_returncode"]
+            stderr_bytes = (directory / f"{name}.{transport.replace('_', '-')}.stderr").read_bytes()
+            if (
+                type(returncode) is not int
+                or returncode == 0
+                or marker.lower() not in stderr_bytes.decode("utf-8", "replace").lower()
+                or hashlib.sha256(stderr_bytes).hexdigest()
+                != record[f"{transport}_stderr_sha256"]
+            ):
+                raise ValueError(f"raw-cache {transport} failure changed: {name}")
+        if (directory / f"{name}.ndjson.stdout").read_bytes():
+            raise ValueError(f"raw-cache NDJSON leaked output: {name}")
+        if (directory / f"{name}.arrow.stdout").read_bytes():
+            raise ValueError(f"raw-cache Arrow leaked output: {name}")
+        manifests = directory / f"{name}.arrow-chunk.manifests.ndjson"
+        acknowledgements = directory / f"{name}.arrow-chunk.acks.ndjson"
+        if (
+            manifests.read_bytes()
+            or acknowledgements.read_bytes()
+            or record["arrow_chunk_manifests_sha256"] != empty_sha
+            or record["arrow_chunk_acks_sha256"] != empty_sha
+        ):
+            raise ValueError(f"raw-cache Arrow chunk crossed ACK boundary: {name}")
+        arrow = directory / f"{name}.arrow"
+        if arrow.exists() or arrow.with_name(arrow.name + ".part").exists():
+            raise ValueError(f"raw-cache Arrow published output: {name}")
+        chunk_dir = directory / f"{name}-arrow-chunk-output"
+        if chunk_dir.exists() and any(chunk_dir.iterdir()):
+            raise ValueError(f"raw-cache Arrow chunk retained output: {name}")
+    return {"cases": len(expected), "all_failed_before_publication": True}
+
+
 def verify(root: Path):
     contract = json.loads((root / "contract.json").read_text(encoding="utf-8"))
     result = {"scope": "synthetic fixture only", "source_sha": contract["source_sha"],
@@ -375,7 +507,63 @@ def verify(root: Path):
                     raise ValueError("frozen fixture identity mismatch: " + path.name)
             if candidate_arrow.stat().st_size != case["candidate_arrow_bytes"]:
                 raise ValueError("native Arrow parser output size changed")
+            raw_cache_results = {}
+            raw_cache_contract = case.get("candidate_raw_cache")
+            if set(raw_cache_contract or {}) != {"zstd", "lz4_frame"}:
+                raise ValueError("native raw-cache replay contract is incomplete")
+            for codec, expected in raw_cache_contract.items():
+                cache_path = directory / "cache-mechanisms" / f"{codec}.cache"
+                output_path = directory / f"candidate-{codec}-cache.ndjson"
+                if set(expected) != {
+                    "cache_bytes",
+                    "cache_sha256",
+                    "output_sha256",
+                    "arrow_bytes",
+                    "arrow_sha256",
+                    "arrow_chunks",
+                }:
+                    raise ValueError(f"{codec} raw-cache replay contract is incomplete")
+                if (
+                    cache_path.stat().st_size != expected["cache_bytes"]
+                    or hashlib.sha256(cache_path.read_bytes()).hexdigest()
+                    != expected["cache_sha256"]
+                ):
+                    raise ValueError(f"{codec} raw-cache fixture identity mismatch")
+                output_bytes = output_path.read_bytes()
+                if (
+                    hashlib.sha256(output_bytes).hexdigest()
+                    != expected["output_sha256"]
+                    or output_bytes != candidate.read_bytes()
+                ):
+                    raise ValueError(f"{codec} raw-cache parser replay changed output")
+                cache_arrow = directory / f"candidate-{codec}-cache.arrow"
+                if (
+                    cache_arrow.stat().st_size != expected["arrow_bytes"]
+                    or hashlib.sha256(cache_arrow.read_bytes()).hexdigest()
+                    != expected["arrow_sha256"]
+                ):
+                    raise ValueError(f"{codec} raw-cache Arrow identity mismatch")
+                raw_cache_results[codec] = {
+                    "cache_bytes": cache_path.stat().st_size,
+                    "rows_equal": True,
+                    "bytes_equal": True,
+                    "arrow": compare_columnar(
+                        candidate,
+                        directory / f"candidate-{codec}-cache-columnar",
+                        case["source_id"],
+                        native_arrow=cache_arrow,
+                    ),
+                    "arrow_chunks": compare_chunked_arrow(
+                        candidate,
+                        directory,
+                        directory / f"candidate-{codec}-cache-arrow-chunks-columnar",
+                        case["source_id"],
+                        expected["arrow_chunks"],
+                        output_label=f"candidate-{codec}-cache-arrow-chunks",
+                    ),
+                }
             result["transport"][mode] = {
+                "candidate_raw_cache": raw_cache_results,
                 "legacy": compare_columnar(legacy, directory / "legacy-columnar", case["source_id"]),
                 "candidate": compare_columnar(candidate, directory / "candidate-columnar", case["source_id"],
                                                 native_arrow=candidate_arrow),
@@ -391,6 +579,9 @@ def verify(root: Path):
                 legacy, candidate, directory / "decoder-differential", case["source_id"],
                 require_binary_repair=mode == "ROW")
             if mode == "ROW":
+                result["transport"][mode]["negative_raw_cache"] = (
+                    verify_negative_raw_cache(root, case)
+                )
                 legacy_rows = [json.loads(line) for line in legacy.read_text(encoding="utf-8").splitlines() if line.strip()]
                 candidate_rows = [json.loads(line) for line in candidate.read_text(encoding="utf-8").splitlines() if line.strip()]
                 result["legacy_failures"] = check_values(legacy_rows)

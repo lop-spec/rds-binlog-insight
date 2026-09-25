@@ -108,14 +108,23 @@ def candidate_command(binary, raw_path, source_id, mode):
     return command
 
 
-def run_candidate_arrow_chunks(binary, raw_path, source_id, mode, case_dir):
+def run_candidate_arrow_chunks(
+    binary,
+    raw_path,
+    source_id,
+    mode,
+    case_dir,
+    *,
+    output_label="candidate-arrow-chunks",
+    extra_args=(),
+):
     """Exercise the real manifest/ACK transport and retain byte-for-byte evidence."""
-    output_dir = (case_dir / "candidate-arrow-chunks").resolve()
+    output_dir = (case_dir / output_label).resolve()
     output_dir.mkdir()
-    manifest_path = case_dir / "candidate-arrow-chunks.manifests.ndjson"
-    ack_path = case_dir / "candidate-arrow-chunks.acks.ndjson"
-    stderr_path = case_dir / "candidate-arrow-chunks.stderr"
-    command = candidate_command(binary, raw_path, source_id, mode) + [
+    manifest_path = case_dir / f"{output_label}.manifests.ndjson"
+    ack_path = case_dir / f"{output_label}.acks.ndjson"
+    stderr_path = case_dir / f"{output_label}.stderr"
+    command = candidate_command(binary, raw_path, source_id, mode) + list(extra_args) + [
         "--output-dir", str(output_dir),
         "--chunk-format", "arrow",
         "--chunk-max-lines", "3",
@@ -251,11 +260,18 @@ def run_candidate_arrow_chunks(binary, raw_path, source_id, mode, case_dir):
 
 
 def run_failed_chunk_transport(
-    binary, source, source_id, mode, output_dir, *, chunk_format
+    binary,
+    source,
+    source_id,
+    mode,
+    output_dir,
+    *,
+    chunk_format,
+    extra_args=(),
 ):
     """ACK every published one-row chunk, then clean collector-owned files."""
     output_dir.mkdir()
-    command = candidate_command(binary, source, source_id, mode) + [
+    command = candidate_command(binary, source, source_id, mode) + list(extra_args) + [
         "--output-dir", str(output_dir),
         "--chunk-max-lines", "1",
         "--chunk-max-bytes", str(128 * 1024 * 1024),
@@ -340,6 +356,148 @@ def run_failed_chunk_transport(
         "manifests_sha256": hashlib.sha256(result.stdout).hexdigest(),
         "acks_sha256": hashlib.sha256(acknowledged).hexdigest(),
     }, acknowledged
+
+
+def raw_cache_negative_streams(cache, expected_size):
+    """Mutate each strict RDSRAW1 boundary without using the Go reader."""
+    content = bytes(cache)
+    if len(content) < 53 + 44 + 44 or content[:8] != b"RDSRAW1\n":
+        raise ValueError("valid raw-cache fixture is too short")
+    frame_at = 53
+    if content[frame_at : frame_at + 4] != b"FRM1":
+        raise ValueError("raw-cache fixture has no first frame")
+    compressed_size = struct.unpack_from("<I", content, frame_at + 8)[0]
+    footer_at = frame_at + 44 + compressed_size
+    if content[footer_at : footer_at + 4] != b"END1" or footer_at + 44 != len(content):
+        raise ValueError("raw-cache fixture has a non-canonical footer")
+
+    def changed(offset, value):
+        result = bytearray(content)
+        result[offset] = value
+        return bytes(result)
+
+    wrong_size = bytearray(content)
+    struct.pack_into("<Q", wrong_size, 9, expected_size + 1)
+    bad_frame_marker = bytearray(content)
+    bad_frame_marker[frame_at : frame_at + 4] = b"BAD1"
+    bad_footer_marker = bytearray(content)
+    bad_footer_marker[footer_at : footer_at + 4] = b"BAD1"
+    return {
+        "truncated-header": (content[:52], expected_size, "header"),
+        "bad-magic": (changed(0, content[0] ^ 0x01), expected_size, "magic"),
+        "unsupported-codec": (changed(8, 0x7F), expected_size, "codec"),
+        "wrong-identity": (changed(17, content[17] ^ 0x01), expected_size, "identity"),
+        "wrong-declared-size": (bytes(wrong_size), expected_size, "expected size"),
+        "wrong-expected-size-argument": (content, expected_size + 1, "expected size"),
+        "bad-frame-marker": (bytes(bad_frame_marker), expected_size, "frame marker"),
+        "bad-frame-sha": (changed(frame_at + 12, content[frame_at + 12] ^ 0x01), expected_size, "size/SHA256"),
+        "bad-footer-marker": (bytes(bad_footer_marker), expected_size, "frame marker"),
+        "truncated-footer": (content[:-1], expected_size, "record"),
+        "bad-final-sha": (changed(len(content) - 1, content[-1] ^ 0x01), expected_size, "final SHA256"),
+        "trailing-data": (content + b"x", expected_size, "trailing data"),
+    }
+
+
+def verify_negative_raw_cache(root, binary, cache_path, source_id, expected_size):
+    """Require raw-cache failures before any NDJSON/Arrow publication or ACK."""
+    negative = root / "negative" / "raw-cache"
+    negative.mkdir()
+    proof = {}
+    for name, (content, supplied_size, marker) in raw_cache_negative_streams(
+        cache_path.read_bytes(), expected_size
+    ).items():
+        source = negative / f"{name}.cache"
+        source.write_bytes(content)
+        raw_args = [
+            "--raw-cache-source-id",
+            source_id,
+            "--raw-cache-expected-size",
+            str(supplied_size),
+        ]
+        result = subprocess.run(
+            candidate_command(binary, source, source_id, "ROW") + raw_args,
+            capture_output=True,
+            timeout=20,
+        )
+        stderr = result.stderr.decode("utf-8", "replace")
+        (negative / f"{name}.ndjson.stdout").write_bytes(result.stdout)
+        (negative / f"{name}.ndjson.stderr").write_bytes(result.stderr)
+        if result.returncode == 0 or result.stdout:
+            raise RuntimeError(f"candidate raw-cache NDJSON accepted or emitted {name}")
+        if marker.lower() not in stderr.lower():
+            raise RuntimeError(
+                f"candidate raw-cache NDJSON {name} lacks {marker!r}: {stderr[-1000:]}"
+            )
+
+        arrow_output = negative / f"{name}.arrow"
+        arrow_result = subprocess.run(
+            candidate_command(binary, source, source_id, "ROW")
+            + raw_args
+            + ["--arrow-output", str(arrow_output)],
+            capture_output=True,
+            timeout=20,
+        )
+        arrow_stderr = arrow_result.stderr.decode("utf-8", "replace")
+        (negative / f"{name}.arrow.stdout").write_bytes(arrow_result.stdout)
+        (negative / f"{name}.arrow.stderr").write_bytes(arrow_result.stderr)
+        if arrow_result.returncode == 0 or arrow_result.stdout:
+            raise RuntimeError(f"candidate raw-cache Arrow accepted or emitted {name}")
+        if marker.lower() not in arrow_stderr.lower():
+            raise RuntimeError(
+                f"candidate raw-cache Arrow {name} lacks {marker!r}: "
+                f"{arrow_stderr[-1000:]}"
+            )
+        if arrow_output.exists() or arrow_output.with_name(
+            arrow_output.name + ".part"
+        ).exists():
+            raise RuntimeError(f"candidate raw-cache Arrow published partial {name}")
+
+        chunk_output = negative / f"{name}-arrow-chunk-output"
+        chunk_result, chunk_proof, chunk_acks = run_failed_chunk_transport(
+            binary,
+            source,
+            source_id,
+            "ROW",
+            chunk_output,
+            chunk_format="arrow",
+            extra_args=raw_args,
+        )
+        chunk_stderr = chunk_result.stderr.decode("utf-8", "replace")
+        (negative / f"{name}.arrow-chunk.manifests.ndjson").write_bytes(
+            chunk_result.stdout
+        )
+        (negative / f"{name}.arrow-chunk.acks.ndjson").write_bytes(chunk_acks)
+        (negative / f"{name}.arrow-chunk.stderr").write_bytes(chunk_result.stderr)
+        if chunk_result.returncode == 0:
+            raise RuntimeError(f"candidate raw-cache Arrow chunk accepted {name}")
+        if marker.lower() not in chunk_stderr.lower():
+            raise RuntimeError(
+                f"candidate raw-cache Arrow chunk {name} lacks {marker!r}: "
+                f"{chunk_stderr[-1000:]}"
+            )
+        if chunk_proof["acknowledged_files"] != 0 or any(chunk_output.iterdir()):
+            raise RuntimeError(
+                f"candidate raw-cache Arrow chunk published before validation: {name}"
+            )
+        proof[name] = {
+            "cache_bytes": len(content),
+            "cache_sha256": hashlib.sha256(content).hexdigest(),
+            "expected_size_argument": supplied_size,
+            "stderr_marker": marker,
+            "ndjson_returncode": result.returncode,
+            "ndjson_stderr_sha256": hashlib.sha256(result.stderr).hexdigest(),
+            "arrow_returncode": arrow_result.returncode,
+            "arrow_stderr_sha256": hashlib.sha256(arrow_result.stderr).hexdigest(),
+            "arrow_chunk_returncode": chunk_result.returncode,
+            "arrow_chunk_stderr_sha256": hashlib.sha256(
+                chunk_result.stderr
+            ).hexdigest(),
+            "arrow_chunk_manifests_sha256": chunk_proof["manifests_sha256"],
+            "arrow_chunk_acks_sha256": chunk_proof["acks_sha256"],
+            "arrow_chunk_acknowledged_files": 0,
+            "published_files": 0,
+        }
+    return proof
 
 
 def verify_negative_streams(root, binary, raw, source_id):
@@ -546,9 +704,60 @@ DELETE FROM rows_abi WHERE id=2;"""
             if any((r["start_position"], r["end_position"]) not in bounds for r in candidate_parsed):
                 raise RuntimeError("candidate emitted positions outside independent event bounds")
             from tools.benchmark_raw_cache import measure
-            measure(raw_path, case_dir / "cache-mechanisms", sha256=hashlib.sha256(raw).hexdigest(),
+            cache_dir = case_dir / "cache-mechanisms"
+            measure(raw_path, cache_dir, sha256=hashlib.sha256(raw).hexdigest(),
                     source_id=source_id, source_size=len(raw), physical_budget=16 * 1024 * 1024,
                     deadline_seconds=30)
+            raw_cache_contract = {}
+            for codec in ("zstd", "lz4_frame"):
+                cache_path = cache_dir / f"{codec}.cache"
+                cache_output = run(
+                    candidate_command(candidate, cache_path, source_id, mode) + [
+                        "--raw-cache-source-id", source_id,
+                        "--raw-cache-expected-size", str(len(raw)),
+                    ],
+                    seconds=20,
+                )
+                output_path = case_dir / f"candidate-{codec}-cache.ndjson"
+                output_path.write_bytes(cache_output)
+                if cache_output != candidate_output:
+                    raise RuntimeError(
+                        f"candidate {codec} raw-cache replay changed parser output"
+                    )
+                raw_args = [
+                    "--raw-cache-source-id",
+                    source_id,
+                    "--raw-cache-expected-size",
+                    str(len(raw)),
+                ]
+                cache_arrow = case_dir / f"candidate-{codec}-cache.arrow"
+                cache_arrow_stdout = run(
+                    candidate_command(candidate, cache_path, source_id, mode)
+                    + raw_args
+                    + ["--arrow-output", str(cache_arrow)],
+                    seconds=20,
+                )
+                if cache_arrow_stdout or not cache_arrow.is_file():
+                    raise RuntimeError(
+                        f"candidate {codec} raw-cache Arrow publication failed"
+                    )
+                cache_chunk_contract = run_candidate_arrow_chunks(
+                    candidate,
+                    cache_path,
+                    source_id,
+                    mode,
+                    case_dir,
+                    output_label=f"candidate-{codec}-cache-arrow-chunks",
+                    extra_args=raw_args,
+                )
+                raw_cache_contract[codec] = {
+                    "cache_bytes": cache_path.stat().st_size,
+                    "cache_sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
+                    "output_sha256": hashlib.sha256(cache_output).hexdigest(),
+                    "arrow_bytes": cache_arrow.stat().st_size,
+                    "arrow_sha256": hashlib.sha256(cache_arrow.read_bytes()).hexdigest(),
+                    "arrow_chunks": cache_chunk_contract,
+                }
             cases[mode] = dict(raw_bytes=len(raw), raw_sha256=hashlib.sha256(raw).hexdigest(),
                                source_id=source_id, header_events=headers, emitted_rows=len(parsed),
                                candidate_rows=len(candidate_parsed),
@@ -556,10 +765,19 @@ DELETE FROM rows_abi WHERE id=2;"""
                                candidate_sha256=hashlib.sha256(candidate_output).hexdigest(),
                                candidate_arrow_bytes=candidate_arrow.stat().st_size,
                                candidate_arrow_sha256=hashlib.sha256(candidate_arrow.read_bytes()).hexdigest(),
-                               candidate_arrow_chunks=chunk_contract)
+                               candidate_arrow_chunks=chunk_contract,
+                               candidate_raw_cache=raw_cache_contract)
             if mode == "ROW":
                 cases[mode]["negative_streams"] = verify_negative_streams(
-                    root, candidate, raw, source_id)
+                    root, candidate, raw, source_id
+                )
+                cases[mode]["negative_raw_cache"] = verify_negative_raw_cache(
+                    root,
+                    candidate,
+                    cache_dir / "zstd.cache",
+                    source_id,
+                    len(raw),
+                )
         proof = dict(cases=cases, source_sha=os.environ["GITHUB_SHA"],
                      native_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                      candidate_native_sha256=hashlib.sha256(candidate.read_bytes()).hexdigest(),

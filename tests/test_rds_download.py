@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import io
+import multiprocessing
 import sys
 import tempfile
 import threading
 import unittest
 import urllib.error
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,9 +18,10 @@ from unittest.mock import Mock, patch
 
 from app.config import Settings
 from app.credentials import CloudCredential
-from app.downloader import DownloadError, download_file
+from app.downloader import DownloadError, download_file, download_raw_cache
 from app.parser_bridge import NativeChecksumResult, ParserError
 from app.pipeline import SyncManager
+from app.raw_cache import RawCacheWriter, inspect_cache, iter_raw
 from app.rds_api import RdsApiError, RemoteBinlog
 from app.server import RequestHandler
 
@@ -33,6 +36,54 @@ def remote(url="https://fixture.invalid/internal?signature=fixture-link"):
         123, "456", "https://fixture.invalid/public", url, "", "Completed",
         "fixture-host", "fixture-request",
     )
+
+
+class _ChecksumStream:
+    def __init__(self):
+        self.data = bytearray()
+        self.aborted = False
+
+    def update(self, data):
+        self.data.extend(data)
+
+    def finish(self):
+        return NativeChecksumResult(
+            len(self.data), hashlib.sha256(self.data).hexdigest(), "fixture-crc"
+        )
+
+    def abort(self):
+        self.aborted = True
+
+
+def _response(data: bytes, status: int = 200, headers: dict[str, str] | None = None):
+    response = io.BytesIO(data)
+    response.status = status
+    response.headers = headers or {}
+    return response
+
+
+def _process_raw_cache_download(payload):
+    destination_text, marker_text, raw, source_id = payload
+    destination = Path(destination_text)
+    marker = Path(marker_text)
+
+    def response(*_args, **_kwargs):
+        with marker.open("ab") as handle:
+            handle.write(b"network\n")
+        return _response(raw)
+
+    with patch(
+        "app.downloader.urllib.request.urlopen", side_effect=response
+    ), patch("app.downloader.NativeChecksumStream", _ChecksumStream):
+        result = download_raw_cache(
+            "https://fixture.invalid/source",
+            destination,
+            source_id=source_id,
+            expected_size=len(raw),
+            expected_crc64="fixture-crc",
+            physical_budget=len(raw),
+        )
+    return result.sha256
 
 
 def manager_stub():
@@ -86,7 +137,7 @@ class CachedChecksumFailureTests(unittest.TestCase):
 
     def test_stream_start_failure_closes_http_response(self):
         with tempfile.TemporaryDirectory() as root:
-            response = Mock(status=200)
+            response = Mock(status=200, headers={})
             with patch('app.downloader.urllib.request.urlopen', return_value=response), patch('app.downloader.NativeChecksumStream', side_effect=ParserError('missing', 'PARSER_EXECUTABLE_MISSING')):
                 with self.assertRaises(DownloadError) as raised:
                     download_file('https://fixture.invalid/', Path(root)/'cache', expected_size=6, expected_crc64='')
@@ -117,6 +168,460 @@ class NativeDownloadChecksumTests(unittest.TestCase):
                 result = download_file('', path, expected_size=9, expected_crc64='11051210869376104954')
             self.assertEqual(result.sha256, hashlib.sha256(b'123456789').hexdigest())
             self.assertEqual(result.size_bytes, 9)
+            network.assert_not_called()
+
+
+class RawCacheDownloadTests(unittest.TestCase):
+    SOURCE_ID = "a" * 64
+
+    def test_fresh_download_streams_checksums_and_publishes_complete_cache(self):
+        raw = (b"compressible-binlog-source-" * 8000)
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            progress = Mock()
+            with patch("app.downloader.urllib.request.urlopen", return_value=_response(raw)), patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ):
+                result = download_raw_cache(
+                    "https://fixture.invalid/source",
+                    destination,
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                    expected_crc64="fixture-crc",
+                    physical_budget=len(raw),
+                    progress=progress,
+                )
+            self.assertEqual(result.path, destination)
+            self.assertEqual(result.sha256, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(
+                b"".join(iter_raw(destination, source_id=self.SOURCE_ID, expected_size=len(raw))),
+                raw,
+            )
+            state = inspect_cache(destination, source_id=self.SOURCE_ID, expected_size=len(raw))
+            self.assertTrue(state.complete)
+            self.assertLess(state.physical_bytes, len(raw))
+            self.assertEqual(progress.call_args.args[0], len(raw))
+            self.assertEqual(list(Path(root).glob("*.part-*")), [])
+
+    def test_concurrent_calls_share_one_bounded_publication(self):
+        raw = b"concurrent-source" * 8000
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+
+            def response(*_args, **_kwargs):
+                return _response(raw)
+
+            def download():
+                return download_raw_cache(
+                    "https://fixture.invalid/source",
+                    destination,
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                    expected_crc64="fixture-crc",
+                    physical_budget=len(raw),
+                )
+
+            with patch(
+                "app.downloader.urllib.request.urlopen", side_effect=response
+            ) as opened, patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ), ThreadPoolExecutor(max_workers=2) as workers:
+                results = list(workers.map(lambda _index: download(), range(2)))
+            self.assertEqual(opened.call_count, 1)
+            self.assertEqual([result.sha256 for result in results], [
+                hashlib.sha256(raw).hexdigest(),
+                hashlib.sha256(raw).hexdigest(),
+            ])
+            self.assertEqual(list(Path(root).glob("*.part-*")), [])
+
+    def test_processes_share_one_cross_process_publication(self):
+        raw = b"cross-process-source" * 8000
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            marker = Path(root) / "network-calls.log"
+            payload = (str(destination), str(marker), raw, self.SOURCE_ID)
+            with ProcessPoolExecutor(
+                max_workers=2,
+                mp_context=multiprocessing.get_context("spawn"),
+            ) as workers:
+                results = [
+                    worker.result(timeout=30)
+                    for worker in [
+                        workers.submit(_process_raw_cache_download, payload),
+                        workers.submit(_process_raw_cache_download, payload),
+                    ]
+                ]
+            self.assertEqual(
+                results,
+                [hashlib.sha256(raw).hexdigest(), hashlib.sha256(raw).hexdigest()],
+            )
+            self.assertEqual(marker.read_text(encoding="ascii").splitlines(), ["network"])
+            self.assertEqual(list(Path(root).glob("*.part-*")), [])
+
+    def test_resume_uses_verified_raw_offset_and_exact_content_range(self):
+        prefix = b"a" * (64 * 1024)
+        suffix = b"b" * 7000
+        raw = prefix + suffix
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            partial = Path(root) / (destination.name + ".part-old")
+            writer = RawCacheWriter(
+                partial,
+                source_id=self.SOURCE_ID,
+                expected_size=len(raw),
+                physical_budget=len(raw) * 2,
+                frame_bytes=64 * 1024,
+            )
+            writer.write(prefix)
+            writer.checkpoint()
+            writer.close()
+            response = _response(
+                suffix,
+                206,
+                {
+                    "Content-Range": f"bytes {len(prefix)}-{len(raw)-1}/{len(raw)}",
+                    "Content-Length": str(len(suffix)),
+                },
+            )
+            with patch("app.downloader.urllib.request.urlopen", return_value=response) as opened, patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ):
+                result = download_raw_cache(
+                    "https://fixture.invalid/source",
+                    destination,
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                    expected_crc64="fixture-crc",
+                    physical_budget=len(raw) * 2,
+                )
+            request = opened.call_args.args[0]
+            self.assertEqual(request.get_header("Range"), f"bytes={len(prefix)}-")
+            self.assertEqual(result.sha256, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(
+                b"".join(iter_raw(destination, source_id=self.SOURCE_ID, expected_size=len(raw))),
+                raw,
+            )
+            self.assertFalse(partial.exists())
+
+    def test_wrong_content_range_fails_closed_without_mutating_recovery(self):
+        prefix = b"a" * (64 * 1024)
+        raw_size = len(prefix) + 10
+        cases = {
+            "start": {"Content-Range": f"bytes 0-9/{raw_size}"},
+            "end": {
+                "Content-Range": f"bytes {len(prefix)}-{raw_size - 2}/{raw_size}",
+                "Content-Length": "9",
+            },
+            "total": {
+                "Content-Range": (
+                    f"bytes {len(prefix)}-{raw_size - 1}/{raw_size + 1}"
+                ),
+                "Content-Length": "10",
+            },
+            "length": {
+                "Content-Range": (
+                    f"bytes {len(prefix)}-{raw_size - 1}/{raw_size}"
+                ),
+                "Content-Length": "11",
+            },
+        }
+        for name, headers in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                destination = Path(root) / "source.rawcache"
+                partial = Path(root) / (destination.name + ".part-old")
+                writer = RawCacheWriter(
+                    partial,
+                    source_id=self.SOURCE_ID,
+                    expected_size=raw_size,
+                    physical_budget=raw_size * 2,
+                    frame_bytes=64 * 1024,
+                )
+                writer.write(prefix)
+                writer.checkpoint()
+                writer.close()
+                before = partial.read_bytes()
+                response = _response(b"b" * 10, 206, headers)
+                with patch(
+                    "app.downloader.urllib.request.urlopen",
+                    return_value=response,
+                ), patch(
+                    "app.downloader.NativeChecksumStream", _ChecksumStream
+                ):
+                    with self.assertRaises(DownloadError) as raised:
+                        download_raw_cache(
+                            "https://fixture.invalid/source",
+                            destination,
+                            source_id=self.SOURCE_ID,
+                            expected_size=raw_size,
+                            expected_crc64="fixture-crc",
+                            physical_budget=raw_size * 2,
+                        )
+                self.assertEqual(raised.exception.code, "RANGE_RESPONSE_INVALID")
+                self.assertEqual(partial.read_bytes(), before)
+                self.assertFalse(destination.exists())
+                self.assertEqual(list(Path(root).glob("*.part-*")), [partial])
+
+    def test_wrong_complete_content_length_fails_before_cache_creation(self):
+        raw = b"complete-response"
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            response = _response(
+                raw,
+                200,
+                {"Content-Length": str(len(raw) + 1)},
+            )
+            with patch(
+                "app.downloader.urllib.request.urlopen",
+                return_value=response,
+            ), patch("app.downloader.NativeChecksumStream", _ChecksumStream):
+                with self.assertRaises(DownloadError) as raised:
+                    download_raw_cache(
+                        "https://fixture.invalid/source",
+                        destination,
+                        source_id=self.SOURCE_ID,
+                        expected_size=len(raw),
+                        expected_crc64="fixture-crc",
+                        physical_budget=len(raw) * 20,
+                    )
+            self.assertEqual(raised.exception.code, "RANGE_RESPONSE_INVALID")
+            self.assertTrue(response.closed)
+            self.assertFalse(destination.exists())
+            self.assertEqual(list(Path(root).glob("*.part-*")), [])
+
+    def test_http_416_never_promotes_an_incomplete_recovery(self):
+        prefix = b"a" * (64 * 1024)
+        raw_size = len(prefix) + 10
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            partial = Path(root) / (destination.name + ".part-old")
+            writer = RawCacheWriter(
+                partial,
+                source_id=self.SOURCE_ID,
+                expected_size=raw_size,
+                physical_budget=raw_size * 2,
+                frame_bytes=64 * 1024,
+            )
+            writer.write(prefix)
+            writer.checkpoint()
+            writer.close()
+            before = partial.read_bytes()
+            error = urllib.error.HTTPError(
+                "https://fixture.invalid/source", 416, "range", {}, None
+            )
+            with patch(
+                "app.downloader.urllib.request.urlopen", side_effect=error
+            ), patch("app.downloader.NativeChecksumStream", _ChecksumStream):
+                with self.assertRaises(DownloadError) as raised:
+                    download_raw_cache(
+                        "https://fixture.invalid/source",
+                        destination,
+                        source_id=self.SOURCE_ID,
+                        expected_size=raw_size,
+                        expected_crc64="fixture-crc",
+                        physical_budget=raw_size * 2,
+                    )
+            self.assertEqual(raised.exception.code, "HTTP_416")
+            self.assertEqual(partial.read_bytes(), before)
+            self.assertFalse(destination.exists())
+
+    def test_complete_verified_frames_can_publish_without_a_live_url(self):
+        raw = b"complete-prefix" * 6000
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            partial = Path(root) / (destination.name + ".part-old")
+            writer = RawCacheWriter(
+                partial,
+                source_id=self.SOURCE_ID,
+                expected_size=len(raw),
+                physical_budget=len(raw) * 2,
+                frame_bytes=64 * 1024,
+            )
+            writer.write(raw)
+            writer.checkpoint()
+            writer.close()
+            self.assertFalse(
+                inspect_cache(
+                    partial,
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                ).complete
+            )
+            with patch("app.downloader.urllib.request.urlopen") as network, patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ):
+                result = download_raw_cache(
+                    "",
+                    destination,
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                    expected_crc64="fixture-crc",
+                    physical_budget=len(raw) * 2,
+                )
+            self.assertEqual(result.sha256, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(
+                b"".join(
+                    iter_raw(
+                        destination,
+                        source_id=self.SOURCE_ID,
+                        expected_size=len(raw),
+                    )
+                ),
+                raw,
+            )
+            self.assertFalse(partial.exists())
+            network.assert_not_called()
+
+    def test_recovery_asset_count_is_bounded_before_network(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            for index in range(16):
+                Path(root, f"{destination.name}.part-{index:02d}").write_bytes(b"")
+            with patch("app.downloader.urllib.request.urlopen") as network:
+                with self.assertRaises(DownloadError) as raised:
+                    download_raw_cache(
+                        "https://fixture.invalid/source",
+                        destination,
+                        source_id=self.SOURCE_ID,
+                        expected_size=1000,
+                        expected_crc64="fixture-crc",
+                        physical_budget=2000,
+                    )
+            self.assertEqual(raised.exception.code, "RAW_CACHE_RECOVERY_ASSET_LIMIT")
+            network.assert_not_called()
+
+    def test_forensic_bytes_exhaust_budget_before_network(self):
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            destination.write_bytes(b"corrupt" * 32)
+            with patch("app.downloader.urllib.request.urlopen") as network, patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ):
+                with self.assertLogs("app.downloader", "WARNING"):
+                    with self.assertRaises(DownloadError) as raised:
+                        download_raw_cache(
+                            "https://fixture.invalid/source",
+                            destination,
+                            source_id=self.SOURCE_ID,
+                            expected_size=1000,
+                            expected_crc64="fixture-crc",
+                            physical_budget=128,
+                        )
+            self.assertEqual(raised.exception.code, "RAW_CACHE_BUDGET_EXCEEDED")
+            self.assertFalse(destination.exists())
+            self.assertEqual(len(list(Path(root).glob("*.corrupt-*"))), 1)
+            network.assert_not_called()
+
+    def test_publish_directory_sync_failure_is_recoverable_and_bounded(self):
+        raw = b"publish-sync-source" * 8000
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            with patch(
+                "app.downloader.urllib.request.urlopen", return_value=_response(raw)
+            ), patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ), patch(
+                "app.downloader._sync_directory",
+                side_effect=OSError("injected directory fsync failure"),
+            ):
+                with self.assertRaises(DownloadError) as raised:
+                    download_raw_cache(
+                        "https://fixture.invalid/source",
+                        destination,
+                        source_id=self.SOURCE_ID,
+                        expected_size=len(raw),
+                        expected_crc64="fixture-crc",
+                        physical_budget=len(raw),
+                    )
+            self.assertEqual(raised.exception.code, "DOWNLOAD_INTERRUPTED")
+            self.assertTrue(destination.is_file())
+            self.assertEqual(len(list(Path(root).glob("*.part-*"))), 1)
+            with patch("app.downloader.urllib.request.urlopen") as network, patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ):
+                recovered = download_raw_cache(
+                    "",
+                    destination,
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                    expected_crc64="fixture-crc",
+                    physical_budget=len(raw),
+                )
+            self.assertEqual(recovered.sha256, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(list(Path(root).glob("*.part-*")), [])
+            network.assert_not_called()
+
+    def test_link_failure_retains_complete_private_cache_for_retry(self):
+        raw = b"publish-link-source" * 8000
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            with patch(
+                "app.downloader.urllib.request.urlopen", return_value=_response(raw)
+            ), patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ), patch(
+                "app.downloader._publish_cache_exclusive",
+                side_effect=OSError("injected link failure"),
+            ):
+                with self.assertRaises(DownloadError) as raised:
+                    download_raw_cache(
+                        "https://fixture.invalid/source",
+                        destination,
+                        source_id=self.SOURCE_ID,
+                        expected_size=len(raw),
+                        expected_crc64="fixture-crc",
+                        physical_budget=len(raw),
+                    )
+            self.assertEqual(raised.exception.code, "DOWNLOAD_INTERRUPTED")
+            self.assertFalse(destination.exists())
+            attempts = list(Path(root).glob("*.part-*"))
+            self.assertEqual(len(attempts), 1)
+            self.assertTrue(
+                inspect_cache(
+                    attempts[0],
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                ).complete
+            )
+            with patch("app.downloader.urllib.request.urlopen") as network, patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ):
+                recovered = download_raw_cache(
+                    "",
+                    destination,
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                    expected_crc64="fixture-crc",
+                    physical_budget=len(raw),
+                )
+            self.assertEqual(recovered.sha256, hashlib.sha256(raw).hexdigest())
+            self.assertEqual(list(Path(root).glob("*.part-*")), [])
+            network.assert_not_called()
+
+    def test_existing_complete_cache_is_reverified_without_network(self):
+        raw = b"cached-source" * 1000
+        with tempfile.TemporaryDirectory() as root:
+            destination = Path(root) / "source.rawcache"
+            with RawCacheWriter(
+                destination,
+                source_id=self.SOURCE_ID,
+                expected_size=len(raw),
+                physical_budget=len(raw) * 2,
+                frame_bytes=64 * 1024,
+            ) as writer:
+                writer.write(raw)
+                writer.finish(expected_sha256=hashlib.sha256(raw).hexdigest())
+            with patch("app.downloader.urllib.request.urlopen") as network, patch(
+                "app.downloader.NativeChecksumStream", _ChecksumStream
+            ):
+                result = download_raw_cache(
+                    "",
+                    destination,
+                    source_id=self.SOURCE_ID,
+                    expected_size=len(raw),
+                    expected_crc64="fixture-crc",
+                    physical_budget=len(raw) * 2,
+                )
+            self.assertEqual(result.size_bytes, len(raw))
             network.assert_not_called()
 
 
@@ -218,6 +723,90 @@ class PipelineDownloadTests(unittest.TestCase):
             manager._download("fixture-job", Mock(), settings(), "fixture-id", remote("sub account not auth permission"))
         download.assert_not_called()
         manager._refresh_item.assert_not_called()
+
+    def test_opt_in_raw_cache_binds_file_identity_budget_and_path(self):
+        manager = manager_stub()
+        result = SimpleNamespace(
+            path=Path("fixture-downloads/fixture-id.rawcache"),
+            size_bytes=123,
+            sha256="fixture-sha",
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "RDS_BINLOG_RAW_CACHE_ENABLED": "1",
+                "RDS_BINLOG_RAW_CACHE_MAX_RATIO": "2",
+            },
+        ), patch("app.pipeline.download_raw_cache", return_value=result) as cached, patch(
+            "app.pipeline.download_file"
+        ) as ordinary:
+            path, sha = manager._download(
+                "fixture-job", Mock(), settings(), "fixture-id", remote()
+            )
+        self.assertEqual((path, sha), (result.path, result.sha256))
+        ordinary.assert_not_called()
+        self.assertEqual(cached.call_args.args[1], result.path)
+        self.assertEqual(cached.call_args.kwargs["source_id"], "fixture-id")
+        self.assertEqual(cached.call_args.kwargs["physical_budget"], 246)
+
+    def test_flag_change_reuses_existing_asset_without_migration(self):
+        cases = (
+            ("0", ".rawcache", "download_raw_cache"),
+            ("1", ".binlog", "download_file"),
+        )
+        for enabled, suffix, expected_call in cases:
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as root:
+                manager = manager_stub()
+                manager.storage.paths["downloads"] = Path(root)
+                existing = Path(root) / f"fixture-id{suffix}"
+                existing.write_bytes(b"existing")
+                result = SimpleNamespace(
+                    path=existing, size_bytes=123, sha256="fixture-sha"
+                )
+                with patch.dict(
+                    "os.environ",
+                    {
+                        "RDS_BINLOG_RAW_CACHE_ENABLED": enabled,
+                        "RDS_BINLOG_RAW_CACHE_MAX_RATIO": "2",
+                    },
+                ), patch(
+                    "app.pipeline.download_raw_cache", return_value=result
+                ) as cached, patch(
+                    "app.pipeline.download_file", return_value=result
+                ) as ordinary:
+                    path, sha = manager._download(
+                        "fixture-job", Mock(), settings(), "fixture-id", remote()
+                    )
+                self.assertEqual((path, sha), (existing, "fixture-sha"))
+                if expected_call == "download_raw_cache":
+                    cached.assert_called_once()
+                    ordinary.assert_not_called()
+                else:
+                    ordinary.assert_called_once()
+                    cached.assert_not_called()
+
+    def test_async_progress_failure_prevents_downloaded_state(self):
+        manager = manager_stub()
+        manager.metadata.update_download_progress.side_effect = RuntimeError(
+            "durable progress failed"
+        )
+        result = SimpleNamespace(
+            path=Path("fixture.binlog"), size_bytes=123, sha256="fixture-sha"
+        )
+
+        def downloaded(_url, _path, **kwargs):
+            kwargs["progress"](123)
+            return result
+
+        with patch("app.pipeline.download_file", side_effect=downloaded), self.assertLogs(
+            "app.pipeline", "ERROR"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "durable progress failed"):
+                manager._download(
+                    "fixture-job", Mock(), settings(), "fixture-id", remote()
+                )
+        states = [call.args[1] for call in manager.metadata.set_file_state.call_args_list]
+        self.assertEqual(states, ["downloading"])
 
 
 class SettingsDownloadProbeTests(unittest.TestCase):

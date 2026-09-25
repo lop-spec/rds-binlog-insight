@@ -9,6 +9,7 @@ from unittest.mock import patch
 from tools.parser_contract_fixture import (
     mysql_query,
     negative_streams,
+    raw_cache_negative_streams,
     read_headers,
     rewrite_events,
     split_events,
@@ -73,6 +74,50 @@ class ParserContractFixtureTests(unittest.TestCase):
         for name in ('missing-fde', 'missing-table-map', 'missing-gtid', 'unknown-event'):
             with self.subTest(name=name):
                 read_headers(variants[name][0])
+
+    def test_raw_cache_negative_matrix_mutates_every_protocol_boundary(self):
+        expected_size = 10
+        payload = b"compressed"
+        cache = (
+            b"RDSRAW1\n"
+            + bytes([1])
+            + struct.pack("<Q", expected_size)
+            + b"a" * 32
+            + struct.pack("<I", 64 * 1024)
+            + b"FRM1"
+            + struct.pack("<II", expected_size, len(payload))
+            + b"b" * 32
+            + payload
+            + b"END1"
+            + struct.pack("<Q", expected_size)
+            + b"c" * 32
+        )
+        variants = raw_cache_negative_streams(cache, expected_size)
+        self.assertEqual(
+            set(variants),
+            {
+                "truncated-header",
+                "bad-magic",
+                "unsupported-codec",
+                "wrong-identity",
+                "wrong-declared-size",
+                "wrong-expected-size-argument",
+                "bad-frame-marker",
+                "bad-frame-sha",
+                "bad-footer-marker",
+                "truncated-footer",
+                "bad-final-sha",
+                "trailing-data",
+            },
+        )
+        self.assertTrue(all(marker for _content, _size, marker in variants.values()))
+        self.assertEqual(
+            variants["wrong-expected-size-argument"][1], expected_size + 1
+        )
+        self.assertEqual(variants["trailing-data"][0], cache + b"x")
+        for name, (content, _size, _marker) in variants.items():
+            if name != "wrong-expected-size-argument":
+                self.assertNotEqual(content, cache, name)
 
     def test_negative_chunk_transport_owns_output_directory_creation(self):
         calls = []

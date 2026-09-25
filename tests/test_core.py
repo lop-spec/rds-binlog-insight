@@ -1686,7 +1686,343 @@ class StorageBulkIngestTests(unittest.TestCase):
                 ),
                 [],
             )
-            storage.publish_ingested_parts(file_id, results[1][1], append=True)
+            with self.assertRaises(sqlite3.IntegrityError):
+                storage.publish_ingested_parts(
+                    file_id,
+                    results[1][1],
+                    append=True,
+                    progress=(1, "missing-job", "fixture", "fixture"),
+                )
+            self.assertEqual(
+                store.parts_in_range(
+                    start_epoch_us=epoch_us - 1,
+                    end_epoch_us=epoch_us + 1,
+                ),
+                [],
+            )
+            self.assertEqual(store.file_record(file_id)["event_count"], 0)
+            with self.assertLogs("app.metadata", level="ERROR") as mirror_logs:
+                with patch.object(
+                    store.catalog_store,
+                    "upsert_many",
+                    side_effect=OSError("injected catalog mirror failure"),
+                ):
+                    storage.publish_ingested_parts(
+                        file_id,
+                        results[1][1],
+                        append=True,
+                        progress=(1, "", "", ""),
+                    )
+            self.assertTrue(
+                any("Failed to mirror embedded part catalogs" in line for line in mirror_logs.output)
+            )
+            self.assertEqual(
+                len(
+                    store.parts_in_range(
+                        start_epoch_us=epoch_us - 1,
+                        end_epoch_us=epoch_us + 1,
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(store.file_record(file_id)["event_count"], 1)
+            published_path = str(results[1][1][0]["path"])
+            fallback_catalog = store.part_catalogs([published_path])[published_path]
+            self.assertIn("audit_db", fallback_catalog["databases"])
+            self.assertIn("orders", fallback_catalog["tables"])
+
+    def test_private_body_sync_failure_never_publishes_or_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory) / "data"
+            store = MetadataStore(data_root / "metadata.sqlite3")
+            settings = Settings(db_instance_id="rm-test000001")
+            item = remote("mysql-bin.000001", "2026-07-27T01:00:00Z")
+            file_id, _ = store.upsert_remote(settings, item)
+            storage = EventStorage(store, data_root)
+            epoch_us = int(time.time() * 1_000_000)
+            ndjson_path = storage.paths["staging"] / "sync-failure.ndjson"
+            ndjson_path.write_text(
+                json.dumps(
+                    {
+                        "event_id": "event-sync-failure",
+                        "event_epoch_us": epoch_us,
+                        "operation": "INSERT",
+                        "database_name": "audit_db",
+                        "table_name": "orders",
+                        "start_position": 1,
+                        "end_position": 2,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.object(
+                storage,
+                "_sync_file",
+                side_effect=OSError("injected body fsync failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "injected body fsync failure"):
+                    storage.ingest_ndjson_file(
+                        file_id=file_id,
+                        instance_id=settings.db_instance_id,
+                        host_instance_id=item.host_instance_id,
+                        source_file_name=item.log_file_name,
+                        ndjson_path=ndjson_path,
+                        part_key="000000",
+                        expected_rows=1,
+                        publish_metadata=False,
+                    )
+
+            self.assertEqual(list(storage.paths["events"].rglob("*.parquet")), [])
+            self.assertEqual(
+                store.parts_in_range(
+                    start_epoch_us=epoch_us - 1,
+                    end_epoch_us=epoch_us + 1,
+                ),
+                [],
+            )
+
+    def test_private_body_directory_and_version_failures_leave_no_visibility(self) -> None:
+        real_replace = os.replace
+        for failure in ("directory-fsync", "version-replace"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                data_root = Path(directory) / "data"
+                store = MetadataStore(data_root / "metadata.sqlite3")
+                settings = Settings(db_instance_id="rm-test000001")
+                item = remote("mysql-bin.000001", "2026-07-27T01:00:00Z")
+                file_id, _ = store.upsert_remote(settings, item)
+                storage = EventStorage(store, data_root)
+                real_write_version = storage._write_body_version
+                version_attempts: list[Path] = []
+
+                def write_version(path, sha256):
+                    version_attempts.append(path)
+                    return real_write_version(path, sha256)
+
+                epoch_us = int(time.time() * 1_000_000)
+                ndjson_path = storage.paths["staging"] / "durability-failure.ndjson"
+                ndjson_path.write_text(
+                    json.dumps(
+                        {
+                            "event_id": f"event-{failure}",
+                            "event_epoch_us": epoch_us,
+                            "operation": "INSERT",
+                            "database_name": "audit_db",
+                            "table_name": "orders",
+                            "start_position": 1,
+                            "end_position": 2,
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                def replace_version(source, destination):
+                    if str(destination).endswith(".version"):
+                        raise OSError("injected version replace failure")
+                    return real_replace(source, destination)
+
+                patches = (
+                    patch.object(
+                        storage,
+                        "_sync_directory",
+                        side_effect=OSError("injected directory fsync failure"),
+                    )
+                    if failure == "directory-fsync"
+                    else patch("app.storage.os.replace", side_effect=replace_version)
+                )
+                with patches, patch.object(
+                    storage,
+                    "_write_body_version",
+                    side_effect=write_version,
+                ), self.assertRaisesRegex(OSError, "injected"):
+                    storage.ingest_ndjson_file(
+                        file_id=file_id,
+                        instance_id=settings.db_instance_id,
+                        host_instance_id=item.host_instance_id,
+                        source_file_name=item.log_file_name,
+                        ndjson_path=ndjson_path,
+                        part_key="000000",
+                        expected_rows=1,
+                        publish_metadata=False,
+                    )
+
+                if failure == "directory-fsync":
+                    self.assertEqual(version_attempts, [])
+                else:
+                    self.assertEqual(len(version_attempts), 1)
+                self.assertEqual(list(storage.paths["events"].rglob("*.parquet")), [])
+                self.assertEqual(list(storage.paths["locks"].glob("*.version")), [])
+                self.assertEqual(list(storage.paths["locks"].glob("*.tmp")), [])
+                self.assertEqual(
+                    store.parts_in_range(
+                        start_epoch_us=epoch_us - 1,
+                        end_epoch_us=epoch_us + 1,
+                    ),
+                    [],
+                )
+
+    def test_private_body_version_gate_and_retry_are_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory) / "data"
+            store = MetadataStore(data_root / "metadata.sqlite3")
+            settings = Settings(db_instance_id="rm-test000001")
+            item = remote("mysql-bin.000001", "2026-07-27T01:00:00Z")
+            file_id, _ = store.upsert_remote(settings, item)
+            storage = EventStorage(store, data_root)
+            epoch_us = int(time.time() * 1_000_000)
+            ndjson_path = storage.paths["staging"] / "retry.ndjson"
+            ndjson_path.write_text(
+                json.dumps(
+                    {
+                        "event_id": "event-retry",
+                        "event_epoch_us": epoch_us,
+                        "operation": "INSERT",
+                        "database_name": "audit_db",
+                        "table_name": "orders",
+                        "start_position": 1,
+                        "end_position": 2,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            def ingest() -> tuple[int, list[dict[str, object]]]:
+                return storage.ingest_ndjson_file(
+                    file_id=file_id,
+                    instance_id=settings.db_instance_id,
+                    host_instance_id=item.host_instance_id,
+                    source_file_name=item.log_file_name,
+                    ndjson_path=ndjson_path,
+                    part_key="000000",
+                    expected_rows=1,
+                    publish_metadata=False,
+                )
+
+            count, parts = ingest()
+            self.assertEqual(count, 1)
+            body = Path(parts[0]["path"])
+            storage._body_version_path(body).write_text(
+                "0" * 64 + "\n", encoding="ascii"
+            )
+            with self.assertRaises(StorageError) as error:
+                storage.publish_ingested_parts(
+                    file_id,
+                    parts,
+                    append=True,
+                    progress=(1, "", "", ""),
+                )
+            self.assertEqual(error.exception.code, "PART_BODY_NOT_DURABLE")
+            self.assertEqual(
+                store.parts_in_range(
+                    start_epoch_us=epoch_us - 1,
+                    end_epoch_us=epoch_us + 1,
+                ),
+                [],
+            )
+
+            retry_count, retry_parts = ingest()
+            self.assertEqual(retry_count, 1)
+            self.assertEqual(retry_parts[0]["path"], parts[0]["path"])
+            self.assertEqual(retry_parts[0]["sha256"], parts[0]["sha256"])
+            restarted_storage = EventStorage(store, data_root)
+            restarted_storage.publish_ingested_parts(
+                file_id,
+                retry_parts,
+                append=True,
+                progress=(1, "", "", ""),
+            )
+            restarted_storage.publish_ingested_parts(
+                file_id,
+                retry_parts,
+                append=True,
+                progress=(1, "", "", ""),
+            )
+            self.assertEqual(store.file_record(file_id)["event_count"], 1)
+            self.assertEqual(
+                len(
+                    store.parts_in_range(
+                        start_epoch_us=epoch_us - 1,
+                        end_epoch_us=epoch_us + 1,
+                    )
+                ),
+                1,
+            )
+
+    def test_concurrent_publication_holds_the_body_lock_through_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_root = Path(directory) / "data"
+            store = MetadataStore(data_root / "metadata.sqlite3")
+            settings = Settings(db_instance_id="rm-test000001")
+            item = remote("mysql-bin.000001", "2026-07-27T01:00:00Z")
+            file_id, _ = store.upsert_remote(settings, item)
+            storage = EventStorage(store, data_root)
+            epoch_us = int(time.time() * 1_000_000)
+            ndjson_path = storage.paths["staging"] / "concurrent-publish.ndjson"
+            ndjson_path.write_text(
+                json.dumps(
+                    {
+                        "event_id": "event-concurrent-publish",
+                        "event_epoch_us": epoch_us,
+                        "operation": "INSERT",
+                        "database_name": "audit_db",
+                        "table_name": "orders",
+                        "start_position": 1,
+                        "end_position": 2,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            _count, parts = storage.ingest_ndjson_file(
+                file_id=file_id,
+                instance_id=settings.db_instance_id,
+                host_instance_id=item.host_instance_id,
+                source_file_name=item.log_file_name,
+                ndjson_path=ndjson_path,
+                part_key="000000",
+                expected_rows=1,
+                publish_metadata=False,
+            )
+            original = store.upsert_parts
+            state_lock = threading.Lock()
+            start = threading.Barrier(2)
+            active = 0
+            maximum = 0
+
+            def delayed_upsert(*args, **kwargs):
+                nonlocal active, maximum
+                with state_lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                try:
+                    time.sleep(0.05)
+                    return original(*args, **kwargs)
+                finally:
+                    with state_lock:
+                        active -= 1
+
+            def publish():
+                start.wait(timeout=5)
+                storage.publish_ingested_parts(
+                    file_id,
+                    [dict(parts[0])],
+                    append=True,
+                    progress=(1, "", "", ""),
+                )
+
+            with patch.object(store, "upsert_parts", side_effect=delayed_upsert):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(publish) for _ in range(2)]
+                    for future in futures:
+                        future.result(timeout=10)
+            self.assertEqual(maximum, 1)
+            self.assertEqual(store.file_record(file_id)["event_count"], 1)
             self.assertEqual(
                 len(
                     store.parts_in_range(
@@ -5212,6 +5548,10 @@ class PipelinePrefetchTests(unittest.TestCase):
                         storage,
                         "ingest_ndjson_file",
                         side_effect=ingest,
+                    ),
+                    patch.object(
+                        storage,
+                        "publish_ingested_parts",
                     ),
                     patch.object(
                         storage,

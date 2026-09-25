@@ -1461,8 +1461,10 @@ func (x *extractor) parsePath(path string) error {
 func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
 	flags := flag.NewFlagSet("binlog-parser", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	input := flags.String("input", "", "path to a MySQL binlog or compressed archive")
+	input := flags.String("input", "", "path to a MySQL binlog, compressed archive, or verified raw cache")
 	sourceFileID := flags.String("source-file-id", "", "stable source-file identifier")
+	rawCacheSourceID := flags.String("raw-cache-source-id", "", "expected lowercase SHA256 identity in an RDSRAW1 cache")
+	rawCacheExpectedSize := flags.Int64("raw-cache-expected-size", -1, "expected uncompressed source bytes in an RDSRAW1 cache")
 	flavor := flags.String("flavor", "mysql", "binlog flavor: mysql or mariadb")
 	outputDir := flags.String("output-dir", "", "publish atomic parser chunks and emit manifests")
 	chunkFormat := flags.String("chunk-format", "ndjson", "output-dir transport: ndjson or arrow")
@@ -1502,6 +1504,35 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	if strings.TrimSpace(*arrowOutputPath) != "" && strings.TrimSpace(*outputDir) != "" {
 		fmt.Fprintln(stderr, "--arrow-output and --output-dir are mutually exclusive")
 		return 2
+	}
+	rawCacheSourceProvided := false
+	rawCacheSizeProvided := false
+	flags.Visit(func(value *flag.Flag) {
+		switch value.Name {
+		case "raw-cache-source-id":
+			rawCacheSourceProvided = true
+		case "raw-cache-expected-size":
+			rawCacheSizeProvided = true
+		}
+	})
+	rawCacheEnabled := rawCacheSourceProvided || rawCacheSizeProvided
+	if rawCacheEnabled {
+		if !rawCacheSourceProvided || !rawCacheSizeProvided {
+			fmt.Fprintln(stderr, "--raw-cache-source-id and --raw-cache-expected-size are required together")
+			return 2
+		}
+		if *rawCacheExpectedSize < 0 {
+			fmt.Fprintln(stderr, "--raw-cache-expected-size must be non-negative")
+			return 2
+		}
+		if *rawCacheSourceID != *sourceFileID {
+			fmt.Fprintln(stderr, "--raw-cache-source-id must equal --source-file-id")
+			return 2
+		}
+		if _, err := parseRawCacheIdentity(*rawCacheSourceID); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
 	}
 	normalizedChunkFormat := strings.ToLower(strings.TrimSpace(*chunkFormat))
 	if normalizedChunkFormat != "ndjson" && normalizedChunkFormat != "arrow" {
@@ -1572,7 +1603,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	extractor.slim = *slim
 	extractor.requireGTID = *requireGTID
 	extractor.requireTableMap = *requireTableMap
-	if err := extractor.parsePath(*input); err != nil {
+	var parseErr error
+	if rawCacheEnabled {
+		parseErr = extractor.parseRawCachePath(*input, *rawCacheSourceID, *rawCacheExpectedSize)
+	} else {
+		parseErr = extractor.parsePath(*input)
+	}
+	if parseErr != nil {
 		if ndjsonChunks != nil {
 			ndjsonChunks.Abort()
 		}
@@ -1582,7 +1619,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		if arrowOutput != nil {
 			arrowOutput.Abort()
 		}
-		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, parseErr)
 		return 1
 	}
 	if ndjsonChunks != nil {

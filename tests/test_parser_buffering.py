@@ -469,6 +469,37 @@ class ParserBufferingTests(unittest.TestCase):
         position = arrow.index("--chunk-format")
         self.assertEqual(arrow[position + 1], "arrow")
 
+    def test_raw_cache_command_binds_source_identity_and_original_size(self) -> None:
+        parser = Path("/fixture/binlog-parser")
+        source_id = "a" * 64
+        with patch("app.parser_bridge.parser_executable", return_value=parser):
+            command = _parser_command(
+                Path("/fixture/source.rawcache"),
+                source_id,
+                "mysql",
+                raw_cache_expected_size=987654,
+            )
+            with self.assertRaises(ParserError) as bad_identity:
+                _parser_command(
+                    Path("/fixture/source.rawcache"),
+                    "not-a-sha",
+                    "mysql",
+                    raw_cache_expected_size=1,
+                )
+            with self.assertRaises(ParserError) as bad_size:
+                _parser_command(
+                    Path("/fixture/source.rawcache"),
+                    source_id,
+                    "mysql",
+                    raw_cache_expected_size=-1,
+                )
+        identity_at = command.index("--raw-cache-source-id")
+        size_at = command.index("--raw-cache-expected-size")
+        self.assertEqual(command[identity_at + 1], source_id)
+        self.assertEqual(command[size_at + 1], "987654")
+        self.assertEqual(bad_identity.exception.code, "PARSER_RAW_CACHE_INPUT_INVALID")
+        self.assertEqual(bad_size.exception.code, "PARSER_RAW_CACHE_INPUT_INVALID")
+
     def test_collector_defaults_to_arrow_with_explicit_ndjson_rollback(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("RDS_BINLOG_PARSER_TRANSPORT", None)

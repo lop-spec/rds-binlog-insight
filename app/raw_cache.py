@@ -2,8 +2,9 @@
 
 The source SHA/CRC and file publication remain the caller's responsibility.
 Recovery never truncates or overwrites an existing asset: verified frames are
-copied into a distinct, exclusive destination. No production switch uses this
-format until the native reader and whole-file publication gates are verified.
+copied into a distinct, exclusive destination. The native reader and pipeline
+integration remain default-off candidate code; enabling or deploying them is a
+separate operational decision and does not relax whole-file publication gates.
 """
 from __future__ import annotations
 
@@ -128,17 +129,35 @@ def inspect_cache(path: Path, *, source_id: str, expected_size: int) -> CacheSta
     raise RawCacheError("raw cache ended without a verification result")
 
 
+def _iter_raw(path: Path, *, source_id: str, expected_size: int,
+              require_complete: bool) -> Iterator[bytes]:
+    with Path(path).open("rb") as handle:
+        for record in _records(handle, source_id=source_id,
+                               expected_size=expected_size,
+                               require_complete=require_complete):
+            if isinstance(record, bytes):
+                yield record
+
+
 def iter_raw(path: Path, *, source_id: str, expected_size: int) -> Iterator[bytes]:
     """Yield verified frames; exhausting the iterator verifies the final footer.
 
     Frames are private input until full consumption AND source CRC validation.
     A consumer stopping early has not verified the complete source.
     """
-    with Path(path).open("rb") as handle:
-        for record in _records(handle, source_id=source_id,
-                               expected_size=expected_size, require_complete=True):
-            if isinstance(record, bytes):
-                yield record
+    yield from _iter_raw(path, source_id=source_id, expected_size=expected_size,
+                         require_complete=True)
+
+
+def iter_verified_prefix(path: Path, *, source_id: str,
+                         expected_size: int) -> Iterator[bytes]:
+    """Yield only complete verified frames from an incomplete recovery asset.
+
+    This does not prove source completion and must only seed a checksum stream
+    whose suffix is fetched with a validated HTTP Range response.
+    """
+    yield from _iter_raw(path, source_id=source_id, expected_size=expected_size,
+                         require_complete=False)
 
 
 class RawCacheWriter:

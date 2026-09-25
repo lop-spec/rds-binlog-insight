@@ -72,6 +72,7 @@ jobs:
           parser/build/binlog-parser-linux-amd64 --help 2>&1 | grep -q -- "-require-gtid"
           parser/build/binlog-parser-linux-amd64 --help 2>&1 | grep -q -- "-arrow-output"
           parser/build/binlog-parser-linux-amd64 --help 2>&1 | grep -q -- "-chunk-format"
+          parser/build/binlog-parser-linux-amd64 --help 2>&1 | grep -q -- "-raw-cache-source-id"
       - name: Validate the root Docker parser source stage without publishing
         run: |
           image="local/rds-binlog-parser-contract:${GITHUB_SHA}"

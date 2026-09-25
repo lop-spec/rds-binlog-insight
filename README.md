@@ -17,6 +17,15 @@
 - 发现器保留冷热文件公平准入，各选定文件组按 `LogBeginTime → LogEndTime → LogFileName`
   排序；可见性与提交遵循准入顺序，不因后续文件先解析完而提前提交。
 - 支持断点续传、文件大小、SHA-256、RDS CRC64-ECMA/XZ 校验。
+- 候选分支可通过 `RDS_BINLOG_RAW_CACHE_ENABLED=1` 把新下载保存为有界独立帧的
+  无损 `.rawcache`；默认关闭，`RDS_BINLOG_RAW_CACHE_MAX_RATIO` 默认 `0.385`，
+  超出物理预算失败关闭。Range 恢复只使用已验证的原始字节 offset；开放式 `206`
+  必须从该 offset 精确覆盖到已知 EOF，并核对总大小和可用 `Content-Length`。完整
+  `200` 的可用 `Content-Length` 也必须与已知原始大小一致；协议不符时在创建 cache
+  前失败关闭。每帧、footer、完整原始 SHA 和 RDS CRC 全部通过后才发布。
+  旧 `.binlog`/partial 与已存在资产继续原样复用，不因开关切换迁移或删除。
+  Go parser 直接有界重放 ZSTD/LZ4 frame，先验证整个 cache，再进入既有容器探测；
+  cache 完整不等于 parser、archive 或查询可见完成。这是未部署候选，不是压缩率或十倍结论。
 - 支持原始 Binlog、`.gz`、`.tar(.gz)`、`.zip`、`.zst`；压缩包条目按流读取。
 - 下载、解析/Parquet 与 OSS 归档使用独立有界执行池。默认最多两个文件处理通道、
   两个转换进程；每个 DuckDB 转换连接使用单线程。仓库默认 Compose 的主服务
@@ -30,8 +39,12 @@
   sequence-bound ACK控制背压，ACK只表示collector有界接管，不表示持久化完成。
   每通道预取1批、最多2个outstanding文件，即预留256 MiB；两个通道最多
   512 MiB，768 MiB共享准入预算在1 GiB暂存盘内另留256 MiB余量。
-  DuckDB按同一47字段规范化路径导入并核对manifest行数，成功消费后删除IPC。
-  `RDS_BINLOG_PARSER_TRANSPORT=ndjson`保留显式回滚路径。
+  DuckDB按同一47字段规范化路径导入并核对manifest行数。在 `_part_body_lock` 内先
+  replace并fsync全部Parquet正文、同步正文目录和events目录，再持久化`.version`文件
+  及目录；之后才把part、SQLite catalog真值、
+  文件event_count与job事件放入同一个 `BEGIN IMMEDIATE` 事务；失败整体回滚且可幂等重试。
+  catalog压缩镜像仍是带revision/SHA fence的可恢复副本，不冒充跨库原子事务。
+  成功消费后才删除IPC；`RDS_BINLOG_PARSER_TRANSPORT=ndjson`保留显式回滚路径。
 - 保存 INSERT / UPDATE / DELETE 行前后值、DDL/Query、GTID、事务、位置、服务端 ID 等。
 - 新写入与最近 1 天的 Parquet 使用 ZSTD 1；确认同步已追平、没有待处理
   Binlog 且没有查询压力后，后台才单线程、一次一个分片转换为 ZSTD 9。
@@ -235,10 +248,12 @@ binlog 的争用风险推断，界面同样如实标注：
   不保存事件正文，只保存聚合计数、直方图和 TopN 明细。
 - `events/event_date=YYYY-MM-DD/*.parquet`：尚未完成 OSS 大小与 SHA-256 回读
   校验的临时 Parquet；校验完成后立即删除，不等待后台索引。
-- `downloads/`：尚未完成解析的临时下载。
+- `downloads/`：尚未完成解析的临时下载。默认仍是现有 `.binlog`；候选开关启用后，
+  没有旧恢复资产的新下载使用 `.rawcache`，失败恢复/取证资产同时受16项与物理预算约束。
 - `staging/`：默认 Compose 使用独立 1 GiB RAM 暂存盘承载最多两个 Go 解析通道的
-  有界 NDJSON；只有完整 `.ndjson` 会交给转换进程，未完成的 `.part`
-  在失败收尾时清理。它不保存唯一数据，容器异常后从持久化原 Binlog 重试。
+  有界 Arrow IPC chunk；显式回滚时使用有界 NDJSON chunk。只有原子发布且通过严格
+  manifest/行数检查的文件会交给转换进程，未完成的 `.part` 在失败收尾时清理。
+  它不保存唯一数据，容器异常后从持久化原 Binlog 或完整 raw-cache 重试。
 - `scratch/`：DuckDB/Arrow 的临时溢写目录，位于 `/data` 的 NVMe 卷；
   不再使用容器 256 MiB 的 `/tmp` 内存盘承载并行转换。
 - `query-cache/`、`cache/`：旧版正文缓存目录；升级后自动清空，不再写入。

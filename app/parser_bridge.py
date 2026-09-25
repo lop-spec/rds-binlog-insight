@@ -148,6 +148,7 @@ def _parser_command(
     chunk_format: str = PARSER_TRANSPORT_NDJSON,
     max_lines: int = NATIVE_CHUNK_MAX_LINES,
     max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
+    raw_cache_expected_size: int | None = None,
 ) -> list[str]:
     command = [
         str(parser_executable()),
@@ -158,6 +159,22 @@ def _parser_command(
         "--flavor",
         flavor,
     ]
+    if raw_cache_expected_size is not None:
+        if type(raw_cache_expected_size) is not int or raw_cache_expected_size < 0:
+            raise ParserError("原文件压缩缓存大小无效", "PARSER_RAW_CACHE_INPUT_INVALID")
+        if (
+            len(source_file_id) != 64
+            or any(character not in "0123456789abcdef" for character in source_file_id)
+        ):
+            raise ParserError("原文件压缩缓存身份无效", "PARSER_RAW_CACHE_INPUT_INVALID")
+        command.extend(
+            [
+                "--raw-cache-source-id",
+                source_file_id,
+                "--raw-cache-expected-size",
+                str(raw_cache_expected_size),
+            ]
+        )
     if output_dir is not None:
         selected_format = parser_transport_format(chunk_format)
         command.extend(["--output-dir", str(output_dir)])
@@ -534,6 +551,7 @@ def parse_native_parser_chunks(
     max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
     cancel_event: threading.Event | None = None,
     no_progress_seconds: float | None = None,
+    raw_cache_expected_size: int | None = None,
 ) -> Iterator[ParserChunk]:
     """Consume atomic Go-published chunks under the manifest/ACK protocol."""
 
@@ -573,6 +591,7 @@ def parse_native_parser_chunks(
                     chunk_format=selected_format,
                     max_lines=max_lines,
                     max_bytes=max_bytes,
+                    raw_cache_expected_size=raw_cache_expected_size,
                 ),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -866,6 +885,7 @@ def _parse_parser_chunks_buffered(
     max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
     max_prefetch: int = NATIVE_CHUNK_PREFETCH,
     no_progress_seconds: float | None = None,
+    raw_cache_expected_size: int | None = None,
 ) -> Iterator[ParserChunk]:
     messages: queue.Queue[tuple[str, object]] = queue.Queue(
         maxsize=max(1, int(max_prefetch))
@@ -899,6 +919,7 @@ def _parse_parser_chunks_buffered(
             max_bytes=max_bytes,
             cancel_event=cancel,
             no_progress_seconds=no_progress_seconds,
+            raw_cache_expected_size=raw_cache_expected_size,
         )
         try:
             while acquire_outstanding_slot():
@@ -1032,6 +1053,7 @@ def parse_parser_chunks_buffered(
     max_bytes: int = NATIVE_CHUNK_MAX_BYTES,
     max_prefetch: int = NATIVE_CHUNK_PREFETCH,
     no_progress_seconds: float | None = None,
+    raw_cache_expected_size: int | None = None,
 ) -> Iterator[ParserChunk]:
     selected_format = parser_transport_format(chunk_format)
     source_file_id = _validate_chunk_source_file_id(source_file_id)
@@ -1063,6 +1085,7 @@ def parse_parser_chunks_buffered(
             max_bytes=max_bytes,
             max_prefetch=max_prefetch,
             no_progress_seconds=no_progress_seconds,
+            raw_cache_expected_size=raw_cache_expected_size,
         )
         completed = True
     finally:

@@ -1883,6 +1883,35 @@ class MetadataStore:
                 f"UPDATE binlog_files SET {', '.join(updates)} WHERE id = ?", values
             )
 
+    @staticmethod
+    def _record_file_chunk_progress_conn(
+        conn: sqlite3.Connection,
+        file_id: str,
+        event_count: int,
+        *,
+        job_id: str,
+        message: str,
+        event_message: str,
+        now_text: str,
+    ) -> None:
+        conn.execute(
+            "UPDATE binlog_files SET state = 'parsing', updated_at = ?, "
+            "error_code = '', error_message = '', event_count = ? "
+            "WHERE id = ?",
+            (now_text, int(event_count), file_id),
+        )
+        if job_id:
+            conn.execute(
+                "UPDATE jobs SET message = ? WHERE id = ?",
+                (message, job_id),
+            )
+            conn.execute(
+                "INSERT INTO job_events "
+                "(job_id, level, code, message, created_at) "
+                "VALUES (?, 'info', 'FILE_CHUNK_PUBLISHED', ?, ?)",
+                (job_id, event_message, now_text),
+            )
+
     def record_file_chunk_progress(
         self,
         file_id: str,
@@ -1892,33 +1921,24 @@ class MetadataStore:
         message: str = "",
         event_message: str = "",
     ) -> None:
-        """Commit chunk progress once, without weakening FULL durability.
+        """Commit standalone progress with FULL SQLite durability.
 
-        Parts are published before this call; final storage/visibility and raw
-        deletion still belong to the existing file commit boundary. An empty
-        job_id records a background chunk without changing the visible job.
+        Parser ingestion uses ``upsert_parts(..., progress=...)`` so part
+        metadata, embedded catalogs and this progress share one transaction.
         """
         now_text = utc_now_text()
         with self._write_lock, self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute(
-                    "UPDATE binlog_files SET state = 'parsing', updated_at = ?, "
-                    "error_code = '', error_message = '', event_count = ? "
-                    "WHERE id = ?",
-                    (now_text, int(event_count), file_id),
+                self._record_file_chunk_progress_conn(
+                    conn,
+                    file_id,
+                    event_count,
+                    job_id=job_id,
+                    message=message,
+                    event_message=event_message,
+                    now_text=now_text,
                 )
-                if job_id:
-                    conn.execute(
-                        "UPDATE jobs SET message = ? WHERE id = ?",
-                        (message, job_id),
-                    )
-                    conn.execute(
-                        "INSERT INTO job_events "
-                        "(job_id, level, code, message, created_at) "
-                        "VALUES (?, 'info', 'FILE_CHUNK_PUBLISHED', ?, ?)",
-                        (job_id, event_message, now_text),
-                    )
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -2007,6 +2027,8 @@ class MetadataStore:
         self,
         file_id: str,
         parts: list[dict[str, Any]],
+        *,
+        progress: tuple[int, str, str, str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         if not parts:
             return {}
@@ -2148,6 +2170,17 @@ class MetadataStore:
                     ],
                 )
                 self._upsert_part_catalogs(conn, parts, now)
+                if progress is not None:
+                    event_count, job_id, message, event_message = progress
+                    self._record_file_chunk_progress_conn(
+                        conn,
+                        file_id,
+                        event_count,
+                        job_id=job_id,
+                        message=message,
+                        event_message=event_message,
+                        now_text=now,
+                    )
                 committed_parts = self._committed_part_rows(conn, parts)
                 conn.execute("COMMIT")
             except Exception:

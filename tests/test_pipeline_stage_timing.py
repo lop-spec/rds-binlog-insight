@@ -20,11 +20,11 @@ from tests.test_core import remote
 class PipelineStageTimingTests(unittest.TestCase):
     def run_fixture(self, *, detached=True, empty=False, archive_error=False,
                     visible=False, progress_error=False, transport="ndjson",
-                    persisted_rows=1, cleanup_error=False):
+                    persisted_rows=1, cleanup_error=False, raw_cache=False):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
-        raw = root / 'fixture.binlog'
+        raw = root / ('fixture.rawcache' if raw_cache else 'fixture.binlog')
         raw.write_bytes(b'original raw must survive until commit')
         paths = []
         for index in range(0 if empty else 3):
@@ -40,13 +40,14 @@ class PipelineStageTimingTests(unittest.TestCase):
         ]
         manager = SyncManager.__new__(SyncManager)
         manager.metadata = Mock()
+        publish = Mock()
         if progress_error:
-            manager.metadata.record_file_chunk_progress.side_effect = RuntimeError('progress commit failed')
+            publish.side_effect = RuntimeError('progress commit failed')
         manager.storage = SimpleNamespace(
             paths={'downloads': root, 'staging': root, 'root': root},
             ingest_ndjson_file=Mock(return_value=(persisted_rows, [])),
             ingest_arrow_file=Mock(return_value=(persisted_rows, [])),
-            publish_ingested_parts=Mock(), finalize_file_parts=Mock())
+            publish_ingested_parts=publish, finalize_file_parts=Mock())
         manager._event = Mock()
         manager._commit_prepared = Mock()
         manager._archive_parts = Mock()
@@ -77,7 +78,7 @@ class PipelineStageTimingTests(unittest.TestCase):
             patch.object(Path, 'unlink', side_effect=OSError('fixture cleanup failed'))
             if cleanup_error else nullcontext()
         )
-        with patch.object(pipeline, 'parse_parser_chunks_buffered', return_value=iter(chunks)), \
+        with patch.object(pipeline, 'parse_parser_chunks_buffered', return_value=iter(chunks)) as parser, \
                 patch.object(pipeline.LOGGER, 'info', self.stage_log), \
                 patch.object(pipeline.time, 'monotonic', side_effect=lambda: next(sequence) / 100), \
                 unlink_context:
@@ -88,6 +89,7 @@ class PipelineStageTimingTests(unittest.TestCase):
                 query_visible_event=visible_event,
                 transform_submitter=transform if detached else None,
                 archive_submitter=archive if detached else None)
+        self.parser_call = parser
         rows = [json.loads(c.args[1]) for c in self.stage_log.call_args_list
                 if c.args[0] == 'FILE_STAGE_TIMINGS %s']
         self.assertEqual(len(rows), 1)
@@ -112,6 +114,13 @@ class PipelineStageTimingTests(unittest.TestCase):
         manager.metadata.set_file_state.assert_called_with('file', 'stored', event_count=len(paths))
         return metrics
 
+    def test_raw_cache_parser_input_is_bound_to_original_remote_size(self):
+        self.run_fixture(raw_cache=True)
+        self.assertEqual(
+            self.parser_call.call_args.kwargs["raw_cache_expected_size"],
+            remote('mysql-bin.fixture', '2026-07-29T01:00:00Z').file_size,
+        )
+
     def test_detached_phases_are_disjoint_and_keep_commit_boundary(self):
         metrics = self.run_fixture()
         self.assertEqual(metrics['transform_mode'], 'detached')
@@ -120,28 +129,37 @@ class PipelineStageTimingTests(unittest.TestCase):
             self.assertGreater(metrics[name], 0)
         self.assertEqual(self.manager.storage.publish_ingested_parts.call_count, 3)
 
-    def test_visible_chunks_record_each_progress_and_log_exactly_once(self):
+    def test_visible_chunks_merge_parts_catalog_and_progress_once(self):
         self.run_fixture(visible=True)
-        calls = self.manager.metadata.record_file_chunk_progress.call_args_list
-        self.assertEqual([c.args for c in calls], [('file', 1), ('file', 2), ('file', 3)])
+        calls = self.manager.storage.publish_ingested_parts.call_args_list
+        self.assertEqual([c.args[0] for c in calls], ['file', 'file', 'file'])
         logs = [c for c in self.stage_log.call_args_list
                 if len(c.args) == 4 and c.args[2] == 'FILE_CHUNK_PUBLISHED']
         self.assertEqual(len(logs), 3)
         for index, (call, log) in enumerate(zip(calls, logs), 1):
             self.assertEqual(call.kwargs, {
-                'job_id': 'job',
-                'message': f'mysql-bin.fixture 已发布 {index} 条事件；这些事件现在即可查询',
-                'event_message': f'mysql-bin.fixture 第 {index} 批：1 条事件已原子发布',
+                'append': True,
+                'progress': (
+                    index,
+                    'job',
+                    f'mysql-bin.fixture 已发布 {index} 条事件；这些事件现在即可查询',
+                    f'mysql-bin.fixture 第 {index} 批：1 条事件已原子发布',
+                ),
             })
-            self.assertEqual(log.args[1:], ('job', 'FILE_CHUNK_PUBLISHED', call.kwargs['event_message']))
+            self.assertEqual(
+                log.args[1:],
+                ('job', 'FILE_CHUNK_PUBLISHED', call.kwargs['progress'][3]),
+            )
+        self.manager.metadata.record_file_chunk_progress.assert_not_called()
         self.assertFalse(any(c.args[2] == 'FILE_CHUNK_PUBLISHED'
                              for c in self.manager._event.call_args_list))
 
     def test_background_chunks_do_not_change_visible_job_or_log_publication(self):
         self.run_fixture()
-        calls = self.manager.metadata.record_file_chunk_progress.call_args_list
+        calls = self.manager.storage.publish_ingested_parts.call_args_list
         self.assertEqual(len(calls), 3)
-        self.assertTrue(all(c.kwargs['job_id'] == '' for c in calls))
+        self.assertTrue(all(c.kwargs['progress'][1] == '' for c in calls))
+        self.manager.metadata.record_file_chunk_progress.assert_not_called()
         self.assertFalse(any(len(c.args) == 4 and c.args[2] == 'FILE_CHUNK_PUBLISHED'
                              for c in self.stage_log.call_args_list))
 
@@ -153,11 +171,17 @@ class PipelineStageTimingTests(unittest.TestCase):
         self.manager._commit_prepared.assert_not_called()
         self.stage_log.assert_not_called()
 
-    def test_inline_publish_is_explicitly_accounted_with_transform(self):
+    def test_inline_private_transform_has_merged_publish_phase(self):
         metrics = self.run_fixture(detached=False)
-        self.assertEqual(metrics['transform_mode'], 'inline-with-publish')
-        self.assertEqual(metrics['publish_seconds'], 0)
+        self.assertEqual(
+            metrics['transform_mode'], 'inline-private-then-merged-publish'
+        )
+        self.assertGreater(metrics['publish_seconds'], 0)
         self.assertEqual(self.manager.storage.ingest_ndjson_file.call_count, 3)
+        self.assertTrue(all(
+            call.kwargs['publish_metadata'] is False
+            for call in self.manager.storage.ingest_ndjson_file.call_args_list
+        ))
 
     def test_arrow_inline_uses_columnar_ingest_and_transport_metrics(self):
         metrics = self.run_fixture(detached=False, transport='arrow')

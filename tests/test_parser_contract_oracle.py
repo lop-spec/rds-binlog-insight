@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ import pyarrow as pa
 
 from app.columnar_input import parser_schema
 from app.storage import PARSER_JSON_COLUMNS
+from tools.parser_contract_fixture import raw_cache_negative_streams
 from tools.parser_contract_oracle import (
     check_values,
     compare_chunked_arrow,
@@ -16,6 +18,7 @@ from tools.parser_contract_oracle import (
     compare_decoders,
     expected_images,
     verify,
+    verify_negative_raw_cache,
 )
 
 
@@ -33,6 +36,71 @@ def faithful_rows():
 
 
 class ParserContractOracleTests(unittest.TestCase):
+    def test_negative_raw_cache_artifacts_are_independently_reconstructed(self):
+        expected_size = 10
+        payload = b"compressed"
+        valid = (
+            b"RDSRAW1\n"
+            + bytes([1])
+            + struct.pack("<Q", expected_size)
+            + b"a" * 32
+            + struct.pack("<I", 64 * 1024)
+            + b"FRM1"
+            + struct.pack("<II", expected_size, len(payload))
+            + b"b" * 32
+            + payload
+            + b"END1"
+            + struct.pack("<Q", expected_size)
+            + b"c" * 32
+        )
+        empty_sha = hashlib.sha256(b"").hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_dir = root / "row" / "cache-mechanisms"
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "zstd.cache").write_bytes(valid)
+            negative = root / "negative" / "raw-cache"
+            negative.mkdir(parents=True)
+            contract = {}
+            for name, (content, supplied_size, marker) in (
+                raw_cache_negative_streams(valid, expected_size).items()
+            ):
+                (negative / f"{name}.cache").write_bytes(content)
+                stderr = marker.encode("utf-8")
+                for transport in ("ndjson", "arrow", "arrow-chunk"):
+                    (negative / f"{name}.{transport}.stderr").write_bytes(stderr)
+                (negative / f"{name}.ndjson.stdout").write_bytes(b"")
+                (negative / f"{name}.arrow.stdout").write_bytes(b"")
+                (negative / f"{name}.arrow-chunk.manifests.ndjson").write_bytes(b"")
+                (negative / f"{name}.arrow-chunk.acks.ndjson").write_bytes(b"")
+                contract[name] = {
+                    "cache_bytes": len(content),
+                    "cache_sha256": hashlib.sha256(content).hexdigest(),
+                    "expected_size_argument": supplied_size,
+                    "stderr_marker": marker,
+                    "ndjson_returncode": 1,
+                    "ndjson_stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                    "arrow_returncode": 1,
+                    "arrow_stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                    "arrow_chunk_returncode": 1,
+                    "arrow_chunk_stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+                    "arrow_chunk_manifests_sha256": empty_sha,
+                    "arrow_chunk_acks_sha256": empty_sha,
+                    "arrow_chunk_acknowledged_files": 0,
+                    "published_files": 0,
+                }
+            case = {
+                "raw_bytes": expected_size,
+                "negative_raw_cache": contract,
+            }
+            self.assertEqual(
+                verify_negative_raw_cache(root, case),
+                {"cases": 12, "all_failed_before_publication": True},
+            )
+            (negative / "bad-magic.arrow.stdout").write_bytes(b"leak")
+            with self.assertRaisesRegex(ValueError, "leaked output"):
+                verify_negative_raw_cache(root, case)
+
     def test_real_storage_contract_uses_keyword_paths_and_compares_all_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); source = root / 'legacy.ndjson'

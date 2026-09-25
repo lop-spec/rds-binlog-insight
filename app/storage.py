@@ -524,13 +524,37 @@ class EventStorage:
     def _body_version_path(self, path: Path) -> Path:
         return self.paths["locks"] / f"{self._body_lock_digest(path)}.version"
 
+    @staticmethod
+    def _sync_file(path: Path) -> None:
+        # Windows rejects fsync on a read-only CRT descriptor; opening for
+        # update does not change immutable bytes and keeps cloud Linux strict.
+        with path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _sync_directory(path: Path) -> None:
+        if os.name != "posix":
+            return
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def _write_body_version(self, path: Path, sha256: str) -> None:
         version_path = self._body_version_path(path)
         temporary = version_path.with_name(
             f".{version_path.name}.{uuid.uuid4().hex[:12]}.tmp"
         )
-        temporary.write_text(str(sha256), encoding="ascii")
-        os.replace(temporary, version_path)
+        try:
+            with temporary.open("x", encoding="ascii") as handle:
+                handle.write(str(sha256))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, version_path)
+            self._sync_directory(version_path.parent)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _read_body_version(self, path: Path) -> str:
         try:
@@ -883,12 +907,29 @@ class EventStorage:
                     continue
                 body_locks.enter_context(self._part_body_lock(final_path))
                 locked_shards.add(shard)
-            for temp_path, final_path, sha256 in prepared:
+            durable_directories: set[Path] = set()
+            for temp_path, final_path, _expected_sha256 in prepared:
                 os.replace(temp_path, final_path)
                 moved.append(final_path)
+                self._sync_file(final_path)
+                durable_directories.add(final_path.parent)
+            # Persist every body directory entry before its version fence. If
+            # the host crashes after a durable version but before the body
+            # rename is durable, a same-sized old body could otherwise pass
+            # the restart publication gate under the new SHA256 version.
+            for directory in sorted(durable_directories, key=str):
+                self._sync_directory(directory)
+            if durable_directories:
+                self._sync_directory(self.paths["events"])
+            for _temp_path, final_path, sha256 in prepared:
                 self._write_body_version(final_path, sha256)
             if publish_metadata:
-                self.publish_ingested_parts(file_id, parts, append=append)
+                self.publish_ingested_parts(
+                    file_id,
+                    parts,
+                    append=append,
+                    _bodies_locked=True,
+                )
             return count, parts
 
     def publish_ingested_parts(
@@ -897,10 +938,57 @@ class EventStorage:
         parts: list[dict[str, Any]],
         *,
         append: bool,
+        progress: tuple[int, str, str, str] | None = None,
+        _bodies_locked: bool = False,
     ) -> None:
+        if not _bodies_locked:
+            with ExitStack() as body_locks:
+                locked_shards: set[int] = set()
+                for part in sorted(parts, key=lambda value: str(value["path"])):
+                    path = Path(str(part["path"]))
+                    shard = self._body_lock_shard(path)
+                    if shard in locked_shards:
+                        continue
+                    body_locks.enter_context(self._part_body_lock(path))
+                    locked_shards.add(shard)
+                self.publish_ingested_parts(
+                    file_id,
+                    parts,
+                    append=append,
+                    progress=progress,
+                    _bodies_locked=True,
+                )
+                return
+        for part in parts:
+            path = Path(str(part["path"]))
+            expected_sha256 = str(part.get("sha256") or "")
+            try:
+                body_matches = (
+                    path.is_file()
+                    and path.stat().st_size == int(part["size_bytes"])
+                    and bool(expected_sha256)
+                    and self._read_body_version(path) == expected_sha256
+                )
+            except OSError:
+                body_matches = False
+            if not body_matches:
+                raise StorageError(
+                    f"Parquet 正文未持久化或版本不匹配：{path.name}",
+                    "PART_BODY_NOT_DURABLE",
+                )
         if append:
-            committed_parts = self.metadata.upsert_parts(file_id, parts)
+            if progress is None:
+                committed_parts = self.metadata.upsert_parts(file_id, parts)
+            else:
+                committed_parts = self.metadata.upsert_parts(
+                    file_id, parts, progress=progress
+                )
         else:
+            if progress is not None:
+                raise StorageError(
+                    "replace publication cannot carry chunk progress",
+                    "PART_PROGRESS_MODE_INVALID",
+                )
             committed_parts = self.metadata.replace_parts(file_id, parts)
         # An identical retry intentionally preserves the already verified OSS
         # locator in MetadataStore. Reflect that committed state in the values

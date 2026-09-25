@@ -19,7 +19,7 @@ from .sync_discovery import RetainedDiscovery, source_order
 
 from .config import Settings, utc_now_text
 from .credentials import CloudCredential, load_credential
-from .downloader import DownloadError, download_file
+from .downloader import DownloadError, download_file, download_raw_cache
 from .maintenance_status import SUPERVISOR_STATUS_NAME, read_json_status
 from .metadata import MetadataStore
 from .sync_lifecycle import PauseControl, sync_health
@@ -54,6 +54,99 @@ LOCAL_INDEX_HANDOFF_MAX_BYTES = 1024**3
 COLD_COMPRESSION_HOT_SECONDS = 24 * 60 * 60
 COLD_COMPRESSION_QUERY_GRACE_SECONDS = 30
 COLD_COMPRESSION_IDLE_SECONDS = 5
+RAW_CACHE_DEFAULT_MAX_RATIO = 0.385
+
+
+def _raw_cache_enabled() -> bool:
+    value = os.environ.get("RDS_BINLOG_RAW_CACHE_ENABLED", "0").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"", "0", "false", "no", "off"}:
+        return False
+    raise ValueError("RDS_BINLOG_RAW_CACHE_ENABLED must be a boolean")
+
+
+def _raw_cache_physical_budget(raw_bytes: int) -> int:
+    try:
+        ratio = float(
+            os.environ.get(
+                "RDS_BINLOG_RAW_CACHE_MAX_RATIO",
+                str(RAW_CACHE_DEFAULT_MAX_RATIO),
+            )
+        )
+    except ValueError as exc:
+        raise ValueError("RDS_BINLOG_RAW_CACHE_MAX_RATIO must be numeric") from exc
+    if not 0 < ratio <= 2:
+        raise ValueError("RDS_BINLOG_RAW_CACHE_MAX_RATIO must be in (0, 2]")
+    return int(max(raw_bytes, 0) * ratio)
+
+
+class _AsyncDownloadProgress:
+    """Coalesce SQLite progress writes without hiding their failures."""
+
+    def __init__(self, callback: Callable[[int], None]):
+        self._callback = callback
+        self._condition = threading.Condition()
+        self._pending: int | None = None
+        self._busy = False
+        self._closed = False
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="binlog-download-progress",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, value: int) -> None:
+        with self._condition:
+            if self._error is not None:
+                raise self._error
+            if self._closed:
+                raise RuntimeError("download progress reporter is closed")
+            self._pending = max(int(value), self._pending or 0)
+            self._condition.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._pending is not None or self._closed
+                )
+                if self._pending is None and self._closed:
+                    return
+                value = self._pending
+                self._pending = None
+                self._busy = True
+            try:
+                assert value is not None
+                self._callback(value)
+            except BaseException as exc:
+                with self._condition:
+                    self._error = exc
+                    self._closed = True
+                    self._busy = False
+                    self._condition.notify_all()
+                return
+            with self._condition:
+                self._busy = False
+                self._condition.notify_all()
+
+    def finish(self, final_value: int | None = None) -> None:
+        if final_value is not None:
+            self.submit(final_value)
+        with self._condition:
+            self._condition.wait_for(
+                lambda: self._error is not None
+                or (self._pending is None and not self._busy)
+            )
+            self._closed = True
+            self._condition.notify_all()
+        self._thread.join(timeout=10)
+        if self._thread.is_alive():
+            raise RuntimeError("download progress reporter did not stop")
+        if self._error is not None:
+            raise self._error
 
 
 class RdsClientLike(Protocol):
@@ -740,10 +833,16 @@ class SyncManager:
             state = str(record["state"])
             raw_path = self.storage.paths["downloads"] / f"{file_id}.binlog"
             partial_path = raw_path.with_suffix(raw_path.suffix + ".part")
+            cache_path = self.storage.paths["downloads"] / f"{file_id}.rawcache"
+            cache_recovery = any(
+                self.storage.paths["downloads"].glob(cache_path.name + ".part-*")
+            )
             if (
                 state != "stored"
                 and not raw_path.is_file()
                 and not partial_path.is_file()
+                and not cache_path.is_file()
+                and not cache_recovery
             ):
                 continue
             record_window = (
@@ -807,46 +906,85 @@ class SyncManager:
         item: RemoteBinlog,
     ) -> tuple[Path, str]:
         started = time.monotonic()
-        path = self.storage.paths["downloads"] / f"{file_id}.binlog"
+        use_raw_cache = _raw_cache_enabled()
+        preferred_suffix = ".rawcache" if use_raw_cache else ".binlog"
+        alternate_suffix = ".binlog" if use_raw_cache else ".rawcache"
+        preferred = self.storage.paths["downloads"] / f"{file_id}{preferred_suffix}"
+        alternate = self.storage.paths["downloads"] / f"{file_id}{alternate_suffix}"
+
+        def has_recoverable_asset(candidate: Path) -> bool:
+            if candidate.is_file():
+                return True
+            if candidate.suffix == ".rawcache":
+                return any(candidate.parent.glob(candidate.name + ".part-*"))
+            return candidate.with_suffix(candidate.suffix + ".part").is_file()
+
+        # A flag change applies only to new downloads. Reuse an existing raw or
+        # raw-cache recovery asset rather than duplicating or migrating it.
+        path = preferred
+        if not has_recoverable_asset(preferred) and has_recoverable_asset(alternate):
+            path = alternate
+            use_raw_cache = path.suffix == ".rawcache"
         self.metadata.set_file_state(
             file_id, "downloading", increment_attempt=True, error_code="", error_message=""
         )
         last_progress = 0
 
-        def on_progress(value: int) -> None:
+        def persist_progress(value: int) -> None:
             nonlocal last_progress
             if value == item.file_size or value - last_progress >= 8 * 1024 * 1024:
                 self.metadata.update_download_progress(file_id, value)
                 last_progress = value
 
+        reporter = _AsyncDownloadProgress(persist_progress)
+
         def attempt(remote: RemoteBinlog):
-            return download_file(
-                remote.selected_url(),
-                path,
-                expected_size=remote.file_size,
-                expected_crc64=remote.checksum_crc64,
-                progress=on_progress,
-            )
+            common = {
+                "expected_size": remote.file_size,
+                "expected_crc64": remote.checksum_crc64,
+                "progress": reporter.submit,
+            }
+            if use_raw_cache:
+                return download_raw_cache(
+                    remote.selected_url(),
+                    path,
+                    source_id=file_id,
+                    physical_budget=_raw_cache_physical_budget(remote.file_size),
+                    **common,
+                )
+            return download_file(remote.selected_url(), path, **common)
 
         try:
-            result = attempt(item)
-        except (DownloadError, RdsApiError) as exc:
-            if exc.code not in {
-                "LINK_EXPIRED",
-                "DOWNLOAD_LINK_MISSING",
-                "INTRANET_DOWNLOAD_LINK_MISSING",
-                "HTTP_404",
-            }:
-                raise
-            self._event(
-                job_id,
-                "warning",
-                "DOWNLOAD_LINK_REFRESH",
-                f"{item.log_file_name} 下载链接不可用，刷新一次",
-            )
-            with self._client_refresh_lock:
-                refreshed = self._refresh_item(client, settings, item)
-            result = attempt(refreshed)
+            try:
+                result = attempt(item)
+            except (DownloadError, RdsApiError) as exc:
+                if exc.code not in {
+                    "LINK_EXPIRED",
+                    "DOWNLOAD_LINK_MISSING",
+                    "INTRANET_DOWNLOAD_LINK_MISSING",
+                    "HTTP_404",
+                }:
+                    raise
+                self._event(
+                    job_id,
+                    "warning",
+                    "DOWNLOAD_LINK_REFRESH",
+                    f"{item.log_file_name} 下载链接不可用，刷新一次",
+                )
+                with self._client_refresh_lock:
+                    refreshed = self._refresh_item(client, settings, item)
+                result = attempt(refreshed)
+            reporter.finish(result.size_bytes)
+        except BaseException:
+            try:
+                reporter.finish()
+            except BaseException as progress_exc:
+                LOGGER.error(
+                    "DOWNLOAD_PROGRESS_FAILED file=%s error=%s",
+                    item.log_file_name,
+                    progress_exc,
+                )
+            raise
         self.metadata.set_file_state(
             file_id,
             "downloaded",
@@ -858,7 +996,9 @@ class SyncManager:
             "info",
             "FILE_DOWNLOADED",
             f"{item.log_file_name}：{result.size_bytes} 字节，"
-            f"流式 CRC64/SHA-256 校验完成，耗时 {time.monotonic() - started:.3f} 秒",
+            f"流式 CRC64/SHA-256 校验完成，缓存格式 "
+            f"{'RDSRAW1' if use_raw_cache else 'raw'}，"
+            f"耗时 {time.monotonic() - started:.3f} 秒",
         )
         return result.path, result.sha256
 
@@ -1049,6 +1189,17 @@ class SyncManager:
         partial = raw_path.with_suffix(raw_path.suffix + ".part")
         if partial.exists():
             partial.unlink()
+        # Recovery assets are private and may be retired only after the same
+        # archive/body gates that protect the ordinary raw source.
+        for recovery in raw_path.parent.glob(f"{file_id}.rawcache.part-*"):
+            recovery.unlink()
+        alternate = raw_path.parent / (
+            f"{file_id}.binlog"
+            if raw_path.suffix == ".rawcache"
+            else f"{file_id}.rawcache"
+        )
+        if alternate.exists():
+            alternate.unlink()
         self.metadata.set_file_state(file_id, "done", raw_deleted=True)
 
     def _process_one(
@@ -1077,6 +1228,9 @@ class SyncManager:
         | None = None,
     ) -> int | PreparedBinlog:
         raw_path = self.storage.paths["downloads"] / f"{file_id}.binlog"
+        cache_path = self.storage.paths["downloads"] / f"{file_id}.rawcache"
+        if cache_path.is_file():
+            raw_path = cache_path
         visible_event = query_visible_event or threading.Event()
         if query_visible_event is None:
             visible_event.set()
@@ -1156,6 +1310,9 @@ class SyncManager:
                     file_id,
                     self.storage.paths["staging"],
                     flavor,
+                    raw_cache_expected_size=(
+                        item.file_size if path.suffix == ".rawcache" else None
+                    ),
                 )
             ):
                 timings["native_wait_seconds"] += time.monotonic() - native_wait_since
@@ -1190,6 +1347,7 @@ class SyncManager:
                             source_file_name=item.log_file_name,
                             part_key=f"{chunk_index:06d}",
                             append=True,
+                            publish_metadata=False,
                             expected_rows=chunk.rows,
                             **path_argument,
                         )
@@ -1209,18 +1367,6 @@ class SyncManager:
                             }
                         ).result()
                         timings["transform_wait_seconds"] += time.monotonic() - transform_started
-                        if chunk_count != chunk.rows:
-                            raise ParserError(
-                                "解析器分块持久化行数与清单不一致",
-                                "PARSER_CHUNK_ROW_COUNT_MISMATCH",
-                            )
-                        publish_started = time.monotonic()
-                        self.storage.publish_ingested_parts(
-                            file_id,
-                            parts,
-                            append=True,
-                        )
-                        timings["publish_seconds"] += time.monotonic() - publish_started
                     if chunk_count != chunk.rows:
                         raise ParserError(
                             "解析器分块持久化行数与清单不一致",
@@ -1242,7 +1388,27 @@ class SyncManager:
                         f"清理解析器分块失败：{chunk.path.name}：{cleanup_error}",
                         "PARSER_CHUNK_CLEANUP_FAILED",
                     ) from cleanup_error
-                count += chunk_count
+                next_count = count + chunk_count
+                progress_visible = visible_event.is_set()
+                event_message = (
+                    f"{item.log_file_name} 第 {chunk_index + 1} 批："
+                    f"{chunk_count} 条事件已原子发布"
+                )
+                publish_started = time.monotonic()
+                self.storage.publish_ingested_parts(
+                    file_id,
+                    parts,
+                    append=True,
+                    progress=(
+                        next_count,
+                        job_id if progress_visible else "",
+                        f"{item.log_file_name} 已发布 {next_count} 条事件；"
+                        "这些事件现在即可查询",
+                        event_message,
+                    ),
+                )
+                timings["publish_seconds"] += time.monotonic() - publish_started
+                count = next_count
                 keep_paths.update(str(part["path"]) for part in parts)
                 if archive is not None:
                     archive_buffer.extend(parts)
@@ -1251,29 +1417,12 @@ class SyncManager:
                         for part in parts
                     )
                     submit_archive_buffer(force=False)
-                metadata_started = time.monotonic()
-                progress_visible = visible_event.is_set()
-                event_message = (
-                    f"{item.log_file_name} 第 {chunk_index + 1} 批："
-                    f"{chunk_count} 条事件已原子发布"
-                )
-                self.metadata.record_file_chunk_progress(
-                    file_id,
-                    count,
-                    job_id=job_id if progress_visible else "",
-                    message=(
-                        f"{item.log_file_name} 已发布 {count} 条事件；"
-                        "这些事件现在即可查询"
-                    ),
-                    event_message=event_message,
-                )
                 if progress_visible:
-                    # The event is already durable in the same transaction as
-                    # the count and job message; do not insert it a second time.
+                    # The event is already durable in the merged part/catalog/
+                    # progress transaction; do not insert it a second time.
                     LOGGER.info(
                         "%s %s %s", job_id, "FILE_CHUNK_PUBLISHED", event_message
                     )
-                timings["metadata_seconds"] += time.monotonic() - metadata_started
                 native_wait_since = time.monotonic()
             timings["native_wait_seconds"] += time.monotonic() - native_wait_since
             submit_archive_buffer(force=True)
@@ -1310,7 +1459,10 @@ class SyncManager:
             "parser_transport_bytes": transport_bytes,
             "ndjson_bytes": ndjson_bytes, "events": count,
             "prepared_seconds": round(parse_seconds, 6),
-            "transform_mode": "detached" if transform_submitter else "inline-with-publish",
+            "transform_mode": (
+                "detached" if transform_submitter
+                else "inline-private-then-merged-publish"
+            ),
             **{key: round(value, 6) for key, value in timings.items()},
         }, ensure_ascii=False))
         prepared = PreparedBinlog(

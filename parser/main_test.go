@@ -52,6 +52,53 @@ func TestSchemaVersionIDMatchesFrozenLegacyIdentity(t *testing.T) {
 	}
 }
 
+func TestRawCacheFlagsArePresenceBoundAndRequiredTogether(t *testing.T) {
+	const sourceID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	base := []string{"--input", "missing", "--source-file-id", sourceID}
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "source only",
+			args: []string{"--raw-cache-source-id", sourceID},
+			want: "required together",
+		},
+		{
+			name: "size only",
+			args: []string{"--raw-cache-expected-size", "0"},
+			want: "required together",
+		},
+		{
+			name: "explicit negative size only",
+			args: []string{"--raw-cache-expected-size", "-2"},
+			want: "required together",
+		},
+		{
+			name: "explicit negative size with identity",
+			args: []string{
+				"--raw-cache-source-id", sourceID,
+				"--raw-cache-expected-size", "-2",
+			},
+			want: "must be non-negative",
+		},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			args := append(append([]string(nil), base...), test.args...)
+			if status := run(args, bytes.NewReader(nil), &stdout, &stderr); status != 2 {
+				t.Fatalf("raw-cache flag error status = %d, stderr=%q", status, stderr.String())
+			}
+			if stdout.Len() != 0 || !strings.Contains(stderr.String(), test.want) {
+				t.Fatalf("raw-cache flag error changed: stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+		})
+	}
+}
+
 func TestReadBinlogEventRequiresCompleteFrameAndPosition(t *testing.T) {
 	raw := testFrame(2, 4, []byte("body"))
 	got, eof, err := readBinlogEvent(bytes.NewReader(raw), 4)
