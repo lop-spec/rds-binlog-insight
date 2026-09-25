@@ -3273,6 +3273,31 @@ class MetadataStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def iter_slowlog_parts(self, *, batch: int = 4096) -> Iterator[dict[str, Any]]:
+        """Every query-visible slow-log part in one ordered read.
+
+        slowlog_parts_page() pages with `p.path > ?`, but its plan (slow-log files first, then their
+        parts) must sort all ~176k slow-log parts for every page: 86 pages x ~2.7 s on production,
+        against ~3 s for this single pass. Callers that keep every part anyway should use this.
+        """
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT p.*, b.instance_id, b.log_file_name,
+                       b.log_begin_utc, b.log_end_utc
+                FROM parquet_parts p
+                JOIN binlog_files b ON b.id = p.binlog_id
+                WHERE b.query_visible = 1
+                  AND b.host_instance_id = ?
+                  AND b.log_file_name LIKE ?
+                ORDER BY p.path
+                """,
+                (SLOW_LOG_HOST_INSTANCE_ID, SLOW_LOG_FILE_PREFIX + "%"),
+            )
+            while rows := cursor.fetchmany(max(int(batch), 1)):
+                for row in rows:
+                    yield dict(row)
+
     def slowlog_parts_page(
         self,
         *,

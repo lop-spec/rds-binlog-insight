@@ -622,3 +622,22 @@ class Release12911Tests(unittest.TestCase):
             call = worker.ch.execute.call_args
             self.assertIn("event_date BETWEEN", call.args[0])
             self.assertEqual(call.kwargs["params"]["d0"], "2026-09-14")
+
+
+class Release12912Tests(unittest.TestCase):
+    def test_slowlog_reconcile_reads_parts_in_one_pass(self):
+        from app.clickhouse_slowlog import reconcile_slowlog_manifest
+
+        day = 86_400_000_000
+        now = 100 * day
+        parts = [{"path": f"p{i}", "min_event_epoch_us": now - i * day, "max_event_epoch_us": now - i * day + 1}
+                 for i in range(5)]
+        metadata = mock.Mock()
+        metadata.iter_slowlog_parts.return_value = iter(parts)
+        manifest = mock.Mock()
+        reconcile_slowlog_manifest(metadata, manifest, retention_days=3, now_us=now)
+        metadata.slowlog_parts_page.assert_not_called()
+        eligible = manifest.reconcile.call_args.args[0]
+        # window starts at now - 3 days; p3 ends 1 us after it (kept), p4 ends a day before it (dropped)
+        self.assertEqual([p["path"] for p in eligible], ["p0", "p1", "p2", "p3"])
+        self.assertEqual(manifest.reconcile.call_args.kwargs["source_parts"], 5)

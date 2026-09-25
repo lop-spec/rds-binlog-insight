@@ -467,24 +467,17 @@ def reconcile_slowlog_manifest(
 ) -> dict[str, int]:
     end_us = int(now_us or time.time_ns() // 1000)
     start_us = end_us - max(int(retention_days), 1) * DAY_US
-    after_path = ""
     source_parts = 0
     eligible: list[dict[str, Any]] = []
-    while True:
-        page = metadata.slowlog_parts_page(
-            after_path=after_path,
-            limit=max(int(page_size), 1),
-        )
-        source_parts += len(page)
-        eligible.extend(
-            part
-            for part in page
-            if int(part.get("max_event_epoch_us") or 0) >= start_us
+    # One ordered pass: every eligible part is kept in memory for the manifest comparison anyway, and
+    # the paged query re-sorted all slow-log parts for each of its ~86 pages (~207 s per reconcile).
+    for part in metadata.iter_slowlog_parts(batch=max(int(page_size), 1)):
+        source_parts += 1
+        if (
+            int(part.get("max_event_epoch_us") or 0) >= start_us
             and int(part.get("min_event_epoch_us") or 0) <= end_us
-        )
-        if len(page) < max(int(page_size), 1):
-            break
-        after_path = str(page[-1]["path"])
+        ):
+            eligible.append(part)
     return manifest.reconcile(
         eligible,
         start_epoch_us=start_us,
