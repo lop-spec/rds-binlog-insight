@@ -15,7 +15,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local/rds-binlog-insight:1.29.7-rawoss
+    image: local/rds-binlog-insight:1.29.8-rawoss
     container_name: rds-binlog-insight
     restart: unless-stopped
     logging: *runtime-logging
@@ -129,7 +129,7 @@ services:
     stop_grace_period: 90s
 
   indexer:
-    image: local/rds-binlog-insight:1.29.7-rawoss
+    image: local/rds-binlog-insight:1.29.8-rawoss
     container_name: rds-binlog-insight-indexer
     restart: unless-stopped
     logging: *runtime-logging
@@ -212,7 +212,7 @@ services:
         condition: service_healthy
 
   slowlog-indexer:
-    image: local/rds-binlog-insight:1.29.7-rawoss
+    image: local/rds-binlog-insight:1.29.8-rawoss
     container_name: rds-binlog-insight-slowlog-indexer
     restart: unless-stopped
     logging: *runtime-logging
@@ -290,7 +290,7 @@ services:
         condition: service_healthy
 
   clickhouse:
-    image: ghcr.io/lop-spec/rds-binlog-insight:clickhouse-1.29.7-rawoss
+    image: ghcr.io/lop-spec/rds-binlog-insight:clickhouse-1.29.8-rawoss
     container_name: rds-binlog-insight-clickhouse
     restart: unless-stopped
     logging: *runtime-logging
@@ -342,7 +342,7 @@ services:
     stop_grace_period: 60s
 
   clickhouse-ingester:
-    image: local/rds-binlog-insight:1.29.7-rawoss
+    image: local/rds-binlog-insight:1.29.8-rawoss
     container_name: rds-binlog-insight-clickhouse-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -417,7 +417,7 @@ services:
 
   clickhouse-oss-ingester:
     profiles: ["clickhouse-oss"]
-    image: local/rds-binlog-insight:1.29.7-rawoss
+    image: local/rds-binlog-insight:1.29.8-rawoss
     container_name: rds-binlog-insight-clickhouse-oss-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -500,7 +500,7 @@ services:
 
   clickhouse-raw-oss-worker:
     profiles: ["clickhouse-raw-oss"]
-    image: local/rds-binlog-insight:1.29.7-rawoss
+    image: local/rds-binlog-insight:1.29.8-rawoss
     container_name: rds-binlog-insight-clickhouse-raw-oss-worker
     restart: unless-stopped
     logging: *runtime-logging
@@ -573,7 +573,7 @@ services:
 
   binlog-rows-worker:
     profiles: ["binlog-rows"]
-    image: local/rds-binlog-insight:1.29.7-rawoss
+    image: local/rds-binlog-insight:1.29.8-rawoss
     container_name: rds-binlog-insight-rows-worker
     restart: unless-stopped
     logging: *runtime-logging
@@ -594,9 +594,10 @@ services:
       # Parquet-backed files in these windows are owned by an external backfill
       RDS_BINLOG_ROWS_EXTERNAL_PARQUET_WINDOWS: "${RDS_BINLOG_ROWS_EXTERNAL_PARQUET_WINDOWS:-}"
       RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB: "${RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB:-4.2}"
-      # cgroup memory.current of the slice holding all services (bind-mount it read-only); pause above the max
-      RDS_BINLOG_ROWS_SLICE_MEMORY_FILE: "${RDS_BINLOG_ROWS_SLICE_MEMORY_FILE:-}"
-      RDS_BINLOG_ROWS_SLICE_MEMORY_MAX_GIB: "${RDS_BINLOG_ROWS_SLICE_MEMORY_MAX_GIB:-11}"
+      # cgroup memory.stat of the slice holding all services (bind-mount it read-only); pause when its
+      # anonymous memory passes the max (page cache is not counted: it fills to memory.high by design)
+      RDS_BINLOG_ROWS_SLICE_STAT_FILE: "${RDS_BINLOG_ROWS_SLICE_STAT_FILE:-}"
+      RDS_BINLOG_ROWS_SLICE_ANON_MAX_GIB: "${RDS_BINLOG_ROWS_SLICE_ANON_MAX_GIB:-8}"
       # newest-first lanes; one Go parse is ~45 s per 500 MB file, production writes ~1270 files/day
       RDS_BINLOG_ROWS_LIVE_LANES: "${RDS_BINLOG_ROWS_LIVE_LANES:-2}"
       RDS_BINLOG_ROWS_DOWNLOAD_STREAMS: "${RDS_BINLOG_ROWS_DOWNLOAD_STREAMS:-4}"
@@ -633,7 +634,7 @@ services:
         condition: service_healthy
 
   clickhouse-slowlog-ingester:
-    image: local/rds-binlog-insight:1.29.7-rawoss
+    image: local/rds-binlog-insight:1.29.8-rawoss
     container_name: rds-binlog-insight-clickhouse-slowlog-ingester
     restart: unless-stopped
     logging: *runtime-logging

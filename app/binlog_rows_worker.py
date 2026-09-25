@@ -92,22 +92,27 @@ def parser_command() -> list[str]:
 
 
 def slice_memory_limits() -> tuple[str, int]:
-    """memory.current of the cgroup slice that holds every service (host path bind-mounted read-only).
+    """memory.stat of the cgroup slice that holds every service (host path bind-mounted read-only).
 
-    Past the slice's memory.high the kernel reclaims and refaults file pages of all services and the
-    disk read cap stalls the whole host, while host MemAvailable still looks fine (it counts that page
-    cache as available). Empty path disables the check, which is logged at start.
+    When anonymous memory leaves too little room under the slice's memory.high for the hot file pages,
+    the kernel refaults them from disk and the read cap stalls the whole host. memory.current is no
+    signal: clean page cache fills it up to the line and is cheap to reclaim. Empty path disables the
+    check, which is logged at start.
     """
-    path = os.environ.get("RDS_BINLOG_ROWS_SLICE_MEMORY_FILE", "").strip()
-    limit = int(float(os.environ.get("RDS_BINLOG_ROWS_SLICE_MEMORY_MAX_GIB", "11") or 11) * 1024 ** 3)
+    path = os.environ.get("RDS_BINLOG_ROWS_SLICE_STAT_FILE", "").strip()
+    limit = int(float(os.environ.get("RDS_BINLOG_ROWS_SLICE_ANON_MAX_GIB", "8") or 8) * 1024 ** 3)
     return path, limit
 
 
 def read_slice_memory(path: str) -> int | None:
+    """Anonymous bytes from a cgroup memory.stat file."""
     try:
-        return int(Path(path).read_text().strip())
+        for line in Path(path).read_text().splitlines():
+            if line.startswith("anon "):
+                return int(line.split()[1])
     except (OSError, ValueError):
         return None
+    return None
 
 
 class LineCountingStream:
@@ -279,7 +284,7 @@ class Worker:
             if slice_path and used is None:
                 reason = f"slice-memory-unreadable: {slice_path}"
             elif used is not None and used > slice_limit:
-                reason = "slice-memory"
+                reason = "slice-anon-memory"
             if not reason:
                 try:
                     if self.clickhouse_memory() > limit:
@@ -506,7 +511,7 @@ def main() -> int:
     if slice_path:
         LOGGER.info("BINLOG_ROWS_SLICE_GUARD path=%s max_bytes=%s", slice_path, slice_limit)
     else:
-        LOGGER.warning("BINLOG_ROWS_SLICE_GUARD_OFF reason=RDS_BINLOG_ROWS_SLICE_MEMORY_FILE unset")
+        LOGGER.warning("BINLOG_ROWS_SLICE_GUARD_OFF reason=RDS_BINLOG_ROWS_SLICE_STAT_FILE unset")
     backfill = _env_windows(os.environ.get("RDS_BINLOG_ROWS_BACKFILL_WINDOWS", ""))
     live = max(1, int(os.environ.get("RDS_BINLOG_ROWS_LIVE_LANES", "2") or 2))
     if live + len(backfill) > WORKER_LANES_MAX:

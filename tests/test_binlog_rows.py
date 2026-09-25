@@ -172,8 +172,10 @@ class SchemaTests(unittest.TestCase):
                 self.assertIn(name, view)
         self.assertIn("% 8) AS tbl_bucket", view)
         self.assertIn(f"leftUTF8(row_query, {br.STATEMENT_MAX_BYTES}))) AS row_query_hash", view)
-        lanes = [s for s in br.build_schema() if "binlog_rows_buf_worker_v1_" in s]
+        lanes = [s for s in br.build_schema() if "binlog_rows_buf_worker_v2_" in s]
         self.assertEqual(len(lanes), br.WORKER_LANES_MAX)
+        for statement in lanes:
+            self.assertIn(f"ORDER BY ({br.BUCKET_EXPR})", statement)
 
 
 class BackendTests(unittest.TestCase):
@@ -463,10 +465,10 @@ class Release1296Tests(unittest.TestCase):
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        path = f"{tmp.name}/memory.current"
+        path = f"{tmp.name}/memory.stat"
         if slice_bytes is not None:
             with open(path, "w") as handle:
-                handle.write(str(slice_bytes))
+                handle.write(f"anon {slice_bytes}\nfile {20 * 1024 ** 3}\nshmem 0\n")
         w = worker.Worker.__new__(worker.Worker)
         w.stop = mock.Mock()
         w.stop.is_set.side_effect = [False, True]
@@ -475,23 +477,24 @@ class Release1296Tests(unittest.TestCase):
         w.clickhouse_memory = mock.Mock(return_value=ch_bytes)
         return w, path
 
-    def test_slice_memory_above_the_line_pauses(self):
-        w, path = self._worker(12 * 1024 ** 3)
-        env = {"RDS_BINLOG_ROWS_SLICE_MEMORY_FILE": path, "RDS_BINLOG_ROWS_SLICE_MEMORY_MAX_GIB": "11"}
+    def test_slice_anon_above_the_line_pauses(self):
+        w, path = self._worker(9 * 1024 ** 3)
+        env = {"RDS_BINLOG_ROWS_SLICE_STAT_FILE": path, "RDS_BINLOG_ROWS_SLICE_ANON_MAX_GIB": "8"}
         with mock.patch.dict("os.environ", env), self.assertLogs("binlog_rows_worker", level="WARNING") as logs:
             self.assertFalse(w.wait_for_capacity(0))
-        self.assertIn("reason=slice-memory", logs.output[0])
+        self.assertIn("reason=slice-anon-memory", logs.output[0])
         w.clickhouse_memory.assert_not_called()
 
-    def test_slice_memory_below_the_line_runs(self):
-        w, path = self._worker(10 * 1024 ** 3)
-        env = {"RDS_BINLOG_ROWS_SLICE_MEMORY_FILE": path, "RDS_BINLOG_ROWS_SLICE_MEMORY_MAX_GIB": "11"}
+    def test_page_cache_does_not_count(self):
+        # 20 GiB of file pages in memory.stat must not pause while anon is below the line
+        w, path = self._worker(4 * 1024 ** 3)
+        env = {"RDS_BINLOG_ROWS_SLICE_STAT_FILE": path, "RDS_BINLOG_ROWS_SLICE_ANON_MAX_GIB": "8"}
         with mock.patch.dict("os.environ", env):
             self.assertTrue(w.wait_for_capacity(0))
 
     def test_unreadable_slice_file_pauses_with_its_reason(self):
         w, path = self._worker(None)
-        with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_SLICE_MEMORY_FILE": path}), \
+        with mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_SLICE_STAT_FILE": path}), \
                 self.assertLogs("binlog_rows_worker", level="WARNING") as logs:
             self.assertFalse(w.wait_for_capacity(0))
         self.assertIn("slice-memory-unreadable", logs.output[0])
