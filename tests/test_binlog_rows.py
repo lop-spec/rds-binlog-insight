@@ -306,6 +306,15 @@ class Release1291Tests(unittest.TestCase):
         sql = client.execute.call_args_list[0].args[0]
         self.assertIn("WHERE (table_name != '' OR operation = 'DDL')", sql)
 
+    def test_move_writes_one_bucket_per_insert(self):
+        client = mock.Mock()
+        br.RowsIngestor(client).move(["raw:f"], "t")
+        statements = [c.args[0] for c in client.execute.call_args_list]
+        self.assertEqual(len(statements), br.BUCKETS)
+        for bucket, sql in enumerate(statements):
+            self.assertTrue(sql.endswith(f"AND {br.BUCKET_EXPR} = {bucket}"), sql)
+        self.assertIn(f"toUInt8({br.BUCKET_EXPR}) AS tbl_bucket", "\n".join(br.build_schema()))
+
     def test_original_sql_text_becomes_row_query(self):
         select = br.parser_select_sql()
         self.assertIn("coalesce(sql_kind, '') = 'ORIGINAL'", select)

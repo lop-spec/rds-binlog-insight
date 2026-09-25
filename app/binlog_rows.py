@@ -35,6 +35,7 @@ WORKER_BUFFER_TABLE = f"{DATABASE}.binlog_rows_buf_worker_v1"
 WORKER_LANES_MAX = 4
 STORAGE_POLICY = "binlog_rows"
 BUCKETS = 8
+BUCKET_EXPR = f"cityHash64(lower(database_name), lower(table_name)) % {BUCKETS}"
 RETENTION_DAYS = 62
 STATEMENT_MAX_BYTES = 65536
 TIER = "clickhouse-binlog-rows"
@@ -183,7 +184,7 @@ def build_schema() -> list[str]:
             continue
         event_select.append(name)
         if name == "event_date":
-            event_select.append(f"toUInt8(cityHash64(lower(database_name), lower(table_name)) % {BUCKETS}) AS tbl_bucket")
+            event_select.append(f"toUInt8({BUCKET_EXPR}) AS tbl_bucket")
     return [
         f"""CREATE TABLE IF NOT EXISTS {ROWS_TABLE} ({rows_cols}
 ) ENGINE = MergeTree
@@ -716,12 +717,21 @@ class RowsIngestor:
                                    settings={"max_execution_time": 120}, timeout=140).strip() or 0)
 
     def move(self, part_keys: list[str], tag: str) -> None:
+        """Buffer -> stage, one table bucket per INSERT.
+
+        A mixed block splits into up to BUCKETS partitions, one tiny part each (~220 parts of ~480 KiB per
+        500 MB binlog: an OSS object set each, then merges). Per-bucket blocks land as one part (~33 per
+        binlog, ~2.9 MiB) with lower peak memory; bigger blocks instead exceed the 1.2 GB query limit.
+        """
         try:
-            self.ch.execute(f"INSERT INTO {STAGE_TABLE} SELECT * FROM {self.buffer} WHERE {ROW_STORE_FILTER}",
-                            settings={"max_threads": 1, "max_insert_threads": 1, "max_block_size": 16384,
-                                      "min_insert_block_size_rows": 16384, "min_insert_block_size_bytes": 16777216,
-                                      "max_insert_block_size": 16384, "max_memory_usage": 1_200_000_000,
-                                      "max_execution_time": 0, "log_comment": tag + "-move"}, timeout=3600)
+            for bucket in range(BUCKETS):
+                self.ch.execute(
+                    f"INSERT INTO {STAGE_TABLE} SELECT * FROM {self.buffer} "
+                    f"WHERE {ROW_STORE_FILTER} AND {BUCKET_EXPR} = {bucket}",
+                    settings={"max_threads": 1, "max_insert_threads": 1, "max_block_size": 16384,
+                              "min_insert_block_size_rows": 16384, "min_insert_block_size_bytes": 16777216,
+                              "max_insert_block_size": 16384, "max_memory_usage": 1_200_000_000,
+                              "max_execution_time": 0, "log_comment": tag + "-move"}, timeout=3600)
         except RawBinlogError:
             self.ch.execute(f"DELETE FROM {ROWS_TABLE} WHERE _source_part_key IN "
                             "(SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))",
