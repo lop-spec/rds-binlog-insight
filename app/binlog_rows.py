@@ -63,7 +63,12 @@ DATE_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}")
 # written per committed file from the worker buffer. Keyed without the file so merges collapse them; the insert
 # deduplication token (one per file) makes a retried file a no-op instead of a double count.
 AGG_TABLE = f"{DATABASE}.binlog_agg_5m_v1"
-AGG_TXN_TABLE = f"{DATABASE}.binlog_agg_txn_5m_v1"
+# Distinct transactions per 5-minute bucket, per table and for all tables (database/table = ALL_TABLES), counted
+# exactly per file at insert and summed at query time: a transaction never spans binlog files, so only one that
+# crosses a bucket boundary is counted twice (the page says so). v1 kept uniq states; merging a week of them took
+# ~40 s per query.
+AGG_TXN_TABLE = f"{DATABASE}.binlog_agg_txn_5m_v2"
+ALL_TABLES = "*"
 AGG_BUCKET_US = 300_000_000
 # Fingerprint and displayed template use the same prefix: some statements are megabytes long.
 FINGERPRINT_CHARS = 4096
@@ -250,7 +255,7 @@ TTL event_date + INTERVAL {RETENTION_DAYS} DAY
 SETTINGS non_replicated_deduplication_window = {AGG_DEDUP_WINDOW}""",
         f"""CREATE TABLE IF NOT EXISTS {AGG_TXN_TABLE} (
  event_date Date, bucket_us Int64, instance_id LowCardinality(String), database_name LowCardinality(String),
- table_name LowCardinality(String), txns AggregateFunction(uniqCombined64, String)
+ table_name LowCardinality(String), txns SimpleAggregateFunction(sum, UInt64)
 ) ENGINE = AggregatingMergeTree PARTITION BY event_date
 ORDER BY (instance_id, bucket_us, database_name, table_name)
 TTL event_date + INTERVAL {RETENTION_DAYS} DAY
@@ -258,12 +263,15 @@ SETTINGS non_replicated_deduplication_window = {AGG_DEDUP_WINDOW}""",
     ]
 
 
-def aggregate_statements(source: str, where: str, *, with_text: bool = True) -> tuple[str, str]:
-    """INSERT ... SELECT statements filling AGG_TABLE and AGG_TXN_TABLE from ``source`` rows.
+def aggregate_statements(source: str, where: str, *, with_text: bool = True) -> dict[str, str]:
+    """INSERT ... SELECT statements filling AGG_TABLE and AGG_TXN_TABLE from ``source`` rows, by token kind.
 
     ``with_text`` reads ``row_query`` (the worker buffer). The row store has no statement text, so the
     history backfill passes False: fingerprint 0 and, to keep it from reading every row image, no payload.
-    Output is ordered so a retried insert produces the same blocks (the dedup token is per block).
+    ``aggtxnall`` must see every table of its buckets at once (a transaction may touch several): the worker's
+    file does; the history backfill runs it on time slices across all table buckets.
+    Output is ordered so a retried insert produces the same blocks (the dedup token is per block). Aliases
+    never equal a source column (ClickHouse aliases are query-global); INSERT maps columns by position.
     """
     bucket = f"intDiv(event_epoch_us, {AGG_BUCKET_US}) * {AGG_BUCKET_US}"
     if with_text:
@@ -283,12 +291,16 @@ SELECT event_date, {bucket} AS bucket_us, instance_id, database_name, table_name
 FROM {source} WHERE {where}
 GROUP BY {keys} ORDER BY {keys}"""
     txn_keys = "event_date, bucket_us, instance_id, database_name, table_name"
-    txns = f"""INSERT INTO {AGG_TXN_TABLE} ({txn_keys}, txns)
-SELECT event_date, {bucket} AS bucket_us, instance_id, database_name, table_name,
- uniqCombined64StateIf(transaction_id, transaction_id != '')
+    txns = "uniqExactIf(transaction_id, transaction_id != '')"
+    per_table = f"""INSERT INTO {AGG_TXN_TABLE} ({txn_keys}, txns)
+SELECT event_date, {bucket} AS bucket_us, instance_id, database_name, table_name, {txns}
 FROM {source} WHERE {where}
 GROUP BY {txn_keys} ORDER BY {txn_keys}"""
-    return stats, txns
+    all_tables = f"""INSERT INTO {AGG_TXN_TABLE} ({txn_keys}, txns)
+SELECT event_date, {bucket} AS bucket_us, instance_id, '{ALL_TABLES}' AS a_db, '{ALL_TABLES}' AS a_tbl, {txns}
+FROM {source} WHERE {where}
+GROUP BY event_date, bucket_us, instance_id ORDER BY event_date, bucket_us, instance_id"""
+    return {"agg": stats, "aggtxn": per_table, "aggtxnall": all_tables}
 
 
 # --------------------------------------------------------------------------- coverage
@@ -912,7 +924,7 @@ class RowsIngestor:
 
     def aggregate(self, file_id: str, tag: str) -> None:
         """Buffer -> analytics aggregates, once per file (a retry with the same token is skipped)."""
-        for kind, sql in zip(("agg", "aggtxn"), aggregate_statements(self.buffer, ROW_STORE_FILTER)):
+        for kind, sql in aggregate_statements(self.buffer, ROW_STORE_FILTER).items():
             self.ch.execute(sql, settings={**AGG_INSERT_SETTINGS, "insert_deduplication_token": f"{kind}:{file_id}",
                                            "log_comment": tag + "-agg"}, timeout=1900)
 

@@ -81,10 +81,10 @@ index answers as before, and a ClickHouse error falls back to it with `BINLOG_RO
 | Object | Key | Content |
 |---|---|---|
 | `binlog_agg_5m_v1` | instance, 5-minute bucket, db, table, operation, `fp` | events, executions (RowsEvents: `row_index = 1`), payload bytes, slow events / exec time (QueryEvent `exec_time`), first/last time, normalized and sample SQL |
-| `binlog_agg_txn_5m_v1` | instance, bucket, db, table | `uniqCombined64` state of `transaction_id` |
+| `binlog_agg_txn_5m_v2` | instance, bucket, db, table (`*`/`*` = all tables) | distinct `transaction_id` per file and bucket, summed (1.29.17; v1 kept `uniqCombined64` states and a 7-day merge took ~40 s) |
 
 - Written by the worker after the move, from the buffer (`RowsIngestor.aggregate`), with
-  `insert_deduplication_token = agg:<file_id>` / `aggtxn:<file_id>` and `non_replicated_deduplication_window`
+  `insert_deduplication_token = agg:<file_id>` / `aggtxn:<file_id>` / `aggtxnall:<file_id>` and `non_replicated_deduplication_window`
   on both tables: a retried or re-ingested file is aggregated once, without keying the aggregates by file.
 - `fp = normalizedQueryHash(leftUTF8(row_query, 4096))`; the displayed template is `normalizeQuery` of the same
   prefix. Identifiers with three or more digits are normalized too, so sharded tables share one fingerprint.

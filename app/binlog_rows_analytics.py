@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .analytics_index import BUCKET_US, DEFAULT_SQL_ORDER, SQL_ORDERS, AnalyticsIndex
-from .binlog_rows import AGG_BUCKET_US, AGG_TABLE, AGG_TXN_TABLE, ch_array, coverage_note
+from .binlog_rows import AGG_BUCKET_US, AGG_TABLE, AGG_TXN_TABLE, ALL_TABLES, ch_array, coverage_note
 
 MODE = "binlog-rows"
 # fp = 0: no statement text (history before the aggregates, or row events without a Rows_query event).
@@ -31,6 +31,7 @@ FINGERPRINT_EXPR = "if(fp = 0, concat('t:', operation, ':', database_name, '.', 
 QUERY_SETTINGS = {"max_threads": 4, "max_execution_time": 60, "max_memory_usage": 1_200_000_000,
                   "log_comment": "binlog-agg-query"}
 DDL_WINDOW_ROWS = 20
+ALL_ROWS = f"database_name = '{ALL_TABLES}' AND table_name = '{ALL_TABLES}'"
 PARALLEL_QUERIES = 4
 UNAVAILABLE_TXN_FIELDS = ("max_duration_us", "max_row_events", "cross_second_transactions",
                           "avg_dependency_depth", "max_dependency_depth", "multi_table_transactions",
@@ -137,7 +138,7 @@ class BinlogRowsAnalytics:
                 "notes": [
                     "按表存储（binlog_rows_v1）入库时按 5 分钟桶聚合；执行次数按 RowsEvent 计（每个事件的首行）。",
                     "语句指纹 = normalizeQuery(原始 SQL 前 4096 字符)；没有原始 SQL 的行按操作与对象合成模板。",
-                    "事务数为近似去重（uniqCombined64）；逐事务明细与行级热点需要逐事务存储，本路径不提供。",
+                    "事务数按 5 分钟桶精确去重后累计（跨桶事务计两次）；逐事务明细与行级热点需要逐事务存储，本路径不提供。",
                 ],
             },
         }
@@ -189,10 +190,9 @@ GROUP BY fingerprint) AS g) WHERE {keep}""",
                    f"min(first_epoch_us) AS a_first, any(sample_sql) AS a_sample FROM {AGG_TABLE} "
                    f"WHERE {objects} AND operation = 'DDL' GROUP BY a_bucket, db_name, tbl_name, a_fp "
                    f"ORDER BY a_first DESC LIMIT {DDL_WINDOW_ROWS}",
-            "txn_total": f"SELECT uniqCombined64Merge(txns) AS a_txns FROM {AGG_TXN_TABLE} WHERE {window}",
-            "txn_trend": f"SELECT intDiv(bucket_us, {{w:Int64}}) * {{w:Int64}} AS ts, "
-                         f"uniqCombined64Merge(txns) AS a_txns FROM {AGG_TXN_TABLE} WHERE {window} "
-                         "GROUP BY ts ORDER BY ts",
+            "txn_total": f"SELECT sum(txns) AS a_txns FROM {AGG_TXN_TABLE} WHERE {window} AND {ALL_ROWS}",
+            "txn_trend": f"SELECT intDiv(bucket_us, {{w:Int64}}) * {{w:Int64}} AS ts, sum(txns) AS a_txns "
+                         f"FROM {AGG_TXN_TABLE} WHERE {window} AND {ALL_ROWS} GROUP BY ts ORDER BY ts",
             "all_rows": f"SELECT sum(events) AS a_events, sum(payload_bytes) AS a_payload FROM {AGG_TABLE} "
                         f"WHERE {window}",
         }
@@ -259,8 +259,8 @@ GROUP BY fingerprint) AS g) WHERE {keep}""",
         if not hotspots:
             return {}
         rows = self._q(
-            f"SELECT database_name AS db_name, table_name AS tbl_name, uniqCombined64Merge(txns) AS a_txns "
-            f"FROM {AGG_TXN_TABLE} WHERE {window} AND table_name IN {{names:Array(String)}} "
+            f"SELECT database_name AS db_name, table_name AS tbl_name, sum(txns) AS a_txns "
+            f"FROM {AGG_TXN_TABLE} WHERE {window} AND NOT ({ALL_ROWS}) AND table_name IN {{names:Array(String)}} "
             "GROUP BY db_name, tbl_name",
             {**params, "names": ch_array(sorted({str(r["table_name"]) for r in hotspots}))})
         return {(r["db_name"], r["tbl_name"]): _int(r["a_txns"]) for r in rows}

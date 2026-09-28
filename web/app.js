@@ -1567,7 +1567,7 @@ function renderAnalyticsTransactions(data) {
   if (data.mode === "binlog-rows") {
     // 按表存储只聚合到「桶 × 表」：逐事务的时长、大小、依赖深度拿不到，显示为不可用而不是 0。
     const tiles = statTiles([
-      { label: "事务数", value: humanCount(totals.transactions), hint: "近似去重" },
+      { label: "事务数", value: humanCount(totals.transactions), hint: "按 5 分钟桶去重后累计" },
       { label: "行事件", value: humanCount(totals.row_events) },
       { label: "DDL 事件", value: humanCount(totals.ddl_transactions), hint: "潜在 MDL 阻塞点" },
       { label: "数据体量", value: humanBytes(totals.payload_bytes), hint: "行镜像字节，聚合上线前的历史不计" },
@@ -1690,7 +1690,7 @@ function renderAnalyticsLocks(data, coverage) {
       <p class="analytics-unavailable"><strong>行级争用热点与长/大事务暂不提供。</strong>该时间窗的 Binlog 来自按表存储，只按 5 分钟 × 表聚合，没有逐行、逐事务的明细；请看下方表级写热点。</p>
       <div class="analytics-block">
         <h3>表级写热点</h3>
-        <p class="analytics-note">覆盖所有写入表。带 * 的事务数按 5 分钟桶近似去重后累计，跨桶的同一事务会被重复计入，仅作量级参考。</p>
+        <p class="analytics-note">覆盖所有写入表。带 * 的事务数按 5 分钟桶去重后累计，跨桶的同一事务会被重复计入，仅作量级参考。</p>
         ${tableHotspots}
       </div>
       <div class="analytics-block">

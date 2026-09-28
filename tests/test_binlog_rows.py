@@ -766,15 +766,23 @@ class Release12916Tests(unittest.TestCase):
     """Binlog analytics from the row-store aggregates; retry and server-side insert safety."""
 
     def test_aggregate_statements_worker_and_history(self):
-        stats, txns = br.aggregate_statements("insight.buf", br.ROW_STORE_FILTER)
+        sqls = br.aggregate_statements("insight.buf", br.ROW_STORE_FILTER)
+        stats, txns, all_tables = sqls["agg"], sqls["aggtxn"], sqls["aggtxnall"]
         self.assertIn("INSERT INTO insight.binlog_agg_5m_v1", stats)
         self.assertIn("normalizedQueryHash(leftUTF8(row_query, 4096))", stats)
         self.assertIn("normalizeQuery(leftUTF8(row_query, 4096))", stats)
         self.assertIn("countIf(row_index = 1)", stats)
         self.assertIn("ORDER BY event_date, bucket_us, instance_id, database_name, table_name, operation, fp", stats)
-        self.assertIn("INSERT INTO insight.binlog_agg_txn_5m_v1", txns)
-        self.assertIn("uniqCombined64StateIf(transaction_id, transaction_id != '')", txns)
-        history, _ = br.aggregate_statements("insight.binlog_rows_v1", "event_date = '2026-09-20'", with_text=False)
+        self.assertIn("INSERT INTO insight.binlog_agg_txn_5m_v2", txns)
+        self.assertIn("uniqExactIf(transaction_id, transaction_id != '')", txns)
+        self.assertIn("'*' AS a_db, '*' AS a_tbl", all_tables)
+        self.assertIn("GROUP BY event_date, bucket_us, instance_id ORDER BY", all_tables)
+        # aliases never equal a source column: the WHERE filter would read the alias instead
+        import re
+        source_columns = set(br.STAGE_COLUMN_NAMES) | {"tbl_bucket", "row_query_hash"}
+        for sql in sqls.values():
+            self.assertFalse(set(re.findall(r"\bAS (\w+)", sql)) & source_columns, sql[:100])
+        history = br.aggregate_statements("insight.binlog_rows_v1", "event_date = '2026-09-20'", with_text=False)["agg"]
         self.assertIn("toUInt64(0) AS fp", history)
         self.assertNotIn("row_query", history)
         self.assertNotIn("before_json", history)
@@ -786,7 +794,7 @@ class Release12916Tests(unittest.TestCase):
         client = mock.Mock()
         br.RowsIngestor(client, buffer_table="insight.buf").aggregate("f1", "binlog-rows-l3")
         tokens = [c.kwargs["settings"]["insert_deduplication_token"] for c in client.execute.call_args_list]
-        self.assertEqual(tokens, ["agg:f1", "aggtxn:f1"])
+        self.assertEqual(tokens, ["agg:f1", "aggtxn:f1", "aggtxnall:f1"])
         self.assertTrue(all(c.kwargs["settings"]["max_threads"] == 1 for c in client.execute.call_args_list))
 
     def _worker(self, tmp):
@@ -873,9 +881,11 @@ class Release12916Tests(unittest.TestCase):
             if "AS a_normalized" in sql:
                 self.assertEqual(params["fps"], "[123]")
                 return [{"a_fp": 123, "a_normalized": "UPDATE t SET a = ?", "a_sample": "UPDATE t SET a = 1"}]
-            if "binlog_agg_txn_5m_v1" in sql and "GROUP BY db_name, tbl_name" in sql:
+            if "binlog_agg_txn_5m_v2" in sql and "GROUP BY db_name, tbl_name" in sql:
+                self.assertIn("AND NOT (database_name = '*' AND table_name = '*') AND table_name IN", sql)
                 return [{"db_name": "shop", "tbl_name": "t", "a_txns": 3}]
-            if "binlog_agg_txn_5m_v1" in sql and "GROUP BY" not in sql:
+            if "binlog_agg_txn_5m_v2" in sql and "GROUP BY" not in sql:
+                self.assertIn("AND database_name = '*' AND table_name = '*'", sql)
                 return [{"a_txns": 7}]
             if "AS a_updates" in sql:
                 return [{"db_name": "shop", "tbl_name": "t", "a_events": 10, "a_updates": 10, "a_deletes": 0}]
