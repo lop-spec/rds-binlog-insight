@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -58,6 +59,17 @@ DAY_US = 86_400_000_000
 QUERY_MEMORY_BYTES = 800_000_000
 QUERY_SPLIT_MIN_US = 10 * 60 * 1_000_000
 DATE_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}")
+# Analytics aggregates (binlog_rows_analytics): 5-minute buckets per table, operation and statement fingerprint,
+# written per committed file from the worker buffer. Keyed without the file so merges collapse them; the insert
+# deduplication token (one per file) makes a retried file a no-op instead of a double count.
+AGG_TABLE = f"{DATABASE}.binlog_agg_5m_v1"
+AGG_TXN_TABLE = f"{DATABASE}.binlog_agg_txn_5m_v1"
+AGG_BUCKET_US = 300_000_000
+# Fingerprint and displayed template use the same prefix: some statements are megabytes long.
+FINGERPRINT_CHARS = 4096
+AGG_DEDUP_WINDOW = 20000
+AGG_INSERT_SETTINGS = {"max_threads": 1, "max_insert_threads": 1, "max_memory_usage": 1_200_000_000,
+                       "max_execution_time": 1800, "max_insert_block_size": 1_048_576}
 
 
 def day_slices(start: int, end: int) -> list[tuple[int, int]]:
@@ -223,7 +235,60 @@ FROM {STAGE_TABLE}""",
 SELECT event_date, cityHash64(q) AS row_query_hash, q AS row_query
 FROM (SELECT any(event_date) AS event_date, leftUTF8(row_query, {STATEMENT_MAX_BYTES}) AS q FROM {STAGE_TABLE}
  WHERE row_query != '' GROUP BY q)""",
+        f"""CREATE TABLE IF NOT EXISTS {AGG_TABLE} (
+ event_date Date, bucket_us Int64, instance_id LowCardinality(String), database_name LowCardinality(String),
+ table_name LowCardinality(String), operation LowCardinality(String), fp UInt64,
+ events SimpleAggregateFunction(sum, UInt64), executions SimpleAggregateFunction(sum, UInt64),
+ payload_bytes SimpleAggregateFunction(sum, UInt64), slow_events SimpleAggregateFunction(sum, UInt64),
+ exec_time_ms_total SimpleAggregateFunction(sum, UInt64), exec_time_ms_max SimpleAggregateFunction(max, Int64),
+ first_epoch_us SimpleAggregateFunction(min, Int64), last_epoch_us SimpleAggregateFunction(max, Int64),
+ normalized_sql SimpleAggregateFunction(any, String) CODEC(ZSTD(3)),
+ sample_sql SimpleAggregateFunction(any, String) CODEC(ZSTD(3))
+) ENGINE = AggregatingMergeTree PARTITION BY event_date
+ORDER BY (instance_id, bucket_us, database_name, table_name, operation, fp)
+TTL event_date + INTERVAL {RETENTION_DAYS} DAY
+SETTINGS non_replicated_deduplication_window = {AGG_DEDUP_WINDOW}""",
+        f"""CREATE TABLE IF NOT EXISTS {AGG_TXN_TABLE} (
+ event_date Date, bucket_us Int64, instance_id LowCardinality(String), database_name LowCardinality(String),
+ table_name LowCardinality(String), txns AggregateFunction(uniqCombined64, String)
+) ENGINE = AggregatingMergeTree PARTITION BY event_date
+ORDER BY (instance_id, bucket_us, database_name, table_name)
+TTL event_date + INTERVAL {RETENTION_DAYS} DAY
+SETTINGS non_replicated_deduplication_window = {AGG_DEDUP_WINDOW}""",
     ]
+
+
+def aggregate_statements(source: str, where: str, *, with_text: bool = True) -> tuple[str, str]:
+    """INSERT ... SELECT statements filling AGG_TABLE and AGG_TXN_TABLE from ``source`` rows.
+
+    ``with_text`` reads ``row_query`` (the worker buffer). The row store has no statement text, so the
+    history backfill passes False: fingerprint 0 and, to keep it from reading every row image, no payload.
+    Output is ordered so a retried insert produces the same blocks (the dedup token is per block).
+    """
+    bucket = f"intDiv(event_epoch_us, {AGG_BUCKET_US}) * {AGG_BUCKET_US}"
+    if with_text:
+        text = f"leftUTF8(row_query, {FINGERPRINT_CHARS})"
+        fp, payload = f"if(row_query = '', toUInt64(0), normalizedQueryHash({text}))", \
+            "sum(length(before_json) + length(after_json))"
+        normalized, sample = f"any(if(row_query = '', '', normalizeQuery({text})))", f"any({text})"
+    else:
+        fp, payload, normalized, sample = "toUInt64(0)", "toUInt64(0)", "''", "''"
+    keys = "event_date, bucket_us, instance_id, database_name, table_name, operation, fp"
+    stats = f"""INSERT INTO {AGG_TABLE} ({keys}, events, executions, payload_bytes, slow_events, exec_time_ms_total,
+ exec_time_ms_max, first_epoch_us, last_epoch_us, normalized_sql, sample_sql)
+SELECT event_date, {bucket} AS bucket_us, instance_id, database_name, table_name, operation, {fp} AS fp, count(),
+ countIf(row_index = 1), {payload}, countIf(row_index = 1 AND execution_time_ms > 0),
+ sumIf(toUInt64(greatest(execution_time_ms, 0)), row_index = 1), max(execution_time_ms), min(event_epoch_us),
+ max(event_epoch_us), {normalized}, {sample}
+FROM {source} WHERE {where}
+GROUP BY {keys} ORDER BY {keys}"""
+    txn_keys = "event_date, bucket_us, instance_id, database_name, table_name"
+    txns = f"""INSERT INTO {AGG_TXN_TABLE} ({txn_keys}, txns)
+SELECT event_date, {bucket} AS bucket_us, instance_id, database_name, table_name,
+ uniqCombined64StateIf(transaction_id, transaction_id != '')
+FROM {source} WHERE {where}
+GROUP BY {txn_keys} ORDER BY {txn_keys}"""
+    return stats, txns
 
 
 # --------------------------------------------------------------------------- coverage
@@ -637,6 +702,12 @@ class BinlogRows:
         return summary
 
     # -- query ----------------------------------------------------------------
+    def analytics(self, query: dict[str, Any], start: int, end: int, *, control: Any | None = None
+                  ) -> dict[str, Any] | None:
+        """Analytics page summary from the aggregates; None when the row store has nothing in the window."""
+        from .binlog_rows_analytics import BinlogRowsAnalytics
+        return BinlogRowsAnalytics(self).summarize(query, start, end, control=control)
+
     def query(self, query: dict[str, Any], start: int, end: int, *, control: Any | None = None) -> dict[str, Any]:
         database, table = str(query.get("database") or "").strip(), str(query.get("table") or "").strip()
         sql, params, limit, offset = build_query(query, start, end, row_image_key=self.registry(database, table))
@@ -805,22 +876,45 @@ class RowsIngestor:
         A mixed block splits into up to BUCKETS partitions, one tiny part each (~220 parts of ~480 KiB per
         500 MB binlog: an OSS object set each, then merges). Per-bucket blocks land as one part (~33 per
         binlog, ~2.9 MiB) with lower peak memory; bigger blocks instead exceed the 1.2 GB query limit.
-        A failed move purges only the partitions of the buckets it attempted (``partitions`` from the buffer).
+        A failed move purges only the partitions of the buckets it attempted (``partitions`` from the buffer),
+        after the failed INSERT has stopped on the server: a client timeout or dropped connection leaves it
+        running, and a purge that starts first misses its later parts (mysql-bin.095753 kept 77,876 duplicate
+        rows that way).
         """
-        bucket = -1
+        bucket, query_id = -1, ""
         try:
             for bucket in range(BUCKETS):
+                query_id = f"{tag}-move-{uuid.uuid4().hex[:16]}-b{bucket}"
                 self.ch.execute(
                     f"INSERT INTO {STAGE_TABLE} SELECT * FROM {self.buffer} "
                     f"WHERE {ROW_STORE_FILTER} AND {BUCKET_EXPR} = {bucket}",
                     settings={"max_threads": 1, "max_insert_threads": 1, "max_block_size": 16384,
                               "min_insert_block_size_rows": 16384, "min_insert_block_size_bytes": 16777216,
                               "max_insert_block_size": 16384, "max_memory_usage": 1_200_000_000,
-                              "max_execution_time": 0, "log_comment": tag + "-move"}, timeout=3600)
-        except RawBinlogError:
+                              "max_execution_time": 0, "log_comment": tag + "-move"}, timeout=3600,
+                    query_id=query_id)
+        except RawBinlogError as exc:
+            self.stop_query(query_id)
             attempted = None if partitions is None else [p for p in partitions if p[1] <= bucket]
             purge_file_rows(self.ch, part_keys, lo_us, hi_us, partitions=attempted, reason="move-failed")
+            exc.rows_purged = True  # the caller may drop its inflight marker: nothing of this file is left
             raise
+
+    def stop_query(self, query_id: str) -> None:
+        """Wait until a server-side query is gone (KILL ... SYNC); failure is logged, the purge still runs."""
+        if not query_id:
+            return
+        try:
+            self.ch.execute("KILL QUERY WHERE query_id = {q:String} SYNC", params={"q": query_id},
+                            settings={"max_execution_time": 600}, timeout=660)
+        except RawBinlogError as exc:
+            LOGGER.warning("BINLOG_ROWS_KILL_FAILED query_id=%s error=%s", query_id, str(exc)[:200])
+
+    def aggregate(self, file_id: str, tag: str) -> None:
+        """Buffer -> analytics aggregates, once per file (a retry with the same token is skipped)."""
+        for kind, sql in zip(("agg", "aggtxn"), aggregate_statements(self.buffer, ROW_STORE_FILTER)):
+            self.ch.execute(sql, settings={**AGG_INSERT_SETTINGS, "insert_deduplication_token": f"{kind}:{file_id}",
+                                           "log_comment": tag + "-agg"}, timeout=1900)
 
     def record(self, entry: dict[str, Any], rows: int, source: str, rq_complete: bool) -> None:
         now = time.time()

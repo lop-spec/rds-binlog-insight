@@ -588,10 +588,16 @@ class Release12911Tests(unittest.TestCase):
 
     def test_failed_move_purges_only_the_files_days(self):
         client = mock.Mock()
-        client.execute.side_effect = [None, RawBinlogError("memory", "X"), None]
+        client.execute.side_effect = [None, RawBinlogError("memory", "X"), None, None]
         lo = 1789430400000000  # 2026-09-15T00:00Z
         with self.assertRaises(RawBinlogError):
             br.RowsIngestor(client).move(["raw:f"], "t", lo_us=lo, hi_us=lo + 3_600_000_000)
+        # the failed bucket's INSERT is stopped on the server before the purge (1.29.16)
+        failed_qid = client.execute.call_args_list[1].kwargs["query_id"]
+        kill = client.execute.call_args_list[2]
+        self.assertIn("KILL QUERY WHERE query_id = {q:String} SYNC", kill.args[0])
+        self.assertEqual(kill.kwargs["params"]["q"], failed_qid)
+        self.assertTrue(failed_qid.endswith("-b1"))
         call = client.execute.call_args_list[-1]
         self.assertIn("DELETE FROM insight.binlog_rows_v1 WHERE event_date BETWEEN {d0:Date} AND {d1:Date}", call.args[0])
         self.assertEqual((call.kwargs["params"]["d0"], call.kwargs["params"]["d1"]), ("2026-09-14", "2026-09-16"))
@@ -754,3 +760,171 @@ class Release12914Tests(unittest.TestCase):
         ing.ch.execute.return_value = "2026-09-23\t0\n2026-09-23\t5\n"
         self.assertEqual(ing.partitions(), [("2026-09-23", 0), ("2026-09-23", 5)])
         self.assertIn("FROM insight.buf", ing.ch.execute.call_args.args[0])
+
+
+class Release12916Tests(unittest.TestCase):
+    """Binlog analytics from the row-store aggregates; retry and server-side insert safety."""
+
+    def test_aggregate_statements_worker_and_history(self):
+        stats, txns = br.aggregate_statements("insight.buf", br.ROW_STORE_FILTER)
+        self.assertIn("INSERT INTO insight.binlog_agg_5m_v1", stats)
+        self.assertIn("normalizedQueryHash(leftUTF8(row_query, 4096))", stats)
+        self.assertIn("normalizeQuery(leftUTF8(row_query, 4096))", stats)
+        self.assertIn("countIf(row_index = 1)", stats)
+        self.assertIn("ORDER BY event_date, bucket_us, instance_id, database_name, table_name, operation, fp", stats)
+        self.assertIn("INSERT INTO insight.binlog_agg_txn_5m_v1", txns)
+        self.assertIn("uniqCombined64StateIf(transaction_id, transaction_id != '')", txns)
+        history, _ = br.aggregate_statements("insight.binlog_rows_v1", "event_date = '2026-09-20'", with_text=False)
+        self.assertIn("toUInt64(0) AS fp", history)
+        self.assertNotIn("row_query", history)
+        self.assertNotIn("before_json", history)
+        schema = "\n".join(br.build_schema())
+        self.assertIn("CREATE TABLE IF NOT EXISTS insight.binlog_agg_5m_v1", schema)
+        self.assertIn("non_replicated_deduplication_window = 20000", schema)
+
+    def test_aggregate_uses_one_dedup_token_per_file_and_table(self):
+        client = mock.Mock()
+        br.RowsIngestor(client, buffer_table="insight.buf").aggregate("f1", "binlog-rows-l3")
+        tokens = [c.kwargs["settings"]["insert_deduplication_token"] for c in client.execute.call_args_list]
+        self.assertEqual(tokens, ["agg:f1", "aggtxn:f1"])
+        self.assertTrue(all(c.kwargs["settings"]["max_threads"] == 1 for c in client.execute.call_args_list))
+
+    def _worker(self, tmp):
+        from pathlib import Path
+        from app import binlog_rows_worker as worker_module
+
+        worker = worker_module.Worker.__new__(worker_module.Worker)
+        worker.storage = mock.Mock(paths={"index": Path(tmp)})
+        worker.ch = mock.Mock()
+        worker.ingested = mock.Mock(return_value=set())
+        return worker
+
+    def test_commit_purges_an_earlier_attempt_then_moves_aggregates_records(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._worker(tmp)
+            entry = {"file_id": "f7", "instance_id": "i", "source_file_name": "mysql-bin.7",
+                     "lo": 1789430400000000, "hi": 1789430460000000}
+            (worker.inflight_dir() / "f7.json").write_text(json.dumps(
+                {"instance_id": "i", "file_id": "f7", "part_keys": ["raw:f7"], "file": "mysql-bin.7",
+                 "lo": entry["lo"], "hi": entry["hi"], "partitions": [["2026-09-15", 1]]}))
+            calls = []
+            ingestor = mock.Mock()
+            ingestor.partitions.return_value = [("2026-09-15", 1)]
+            ingestor.move.side_effect = lambda *a, **k: calls.append("move")
+            ingestor.aggregate.side_effect = lambda *a, **k: calls.append("aggregate")
+            ingestor.record.side_effect = lambda *a, **k: calls.append("record")
+            worker.ch.execute.side_effect = lambda sql, **k: calls.append("purge" if sql.startswith("DELETE") else sql)
+            worker.commit(ingestor, entry, ["raw:f7"], 1, "raw", True, 0)
+            self.assertEqual(calls, ["purge", "move", "aggregate", "record"])
+            self.assertEqual(list(worker.inflight_dir().glob("*.json")), [])
+
+    def test_failed_move_that_purged_drops_its_marker(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self._worker(tmp)
+            entry = {"file_id": "f8", "instance_id": "i", "source_file_name": "b", "lo": 1, "hi": 2}
+            ingestor = mock.Mock()
+            ingestor.partitions.return_value = []
+            purged = RawBinlogError("memory", "X")
+            purged.rows_purged = True
+            ingestor.move.side_effect = purged
+            with self.assertRaises(RawBinlogError):
+                worker.commit(ingestor, entry, ["raw:f8"], 1, "raw", True, 0)
+            self.assertFalse((worker.inflight_dir() / "f8.json").exists())
+            ingestor.move.side_effect = RawBinlogError("purge failed too", "X")  # no rows_purged: keep marker
+            with self.assertRaises(RawBinlogError):
+                worker.commit(ingestor, entry, ["raw:f8"], 1, "raw", True, 0)
+            self.assertTrue((worker.inflight_dir() / "f8.json").exists())
+
+    def _analytics(self, coverage, responder):
+        from app.binlog_rows_analytics import BinlogRowsAnalytics
+
+        rows = mock.Mock()
+        rows.coverage.return_value = coverage
+        rows.ch.rows.side_effect = responder
+        return BinlogRowsAnalytics(rows)
+
+    def test_analytics_returns_none_without_row_store_coverage(self):
+        a = self._analytics({"indexedFiles": 0, "pendingFiles": 0, "missingFiles": 0, "gaps": []},
+                            lambda *a, **k: self.fail("no query without coverage"))
+        self.assertIsNone(a.summarize({"instance": "i"}, 0, 3_600_000_000))
+        self.assertIsNone(a.summarize({"instance": ""}, 0, 3_600_000_000))
+
+    def test_analytics_shape_matches_the_parquet_contract(self):
+        from app.analytics_index import SQL_ORDERS
+
+        seen = []
+
+        def responder(sql, params, settings, timeout):
+            seen.append(sql)
+            if "countIf(fp = 0) AS a_synthetic" in sql:
+                return [{"a_events": 10, "a_executions": 4, "a_payload": 100, "a_slow": 1, "a_fingerprints": 2,
+                         "a_objects": 1, "a_synthetic": 1}]
+            if "row_number() OVER" in sql:
+                base = {"events": 5, "executions": 2, "row_events": 5, "payload_bytes": 50, "exec_time_ms_total": 0,
+                        "exec_time_ms_max": 0, "slow_events": 0, "first_epoch_us": 1, "last_epoch_us": 2,
+                        "objects": 1, "db_name": "shop", "tbl_name": "t", "op_name": "UPDATE",
+                        "est_scan_total": 0, **{f"r_{k}": 1 for k in SQL_ORDERS}}
+                return [{**base, "fingerprint": "123", "fp_max": 123},
+                        {**base, "fingerprint": "t:UPDATE:shop.t", "fp_max": 0, **{f"r_{k}": 2 for k in SQL_ORDERS}}]
+            if "AS a_normalized" in sql:
+                self.assertEqual(params["fps"], "[123]")
+                return [{"a_fp": 123, "a_normalized": "UPDATE t SET a = ?", "a_sample": "UPDATE t SET a = 1"}]
+            if "binlog_agg_txn_5m_v1" in sql and "GROUP BY db_name, tbl_name" in sql:
+                return [{"db_name": "shop", "tbl_name": "t", "a_txns": 3}]
+            if "binlog_agg_txn_5m_v1" in sql and "GROUP BY" not in sql:
+                return [{"a_txns": 7}]
+            if "AS a_updates" in sql:
+                return [{"db_name": "shop", "tbl_name": "t", "a_events": 10, "a_updates": 10, "a_deletes": 0}]
+            if sql.startswith("SELECT sum(events) AS a_events, sum(payload_bytes) AS a_payload FROM"):
+                return [{"a_events": 10, "a_payload": 100}]
+            return []
+
+        coverage = {"indexedFiles": 3, "pendingFiles": 1, "missingFiles": 0, "gaps": [{"reason": "pending"}],
+                    "requested_us": 10, "covered_us": 5}
+        out = self._analytics(coverage, responder).summarize(
+            {"instance": "i", "limit": 10, "order": "executions", "operation": "update"}, 0, 3_600_000_000)
+        self.assertEqual(set(out), {"mode", "window", "sql", "transactions", "locks", "coverage", "evidence"})
+        self.assertEqual(set(out["sql"]["orders"]), set(SQL_ORDERS))
+        real, synthetic = out["sql"]["statements"]
+        self.assertEqual((real["source_kind"], real["normalized_sql"]), ("rows-query", "UPDATE t SET a = ?"))
+        self.assertEqual((synthetic["source_kind"], synthetic["normalized_sql"]), ("synthetic", "UPDATE shop.t"))
+        self.assertEqual(out["sql"]["totals"]["fingerprints"], 2)
+        self.assertNotIn("_synthetic_rows", out["sql"])
+        self.assertEqual(out["transactions"]["totals"]["transactions"], 7)
+        self.assertIsNone(out["transactions"]["totals"]["max_duration_us"])
+        self.assertEqual(out["locks"]["table_hotspots"][0]["txn_count"], 3)
+        cov = out["coverage"]
+        self.assertEqual((cov["unit"], cov["total_parts"], cov["covered_parts"], cov["pending_parts"]),
+                         ("files", 4, 3, 1))
+        self.assertFalse(cov["complete"])
+        self.assertIn("合成", cov["note"])
+        self.assertTrue(any("operation = {operation:String}" in s for s in seen))
+        # ClickHouse aliases are query-global: outside the renaming subquery no alias may equal a column name
+        import re
+        columns = {"event_date", "bucket_us", "instance_id", "database_name", "table_name", "operation", "fp",
+                   "events", "executions", "payload_bytes", "slow_events", "exec_time_ms_total", "exec_time_ms_max",
+                   "first_epoch_us", "last_epoch_us", "normalized_sql", "sample_sql", "txns"}
+        for sql in seen:
+            if "AS src" in sql:
+                continue
+            clash = set(re.findall(r"\bAS (\w+)", sql)) & columns
+            self.assertFalse(clash, (clash, sql[:120]))
+
+    def test_storage_serves_binlog_analytics_from_the_row_store_and_falls_back(self):
+        from app.storage import EventStorage
+
+        fake = mock.Mock()
+        fake._query_window.return_value = (0, 3_600_000_000)
+        fake.metadata.parts_in_range.return_value = []
+        fake.binlog_rows.analytics.return_value = {"mode": "binlog-rows"}
+        query, settings = {"source": "binlog", "instance": "i"}, mock.Mock(retention_days=60)
+        self.assertEqual(EventStorage.analytics_summary(fake, query, settings, None), {"mode": "binlog-rows"})
+        fake.binlog_rows.analytics.side_effect = RuntimeError("clickhouse down")
+        fake.analytics_index.coverage.side_effect = LookupError("parquet path reached")
+        with self.assertLogs("app.storage", level="ERROR") as logs, self.assertRaises(LookupError):
+            EventStorage.analytics_summary(fake, query, settings, None)
+        self.assertIn("BINLOG_ROWS_ANALYTICS_FAILED", logs.output[0])

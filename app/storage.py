@@ -2493,6 +2493,23 @@ class EventStorage:
             LOGGER.warning(
                 "Slow-log analytics index coverage incomplete; using legacy fallback"
             )
+        rows_store = getattr(self, "binlog_rows", None)
+        if source in ("", "binlog") and rows_store is not None:
+            # Prod binlog is archived raw since 2026-09-22 and has no Parquet parts any more: the row
+            # store's aggregates answer. Windows it does not hold (other instances, days before the row
+            # store) keep the Parquet analytics index.
+            try:
+                rows_summary = rows_store.analytics(query, start_us, end_us, control=control)
+            except Exception:
+                if control is not None:
+                    control.check_cancelled()
+                LOGGER.exception("BINLOG_ROWS_ANALYTICS_FAILED instance=%s; using the Parquet analytics index",
+                                 instance)
+            else:
+                if rows_summary is not None:
+                    return rows_summary
+                LOGGER.info("BINLOG_ROWS_ANALYTICS_NOT_COVERED instance=%s; using the Parquet analytics index",
+                            instance)
         # HTTP supplies a request-local factory, not an early coverage probe.
         # This keeps both the part scan and repair enqueue single-pass and avoids
         # constructing OSS clients on a complete SQLite/ClickHouse serving path.

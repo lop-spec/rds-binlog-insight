@@ -61,3 +61,37 @@ worker runs the same binary with `--slim` (override the path with `RDS_BINLOG_RO
 
 Measured on the production host (4 vCPU): one 524 MB binlog ≈ 56 s end to end with the slim parser
 (74 s full parser streamed, 132 s with on-disk chunks); download 2.5 s with 4 ranged streams.
+
+## Commit safety (1.29.16)
+
+Each file is moved behind an inflight marker (`data/index/binlog-rows-inflight/<file_id>.json`, with the
+buffer's `(event_date, bucket)` partitions). A marker still present when the same file is committed again
+means an earlier attempt may have left rows: `commit()` purges them first (the start-up recovery does the
+same). A failed per-bucket INSERT is stopped on the server (`KILL QUERY ... SYNC` on its query id) before the
+purge; a purge that starts while the INSERT still runs misses its later parts (`mysql-bin.095753` kept 77,876
+duplicate rows that way before 1.29.16).
+
+## Analytics (1.29.16)
+
+Prod binlog has been archived raw since 2026-09-22, so the Parquet analytics index has no prod input. The
+analytics page (`/api/analytics`, source binlog) is served from two ClickHouse aggregates when the row store
+holds files of the requested instance in the window; otherwise (other instances, older days) the Parquet
+index answers as before, and a ClickHouse error falls back to it with `BINLOG_ROWS_ANALYTICS_FAILED` logged.
+
+| Object | Key | Content |
+|---|---|---|
+| `binlog_agg_5m_v1` | instance, 5-minute bucket, db, table, operation, `fp` | events, executions (RowsEvents: `row_index = 1`), payload bytes, slow events / exec time (QueryEvent `exec_time`), first/last time, normalized and sample SQL |
+| `binlog_agg_txn_5m_v1` | instance, bucket, db, table | `uniqCombined64` state of `transaction_id` |
+
+- Written by the worker after the move, from the buffer (`RowsIngestor.aggregate`), with
+  `insert_deduplication_token = agg:<file_id>` / `aggtxn:<file_id>` and `non_replicated_deduplication_window`
+  on both tables: a retried or re-ingested file is aggregated once, without keying the aggregates by file.
+- `fp = normalizedQueryHash(leftUTF8(row_query, 4096))`; the displayed template is `normalizeQuery` of the same
+  prefix. Identifiers with three or more digits are normalized too, so sharded tables share one fingerprint.
+  `fp = 0` (no statement text) is shown as a synthetic `OPERATION db.table` template.
+- Rows ingested before 1.29.16 were backfilled per table and operation only (`aggregate_statements(...,
+  with_text=False)`: fingerprint 0, no payload bytes); statement fingerprints and sample SQL start with 1.29.16.
+- Not available from the row store (the page says so instead of showing zeros): transaction duration and
+  size distributions, dependency depth, longest / largest / multi-table transactions, row-level hotspots.
+- ClickHouse aliases are query-global: no alias in `binlog_rows_analytics` may equal a column name (a test
+  checks every emitted statement).

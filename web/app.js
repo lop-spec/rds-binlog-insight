@@ -1564,6 +1564,18 @@ const TXN_DRILLS = {
 
 function renderAnalyticsTransactions(data) {
   const totals = data.totals || {};
+  if (data.mode === "binlog-rows") {
+    // 按表存储只聚合到「桶 × 表」：逐事务的时长、大小、依赖深度拿不到，显示为不可用而不是 0。
+    const tiles = statTiles([
+      { label: "事务数", value: humanCount(totals.transactions), hint: "近似去重" },
+      { label: "行事件", value: humanCount(totals.row_events) },
+      { label: "DDL 事件", value: humanCount(totals.ddl_transactions), hint: "潜在 MDL 阻塞点" },
+      { label: "数据体量", value: humanBytes(totals.payload_bytes), hint: "行镜像字节，聚合上线前的历史不计" },
+    ]);
+    return `${tiles}
+      <div class="analytics-block"><h3>提交趋势</h3>${sparkline(data.trend || [], { valueKey: "transactions" })}</div>
+      <p class="analytics-unavailable"><strong>逐事务明细暂不提供。</strong>该时间窗的 Binlog 来自按表存储，只按 5 分钟 × 表聚合；事务时长与大小分布、提交依赖深度、最长/最大/跨表事务都需要逐事务存储，这里只给事务数与提交趋势。</p>`;
+  }
   const tiles = statTiles([
     { label: "事务数", value: humanCount(totals.transactions) },
     { label: "行事件", value: humanCount(totals.row_events) },
@@ -1668,6 +1680,25 @@ function renderAnalyticsLocks(data, coverage) {
     "该时间窗内没有 DDL"
   );
   const headers = ["事务标识", "开始时间", "持续时长", "行事件", "体量", "对象", "标记"];
+  if (data.mode === "binlog-rows") {
+    const top = (data.table_hotspots || [])[0];
+    const rowsTiles = statTiles([
+      { label: "最热表写事件", value: humanCount(top?.event_count), hint: top ? objectLabel(top.database_name, top.table_name) : "" },
+      { label: "DDL 事件", value: humanCount(risk.ddl_events), hint: "潜在 MDL 阻塞点" },
+    ]);
+    return `${rowsTiles}
+      <p class="analytics-unavailable"><strong>行级争用热点与长/大事务暂不提供。</strong>该时间窗的 Binlog 来自按表存储，只按 5 分钟 × 表聚合，没有逐行、逐事务的明细；请看下方表级写热点。</p>
+      <div class="analytics-block">
+        <h3>表级写热点</h3>
+        <p class="analytics-note">覆盖所有写入表。带 * 的事务数按 5 分钟桶近似去重后累计，跨桶的同一事务会被重复计入，仅作量级参考。</p>
+        ${tableHotspots}
+      </div>
+      <div class="analytics-block">
+        <h3>DDL 与并发写窗口（MDL 风险）</h3>
+        <p class="analytics-note">DDL 需要元数据锁；前后 5 分钟桶内该表仍有 DML，说明存在被阻塞的可能。Binlog 无法证明是否真的等待过。</p>
+        ${ddl}
+      </div>`;
+  }
   return `${tiles}
     <div class="analytics-block">
       <h3>行锁争用热点（推断）</h3>
@@ -1718,11 +1749,14 @@ function renderAnalyticsCoverage(coverage, window, source = "binlog", indexStats
       parts.push("该时间窗内<strong>没有已同步的 Binlog 分区</strong>，空结果不代表数据库没有写入；请先在“同步任务”里同步这段时间");
     }
   } else {
-    parts.push(`分区覆盖 <strong>${covered}/${total}</strong>`);
+    // 按表存储路径按 binlog 文件计覆盖（coverage.unit = files），Parquet 路径按分区。
+    const unit = coverage?.unit === "files" ? "文件" : "分区";
+    parts.push(`${unit}覆盖 <strong>${covered}/${total}</strong>`);
     if (scanned) parts.push(`本次即时扫描 ${scanned} 个`);
-    if (pending) parts.push(`<strong>${pending}</strong> 个待后台补齐，结果暂不含这些分区`);
-    if (complete) parts.push("窗口内全部分区已覆盖");
+    if (pending) parts.push(`<strong>${pending}</strong> 个待后台补齐，结果暂不含这些${unit}`);
+    if (complete) parts.push(`窗口内全部${unit}已覆盖`);
   }
+  if (coverage?.note) parts.push(escapeHtml(coverage.note));
   if (errors.length) parts.push(`扫描失败 ${errors.length} 个：${escapeHtml(errors[0])}`);
   if (window?.trend_bucket_us) parts.push(`趋势粒度 ${humanMicros(window.trend_bucket_us)}`);
   if (source === "slowlog" && indexStats) {

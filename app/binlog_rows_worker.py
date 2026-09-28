@@ -243,8 +243,14 @@ class Worker:
 
     def commit(self, ingestor: RowsIngestor, entry: dict[str, Any], part_keys: list[str], rows: int, source: str,
                rq_complete: bool, lane: int) -> None:
-        """Move + manifest behind a durable marker, so an interrupted move is purged on the next start."""
+        """Move + aggregates + manifest behind a durable marker.
+
+        A marker left by an earlier attempt means rows of this file may already be stored (the move or a later
+        step failed without purging): purge them before moving again, in this process as on the next start.
+        """
         marker = self.inflight_dir() / f"{entry['file_id']}.json"
+        if marker.exists():
+            self.purge_marker(marker, reason="retry")
         tmp = marker.with_suffix(".tmp")
         partitions = ingestor.partitions()
         tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
@@ -252,8 +258,14 @@ class Worker:
                                    "lo": entry.get("lo"), "hi": entry.get("hi"), "partitions": partitions}))
         os.replace(tmp, marker)
         # purges its own partial rows (bounded to the partitions it attempted) on failure
-        ingestor.move(part_keys, f"binlog-rows-l{lane}", lo_us=entry.get("lo"), hi_us=entry.get("hi"),
-                      partitions=partitions)
+        try:
+            ingestor.move(part_keys, f"binlog-rows-l{lane}", lo_us=entry.get("lo"), hi_us=entry.get("hi"),
+                          partitions=partitions)
+        except RawBinlogError as exc:
+            if getattr(exc, "rows_purged", False):
+                marker.unlink(missing_ok=True)
+            raise
+        ingestor.aggregate(entry["file_id"], f"binlog-rows-l{lane}")
         ingestor.record(entry, rows, source, rq_complete)
         marker.unlink(missing_ok=True)
 
@@ -269,28 +281,32 @@ class Worker:
             LOGGER.warning("BINLOG_ROWS_FILE_SPAN_FAILED file_id=%s error=%s", file_id, exc)
         return None, None
 
+    def purge_marker(self, marker: Path, *, reason: str) -> bool:
+        """Purge the rows a marker's file may have left and drop the marker; False if it is already committed."""
+        info = json.loads(marker.read_text())
+        if info["file_id"] in self.ingested(info["instance_id"], fresh=True):
+            marker.unlink(missing_ok=True)
+            return False
+        LOGGER.warning("BINLOG_ROWS_INFLIGHT_PURGE file=%s parts=%s reason=%s", info.get("file"),
+                       len(info["part_keys"]), reason)
+        lo, hi = info.get("lo"), info.get("hi")
+        if not (lo and hi):
+            lo, hi = self.file_span(info["file_id"])  # markers written before 1.29.11 carry no span
+        partitions = info.get("partitions")  # markers written before 1.29.14 carry none
+        purge_file_rows(self.ch, info["part_keys"], lo, hi,
+                        partitions=None if partitions is None else [tuple(p) for p in partitions],
+                        reason=reason)
+        marker.unlink(missing_ok=True)
+        return True
+
     def recover_inflight(self) -> int:
         """Purge rows of moves that never reached the manifest (crash, kill, container stop)."""
         purged = 0
         for marker in sorted(self.inflight_dir().glob("*.json")):
             try:
-                info = json.loads(marker.read_text())
+                purged += self.purge_marker(marker, reason="inflight-recovery")
             except ValueError:
                 LOGGER.error("BINLOG_ROWS_INFLIGHT_UNREADABLE marker=%s", marker.name)
-                continue
-            if info["file_id"] in self.ingested(info["instance_id"], fresh=True):
-                marker.unlink(missing_ok=True)
-                continue
-            LOGGER.warning("BINLOG_ROWS_INFLIGHT_PURGE file=%s parts=%s", info.get("file"), len(info["part_keys"]))
-            lo, hi = info.get("lo"), info.get("hi")
-            if not (lo and hi):
-                lo, hi = self.file_span(info["file_id"])  # markers written before 1.29.11 carry no span
-            partitions = info.get("partitions")  # markers written before 1.29.14 carry none
-            purge_file_rows(self.ch, info["part_keys"], lo, hi,
-                            partitions=None if partitions is None else [tuple(p) for p in partitions],
-                            reason="inflight-recovery")
-            marker.unlink(missing_ok=True)
-            purged += 1
         return purged
 
     def collector_lag_seconds(self) -> int:
