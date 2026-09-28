@@ -150,6 +150,263 @@ class ClickHouseManifest:
             ).fetchone()
         return str(row["status"]) if row is not None else None
 
+    def reconcile_streaming(
+        self,
+        parts: Iterable[dict[str, Any]],
+        *,
+        start_epoch_us: int,
+        end_epoch_us: int,
+        source_parts: int | None = None,
+        filter_parts_to_window: bool = False,
+        sweep_unseen: bool = True,
+        preserve_reconcile_state: bool = False,
+        stage_batch: int = 512,
+    ) -> dict[str, int]:
+        """Reconcile a large source iterator without materializing it in Python.
+
+        The source snapshot is staged in SQLite TEMP storage, then compared to
+        the durable manifest with set-based statements.  This keeps memory
+        bounded as the manifest grows while preserving the full-sweep delete,
+        replacement and retention semantics of :meth:`reconcile`.
+        """
+        now_us = time.time_ns() // 1000
+        source_count = 0
+        eligible_count = 0
+        batch: list[tuple[Any, ...]] = []
+        with self.connection() as connection:
+            connection.execute("PRAGMA temp_store = FILE")
+            connection.execute(
+                """
+                CREATE TEMP TABLE reconcile_parts (
+                    part_path TEXT PRIMARY KEY,
+                    logical_part_id TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    content_revision INTEGER NOT NULL,
+                    min_event_epoch_us INTEGER NOT NULL,
+                    max_event_epoch_us INTEGER NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    size_bytes INTEGER NOT NULL
+                ) WITHOUT ROWID
+                """
+            )
+
+            def flush() -> None:
+                if not batch:
+                    return
+                connection.executemany(
+                    """
+                    INSERT OR REPLACE INTO reconcile_parts(
+                        part_path, logical_part_id, sha256, content_revision,
+                        min_event_epoch_us, max_event_epoch_us, row_count,
+                        size_bytes
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    batch,
+                )
+                batch.clear()
+
+            for part in parts:
+                source_count += 1
+                min_us = int(part.get("min_event_epoch_us") or 0)
+                max_us = int(part.get("max_event_epoch_us") or 0)
+                if filter_parts_to_window and (
+                    max_us < int(start_epoch_us) or min_us > int(end_epoch_us)
+                ):
+                    continue
+                eligible_count += 1
+                identity = part_identity(part)
+                if not identity:
+                    continue
+                batch.append(
+                    (
+                        str(part["path"]),
+                        identity,
+                        str(part.get("sha256") or ""),
+                        int(part.get("content_revision") or 0),
+                        min_us,
+                        max_us,
+                        int(part.get("row_count") or 0),
+                        int(part.get("size_bytes") or 0),
+                    )
+                )
+                if len(batch) >= max(int(stage_batch), 1):
+                    flush()
+            flush()
+            # TEMP staging uses an implicit transaction. Commit only that
+            # connection-local snapshot before taking the durable write lock.
+            connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            state = connection.execute(
+                "SELECT generation FROM clickhouse_reconcile_state "
+                "WHERE singleton = 1"
+            ).fetchone()
+            generation = int(state["generation"] if state else 0) + 1
+            queued = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM reconcile_parts source
+                    LEFT JOIN clickhouse_parts current
+                      ON current.part_path = source.part_path
+                     AND current.logical_part_id = source.logical_part_id
+                    WHERE current.part_path IS NULL
+                       OR current.status NOT IN (
+                           'pending', 'loading', 'ready', 'load_failed'
+                       )
+                    """
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO clickhouse_parts(
+                    part_path, logical_part_id, sha256, content_revision,
+                    min_event_epoch_us, max_event_epoch_us, row_count,
+                    size_bytes, status, attempts, next_retry_us,
+                    inserted_rows, last_error, first_seen_us,
+                    updated_at_us, ready_at_us, seen_generation
+                )
+                SELECT part_path, logical_part_id, sha256, content_revision,
+                       min_event_epoch_us, max_event_epoch_us, row_count,
+                       size_bytes, 'pending', 0, 0, 0, '', ?, ?, 0, ?
+                FROM reconcile_parts
+                WHERE 1
+                ON CONFLICT(part_path, logical_part_id) DO UPDATE SET
+                    sha256 = excluded.sha256,
+                    content_revision = excluded.content_revision,
+                    min_event_epoch_us = excluded.min_event_epoch_us,
+                    max_event_epoch_us = excluded.max_event_epoch_us,
+                    row_count = excluded.row_count,
+                    size_bytes = excluded.size_bytes,
+                    status = CASE WHEN clickhouse_parts.status IN
+                        ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                        THEN 'pending' ELSE clickhouse_parts.status END,
+                    attempts = CASE WHEN clickhouse_parts.status IN
+                        ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                        THEN 0 ELSE clickhouse_parts.attempts END,
+                    next_retry_us = CASE WHEN clickhouse_parts.status IN
+                        ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                        THEN 0 ELSE clickhouse_parts.next_retry_us END,
+                    inserted_rows = CASE WHEN clickhouse_parts.status IN
+                        ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                        THEN 0 ELSE clickhouse_parts.inserted_rows END,
+                    last_error = CASE WHEN clickhouse_parts.status IN
+                        ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                        THEN '' ELSE clickhouse_parts.last_error END,
+                    ready_at_us = CASE WHEN clickhouse_parts.status IN
+                        ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                        THEN 0 ELSE clickhouse_parts.ready_at_us END,
+                    updated_at_us = excluded.updated_at_us,
+                    seen_generation = excluded.seen_generation
+                WHERE clickhouse_parts.status IN
+                        ('delete_pending', 'deleting', 'delete_failed', 'retired')
+                   OR clickhouse_parts.sha256 != excluded.sha256
+                   OR clickhouse_parts.content_revision != excluded.content_revision
+                   OR clickhouse_parts.min_event_epoch_us != excluded.min_event_epoch_us
+                   OR clickhouse_parts.max_event_epoch_us != excluded.max_event_epoch_us
+                   OR clickhouse_parts.row_count != excluded.row_count
+                   OR clickhouse_parts.size_bytes != excluded.size_bytes
+                """,
+                (now_us, now_us, generation),
+            )
+            replacements = int(
+                connection.execute(
+                    """
+                    UPDATE clickhouse_parts
+                    SET status = CASE WHEN status = 'deleting'
+                                      THEN status ELSE 'delete_pending' END,
+                        next_retry_us = CASE WHEN status = 'deleting'
+                                             THEN next_retry_us ELSE 0 END,
+                        last_error = CASE WHEN status = 'deleting'
+                                          THEN last_error ELSE '' END,
+                        updated_at_us = ?
+                    WHERE status != 'retired'
+                      AND EXISTS (
+                          SELECT 1 FROM reconcile_parts source
+                          WHERE source.part_path = clickhouse_parts.part_path
+                            AND source.logical_part_id != clickhouse_parts.logical_part_id
+                      )
+                    """,
+                    (now_us,),
+                ).rowcount
+            )
+
+            deleted = 0
+            aged_out = 0
+            if sweep_unseen:
+                deleted = int(
+                    connection.execute(
+                        """
+                        UPDATE clickhouse_parts
+                        SET status = CASE WHEN status = 'deleting'
+                                          THEN status ELSE 'delete_pending' END,
+                            next_retry_us = CASE WHEN status = 'deleting'
+                                                 THEN next_retry_us ELSE 0 END,
+                            updated_at_us = ?
+                        WHERE status != 'retired'
+                          AND max_event_epoch_us >= ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM reconcile_parts source
+                              WHERE source.part_path = clickhouse_parts.part_path
+                                AND source.logical_part_id = clickhouse_parts.logical_part_id
+                          )
+                        """,
+                        (now_us, int(start_epoch_us)),
+                    ).rowcount
+                )
+                aged_out = int(
+                    connection.execute(
+                        """
+                        UPDATE clickhouse_parts
+                        SET status = 'retired', next_retry_us = 0,
+                            last_error = '', updated_at_us = ?
+                        WHERE status != 'retired'
+                          AND max_event_epoch_us < ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM reconcile_parts source
+                              WHERE source.part_path = clickhouse_parts.part_path
+                                AND source.logical_part_id = clickhouse_parts.logical_part_id
+                          )
+                        """,
+                        (now_us, int(start_epoch_us)),
+                    ).rowcount
+                )
+
+            if preserve_reconcile_state:
+                connection.execute(
+                    """
+                    UPDATE clickhouse_reconcile_state
+                    SET generation = ?, last_error = ''
+                    WHERE singleton = 1
+                    """,
+                    (generation,),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE clickhouse_reconcile_state
+                    SET generation = ?, start_epoch_us = ?, end_epoch_us = ?,
+                        source_parts = ?, eligible_parts = ?,
+                        completed_at_us = ?, last_error = ''
+                    WHERE singleton = 1
+                    """,
+                    (
+                        generation,
+                        int(start_epoch_us),
+                        int(end_epoch_us),
+                        int(source_parts if source_parts is not None else source_count),
+                        eligible_count,
+                        now_us,
+                    ),
+                )
+        return {
+            "generation": generation,
+            "eligible_parts": eligible_count,
+            "queued_parts": queued,
+            "replacement_deletes": replacements,
+            "missing_deletes": deleted,
+            "aged_out_parts": aged_out,
+        }
+
     def reconcile(
         self,
         parts: list[dict[str, Any]],

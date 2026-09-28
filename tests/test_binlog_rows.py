@@ -649,10 +649,11 @@ class Release12912Tests(unittest.TestCase):
         manifest = mock.Mock()
         reconcile_slowlog_manifest(metadata, manifest, retention_days=3, now_us=now)
         metadata.slowlog_parts_page.assert_not_called()
-        eligible = manifest.reconcile.call_args.args[0]
-        # window starts at now - 3 days; p3 ends 1 us after it (kept), p4 ends a day before it (dropped)
-        self.assertEqual([p["path"] for p in eligible], ["p0", "p1", "p2", "p3"])
-        self.assertEqual(manifest.reconcile.call_args.kwargs["source_parts"], 5)
+        source = manifest.reconcile_streaming.call_args.args[0]
+        self.assertNotIsInstance(source, list)
+        self.assertEqual([p["path"] for p in source], ["p0", "p1", "p2", "p3", "p4"])
+        self.assertTrue(manifest.reconcile_streaming.call_args.kwargs["filter_parts_to_window"])
+        self.assertEqual(manifest.reconcile_streaming.call_args.kwargs["start_epoch_us"], now - 3 * day)
 
 
 class Release12914Tests(unittest.TestCase):
