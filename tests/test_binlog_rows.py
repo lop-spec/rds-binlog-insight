@@ -938,3 +938,43 @@ class Release12916Tests(unittest.TestCase):
         with self.assertLogs("app.storage", level="ERROR") as logs, self.assertRaises(LookupError):
             EventStorage.analytics_summary(fake, query, settings, None)
         self.assertIn("BINLOG_ROWS_ANALYTICS_FAILED", logs.output[0])
+
+
+class Release12918Tests(unittest.TestCase):
+    def test_row_store_answers_before_the_parquet_part_listing(self):
+        from app.storage import EventStorage
+
+        fake = mock.Mock()
+        fake._query_window.return_value = (0, 3_600_000_000)
+        fake.binlog_rows.analytics.return_value = {"mode": "binlog-rows"}
+        out = EventStorage.analytics_summary(fake, {"source": "binlog", "instance": "i"}, mock.Mock(retention_days=60),
+                                             None)
+        self.assertEqual(out, {"mode": "binlog-rows"})
+        fake.metadata.parts_in_range.assert_not_called()
+
+    def test_ddl_without_table_has_no_dml_figure(self):
+        from app.analytics_index import SQL_ORDERS
+        from app.binlog_rows_analytics import BinlogRowsAnalytics
+
+        def responder(sql, params, settings, timeout):
+            if "operation = 'DDL' GROUP BY a_bucket" in sql:
+                return [{"a_bucket": 0, "db_name": "shop", "tbl_name": "", "a_fp": 0, "a_first": 5, "a_sample": ""},
+                        {"a_bucket": 0, "db_name": "shop", "tbl_name": "t", "a_fp": 1, "a_first": 4,
+                         "a_sample": "ALTER TABLE t"}]
+            if "operation != 'DDL'" in sql:
+                self.assertEqual(params["tbl"], "t")
+                return [{"a_events": 9}]
+            if "countIf(fp = 0) AS a_synthetic" in sql:
+                return [{"a_events": 0, "a_executions": 0, "a_payload": 0, "a_slow": 0, "a_fingerprints": 0,
+                         "a_objects": 0, "a_synthetic": 0}]
+            if sql.startswith("SELECT sum(events) AS a_events, sum(payload_bytes) AS a_payload FROM"):
+                return [{"a_events": 0, "a_payload": 0}]
+            return []
+
+        rows = mock.Mock()
+        rows.coverage.return_value = {"indexedFiles": 1, "pendingFiles": 0, "missingFiles": 0, "gaps": []}
+        rows.ch.rows.side_effect = responder
+        ddl = BinlogRowsAnalytics(rows).summarize({"instance": "i"}, 0, 3_600_000_000)["locks"]["ddl_windows"]
+        self.assertEqual([d["concurrent_dml_events"] for d in ddl], [None, 9])
+        self.assertEqual(ddl[0]["sample_sql"], "（历史数据未记录语句）")
+        self.assertTrue(SQL_ORDERS)

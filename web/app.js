@@ -1675,7 +1675,9 @@ function renderAnalyticsLocks(data, coverage) {
       escapeHtml(formatTime(Number(item.event_epoch_us))),
       escapeHtml(objectLabel(item.database_name, item.table_name)),
       `<code class="sql-cell">${escapeHtml(item.sample_sql || "—")}</code>`,
-      `${humanCount(item.concurrent_dml_events)}${Number(item.concurrent_dml_events) > 0 ? ' <span class="chip warn">有并发写</span>' : ""}`,
+      item.concurrent_dml_events == null
+        ? '<span class="muted" title="该 DDL 没有表名，无法对应同表写入">—</span>'
+        : `${humanCount(item.concurrent_dml_events)}${Number(item.concurrent_dml_events) > 0 ? ' <span class="chip warn">有并发写</span>' : ""}`,
     ]),
     "该时间窗内没有 DDL"
   );

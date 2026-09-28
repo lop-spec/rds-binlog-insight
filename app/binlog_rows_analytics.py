@@ -96,17 +96,19 @@ class BinlogRowsAnalytics:
                 for r in run["hotspots"].result()]
             txn_counts = pool.submit(self._table_txns, hotspots, params, window)
             ddl_rows = run["ddl"].result()
+            # DDL rows carry no table name in the row store: same-table DML is unknown, not zero
             dml = [pool.submit(self._q, self._ddl_dml_sql(), {
                 "i": params["i"], "db": row["db_name"], "tbl": row["tbl_name"],
                 "a": _int(row["a_bucket"]) - AGG_BUCKET_US, "b": _int(row["a_bucket"]) + AGG_BUCKET_US})
-                for row in ddl_rows]
+                if row["tbl_name"] else None for row in ddl_rows]
             if control is not None:
                 control.check_cancelled()
             sql, synthetic = self._sql_section(run, ranked, texts.result(), params["i"], order, limit)
             counts = txn_counts.result()
             ddl = [{"event_epoch_us": _int(row["a_first"]), "database_name": row["db_name"],
                     "table_name": row["tbl_name"], "sample_sql": str(row["a_sample"] or "") or "（历史数据未记录语句）",
-                    "concurrent_dml_events": _int((f.result() or [{}])[0].get("a_events"))}
+                    "concurrent_dml_events": (None if f is None
+                                              else _int((f.result() or [{}])[0].get("a_events")))}
                    for row, f in zip(ddl_rows, dml)]
             txn_total, txn_trend = run["txn_total"].result(), run["txn_trend"].result()
             all_rows = run["all_rows"].result()[0]
