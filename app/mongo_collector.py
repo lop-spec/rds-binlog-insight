@@ -66,12 +66,21 @@ def load_instances(root: Path):
     return value
 
 
+class SlowWindowOverCapacity(RuntimeError):
+    """The window holds more slow records than SLOWLOG_MAX_PAGES pages: retrying cannot succeed."""
+
+
 class MongoCollector:
     SLOWLOG_PAGE_TIMEOUT = 12
     # DDS documents 30 DescribeSlowLogRecords requests/minute. Share this gate
     # between realtime and history lanes; do not speed up by adding readers.
     SLOWLOG_REQUEST_INTERVAL = 2.1
-    SLOWLOG_MAX_PAGES = 500
+    # 2026-09-17 12:00 (UTC+8) held 141,394 records in one five-minute window (normally ~2,300), above the former
+    # 500-page cap, and the live checkpoint stayed on it for 12 days. 2,000 pages = 200,000 records (~1.3 GiB as
+    # Python objects at ~7 KB each; the app container has 6 GiB) covers that incident with headroom.
+    SLOWLOG_MAX_PAGES = 2000
+    # After an outage an hour of provider lag is normal; past six hours the live lane is stuck, not catching up.
+    LIVE_MAX_LAG = 72 * WINDOW
 
     def __init__(self, store, entry, settings_loader, archive_loader=None):
         self.store=store;self.entry=entry;self.instance=entry['instanceId']
@@ -107,7 +116,7 @@ class MongoCollector:
             if count<0 or (total is not None and count!=total):raise RuntimeError('source_changed_during_pagination')
             if total is None:
                 pages=max(1,(count+99)//100)
-                if pages>self.SLOWLOG_MAX_PAGES:raise RuntimeError('slowlog_page_limit_or_count_mismatch')
+                if pages>self.SLOWLOG_MAX_PAGES:raise SlowWindowOverCapacity('slowlog_page_limit_exceeded: records=%s pages=%s cap=%s'%(count,pages,self.SLOWLOG_MAX_PAGES))
                 # A dense window cannot fit the old fixed 240s budget even when
                 # every request succeeds. Budget all pages plus API pacing;
                 # retain per-request timeout, finite page cap and stop checks.
@@ -275,13 +284,34 @@ class MongoCollector:
         if success!=len(self.entry['nodes']):raise RuntimeError('incomplete_node_sampling')
         return success
 
+    def note_skipped(self,start,end,reason):
+        """Windows the live lane gave up on stay visible in /api/mongo/status; the history lane may still fill them."""
+        entry=dict(start_us=start,end_us=end,reason=reason,at=int(time.time()))
+        self.state['slowlog_skipped']=([entry]+list(self.state.get('slowlog_skipped',[])))[:10]
+
     def slow_tick(self):
         end=(int(time.time()*1e6)-180_000_000)//WINDOW*WINDOW
         checkpoint=self.store.base(self.instance)/'slow-checkpoint.json'
         start=int(json.loads(checkpoint.read_text())['next']) if checkpoint.exists() else end-3*WINDOW
+        if start<end-self.LIVE_MAX_LAG:
+            # Stuck far behind: jump to the present. The skipped range is not marked done; the bounded history lane
+            # discovers it as missing windows (newest first) and reports what it cannot fetch.
+            jump=end-3*WINDOW
+            LOGGER.warning('mongo_slowlog live_skip: instance=%s reason=lag_exceeds_limit from=%s to=%s lag_hours=%.1f',
+                           self.instance,start,jump,(end-start)/(60*MINUTE))
+            self.note_skipped(start,jump,'lag_exceeds_limit')
+            atomic_json(checkpoint,{'next':jump});start=jump
         # Catch up forward first. One completed small window is a progress unit.
         if start<end:
-            m=self.slow_window(start,start+WINDOW)
+            try:m=self.slow_window(start,start+WINDOW)
+            except SlowWindowOverCapacity as exc:
+                # Deterministic: the record count cannot shrink, so every retry fails the same way. Skip it, keep it
+                # visible, and let the lane move on instead of blocking every later window.
+                LOGGER.warning('mongo_slowlog live_skip: instance=%s reason=over_capacity window=%s detail=%s',
+                               self.instance,start,exc)
+                self.note_skipped(start,start+WINDOW,str(exc))
+                atomic_json(checkpoint,{'next':start+WINDOW})
+                return 0
             atomic_json(checkpoint,{'next':start+WINDOW})
             self.state['slowlog_window']=m['end'];return m['records']
         # Refresh closed but recently completed windows for delayed provider logs.

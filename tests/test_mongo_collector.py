@@ -86,9 +86,60 @@ class CollectorGates(unittest.TestCase):
         client.call.assert_not_called();c.store.publish.assert_not_called()
 
     def test_oversized_window_fails_explicitly_without_publishing(self):
-        c=self.collector([{'TotalRecordCount':50001,'Items':{'LogRecords':[record()]}}])
+        c=self.collector([{'TotalRecordCount':200001,'Items':{'LogRecords':[record()]}}])
         with self.assertRaisesRegex(RuntimeError,'page_limit'):c.slow_window(T,T+5*MINUTE)
         c.store.publish.assert_not_called()
+
+    def test_incident_sized_window_of_141k_records_is_fetched_completely(self):
+        # 2026-09-17 12:00: 141,394 records = 1,414 pages, above the former 500-page cap.
+        total=141394;clock=[0.0];pages=[]
+        c=self.collector([])
+        client=Mock()
+        def response(action,params):
+            pages.append(params['PageNumber'])
+            n=min(100,total-(params['PageNumber']-1)*100)
+            return {'TotalRecordCount':total,'Items':{'LogRecords':[record() for _ in range(n)]}}
+        client.call.side_effect=response;c.rpc=lambda cms=False:client
+        def wait(delay):clock[0]+=delay;return False
+        with patch('app.mongo_collector.time.monotonic',side_effect=lambda:clock[0]),patch.object(c.stop_event,'wait',side_effect=wait):
+            c.slow_window(T,T+5*MINUTE)
+        self.assertEqual(len(pages),1414)
+        c.store.publish.assert_called_once()
+        self.assertEqual(len(c.store.publish.call_args.args[3]),total)
+
+    def test_over_capacity_window_is_skipped_by_the_live_lane_and_stays_visible(self):
+        from app.mongo_collector import SlowWindowOverCapacity
+        from app.mongo_store import MongoStore,atomic_json
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            c=MongoCollector(store,dict(instanceId='dds-example'),lambda:None)
+            checkpoint=store.base(c.instance)/'slow-checkpoint.json';atomic_json(checkpoint,{'next':T})
+            c.slow_window=Mock(side_effect=SlowWindowOverCapacity('slowlog_page_limit_exceeded: records=300000'))
+            with patch('app.mongo_collector.time.time',return_value=T/1e6+1000):
+                with self.assertLogs('app.mongo_collector',level='WARNING') as logs:
+                    self.assertEqual(c.slow_tick(),0)
+            self.assertIn('live_skip',logs.output[0]);self.assertIn('over_capacity',logs.output[0])
+            self.assertEqual(json.loads(checkpoint.read_text())['next'],T+5*MINUTE)
+            skipped=c.state['slowlog_skipped'][0]
+            self.assertEqual((skipped['start_us'],skipped['end_us']),(T,T+5*MINUTE))
+            self.assertIn('records=300000',skipped['reason'])
+
+    def test_live_lane_far_behind_jumps_to_the_present_and_leaves_the_gap_to_history(self):
+        from app.mongo_store import MongoStore,atomic_json
+        with tempfile.TemporaryDirectory() as td:
+            store=MongoStore(Path(td),backend='parquet')
+            c=MongoCollector(store,dict(instanceId='dds-example'),lambda:None)
+            checkpoint=store.base(c.instance)/'slow-checkpoint.json';atomic_json(checkpoint,{'next':T})
+            now=T+12*24*60*MINUTE
+            c.slow_window=Mock(return_value=dict(end=0,records=7))
+            with patch('app.mongo_collector.time.time',return_value=now/1e6):
+                with self.assertLogs('app.mongo_collector',level='WARNING') as logs:
+                    self.assertEqual(c.slow_tick(),7)
+            end=(now-180_000_000)//(5*MINUTE)*(5*MINUTE)
+            self.assertIn('lag_exceeds_limit',logs.output[0])
+            c.slow_window.assert_called_once_with(end-3*5*MINUTE,end-2*5*MINUTE)
+            self.assertEqual(c.state['slowlog_skipped'][0]['reason'],'lag_exceeds_limit')
+            self.assertEqual(c.state['slowlog_skipped'][0]['start_us'],T)
 
     def test_failed_dense_window_does_not_advance_checkpoint_and_can_retry(self):
         from app.mongo_store import MongoStore,atomic_json
