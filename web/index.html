@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.29.20-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.29.20-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.29.21-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.29.21-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -179,6 +179,7 @@
           <form id="analytics-form" class="query-grid">
             <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="RDS：慢日志提供真实扫描行数和耗时，Binlog 提供写入与事务推断，一次分析同时取回；MongoDB 单独分析"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option></select></label>
             <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
+            <label id="rds-controls" class="field span-2"><span>性能指标</span><select id="rds-metric" title="选一个上涨的主要指标：按 SQL 执行耗时与该指标曲线的相关度从高到低排查，并对比昨日同窗的耗时增量（时间窗需小于 24 小时）"></select></label>
             <label id="analytics-node-field" class="field span-2" hidden><span>Node ID（慢日志）</span><input id="analytics-node" type="text" list="analytics-node-options" maxlength="128" autocomplete="off" placeholder="留空表示全部已采集节点" title="阿里云 DAS Node ID；可从已配置节点中选择，也可直接填写"><datalist id="analytics-node-options"></datalist></label>
             <label class="field span-2"><span>开始时间</span><input id="analytics-start" type="datetime-local" step="1"></label>
             <label class="field span-2"><span>结束时间</span><input id="analytics-end" type="datetime-local" step="1"></label>
@@ -191,20 +192,22 @@
             <div id="mongo-controls" class="query-grid span-8" hidden>
               <label class="field span-2"><span>MongoDB 实例</span><select id="mongo-instance"></select></label>
               <label class="field"><span>角色</span><select id="mongo-role"><option value="Primary">Primary</option><option value="Secondary">Secondary</option><option value="">全部角色（分开计算）</option></select></label>
-              <label class="field"><span>慢记录层级</span><select id="mongo-kind"><option value="command">外层命令</option><option value="suboperation">内部操作</option></select></label>
               <label class="field span-2"><span>性能指标</span><select id="mongo-metric"></select></label>
-              <label class="field span-2"><span>判断方式</span><select id="mongo-analysis-mode"><option value="attribution">上涨排查 · 成本增量证据</option><option value="correlation">时序相关 · 不判断根因</option></select></label>
+              <label class="field"><span>对照基线</span><select id="mongo-baseline"><option value="yesterday">昨日同窗（不超过 24 小时）</option><option value="previous">前一个等长窗口</option><option value="custom">指定开始时间</option></select></label>
+              <details class="filter-disclosure span-8"><summary>更多条件</summary><div class="query-grid">
+              <label class="field"><span>慢记录层级</span><select id="mongo-kind"><option value="command">外层命令</option><option value="suboperation">内部操作</option></select></label>
+              <label class="field span-2"><span>判断方式</span><select id="mongo-analysis-mode"><option value="correlation">相关度排序（默认）</option><option value="attribution">成本增量证据排序（旧）</option></select></label>
               <label class="field"><span>命令</span><select id="mongo-command"><option value="">全部</option><option>find</option><option>aggregate</option><option>distinct</option><option>update</option><option>insert</option><option>delete</option><option>getMore</option><option>count</option><option>findAndModify</option></select></label>
               <label class="field span-2"><span>集合 / 集合族</span><input id="mongo-namespace" placeholder="库.集合；支持片段筛选"></label>
-              <label class="field"><span>对照基线</span><select id="mongo-baseline"><option value="yesterday">昨日同窗（不超过 24 小时）</option><option value="previous">前一个等长窗口</option><option value="custom">指定开始时间</option></select></label>
               <label class="field span-2"><span>指定基线开始（等长）</span><input id="mongo-baseline-start" type="datetime-local" step="1"></label>
               <label class="field span-2"><span>真实问题回放</span><select id="mongo-replay"><option value="">选择已固定的异常与基线</option></select></label>
+              </div></details>
               <p id="mongo-baseline-hint" class="analytics-note span-8" role="status" aria-live="polite"></p>
             </div>
             <div id="analytics-filter-summary" class="active-filters span-8" hidden></div>
             <div class="form-actions span-8">
               <button id="analytics-submit" class="button primary" type="submit">
-                <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-6M22 20H2"/></svg>开始分析
+                <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-6M22 20H2"/></svg>开始排查
               </button>
               <details class="action-menu"><summary>更多操作</summary><div class="menu-content"><button id="analytics-reset" class="button ghost" type="button">重置条件</button></div></details>
             </div>
@@ -225,10 +228,12 @@
           <div class="section-heading">
             <div><h2>分析结果</h2><span id="analytics-meta">等待分析</span></div>
             <div class="segmented" id="analytics-tabs" aria-label="分析维度">
-              <button data-analytics-tab="sql" class="is-active" type="button">慢日志</button>
-              <button data-analytics-tab="writes" type="button">写入 SQL</button>
-              <button data-analytics-tab="transactions" type="button">事务</button>
-              <button data-analytics-tab="locks" type="button">锁争用推断</button>
+              <button data-analytics-tab="rise" class="is-active" type="button">上涨排查</button>
+              <button data-analytics-tab="sql" class="is-detail" type="button" hidden>慢日志</button>
+              <button data-analytics-tab="writes" class="is-detail" type="button" hidden>写入 SQL</button>
+              <button data-analytics-tab="transactions" class="is-detail" type="button" hidden>事务</button>
+              <button data-analytics-tab="locks" class="is-detail" type="button" hidden>锁争用推断</button>
+              <button id="analytics-more-views" class="is-more" type="button" aria-expanded="false" title="慢日志、Binlog 写入、事务、锁争用的原始明细（按需加载）">更多视图</button>
             </div>
           </div>
 
@@ -238,6 +243,7 @@
             <span>选择时间范围后点击“开始分析”。</span>
           </div>
 
+          <div id="analytics-panel-rise" class="analytics-panel is-active"></div>
           <div id="analytics-panel-sql" class="analytics-panel"></div>
           <div id="analytics-panel-writes" class="analytics-panel"></div>
           <div id="analytics-panel-transactions" class="analytics-panel"></div>
@@ -467,9 +473,10 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.29.20-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.29.20-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.29.20-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.29.20-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.29.21-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.29.21-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.29.21-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.29.21-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.29.21-rawoss" defer></script>
 </body>
 </html>

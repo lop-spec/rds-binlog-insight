@@ -134,7 +134,7 @@ test('each resource defaults to cost evidence and explicit correlation remains a
    const q=new URL(calls[0],'http://fixture').searchParams;assert.equal(q.get('metric'),metric);assert.equal(q.get('order'),mode);
   }
  }
- const {calls,run}=requestContext();await run();assert.equal(new URL(calls[0],'http://fixture').searchParams.get('order'),'attribution');
+ const {calls,run}=requestContext();await run();assert.equal(new URL(calls[0],'http://fixture').searchParams.get('order'),'correlation');
 });
 test('resource evidence exposes waiting counterexample and missing deltas without a causal score',()=>{
  const c=context();vm.runInContext(source,c);

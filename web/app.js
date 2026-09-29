@@ -19,7 +19,10 @@ const state = {
   notifiedQueryTasks: new Set(),
   lastBackfillMessage: "",
   analytics: null,
-  analyticsTab: "sql",
+  analyticsTab: "rise",
+  rdsTab: "rise",
+  rise: null,
+  analyticsRunsQuery: "",
   analyticsInitialized: false,
   // 每种证据各自的排序键（慢日志与 Binlog 的可选排序不同）；RDS 一次分析同时取回两种结果。
   sqlOrders: {},
@@ -1776,21 +1779,20 @@ function analyticsKind(result) {
 }
 
 function analyticsTabKind(name) {
-  return name === "sql" ? "slowlog" : "binlog";
+  return name === "rise" ? "rise" : name === "sql" ? "slowlog" : "binlog";
 }
 
 function syncAnalyticsMode() {
-  if (typeof syncMongoMode === 'function') {
-    const mongo = $("#analytics-source").value === "mongodb";
-    syncMongoMode(mongo);
-    if (mongo) return;
-  }
+  const mongo = $("#analytics-source").value === "mongodb";
+  if (typeof syncMongoMode === 'function') syncMongoMode(mongo);
+  if (typeof syncRdsControls === 'function') syncRdsControls(!mongo);
+  if (mongo) return;
   $("#analytics-tabs").hidden = false;
   const nodeField = $("#analytics-node-field");
   const nodeInput = $("#analytics-node");
   if (nodeField) nodeField.hidden = false;
   if (nodeInput) nodeInput.disabled = false;
-  switchAnalyticsTab(state.analyticsTab || "sql");
+  switchAnalyticsTab(state.rdsTab || "rise");
 }
 
 function switchAnalyticsTab(name) {
@@ -1798,10 +1800,15 @@ function switchAnalyticsTab(name) {
   $$("[data-analytics-tab]").forEach((button) => button.classList.toggle("is-active", button.dataset.analyticsTab === name));
   $$(".analytics-panel").forEach((panel) => panel.classList.toggle("is-active", panel.id === `analytics-panel-${name}`));
   if ($("#analytics-source").value === "mongodb") return;
+  state.rdsTab = name;
   const kind = analyticsTabKind(name);
   // 锁分析口径只对事务 / 锁争用两页成立；慢日志与写入 SQL 页不需要它。
   const warning = $("#analytics-lock-warning");
   if (warning) warning.hidden = !["transactions", "locks"].includes(name);
+  if (kind === "rise") {
+    if (state.rise?.data && typeof renderRiseCoverage === "function") renderRiseCoverage(state.rise.data);
+    return;
+  }
   const run = state.analyticsRuns?.[kind];
   if (run?.result) {
     state.analytics = run.result;
@@ -1887,15 +1894,30 @@ function analyticsQueryString(orderOverride = "", kind = "slowlog") {
 
 async function runAnalytics(orderOverride = "") {
   if ($("#analytics-source").value === "mongodb") return runMongoAnalytics();
-  // 换排序不需要重新扫描分区：已覆盖的聚合直接重排即可。
-  const scope = [$("#analytics-source").selectedOptions[0].textContent, $("#analytics-instance").selectedOptions[0].textContent,
-    `${$("#analytics-start").value.replace('T', ' ')} → ${$("#analytics-end").value.replace('T', ' ')}`,
-    $("#analytics-filter-summary").textContent].filter(Boolean).join(' · ');
-  // RDS：慢日志与 Binlog 写入同时取回，标签切换不再发请求；一类失败不影响另一类。
+  return runRise();
+}
+
+// 更多视图（慢日志 / 写入 SQL / 事务 / 锁争用）：按上涨排查同一份条件按需加载，不在每次排查时多发请求。
+function analyticsDetailQuery(base, kind) {
+  const params = new URLSearchParams(base);
+  params.set("source", kind);
+  params.delete("metric");
+  params.set("order", state.sqlOrders?.[kind] || "executions");
+  return params.toString();
+}
+
+async function loadAnalyticsDetails() {
+  const base = state.rise?.query;
+  if (!base || state.analyticsRunsQuery === base) return;
+  state.analyticsRunsQuery = base;
+  for (const id of ["sql", "writes", "transactions", "locks"]) {
+    $(`#analytics-panel-${id}`).innerHTML = '<p class="analytics-note">正在加载明细…</p>';
+  }
   const kinds = ["slowlog", "binlog"];
-  const queries = Object.fromEntries(kinds.map((kind) => [kind, analyticsQueryString(orderOverride, kind)]));
+  const scope = $("#analytics-meta").textContent;
+  const queries = Object.fromEntries(kinds.map((kind) => [kind, analyticsDetailQuery(base, kind)]));
   const settled = await Promise.allSettled(kinds.map((kind) => api(`/api/analytics?${queries[kind]}`)));
-  if (settled.every((item) => item.status === "rejected")) throw settled[0].reason;
+  if (state.analyticsRunsQuery !== base) return; // 期间已重新排查
   const runs = {};
   kinds.forEach((kind, index) => {
     const outcome = settled[index];
@@ -1904,25 +1926,31 @@ async function runAnalytics(orderOverride = "") {
       : { query: queries[kind], error: outcome.reason };
   });
   state.analyticsRuns = runs;
-  state.performanceCache = null;
   for (const kind of kinds) {
     if (runs[kind].result) renderAnalytics(runs[kind].result);
     else renderAnalyticsFailure(kind, runs[kind].error);
   }
-  $("#analytics-empty").hidden = true;
-  switchAnalyticsTab(state.analyticsTab || "sql");
   $("#analytics-meta").textContent = scope;
-  const failed = kinds.filter((kind) => runs[kind].error);
-  for (const kind of failed) toast(`${kind === "slowlog" ? "慢日志" : "Binlog 写入"}分析失败：${runs[kind].error?.message || runs[kind].error}`, "error", 6000);
-  const pending = kinds.reduce((sum, kind) => sum + Number(runs[kind].result?.coverage?.pending_parts || 0), 0);
-  const filesUnit = kinds.some((kind) => runs[kind].result?.coverage?.unit === "files");
-  if (pending) {
-    toast(filesUnit
-      ? `分析完成；还有 ${pending} 个文件尚未入库，入库后重新分析可得到完整结果`
-      : `分析完成；还有 ${pending} 个分区未建索引，后台补齐后重新分析可得到完整结果`, "info", 6000);
-  } else if (!failed.length) {
-    toast("分析完成", "success");
+  switchAnalyticsTab(state.analyticsTab || "rise");
+  for (const kind of kinds.filter((item) => runs[item].error)) {
+    toast(`${kind === "slowlog" ? "慢日志" : "Binlog 写入"}明细加载失败：${runs[kind].error?.message || runs[kind].error}`, "error", 6000);
   }
+}
+
+// 点标签：明细视图第一次打开时才请求；上涨排查本身不需要。
+async function openAnalyticsTab(name) {
+  switchAnalyticsTab(name);
+  if (name === "rise" || $("#analytics-source").value === "mongodb") return;
+  await loadAnalyticsDetails();
+}
+
+function toggleAnalyticsMoreViews(force) {
+  const button = $("#analytics-more-views");
+  const open = typeof force === "boolean" ? force : button.getAttribute("aria-expanded") !== "true";
+  button.setAttribute("aria-expanded", String(open));
+  button.textContent = open ? "收起视图" : "更多视图";
+  $$("[data-analytics-tab].is-detail").forEach((item) => { item.hidden = !open; });
+  if (!open && state.analyticsTab !== "rise") switchAnalyticsTab("rise");
 }
 
 /* ------------------------------ 结构对比 ------------------------------ */
@@ -2248,7 +2276,10 @@ function bindEvents() {
   }
   $("#analytics-range").addEventListener("change", (event) => { if (event.target.value !== "custom") setAnalyticsRange(event.target.value); });
   $("#view-analytics").addEventListener("change", (event) => { if (event.target.matches("[data-sql-sort]")) changeSqlOrder(event.target); });
-  $$("[data-analytics-tab]").forEach((button) => button.addEventListener("click", () => switchAnalyticsTab(button.dataset.analyticsTab)));
+  $$("[data-analytics-tab]").forEach((button) => button.addEventListener("click", () => {
+    openAnalyticsTab(button.dataset.analyticsTab).catch((error) => toast(error.message, "error", 6000));
+  }));
+  $("#analytics-more-views").addEventListener("click", () => toggleAnalyticsMoreViews());
   $("#analytics-source").addEventListener("change", () => syncAnalyticsMode());
   $("#analytics-form").addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -2258,6 +2289,11 @@ function bindEvents() {
   });
   // 排序与事务下钻都在重渲染后的节点上，用事件委托绑定一次。
   $("#view-analytics").addEventListener("click", async (event) => {
+    const riseRow = event.target.closest("[data-rise-fp]");
+    if (riseRow) {
+      await openRiseDetail(riseRow.dataset.riseNode, riseRow.dataset.riseFp);
+      return;
+    }
     const slowEvent = event.target.closest("[data-slow-fingerprint]");
     if (slowEvent) {
       await openSlowSqlDetail(slowEvent.dataset.slowFingerprint);
@@ -2267,7 +2303,8 @@ function bindEvents() {
     if (drill) {
       state.txnDrill = drill.dataset.txnDrill;
       if (!state.analytics) return;
-      switchAnalyticsTab("transactions");
+      toggleAnalyticsMoreViews(true);
+      await openAnalyticsTab("transactions");
       renderTxnDrill(state.txnDrill);
       $("#txn-drill-title")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
@@ -2277,6 +2314,7 @@ function bindEvents() {
   $("#analytics-reset").addEventListener("click", () => {
     $("#analytics-source").value = "rds";
     $("#analytics-instance").value = "";
+    state.rdsTab = "rise";
     syncAnalyticsMode();
     $("#analytics-node").value = "";
     $("#analytics-database").value = "";

@@ -2,8 +2,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from app.config import Settings
-from app.slowlog_impact import DAY_US, execution_series, rank_resource_overlap, rank_performance_growth
-from app.slowlog_impact_service import load_iops_points, query_resource_overlap
+from app.slowlog_impact import DAY_US, execution_series, order_by_correlation, rank_resource_overlap, rank_performance_growth
+from app.slowlog_impact_service import RDS_METRICS, load_iops_points, load_metric_points, query_resource_overlap
 
 W = 60_000_000
 
@@ -167,6 +167,95 @@ class ServiceTests(unittest.TestCase):
         sql=backend._rows.call_args.args[0]
         self.assertIn('nullIf(metric_rows_examined,0)',sql)
         self.assertIn('nullIf(metric_lock_time_ms,0)',sql)
+
+
+def runs(name, starts, duration=30_000):
+    """Executions of one SQL family, each with its own event id (the ranker rejects duplicates)."""
+    return [dict(event(name, start, duration), event_id=f"{name}-{start}") for start in starts]
+
+
+class CorrelationOrderTests(unittest.TestCase):
+    def ranked(self, current, before, values):
+        previous = [{**e, "start_us": e["start_us"] - DAY_US} for e in before]
+        return rank_performance_growth(current, previous, points(values), start_us=0, end_us=6 * W - 1,
+                                       index_complete=True, baseline_complete=True)
+
+    def test_orders_by_signed_r_descending_not_by_cost_or_evidence(self):
+        # metric rises 10 -> 60. "ramp" runs longer each minute (r = +1), "inverse" shorter (r = -1),
+        # "big" runs the whole window at a constant rate: the largest cost, but its coefficient is undefined.
+        ramp = [dict(event("ramp", i * W, (i + 1) * 10_000), event_id=f"ramp-{i}") for i in range(6)]
+        inverse = [dict(event("inverse", i * W, (6 - i) * 10_000), event_id=f"inverse-{i}") for i in range(6)]
+        big = [event("big", 0, 360_000)]
+        result = self.ranked(big + inverse + ramp, [], [10, 20, 30, 40, 50, 60])
+        order_by_correlation(result)
+        rows = result["nodes"][0]["statements"]
+        self.assertEqual([r["sql_id"] for r in rows], ["ramp", "inverse", "big"])
+        by = {r["sql_id"]: r for r in rows}
+        self.assertGreater(by["ramp"]["resource_r"], 0.99)
+        self.assertLess(by["inverse"]["resource_r"], -0.99)
+        self.assertIsNone(by["big"]["resource_r"])
+        self.assertGreater(by["big"]["runtime_us_total"], by["ramp"]["runtime_us_total"])
+        self.assertEqual([r["correlation_rank"] for r in rows], [1, 2, None])
+        self.assertEqual(by["ramp"]["active_minutes"], 6)
+        self.assertEqual(result["order"], "correlation")
+
+    def test_uncomputable_coefficients_follow_computable_ones_in_stable_order(self):
+        flat = [event(name, 0, 360_000) for name in ("b-flat", "a-flat")]
+        ramp = [dict(event("ramp", i * W, (i + 1) * 10_000), event_id=f"ramp-{i}") for i in range(6)]
+        result = self.ranked(flat + ramp, [], [1, 2, 3, 4, 5, 6])
+        order_by_correlation(result)
+        rows = result["nodes"][0]["statements"]
+        self.assertEqual(rows[0]["sql_id"], "ramp")
+        tail = [r for r in rows if r["resource_r"] is None]
+        self.assertEqual([r["sql_id"] for r in tail], ["a-flat", "b-flat"])
+        self.assertTrue(all(r["correlation_rank"] is None for r in tail))
+
+
+def json_key(sql_id):
+    import json
+    return json.dumps(["", "sql_id", sql_id], separators=(",", ":"))
+
+
+class MetricSelectionTests(unittest.TestCase):
+    def test_registry_covers_the_main_rds_metrics(self):
+        self.assertEqual(list(RDS_METRICS), ["cpu", "iops", "rows_read", "row_lock", "threads"])
+        self.assertEqual(RDS_METRICS["cpu"][0], "Cluster_CpuUsage")
+        self.assertEqual(RDS_METRICS["iops"][0], "Cluster_IOPSUsage")
+
+    def test_loader_requests_the_named_cms_metric(self):
+        client = Mock()
+        client.call.return_value = dict(Code="200", Datapoints="[]")
+        with patch("app.slowlog_impact_service.CmsRpcClient", return_value=client):
+            load_metric_points(Settings(), 0, W, "instance", credential_loader=lambda _: object(), metric_name="Cluster_CpuUsage")
+            load_iops_points(Settings(), 0, W, "instance", credential_loader=lambda _: object())
+        names = [c.args[1]["MetricName"] for c in client.call.call_args_list]
+        self.assertEqual(names, ["Cluster_CpuUsage", "Cluster_IOPSUsage"])
+
+    def test_unsupported_metric_is_reported_before_any_read(self):
+        backend, loader = Mock(), Mock()
+        backend.serving_enabled = True
+        with self.assertLogs("app.slowlog_impact_service", "WARNING"):
+            result = query_resource_overlap(Mock(), backend, {"source": "slowlog", "instance": "x", "metric": "nope"},
+                                            Settings(), loader)
+        self.assertEqual(result["status"], "unsupported_metric")
+        backend._window.assert_not_called()
+        loader.assert_not_called()
+
+    def test_default_metric_keeps_the_old_loader_signature_and_other_metrics_pass_the_name(self):
+        for metric, expect in (("", {}), ("cpu", {"metric_name": "Cluster_CpuUsage"})):
+            backend, metadata, loader = Mock(), Mock(), Mock(return_value=[])
+            backend.serving_enabled = True
+            # the baseline window must echo the requested range or the service reports baseline_outside_retention
+            backend._window.side_effect = lambda q, retention: ((q["start_epoch_us"], q["end_epoch_us"])
+                                                                 if "start_epoch_us" in q else (0, 6 * W - 1))
+            backend._manifest_coverage.return_value = {"complete": True, "total_parts": 1}
+            backend._scope_sql.return_value = ("SELECT 1", {})
+            backend._rows.return_value = [dict(event_id="e", start_us=W, node_id="a", database_name="d", fingerprint="f",
+                                               sql_id="s", duration_ms=1000, rows_examined=1, lock_time_ms=1)]
+            query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "metric": metric},
+                                   Settings(), loader)
+            self.assertEqual(loader.call_args_list[0].kwargs, expect)
+            self.assertEqual(loader.call_args_list[1].kwargs, expect)  # the baseline day uses the same metric
 
 
 if __name__ == "__main__":

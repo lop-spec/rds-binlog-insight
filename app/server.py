@@ -788,6 +788,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("workspace.css")
             elif parsed.path == "/assets/mongo.js":
                 self._serve_static("mongo.js")
+            elif parsed.path == "/assets/rise.js":
+                self._serve_static("rise.js")
             elif parsed.path == "/api/mongo/status":
                 self._json({"ok": True, "data": self.app.mongo.status()})
             elif parsed.path == "/api/mongo/analytics":
@@ -915,10 +917,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self._json({"ok": True, "data": result})
             elif parsed.path == "/api/slowlog-impact":
                 settings = self.app.metadata.load_settings()
+                # order=correlation is this endpoint's own ranking (not one of the analytics SQL orders);
+                # metric picks the CMS series (cpu, iops, rows_read, row_lock, threads).
+                impact_query = _analytics_query({**query, "order": ["executions"]})
+                impact_query["metric"] = _query_value(query, "metric").strip().lower()
+                impact_query["impact_order"] = _query_value(query, "order").strip().lower()
                 result = query_resource_overlap(
                     self.app.metadata,
                     self.app.storage.clickhouse_slowlog_backend,
-                    _analytics_query(query), settings,
+                    impact_query, settings,
                 )
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/analytics":

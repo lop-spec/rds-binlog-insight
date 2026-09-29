@@ -82,17 +82,20 @@ test('form controls preserved and native disclosures are closed initially', () =
 });
 
 
-// ---- 1.29.19: RDS is one data source; slow log and Binlog writes load together and switch as tabs ----
+// ---- 1.29.21: RDS = 上涨排查 (metric + window -> SQL ranked by correlation); the four detail views load on demand ----
+const rise = fs.readFileSync(path.join(root, 'web/rise.js'), 'utf8');
 function rdsContext(api) {
   const nodes = {};
   const node = (selector) => (nodes[selector] ??= {innerHTML: '', textContent: '', hidden: false, value: '', className: '',
-    classList: {toggle() {}}, selectedOptions: [{textContent: selector === '#analytics-source' ? 'RDS' : '全部实例'}]});
-  const c = vm.createContext({console, URLSearchParams, Date, Promise, Number, Object, Math, JSON,
+    classList: {toggle() {}}, getAttribute: () => 'false', setAttribute() {}, options: [],
+    selectedOptions: [{textContent: selector === '#analytics-source' ? 'RDS' : '全部实例'}]});
+  const c = vm.createContext({console, URLSearchParams, Date, Promise, Number, Object, Math, JSON, Infinity, String,
     document: {addEventListener() {}, querySelector: node, querySelectorAll: () => []}});
-  vm.runInContext(workspace + '\n' + app, c);
+  vm.runInContext(workspace + '\n' + app + '\n' + rise, c);
   Object.assign(nodes, {'#analytics-source': {value: 'rds', selectedOptions: [{textContent: 'RDS'}]},
-    '#analytics-start': {value: '2026-09-28T10:00'}, '#analytics-end': {value: '2026-09-29T10:00'},
-    '#analytics-instance': {value: 'rm-prod', selectedOptions: [{textContent: 'mysql-main'}]},
+    '#analytics-start': {value: '2026-09-28T10:00'}, '#analytics-end': {value: '2026-09-28T12:00'},
+    '#analytics-instance': {value: 'rm-main', selectedOptions: [{textContent: 'mysql-main'}], options: [{value: 'rm-main'}]},
+    '#rds-metric': {value: 'cpu', options: [1]}, '#rds-controls': {hidden: true},
     '#analytics-node': {value: ''}, '#analytics-database': {value: ''}, '#analytics-table': {value: ''},
     '#analytics-operation': {value: ''}, '#analytics-limit': {value: '50'}, '#analytics-filter-summary': {textContent: ''},
     '#analytics-lock-warning': {hidden: true}, '#analytics-tabs': {hidden: false}, '#analytics-empty': {hidden: false},
@@ -107,41 +110,103 @@ function rdsContext(api) {
 const slowResult = {evidence: {source: 'slowlog'}, sql: {mode: 'slowlog', tag: 's', orders: {}}, coverage: {total_parts: 4272}};
 const binlogResult = {evidence: {source: 'binlog'}, sql: {tag: 'b', orders: {}}, transactions: {}, locks: {},
   coverage: {total_parts: 1084, unit: 'files', pending_parts: 2}};
+const stmt = (sqlId, r, now, before, extra = {}) => ({fingerprint: `["d","sql_id","${sqlId}"]`, sql_id: sqlId, normalized_sql: `SELECT ${sqlId} FROM t`,
+  resource_r: r, correlation_status: r === null ? 'constant_x' : 'ok', runtime_us_total: now, baseline_runtime_us_total: before,
+  runtime_delta_us: now - before, executions: 4, active_minutes: 3, runtime_us: [0, 1, 2], sample_event_id: `ev-${sqlId}`,
+  attribution: {baseline_count: 1, current_count: 4, rows_examined: {delta: 1200}, lock_time_ms: {delta: 0}}, ...extra});
+const impactResult = {status: 'ok', metric_id: 'cpu', metric: 'Cluster_CpuUsage', order: 'correlation', instance_id: 'rm-main',
+  start_us: 1790000000000000, end_us: 1790007200000000, executions: 10, baseline_executions: 8,
+  sample_end_us: [1790000060000000, 1790000120000000, 1790000180000000],
+  coverage: {total_parts: 12, covered_parts: 12, complete: true}, baseline_coverage: {total_parts: 12, covered_parts: 12, complete: true},
+  nodes: [
+    {node_id: 'rn-quiet', status: 'ok', peak: 30, metric_scale: 1, metric_values: [10, 11, 12], resource_comparison: {baseline_mean: 10, current_mean: 11, delta: 1},
+      total_fingerprints: 1, statements: [stmt('quiet', 0.3, 5_000_000, 5_000_000)]},
+    {node_id: 'rn-hot', status: 'ok', peak: 99, metric_scale: 1000, metric_values: [30000, 60000, 90000],
+      resource_comparison: {baseline_mean: 30, current_mean: 60, delta: 30}, total_fingerprints: 3,
+      statements: [stmt('ramp', 0.97, 180_000_000, 60_000_000), stmt('steady', 0.4, 90_000_000, 90_000_000),
+                   stmt('flat', null, 60_000_000, 0)]},
+  ]};
 
-test('RDS analysis fetches slow log and Binlog together and fills separate panels', async () => {
-  const {c, nodes, calls, toasts} = rdsContext(async (url) => (url.includes('source=slowlog') ? slowResult : binlogResult));
+test('RDS run asks for one correlation-ordered impact analysis and nothing else', async () => {
+  const {c, nodes, calls, toasts} = rdsContext(async () => impactResult);
   await vm.runInContext('runAnalytics()', c);
-  assert.equal(calls.length, 2);
-  assert.ok(calls.some((u) => u.includes('source=slowlog')) && calls.some((u) => u.includes('source=binlog')));
-  assert.ok(calls.every((u) => u.includes('instance=rm-prod')));
+  assert.equal(calls.length, 1);
+  const url = new URL(calls[0], 'http://fixture');
+  assert.equal(url.pathname, '/api/slowlog-impact');
+  assert.equal(url.searchParams.get('source'), 'slowlog');
+  assert.equal(url.searchParams.get('metric'), 'cpu');
+  assert.equal(url.searchParams.get('order'), 'correlation');
+  assert.equal(url.searchParams.get('instance'), 'rm-main');
+  assert.ok(toasts.some(([kind]) => kind === 'success'));
+  assert.match(nodes['#analytics-meta'].textContent, /^RDS · mysql-main · CPU 使用率 %/);
+  // detail views were not requested
+  assert.equal(nodes['#analytics-panel-sql']?.innerHTML ?? '', '');
+});
+
+test('the hottest node comes first and its SQL are listed in the order the API returned (correlation), with cost increments', async () => {
+  const {c, nodes} = rdsContext(async () => impactResult);
+  await vm.runInContext('runAnalytics()', c);
+  const htmlOut = nodes['#analytics-panel-rise'].innerHTML;
+  assert.ok(htmlOut.indexOf('rn-hot') < htmlOut.indexOf('rn-quiet'), 'node with the larger metric rise first');
+  assert.ok(htmlOut.indexOf('SELECT ramp') < htmlOut.indexOf('SELECT steady') && htmlOut.indexOf('SELECT steady') < htmlOut.indexOf('SELECT flat'));
+  assert.match(htmlOut, /\+0\.97/);                       // signed correlation
+  assert.match(htmlOut, /\+2 分/);                         // ramp: 60 s -> 180 s = +120 s
+  assert.match(htmlOut, /昨日同窗无/);                       // flat: no baseline executions
+  assert.match(htmlOut, /title="constant_x|每分钟耗时恒定/);  // uncomputable r explained, not shown as 0
+  assert.match(htmlOut, /窗口均值 <strong>60<\/strong>/);
+  assert.match(htmlOut, /class="is-flat"/);                // steady/quiet rows: no growth -> dimmed
+});
+
+test('unavailable impact analysis says why instead of an empty table', async () => {
+  const {c, nodes, toasts} = rdsContext(async () => ({status: 'overlapping_baseline', nodes: []}));
+  await vm.runInContext('runAnalytics()', c);
+  assert.match(nodes['#analytics-panel-rise'].innerHTML, /24 小时以内/);
+  assert.ok(toasts.some(([kind, m]) => kind === 'error' && /无法排查/.test(m)));
+  const none = rdsContext(async () => impactResult);
+  none.nodes['#analytics-instance'].value = '';
+  await assert.rejects(vm.runInContext('runAnalytics()', none.c), /请先选择一个 RDS 实例/);
+  assert.equal(none.calls.length, 0);
+});
+
+test('detail views load once, on demand, from the same conditions as the investigation', async () => {
+  const {c, nodes, calls} = rdsContext(async (url) => (url.includes('/api/slowlog-impact') ? impactResult
+    : url.includes('source=slowlog') ? slowResult : binlogResult));
+  await vm.runInContext('runAnalytics()', c);
+  assert.equal(calls.length, 1);
+  await vm.runInContext('openAnalyticsTab("writes")', c);
+  assert.equal(calls.length, 3);
+  const detail = calls.slice(1).map((u) => new URL(u, 'http://fixture'));
+  assert.deepEqual(detail.map((u) => u.searchParams.get('source')).sort(), ['binlog', 'slowlog']);
+  assert.ok(detail.every((u) => u.pathname === '/api/analytics' && !u.searchParams.has('metric') && u.searchParams.get('instance') === 'rm-main'));
   assert.equal(nodes['#analytics-panel-sql'].innerHTML, 'SQL[slowlog:s]');
   assert.equal(nodes['#analytics-panel-writes'].innerHTML, 'SQL[binlog:b]');
   assert.equal(nodes['#analytics-panel-transactions'].innerHTML, 'TXN');
-  assert.match(nodes['#analytics-meta'].textContent, /^RDS · mysql-main/);
-  assert.ok(toasts.some(([, m]) => /2 个文件尚未入库/.test(m)));
-  // switching tabs never requests again and re-points the shared state at that tab's result
-  vm.runInContext('switchAnalyticsTab("locks")', c);
-  assert.equal(calls.length, 2);
-  assert.equal(vm.runInContext('state.analytics.sql.tag', c), 'b');
-  assert.equal(nodes['#analytics-lock-warning'].hidden, false);
-  vm.runInContext('switchAnalyticsTab("sql")', c);
+  await vm.runInContext('openAnalyticsTab("locks")', c);
+  await vm.runInContext('openAnalyticsTab("sql")', c);
+  assert.equal(calls.length, 3, 'switching between detail tabs never requests again');
   assert.equal(vm.runInContext('state.analytics.sql.tag', c), 's');
   assert.equal(nodes['#analytics-lock-warning'].hidden, true);
-  assert.match(vm.runInContext('state.analyticsQuery', c), /source=slowlog/);
+  vm.runInContext('switchAnalyticsTab("locks")', c);
+  assert.equal(vm.runInContext('state.analytics.sql.tag', c), 'b');
+  assert.equal(nodes['#analytics-lock-warning'].hidden, false);
+  // a new investigation invalidates the loaded details
+  await vm.runInContext('runAnalytics()', c);
+  await vm.runInContext('openAnalyticsTab("sql")', c);
+  assert.equal(calls.length, 3 + 1 + 2);
 });
 
-test('one failed kind keeps the other usable and is reported; both failing throws', async () => {
+test('one failed detail kind keeps the other usable and is reported', async () => {
   const {c, nodes, toasts} = rdsContext(async (url) => {
+    if (url.includes('/api/slowlog-impact')) return impactResult;
     if (url.includes('source=binlog')) throw new Error('clickhouse down');
     return slowResult;
   });
   await vm.runInContext('runAnalytics()', c);
+  await vm.runInContext('openAnalyticsTab("writes")', c);
   assert.equal(nodes['#analytics-panel-sql'].innerHTML, 'SQL[slowlog:s]');
   assert.match(nodes['#analytics-panel-writes'].innerHTML, /Binlog 写入分析失败.*clickhouse down/);
   assert.match(nodes['#analytics-panel-locks'].innerHTML, /clickhouse down/);
-  assert.ok(toasts.some(([k, m]) => k === 'error' && /Binlog 写入分析失败/.test(m)));
-  const both = rdsContext(async () => { throw new Error('boom'); });
-  await assert.rejects(vm.runInContext('runAnalytics()', both.c), /boom/);
+  assert.ok(toasts.some(([k, m]) => k === 'error' && /Binlog 写入明细加载失败/.test(m)));
 });
 
 test('sorting a Binlog result re-renders the writes panel and keeps orders per kind', () => {
@@ -155,12 +220,14 @@ test('sorting a Binlog result re-renders the writes panel and keeps orders per k
   assert.match(vm.runInContext('analyticsQueryString("", "slowlog")', c), /order=executions/);
 });
 
-test('data source is exactly RDS and MongoDB; tabs are slow log, writes, transactions, locks', () => {
+test('data source is exactly RDS and MongoDB; the primary tab is 上涨排查 and the four detail views sit behind 更多视图', () => {
   const options = [...html.matchAll(/<select id="analytics-source"[^>]*>(.*?)<\/select>/gs)][0][1];
   assert.deepEqual([...options.matchAll(/value="([^"]+)"/g)].map((m) => m[1]), ['rds', 'mongodb']);
-  const tabs = [...html.matchAll(/data-analytics-tab="([^"]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(tabs, ['sql', 'writes', 'transactions', 'locks']);
-  for (const id of ['analytics-panel-sql', 'analytics-panel-writes', 'analytics-panel-transactions', 'analytics-panel-locks']) {
-    assert.ok(html.includes(`id="${id}"`), id);
-  }
+  const tabs = [...html.matchAll(/<button data-analytics-tab="([^"]+)"([^>]*)>/g)].map((m) => [m[1], /is-detail/.test(m[2]) && /hidden/.test(m[2])]);
+  assert.deepEqual(tabs, [['rise', false], ['sql', true], ['writes', true], ['transactions', true], ['locks', true]]);
+  assert.ok(html.includes('id="analytics-more-views"'));
+  for (const id of ['rise', 'sql', 'writes', 'transactions', 'locks']) assert.ok(html.includes(`id="analytics-panel-${id}"`), id);
+  assert.match(html, /rise\.js/);
+  const metrics = [...rise.matchAll(/\["(\w+)", "[^"]+"\]/g)].map((m) => m[1]).slice(0, 5);
+  assert.deepEqual(metrics, ['cpu', 'iops', 'rows_read', 'row_lock', 'threads']);
 });

@@ -83,3 +83,12 @@ python tools/backtest_slowlog_impact.py --events private-events.json --baseline 
 ```
 
 回测工具只读输入，不覆盖已有报告；缺失真值或排名不达标时退出码 1。真实实例、SQL 与原始证据保留在运维私有目录，不进入公共仓库。
+
+## 上涨排查（1.29.21）
+
+分析洞察选 RDS 后，默认页是「上涨排查」：选实例、时间窗（小于 24 小时）和一个主要指标，得到每个节点里按相关度排序的 SQL，并列出相对昨日同窗的成本增量。慢日志、Binlog 写入、事务、锁争用四个原始视图收在「更多视图」里，第一次打开时才按同一条件加载。
+
+- 接口：`GET /api/slowlog-impact?metric=<id>&order=correlation`（其余参数不变）。`metric`：`cpu`（`Cluster_CpuUsage`）、`iops`（`Cluster_IOPSUsage`，缺省）、`rows_read`（`Cluster_InnoDBRowRead`）、`row_lock`（`Cluster_InnoDBRowLockTimePs`）、`threads`（`Cluster_ThreadsRunning`）。这些指标都按节点返回，取法与 IOPS 相同（`DescribeMetricList`，一分钟点，缺点不补零）。
+- `order=correlation`：每个节点内按带符号皮尔逊 r（SQL 每分钟执行微秒与该指标的序列）从高到低；算不出来的（序列恒定、分钟数不足）排在后面并按稳定标识排序，没有隐藏的成本排序。规则与 MongoDB 工作台相同。每个节点最多返回 20 个 SQL 家族（缺省排序仍是 10 个），并带 `correlation_rank`、`active_minutes`。
+- 成本增量列：耗时（窗口 vs 昨日同窗）、执行次数、扫描行与锁等待增量，都来自已有字段，缺字段显示 —，不按 0 计算。
+- 不带 `order=correlation` 的调用（旧界面的「性能关联」）行为不变。相关只是时序关联，不是资源消耗的度量，也不是因果。

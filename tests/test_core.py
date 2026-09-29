@@ -172,6 +172,18 @@ class ConfigAndChecksumTests(unittest.TestCase):
         self.assertIn(f"/assets/app.css?v={APP_VERSION}", index_html)
         self.assertIn(f"/assets/app.js?v={APP_VERSION}", index_html)
 
+    def test_every_asset_the_page_references_is_routed_and_exists(self) -> None:
+        # a script added to index.html but not to the server's asset routes 404s and takes the page down
+        import re
+        root = Path(__file__).resolve().parents[1]
+        page = (root / "web" / "index.html").read_text("utf-8")
+        routes = (root / "app" / "server.py").read_text("utf-8")
+        assets = set(re.findall(r"/assets/([\w.\-]+)\?v=", page))
+        self.assertTrue({"app.js", "rise.js", "workspace.js", "mongo.js"} <= assets)
+        for name in sorted(assets):
+            self.assertIn(f'parsed.path == "/assets/{name}"', routes, name)
+            self.assertTrue((root / "web" / name).is_file(), name)
+
     def test_body_cache_settings_are_removed(self) -> None:
         settings = Settings()
         updated = parse_settings_payload(

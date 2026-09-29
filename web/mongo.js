@@ -148,7 +148,7 @@ async function runMongoAnalytics() {
       baseline=syncMongoBaseline(start,end,true);
     }
     const params=new URLSearchParams({instance:$('#mongo-instance').value,startEpochUs:String(start),endEpochUs:String(end),baselineStart:String(baseline.start),
-      role:$('#mongo-role').value,kind:$('#mongo-kind').value,metric:$('#mongo-metric').value,order:$('#mongo-analysis-mode')?.value==='correlation'?'correlation':'attribution',
+      role:$('#mongo-role').value,kind:$('#mongo-kind').value,metric:$('#mongo-metric').value,order:$('#mongo-analysis-mode')?.value==='attribution'?'attribution':'correlation',
       command:$('#mongo-command').value,namespace:$('#mongo-namespace').value,limit:$('#analytics-limit').value});
     $('#analytics-meta').textContent='正在读取 MongoDB 既有汇总、计数与性能点…';
     $('#analytics-coverage').textContent=$('#mongo-baseline-hint').textContent;
@@ -190,7 +190,7 @@ function renderMongoAnalytics(data) {
   const orderNotice=automatic?(data.ranking?.available===false?`所选指标相关度暂不可计算：${mongoReason(data.ranking.reason)}。保留当前指标，不改按耗时或次数排序。`:''):(data.order_reason?`原排序“${MONGO_ORDERS[data.requested_order]||data.requested_order}”不可用（${mongoReason(data.order_reason)}），已明确改按“${MONGO_ORDERS[data.order]||data.order}”排序，不是异常增量榜。`:'');
   const rows=(data.statements||[]).map(x=>[
     `<button type="button" class="button ghost compact" data-mongo-group="${escapeHtml(x.group_id)}" data-mongo-role="${escapeHtml(x.role)}">${escapeHtml(x.namespace)}${x.scope==='database'?' · 库级命令':''}<br><strong>${['unknown','command'].includes(x.command)?'命令类型未识别':escapeHtml(x.command)}</strong> · ${escapeHtml(x.role)}</button>${x.incomplete?'<br><small>正文不完整，详情保留已知成本</small>':''}`,
-    mongoEvidence(x), mongoCorrelation(x),
+    mongoCorrelation(x), mongoEvidence(x),
     `<strong>${mongoNumber(x.count)} 条</strong>${x.baseline_count==null?'':`<br>基线 ${mongoNumber(x.baseline_count)} 条`}${x.count_delta==null?'':`<br>增量 ${mongoDelta(x.count_delta)}`}`,
     `${mongoCost(x.costs.duration_us,1e6,'s')}<br>平均 ${mongoNumber(x.avg_us/1000)} ms<br>最大 ${mongoNumber(x.max_us/1000)} ms`,
     `扫描 ${mongoCost(x.costs.docs)}<br>读取 ${mongoCost(x.costs.bytes_read,2**20,'MiB')}`,
@@ -213,16 +213,19 @@ function renderMongoAnalytics(data) {
   const namespaceNote=namespaceTop.unavailable==='window_exceeds_180_minutes'
     ? '窗口超过 180 分钟时不做该聚合；缩小窗口后可见。'
     : `仅统计完整落在窗口内的区间：${mongoNumber(namespaceTop.intervals,0)} 个区间、覆盖 ${mongoNumber(namespaceTop.observed_seconds)} 秒。${namespaceTop.truncated_intervals?'单次采样的集合列表按锁时间截断，分表族合计不受截断影响。':''}`;
-  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>慢命令成本与性能关联</h3><p>${totals}</p>${scopeNotice||orderNotice?`<div class="notice"><div><strong>${escapeHtml(orderNotice||'窗口数据尚未完整')}</strong><p>${escapeHtml(scopeNotice)}</p><button type="button" class="button secondary compact" data-mongo-recent>改查最近 1 小时，对比前 1 小时</button></div></div>`:''}<p class="analytics-note">${escapeHtml(recovery)} ${escapeHtml(historyErrors)} 重新分析可查看回补后的结果。</p><p class="analytics-note">${escapeHtml(data.warning)} · 只对所选层级计算。字段未上报不补零；部分字段展示覆盖条数。快捷时间对齐最新完整慢日志窗口；自定义时间不改写。</p>
-    ${series.map(s=>`<h4>${escapeHtml(s.role)} · ${escapeHtml(s.node||'节点未标识')} · ${escapeHtml(MONGO_METRICS[data.metric]||data.metric)}</h4>${mongoSparkline(s.points)}`).join('')||'<p>没有匹配的性能数据。</p>'}
+  const metricName=MONGO_METRICS[data.metric]||data.metric;
+  const noticeBlock=scopeNotice||orderNotice?`<div class="notice"><div><strong>${escapeHtml(orderNotice||'窗口数据尚未完整')}</strong><p>${escapeHtml(scopeNotice)}</p><p class="analytics-note">${escapeHtml(recovery)} ${escapeHtml(historyErrors)} 重新分析可查看回补后的结果。</p><button type="button" class="button secondary compact" data-mongo-recent>改查最近 1 小时，对比前 1 小时</button></div></div>`:'';
+  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>${escapeHtml(metricName)} 上涨排查</h3>${noticeBlock}
+    ${series.map(s=>`<h4>${escapeHtml(s.role)} · ${escapeHtml(s.node||'节点未标识')} · ${escapeHtml(metricName)}</h4>${mongoSparkline(s.points)}`).join('')||'<p>没有匹配的性能数据。</p>'}
     ${data.order==='attribution'?'<p class="analytics-note">按所选资源对应的成本增量排序，不把耗时增长当成 CPU 增长；IOPS 仅有读取量旁证，响应时间是结果而非原因。缺字段/缺基线的命令不参与增长排名，仍保留已采集成本。候选不是已确认根因；资源均值变化也不代表峰值归因。</p>':''}
     ${data.order==='attribution'&&data.ranking?.available===false?'<p class="notice">没有足够的资源增长证据；下列记录仅供核对，不降级为相关度或耗时根因榜。</p>':''}
-    ${analyticsTable(['集合族 / 命令','资源证据 / 反证','时序相关（含等待）','慢命令次数','累计 / 平均 / 最大耗时','扫描文档 / 读取量','CPU / 写关注等待'],rows)}
-    </section><details class="detail-block"><summary>最长慢命令与反证（补充排查）</summary>${analyticsTable(['命令','最长耗时','代表样本开始','排除项'],outlierRows)}</details><details class="detail-block"><summary>节点命令总次数（不是慢日志计数）</summary><p>按服务器原生计数器的连续区间相减；缺失和跨进程区间不计。QPS 使用已覆盖秒数，不外推完整窗口。基线与当前各至少两个有效区间才比较观测 QPS；不等于全窗口次数增长。</p>${analyticsTable(['节点','角色','命令','计数增量','基线 → 当前 QPS','观测 QPS 变化','当前 / 窗口；基线覆盖','失败'],counterRows,'该历史窗口未采集原生命令计数，不能从慢日志补出来。')}${detailBlock('计数缺口',JSON.stringify({current:data.native_gaps||[],baseline:data.native_baseline_gaps||[]}))}</details>
+    ${analyticsTable(['集合族 / 命令','时序相关（含等待）','资源证据 / 反证（成本增量）','慢命令次数','累计 / 平均 / 最大耗时','扫描文档 / 读取量','CPU / 写关注等待'],rows)}
+    <p class="analytics-note">${automatic?`按 ${escapeHtml(metricName)} 相关度（带符号皮尔逊 r）从高到低。`:''}相关不等于因果；慢记录不是全部执行。</p>
+    </section><details class="detail-block"><summary>更多明细</summary><p class="analytics-note">${totals}</p><p class="analytics-note">${escapeHtml(data.warning)} · 只对所选层级计算。字段未上报不补零；部分字段展示覆盖条数。快捷时间对齐最新完整慢日志窗口；自定义时间不改写。</p><details class="detail-block"><summary>最长慢命令与反证（补充排查）</summary>${analyticsTable(['命令','最长耗时','代表样本开始','排除项'],outlierRows)}</details><details class="detail-block"><summary>节点命令总次数（不是慢日志计数）</summary><p>按服务器原生计数器的连续区间相减；缺失和跨进程区间不计。QPS 使用已覆盖秒数，不外推完整窗口。基线与当前各至少两个有效区间才比较观测 QPS；不等于全窗口次数增长。</p>${analyticsTable(['节点','角色','命令','计数增量','基线 → 当前 QPS','观测 QPS 变化','当前 / 窗口；基线覆盖','失败'],counterRows,'该历史窗口未采集原生命令计数，不能从慢日志补出来。')}${detailBlock('计数缺口',JSON.stringify({current:data.native_gaps||[],baseline:data.native_baseline_gaps||[]}))}</details>
     <details class="detail-block"><summary>内存组成与当前节点状态</summary>${analyticsTable(['节点','角色','样本时间','RSS GiB','WT GiB','WT 上限 GiB','WT 脏页 GiB','实际分配 GiB','已知空闲 GiB（不含 unmapped）','连接','打开游标','读 / 写排队'],memory,'该窗口无原生内存快照。')}</details>
     <details class="detail-block"><summary>集合占用（服务器原生 top，不是慢日志）</summary><p>按 namespace 的读写锁次数与锁持有时间相减得到：它回答"哪张表忙"，不区分具体语句；微秒是锁持有时间（含等待），不是 CPU 时间。${escapeHtml(namespaceNote)}</p>${analyticsTable(['分表族','分表数','读次数','读锁 s','写次数','写锁 s','合计锁 s'],familyRows,'该窗口没有完整的集合区间。')}${analyticsTable(['集合','读次数','读锁 s','写次数','写锁 s','合计锁 s'],namespaceRows,'该窗口没有完整的集合区间。')}</details>
     <details class="detail-block"><summary>集合 / 模板全量次数（接入服务范围）</summary><p>仅统计注册 Command Monitoring 的服务；未接入时不显示虚构的全量次数。</p>${analyticsTable(['服务','集合','命令','尝试次数','失败','丢失'],clients,'尚无应用命令聚合接入。')}</details>
-    <details class="detail-block"><summary>可复算数据与缺口</summary>${detailBlock('数据覆盖',JSON.stringify({coverage,baseline,optional:data.optional_unavailable},null,2))}</details>`;
+    <details class="detail-block"><summary>可复算数据与缺口</summary>${detailBlock('数据覆盖',JSON.stringify({coverage,baseline,optional:data.optional_unavailable},null,2))}</details></details>`;
   switchAnalyticsTab('sql');
 }
 

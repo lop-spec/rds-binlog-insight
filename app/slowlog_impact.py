@@ -135,6 +135,22 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
     return result
 
 
+def order_by_correlation(result: dict[str, Any]) -> None:
+    """Rank each node's SQL families by signed Pearson r (descending) between execution time and the metric.
+
+    The rule of the MongoDB workspace: uncomputable coefficients (constant series, too few minutes) follow the
+    computable ones in stable identity order; there is no hidden cost tie-break. Cost increments stay visible as
+    columns. Correlation is a timing association, not a measurement of per-SQL resource consumption.
+    """
+    for node in result.get("nodes", []):
+        rows = node.get("statements", [])
+        rows.sort(key=lambda row: (row.get("resource_r") is None, -(row.get("resource_r") or 0.0), row["fingerprint"]))
+        for position, row in enumerate(rows, 1):
+            row["correlation_rank"] = position if row.get("resource_r") is not None else None
+            row["active_minutes"] = sum(1 for value in row.get("runtime_us", []) if value)
+    result["order"] = "correlation"
+
+
 def execution_series(events: list[dict[str, Any]], start_us: int, end_us: int,
                      period_us: int = PERIOD_US) -> dict[tuple[str, str], dict[int, int]]:
     """Sum exact microseconds intersecting each complete sampling interval.

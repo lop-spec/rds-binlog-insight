@@ -10,7 +10,7 @@ from typing import Any
 
 from .credentials import load_credential
 from .slow_log_collector import DasRpcClient
-from .slowlog_impact import DAY_US, MAX_EVENTS, family_key, rank_performance_growth
+from .slowlog_impact import DAY_US, MAX_EVENTS, family_key, order_by_correlation, rank_performance_growth
 
 LOGGER = logging.getLogger(__name__)
 
@@ -19,8 +19,23 @@ class CmsRpcClient(DasRpcClient):
     VERSION = "2019-01-01"
 
 
-def load_iops_points(settings: Any, start_us: int, end_us: int, instance: str,
-                     node: str = "", credential_loader: Any = load_credential) -> list[dict[str, Any]]:
+# The metrics to investigate on the cluster edition (CMS namespace acs_rds_dashboard, per node). CPU and IOPS are the
+# usual complaints; rows read and row-lock time are the InnoDB signals that separate scan storms from lock pile-ups.
+RDS_METRICS = {
+    "cpu": ("Cluster_CpuUsage", "CPU 使用率 %"),
+    "iops": ("Cluster_IOPSUsage", "IOPS 使用率 %"),
+    "rows_read": ("Cluster_InnoDBRowRead", "InnoDB 读取行数 / 秒"),
+    "row_lock": ("Cluster_InnoDBRowLockTimePs", "行锁等待 ms / 秒"),
+    "threads": ("Cluster_ThreadsRunning", "活跃线程数"),
+}
+DEFAULT_METRIC = "iops"
+TOP_PER_NODE = 10
+TOP_PER_NODE_CORRELATION = 20
+
+
+def load_metric_points(settings: Any, start_us: int, end_us: int, instance: str,
+                       node: str = "", credential_loader: Any = load_credential,
+                       metric_name: str = RDS_METRICS[DEFAULT_METRIC][0]) -> list[dict[str, Any]]:
     credential = credential_loader(settings.credential_target)
     if credential is None:
         raise RuntimeError("cloud_credential_unavailable")
@@ -30,7 +45,7 @@ def load_iops_points(settings: Any, start_us: int, end_us: int, instance: str,
     dimensions = {"instanceId": instance}
     if node:
         dimensions["nodeId"] = node
-    params = {"Namespace": "acs_rds_dashboard", "MetricName": "Cluster_IOPSUsage",
+    params = {"Namespace": "acs_rds_dashboard", "MetricName": metric_name,
               "Dimensions": json.dumps([dimensions]), "StartTime": str(start_us // 1000),
               "EndTime": str((end_us + 1) // 1000), "Period": "60", "Length": "1440"}
     result = []
@@ -59,8 +74,11 @@ def load_iops_points(settings: Any, start_us: int, end_us: int, instance: str,
     raise RuntimeError("metric_page_limit_exceeded")
 
 
+load_iops_points = load_metric_points  # the pre-1.29.21 name; same signature, IOPS is the default metric
+
+
 def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
-                           settings: Any, metrics_loader: Any = load_iops_points) -> dict[str, Any]:
+                           settings: Any, metrics_loader: Any = load_metric_points) -> dict[str, Any]:
     def unavailable(reason: str) -> dict[str, Any]:
         LOGGER.warning("slowlog_resource_query unavailable: %s", reason)
         return {"status": reason, "nodes": []}
@@ -72,6 +90,13 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     instance = str(query.get("instance") or "")
     if not instance:
         return unavailable("single_instance_required")
+    metric_id = str(query.get("metric") or DEFAULT_METRIC)
+    if metric_id not in RDS_METRICS:
+        return unavailable("unsupported_metric")
+    metric_name, metric_label = RDS_METRICS[metric_id]
+    # Only a non-default metric passes the name, so a caller-supplied loader for IOPS keeps its old signature.
+    loader_options = {} if metric_id == DEFAULT_METRIC else {"metric_name": metric_name}
+    by_correlation = str(query.get("impact_order") or "") == "correlation"
     window = backend._window(query, settings.retention_days)
     if window is None:
         return unavailable("invalid_window")
@@ -111,9 +136,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         return unavailable("baseline_event_limit_exceeded")
     try:
         points = metrics_loader(settings, start_us, end_us, instance,
-                                str(query.get("node_id") or ""))
+                                str(query.get("node_id") or ""), **loader_options)
         try:
-            baseline_points = metrics_loader(settings, baseline_start, baseline_end, instance, str(query.get('node_id') or ''))
+            baseline_points = metrics_loader(settings, baseline_start, baseline_end, instance, str(query.get('node_id') or ''), **loader_options)
         except (RuntimeError, ValueError, KeyError, TypeError, OSError):
             LOGGER.exception('slowlog_resource_query baseline metrics unavailable; not inferring resource growth')
             baseline_points = []
@@ -125,6 +150,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):
         LOGGER.exception("slowlog_resource_query metric or input validation failed")
         return unavailable("metric_or_input_unavailable")
+    if by_correlation:
+        order_by_correlation(result)
+    top = TOP_PER_NODE_CORRELATION if by_correlation else TOP_PER_NODE
     counts = Counter((row["node_id"], family_key(row)) for row in rows)
     samples = {}
     for event in rows:
@@ -133,11 +161,11 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         if previous is None or (int(event["duration_ms"]), event["event_id"]) > (int(previous["duration_ms"]), previous["event_id"]):
             samples[key] = event
     selected = {(instance, samples[node["node_id"], row["fingerprint"]]["fingerprint"])
-                for node in result.get("nodes", []) for row in node.get("statements", [])[:10]}
+                for node in result.get("nodes", []) for row in node.get("statements", [])[:top]}
     profiles = backend.statement_index.statement_profiles(selected)
     for node in result.get("nodes", []):
         node["total_fingerprints"] = len(node.get("statements", []))
-        node["statements"] = node.get("statements", [])[:10]
+        node["statements"] = node.get("statements", [])[:top]
         for row in node["statements"]:
             key = node["node_id"], row["fingerprint"]
             row.update(profiles.get((instance, samples[key]["fingerprint"]), {}))
@@ -148,6 +176,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             row["score_numerator"] = str(row["score_numerator"])
     result.update(instance_id=instance, start_us=start_us, end_us=end_us,
                   coverage=coverage, baseline_coverage=baseline_coverage,
-                  executions=len(rows), baseline_executions=len(baseline), metric="Cluster_IOPSUsage",
+                  executions=len(rows), baseline_executions=len(baseline), metric=metric_name,
+                  metric_id=metric_id, metric_label=metric_label,
                   calculation_scope="Independent read-only snapshot; all fingerprints ranked before Top 10")
     return result
