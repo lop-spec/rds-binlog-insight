@@ -272,7 +272,7 @@ RDS 实例可以按节点写多项；每项拥有独立水位线与默认 OSS �
 }
 ```
 
-「分析洞察」切到「RDS 慢日志」后可按 Node ID 过滤。Top 慢 SQL 的 SQL 文本是
+「分析洞察」的「慢日志」标签（数据来源 RDS，同一次分析同时取回慢日志与 Binlog 写入）可按 Node ID 过滤。Top 慢 SQL 的 SQL 文本是
 可点击入口，点开后复用事件详情抽屉展示完整 SQL、执行耗时、锁等待、扫描/返回行数、
 账号、客户端、线程、实例和 Node ID。`/api/analytics?source=slowlog` 的每条选中指纹
 同时返回 `max_scan_event_id` 与 `max_query_event_id`；对应原始执行统一放在

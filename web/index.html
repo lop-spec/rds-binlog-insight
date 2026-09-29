@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.29.18-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.29.18-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.29.19-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.29.19-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -177,9 +177,9 @@
           </div>
 
           <form id="analytics-form" class="query-grid">
-            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="Binlog 用于写入与事务推断；RDS 慢日志提供真实扫描行数和耗时"><option value="slowlog">RDS 慢日志</option><option value="binlog">Binlog 写入</option><option value="mongodb">MongoDB 慢日志 / 命令</option></select></label>
+            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="RDS：慢日志提供真实扫描行数和耗时，Binlog 提供写入与事务推断，一次分析同时取回；MongoDB 单独分析"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option></select></label>
             <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
-            <label id="analytics-node-field" class="field span-2" hidden><span>Node ID</span><input id="analytics-node" type="text" list="analytics-node-options" maxlength="128" autocomplete="off" placeholder="留空表示全部已采集节点" title="阿里云 DAS Node ID；可从已配置节点中选择，也可直接填写"><datalist id="analytics-node-options"></datalist></label>
+            <label id="analytics-node-field" class="field span-2" hidden><span>Node ID（慢日志）</span><input id="analytics-node" type="text" list="analytics-node-options" maxlength="128" autocomplete="off" placeholder="留空表示全部已采集节点" title="阿里云 DAS Node ID；可从已配置节点中选择，也可直接填写"><datalist id="analytics-node-options"></datalist></label>
             <label class="field span-2"><span>开始时间</span><input id="analytics-start" type="datetime-local" step="1"></label>
             <label class="field span-2"><span>结束时间</span><input id="analytics-end" type="datetime-local" step="1"></label>
             <details id="analytics-filters" class="filter-disclosure span-8"><summary>更多筛选 <span class="filter-count"></span></summary><div class="query-grid">
@@ -225,7 +225,8 @@
           <div class="section-heading">
             <div><h2>分析结果</h2><span id="analytics-meta">等待分析</span></div>
             <div class="segmented" id="analytics-tabs" aria-label="分析维度">
-              <button data-analytics-tab="sql" class="is-active" type="button">SQL</button>
+              <button data-analytics-tab="sql" class="is-active" type="button">慢日志</button>
+              <button data-analytics-tab="writes" type="button">写入 SQL</button>
               <button data-analytics-tab="transactions" type="button">事务</button>
               <button data-analytics-tab="locks" type="button">锁争用推断</button>
             </div>
@@ -238,6 +239,7 @@
           </div>
 
           <div id="analytics-panel-sql" class="analytics-panel"></div>
+          <div id="analytics-panel-writes" class="analytics-panel"></div>
           <div id="analytics-panel-transactions" class="analytics-panel"></div>
           <div id="analytics-panel-locks" class="analytics-panel"></div>
         </div>
@@ -465,9 +467,9 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.29.18-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.29.18-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.29.18-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.29.18-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.29.19-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.29.19-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.29.19-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.29.19-rawoss" defer></script>
 </body>
 </html>

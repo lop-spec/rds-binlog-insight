@@ -21,7 +21,9 @@ const state = {
   analytics: null,
   analyticsTab: "sql",
   analyticsInitialized: false,
-  sqlOrder: "executions",
+  // 每种证据各自的排序键（慢日志与 Binlog 的可选排序不同）；RDS 一次分析同时取回两种结果。
+  sqlOrders: {},
+  analyticsRuns: {},
   txnDrill: "longest",
   // 事务钻取：从分析洞察的事务榜单点进来时带上 GTID，审计查询按它精确过滤。
   txnFilter: "",
@@ -1768,56 +1770,81 @@ function renderAnalyticsCoverage(coverage, window, source = "binlog", indexStats
   node.innerHTML = `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg><span>${parts.join(" · ")}</span>`;
 }
 
-function syncAnalyticsMode(slowSource) {
+// RDS 的两类证据：慢日志（标签「慢日志」）与 Binlog（写入 SQL / 事务 / 锁争用推断）。
+function analyticsKind(result) {
+  return result?.evidence?.source === "slowlog" || result?.sql?.mode === "slowlog" ? "slowlog" : "binlog";
+}
+
+function analyticsTabKind(name) {
+  return name === "sql" ? "slowlog" : "binlog";
+}
+
+function syncAnalyticsMode() {
   if (typeof syncMongoMode === 'function') {
     const mongo = $("#analytics-source").value === "mongodb";
     syncMongoMode(mongo);
     if (mongo) return;
   }
-  const warning = $("#analytics-lock-warning");
-  if (warning) warning.hidden = slowSource;
-  $("#analytics-tabs").hidden = slowSource;
+  $("#analytics-tabs").hidden = false;
   const nodeField = $("#analytics-node-field");
   const nodeInput = $("#analytics-node");
-  if (nodeField) nodeField.hidden = !slowSource;
-  if (nodeInput) nodeInput.disabled = !slowSource;
-  for (const name of ["transactions", "locks"]) {
-    const button = $(`[data-analytics-tab="${name}"]`);
-    if (button) {
-      button.disabled = slowSource;
-      button.hidden = slowSource;
-      button.title = slowSource ? "慢日志洞察不推断事务与锁争用，请切换到 Binlog 写入" : "";
-    }
-  }
-  if (slowSource) {
-    state.analyticsTab = "sql";
-    switchAnalyticsTab("sql");
-  }
+  if (nodeField) nodeField.hidden = false;
+  if (nodeInput) nodeInput.disabled = false;
+  switchAnalyticsTab(state.analyticsTab || "sql");
 }
 
 function switchAnalyticsTab(name) {
   state.analyticsTab = name;
   $$("[data-analytics-tab]").forEach((button) => button.classList.toggle("is-active", button.dataset.analyticsTab === name));
   $$(".analytics-panel").forEach((panel) => panel.classList.toggle("is-active", panel.id === `analytics-panel-${name}`));
+  if ($("#analytics-source").value === "mongodb") return;
+  const kind = analyticsTabKind(name);
+  // 锁分析口径只对事务 / 锁争用两页成立；慢日志与写入 SQL 页不需要它。
+  const warning = $("#analytics-lock-warning");
+  if (warning) warning.hidden = !["transactions", "locks"].includes(name);
+  const run = state.analyticsRuns?.[kind];
+  if (run?.result) {
+    state.analytics = run.result;
+    state.analyticsQuery = run.query;
+    renderAnalyticsCoverage(run.result.coverage, run.result.window, kind, run.result.slowlog_index);
+  } else if (run?.error) {
+    renderAnalyticsCoverageFailure(kind, run.error);
+  }
+}
+
+function renderAnalyticsCoverageFailure(kind, error) {
+  const node = $("#analytics-coverage");
+  node.className = "notice warning compact-notice";
+  node.innerHTML = `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg><span>${kind === "slowlog" ? "慢日志" : "Binlog 写入"}分析失败：${escapeHtml(error?.message || String(error))}</span>`;
+}
+
+function renderAnalyticsFailure(kind, error) {
+  const html = `<p class="analytics-unavailable"><strong>${kind === "slowlog" ? "慢日志" : "Binlog 写入"}分析失败。</strong>${escapeHtml(error?.message || String(error))}；另一类结果不受影响，可稍后重新分析。</p>`;
+  if (kind === "slowlog") {
+    $("#analytics-panel-sql").innerHTML = html;
+    return;
+  }
+  for (const name of ["writes", "transactions", "locks"]) $(`#analytics-panel-${name}`).innerHTML = html;
 }
 
 function renderAnalytics(result) {
   state.analytics = result;
-  const slowSource = result.evidence?.source === "slowlog";
-  const actualSlowlog = result.sql?.mode === "slowlog";
-  syncAnalyticsMode(slowSource);
+  const kind = analyticsKind(result);
+  const actualSlowlog = kind === "slowlog";
   $("#analytics-empty").hidden = true;
-  $("#analytics-panel-sql").innerHTML = renderAnalyticsSql(result.sql || {});
-  $("#analytics-panel-transactions").innerHTML = renderAnalyticsTransactions(result.transactions || {});
-  $("#analytics-panel-locks").innerHTML = renderAnalyticsLocks(result.locks || {}, result.coverage);
-  renderAnalyticsCoverage(result.coverage, result.window, slowSource ? "slowlog" : "binlog", result.slowlog_index);
-  renderTxnDrill(state.txnDrill || "longest");
+  if (actualSlowlog) {
+    $("#analytics-panel-sql").innerHTML = renderAnalyticsSql(result.sql || {});
+  } else {
+    $("#analytics-panel-writes").innerHTML = renderAnalyticsSql(result.sql || {});
+    $("#analytics-panel-transactions").innerHTML = renderAnalyticsTransactions(result.transactions || {});
+    $("#analytics-panel-locks").innerHTML = renderAnalyticsLocks(result.locks || {}, result.coverage);
+    renderTxnDrill(state.txnDrill || "longest");
+  }
   const totals = result.sql?.totals || {};
   const txns = result.transactions?.totals || {};
   $("#analytics-meta").textContent = actualSlowlog
     ? `${humanCount(totals.executions)} 条慢 SQL · 实际扫描 ${humanCount(totals.actual_scan_rows)} 行 · 返回 ${humanCount(totals.rows_sent)} 行 · ${humanCount(totals.fingerprints)} 个指纹`
     : `${humanCount(totals.events)} 次执行 · ${humanCount(totals.row_events)} 行影响 · ${humanCount(txns.transactions)} 个事务 · ${humanCount(totals.fingerprints)} 个指纹`;
-  switchAnalyticsTab(state.analyticsTab || "sql");
 }
 
 function setAnalyticsRange(range) {
@@ -1829,7 +1856,7 @@ function setAnalyticsRange(range) {
   $("#analytics-range").value = range;
 }
 
-function analyticsQueryString(orderOverride = "") {
+function analyticsQueryString(orderOverride = "", kind = "slowlog") {
   const params = new URLSearchParams();
   const start = $("#analytics-start").value;
   const end = $("#analytics-end").value;
@@ -1840,7 +1867,7 @@ function analyticsQueryString(orderOverride = "") {
   if (startDate >= endDate) throw new Error("结束时间必须晚于开始时间");
   params.set("startEpochUs", String(startDate.getTime() * 1000));
   params.set("endEpochUs", String(endDate.getTime() * 1000));
-  const source = $("#analytics-source").value || "binlog";
+  const source = kind;
   params.set("source", source);
   const instance = $("#analytics-instance").value;
   if (instance) params.set("instance", instance);
@@ -1854,27 +1881,46 @@ function analyticsQueryString(orderOverride = "") {
   if (operation) params.set("operation", operation);
   params.set("limit", $("#analytics-limit").value);
   // 未覆盖分区的即时补建由服务端自动决策（缺得少补全、缺得多补最新一批）。
-  params.set("order", orderOverride || state.sqlOrder || "executions");
+  params.set("order", orderOverride || state.sqlOrders?.[kind] || "executions");
   return params.toString();
 }
 
 async function runAnalytics(orderOverride = "") {
   if ($("#analytics-source").value === "mongodb") return runMongoAnalytics();
-  if (orderOverride) state.sqlOrder = orderOverride;
   // 换排序不需要重新扫描分区：已覆盖的聚合直接重排即可。
-  const query = analyticsQueryString(orderOverride);
   const scope = [$("#analytics-source").selectedOptions[0].textContent, $("#analytics-instance").selectedOptions[0].textContent,
     `${$("#analytics-start").value.replace('T', ' ')} → ${$("#analytics-end").value.replace('T', ' ')}`,
     $("#analytics-filter-summary").textContent].filter(Boolean).join(' · ');
-  const result = await api(`/api/analytics?${query}`);
-  state.analyticsQuery = query;
+  // RDS：慢日志与 Binlog 写入同时取回，标签切换不再发请求；一类失败不影响另一类。
+  const kinds = ["slowlog", "binlog"];
+  const queries = Object.fromEntries(kinds.map((kind) => [kind, analyticsQueryString(orderOverride, kind)]));
+  const settled = await Promise.allSettled(kinds.map((kind) => api(`/api/analytics?${queries[kind]}`)));
+  if (settled.every((item) => item.status === "rejected")) throw settled[0].reason;
+  const runs = {};
+  kinds.forEach((kind, index) => {
+    const outcome = settled[index];
+    runs[kind] = outcome.status === "fulfilled"
+      ? { query: queries[kind], result: outcome.value }
+      : { query: queries[kind], error: outcome.reason };
+  });
+  state.analyticsRuns = runs;
   state.performanceCache = null;
-  renderAnalytics(result);
+  for (const kind of kinds) {
+    if (runs[kind].result) renderAnalytics(runs[kind].result);
+    else renderAnalyticsFailure(kind, runs[kind].error);
+  }
+  $("#analytics-empty").hidden = true;
+  switchAnalyticsTab(state.analyticsTab || "sql");
   $("#analytics-meta").textContent = scope;
-  const pending = Number(result.coverage?.pending_parts || 0);
+  const failed = kinds.filter((kind) => runs[kind].error);
+  for (const kind of failed) toast(`${kind === "slowlog" ? "慢日志" : "Binlog 写入"}分析失败：${runs[kind].error?.message || runs[kind].error}`, "error", 6000);
+  const pending = kinds.reduce((sum, kind) => sum + Number(runs[kind].result?.coverage?.pending_parts || 0), 0);
+  const filesUnit = kinds.some((kind) => runs[kind].result?.coverage?.unit === "files");
   if (pending) {
-    toast(`分析完成；还有 ${pending} 个分区未建索引，后台补齐后重新分析可得到完整结果`, "info", 6000);
-  } else {
+    toast(filesUnit
+      ? `分析完成；还有 ${pending} 个文件尚未入库，入库后重新分析可得到完整结果`
+      : `分析完成；还有 ${pending} 个分区未建索引，后台补齐后重新分析可得到完整结果`, "info", 6000);
+  } else if (!failed.length) {
     toast("分析完成", "success");
   }
 }
@@ -2203,9 +2249,7 @@ function bindEvents() {
   $("#analytics-range").addEventListener("change", (event) => { if (event.target.value !== "custom") setAnalyticsRange(event.target.value); });
   $("#view-analytics").addEventListener("change", (event) => { if (event.target.matches("[data-sql-sort]")) changeSqlOrder(event.target); });
   $$("[data-analytics-tab]").forEach((button) => button.addEventListener("click", () => switchAnalyticsTab(button.dataset.analyticsTab)));
-  $("#analytics-source").addEventListener("change", () => {
-    syncAnalyticsMode($("#analytics-source").value === "slowlog");
-  });
+  $("#analytics-source").addEventListener("change", () => syncAnalyticsMode());
   $("#analytics-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     try {
@@ -2231,9 +2275,9 @@ function bindEvents() {
 
   });
   $("#analytics-reset").addEventListener("click", () => {
-    $("#analytics-source").value = "slowlog";
+    $("#analytics-source").value = "rds";
     $("#analytics-instance").value = "";
-    syncAnalyticsMode(true);
+    syncAnalyticsMode();
     $("#analytics-node").value = "";
     $("#analytics-database").value = "";
     $("#analytics-table").value = "";

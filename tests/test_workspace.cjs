@@ -80,3 +80,87 @@ test('form controls preserved and native disclosures are closed initially', () =
   assert.doesNotMatch(html,/data-analytics-range=|data-range=/);
   assert.match(html,/workspace\.js/); assert.match(html,/workspace\.css/);
 });
+
+
+// ---- 1.29.19: RDS is one data source; slow log and Binlog writes load together and switch as tabs ----
+function rdsContext(api) {
+  const nodes = {};
+  const node = (selector) => (nodes[selector] ??= {innerHTML: '', textContent: '', hidden: false, value: '', className: '',
+    classList: {toggle() {}}, selectedOptions: [{textContent: selector === '#analytics-source' ? 'RDS' : '全部实例'}]});
+  const c = vm.createContext({console, URLSearchParams, Date, Promise, Number, Object, Math, JSON,
+    document: {addEventListener() {}, querySelector: node, querySelectorAll: () => []}});
+  vm.runInContext(workspace + '\n' + app, c);
+  Object.assign(nodes, {'#analytics-source': {value: 'rds', selectedOptions: [{textContent: 'RDS'}]},
+    '#analytics-start': {value: '2026-09-28T10:00'}, '#analytics-end': {value: '2026-09-29T10:00'},
+    '#analytics-instance': {value: 'rm-prod', selectedOptions: [{textContent: 'mysql-main'}]},
+    '#analytics-node': {value: ''}, '#analytics-database': {value: ''}, '#analytics-table': {value: ''},
+    '#analytics-operation': {value: ''}, '#analytics-limit': {value: '50'}, '#analytics-filter-summary': {textContent: ''},
+    '#analytics-lock-warning': {hidden: true}, '#analytics-tabs': {hidden: false}, '#analytics-empty': {hidden: false},
+    '#analytics-meta': {textContent: ''}, '#analytics-coverage': {className: '', innerHTML: ''}});
+  const calls = [], toasts = [];
+  Object.assign(c, {api: async (url) => { calls.push(url); return api(url); }, toast: (m, k) => toasts.push([k, m]),
+    renderAnalyticsSql: (sql) => `SQL[${sql.mode || 'binlog'}:${sql.tag}]`, renderAnalyticsTransactions: () => 'TXN',
+    renderAnalyticsLocks: () => 'LOCKS', renderAnalyticsCoverage: (cov, w, kind) => { nodes.notice = kind + ':' + cov.total_parts; },
+    renderTxnDrill() {}});
+  return {c, nodes, calls, toasts};
+}
+const slowResult = {evidence: {source: 'slowlog'}, sql: {mode: 'slowlog', tag: 's', orders: {}}, coverage: {total_parts: 4272}};
+const binlogResult = {evidence: {source: 'binlog'}, sql: {tag: 'b', orders: {}}, transactions: {}, locks: {},
+  coverage: {total_parts: 1084, unit: 'files', pending_parts: 2}};
+
+test('RDS analysis fetches slow log and Binlog together and fills separate panels', async () => {
+  const {c, nodes, calls, toasts} = rdsContext(async (url) => (url.includes('source=slowlog') ? slowResult : binlogResult));
+  await vm.runInContext('runAnalytics()', c);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.some((u) => u.includes('source=slowlog')) && calls.some((u) => u.includes('source=binlog')));
+  assert.ok(calls.every((u) => u.includes('instance=rm-prod')));
+  assert.equal(nodes['#analytics-panel-sql'].innerHTML, 'SQL[slowlog:s]');
+  assert.equal(nodes['#analytics-panel-writes'].innerHTML, 'SQL[binlog:b]');
+  assert.equal(nodes['#analytics-panel-transactions'].innerHTML, 'TXN');
+  assert.match(nodes['#analytics-meta'].textContent, /^RDS · mysql-main/);
+  assert.ok(toasts.some(([, m]) => /2 个文件尚未入库/.test(m)));
+  // switching tabs never requests again and re-points the shared state at that tab's result
+  vm.runInContext('switchAnalyticsTab("locks")', c);
+  assert.equal(calls.length, 2);
+  assert.equal(vm.runInContext('state.analytics.sql.tag', c), 'b');
+  assert.equal(nodes['#analytics-lock-warning'].hidden, false);
+  vm.runInContext('switchAnalyticsTab("sql")', c);
+  assert.equal(vm.runInContext('state.analytics.sql.tag', c), 's');
+  assert.equal(nodes['#analytics-lock-warning'].hidden, true);
+  assert.match(vm.runInContext('state.analyticsQuery', c), /source=slowlog/);
+});
+
+test('one failed kind keeps the other usable and is reported; both failing throws', async () => {
+  const {c, nodes, toasts} = rdsContext(async (url) => {
+    if (url.includes('source=binlog')) throw new Error('clickhouse down');
+    return slowResult;
+  });
+  await vm.runInContext('runAnalytics()', c);
+  assert.equal(nodes['#analytics-panel-sql'].innerHTML, 'SQL[slowlog:s]');
+  assert.match(nodes['#analytics-panel-writes'].innerHTML, /Binlog 写入分析失败.*clickhouse down/);
+  assert.match(nodes['#analytics-panel-locks'].innerHTML, /clickhouse down/);
+  assert.ok(toasts.some(([k, m]) => k === 'error' && /Binlog 写入分析失败/.test(m)));
+  const both = rdsContext(async () => { throw new Error('boom'); });
+  await assert.rejects(vm.runInContext('runAnalytics()', both.c), /boom/);
+});
+
+test('sorting a Binlog result re-renders the writes panel and keeps orders per kind', () => {
+  const {c, nodes} = rdsContext(async () => binlogResult);
+  vm.runInContext('state.analytics={evidence:{source:"binlog"},sql:{order:"executions",orders:{events:[{}]},tag:"b"}}', c);
+  vm.runInContext('changeSqlOrder({value:"events"})', c);
+  assert.equal(nodes['#analytics-panel-writes'].innerHTML, 'SQL[binlog:b]');
+  assert.equal(vm.runInContext('state.sqlOrders.binlog', c), 'events');
+  assert.equal(vm.runInContext('state.sqlOrders.slowlog', c), undefined);
+  assert.match(vm.runInContext('analyticsQueryString("", "binlog")', c), /order=events/);
+  assert.match(vm.runInContext('analyticsQueryString("", "slowlog")', c), /order=executions/);
+});
+
+test('data source is exactly RDS and MongoDB; tabs are slow log, writes, transactions, locks', () => {
+  const options = [...html.matchAll(/<select id="analytics-source"[^>]*>(.*?)<\/select>/gs)][0][1];
+  assert.deepEqual([...options.matchAll(/value="([^"]+)"/g)].map((m) => m[1]), ['rds', 'mongodb']);
+  const tabs = [...html.matchAll(/data-analytics-tab="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(tabs, ['sql', 'writes', 'transactions', 'locks']);
+  for (const id of ['analytics-panel-sql', 'analytics-panel-writes', 'analytics-panel-transactions', 'analytics-panel-locks']) {
+    assert.ok(html.includes(`id="${id}"`), id);
+  }
+});

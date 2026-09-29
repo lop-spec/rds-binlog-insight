@@ -40,7 +40,7 @@ function setupWorkspaceControls() {
       if (document.activeElement === (event.shiftKey ? nodes[0] : nodes.at(-1))) { event.preventDefault(); target?.focus(); }
     }
   });
-  syncAnalyticsMode($('#analytics-source').value === 'slowlog');
+  syncAnalyticsMode();
 }
 
 function updateFilterSummary(type) {
@@ -83,9 +83,11 @@ async function changeSqlOrder(select) {
     select.value = sql.order || 'executions';
     return;
   }
-  state.sqlOrder = sql.order = key;
+  const kind = analyticsKind(state.analytics);
+  state.sqlOrders = {...state.sqlOrders, [kind]: key};
+  sql.order = key;
   sql.statements = sql.orders[key];
-  $('#analytics-panel-sql').innerHTML = renderAnalyticsSql(sql);
+  $(kind === 'slowlog' ? '#analytics-panel-sql' : '#analytics-panel-writes').innerHTML = renderAnalyticsSql(sql);
 }
 
 const CORRELATION_STATUS = {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import json
 import sqlite3
 import tempfile
@@ -1060,7 +1061,12 @@ class SlowLogRoutingTests(unittest.TestCase):
         script = (root / "web" / "app.js").read_text("utf-8")
         self.assertIn('id="analytics-source"', html)
         self.assertIn('id="analytics-node"', html)
-        self.assertIn('<option value="slowlog">RDS 慢日志</option>', html)
+        # one RDS source (slow log and Binlog writes are tabs of it) besides MongoDB
+        select = re.search(r'<select id="analytics-source"[^>]*>(.*?)</select>', html, re.S).group(1)
+        self.assertEqual(re.findall(r'value="([^"]+)"', select), ["rds", "mongodb"])
+        self.assertIn('<option value="rds">RDS</option>', html)
+        self.assertIn('data-analytics-tab="writes"', html)
+        self.assertIn('id="analytics-panel-writes"', html)
         self.assertIn("实际扫描行数", script)
         self.assertIn("RowsExamined", script)
         self.assertIn('params.set("source", source)', script)
