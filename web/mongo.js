@@ -80,6 +80,20 @@ function syncMongoBaseline(start=new Date($('#analytics-start').value).getTime()
     return null;
   }
 }
+function mongoShiftText(us) {
+  const minutes=Math.round(Math.abs(us)/60_000_000),hours=Math.floor(minutes/60);
+  return `${us<0?'早':'晚'} ${hours?`${hours} 小时${minutes%60?` ${minutes%60} 分钟`:''}`:`${minutes} 分钟`}`;
+}
+// 服务端发现所选时段缺慢日志窗口时，会改查最近的完整时段；时间框和基线跟着改，之后的重新分析沿用它。
+function applyMongoAdjustment(data) {
+  if (!data.adjusted) return;
+  $('#analytics-start').value=toLocalInput(new Date(data.start_us/1000));
+  $('#analytics-end').value=toLocalInput(new Date(data.end_us/1000));
+  $('#analytics-range').value='custom';
+  $('#mongo-baseline-start').value=toLocalInput(new Date(data.baseline_start/1000));
+  syncMongoBaseline();
+  toast('所选时段的慢日志窗口不完整，已改查最近的完整时段','info',6000);
+}
 function mongoAnalysisError(error) {
   const messages={baseline_must_not_overlap_current_window:'基线与分析时间重叠，请改选“前一个等长窗口”或更早的基线开始时间',mongo_window_exceeds_seven_days:'MongoDB 单次最多分析 7 天，请缩小时间范围'};
   return messages[error.message]||error.message;
@@ -154,6 +168,7 @@ async function runMongoAnalytics() {
     $('#analytics-coverage').textContent=$('#mongo-baseline-hint').textContent;
     const data=await api('/api/mongo/analytics?'+params);
     if (request!==mongoRequest||$('#analytics-source').value!=='mongodb') return;
+    applyMongoAdjustment(data);
     mongoResult=data;renderMongoAnalytics(data);
   } catch(error) {
     if(request!==mongoRequest||$('#analytics-source').value!=='mongodb')return;
@@ -214,8 +229,10 @@ function renderMongoAnalytics(data) {
     ? '窗口超过 180 分钟时不做该聚合；缩小窗口后可见。'
     : `仅统计完整落在窗口内的区间：${mongoNumber(namespaceTop.intervals,0)} 个区间、覆盖 ${mongoNumber(namespaceTop.observed_seconds)} 秒。${namespaceTop.truncated_intervals?'单次采样的集合列表按锁时间截断，分表族合计不受截断影响。':''}`;
   const metricName=MONGO_METRICS[data.metric]||data.metric;
+  const moved=data.adjusted;
+  const adjustBlock=moved?`<div class="notice info compact-notice"><div><strong>已自动改查最近的完整时段（${mongoShiftText(moved.shift_us)}）</strong><span>所选时段（${escapeHtml(formatTime(moved.requested_start_us))} → ${escapeHtml(formatTime(moved.requested_end_us))}）的慢日志窗口不完整，以下为 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))} 的结果；时间框已同步。${moved.baseline_complete===false?'附近没有对照窗口也完整的时段，对照窗口仍不完整。':''}</span></div></div>`:'';
   const noticeBlock=scopeNotice||orderNotice?`<div class="notice"><div><strong>${escapeHtml(orderNotice||'窗口数据尚未完整')}</strong><p>${escapeHtml(scopeNotice)}</p><p class="analytics-note">${escapeHtml(recovery)} ${escapeHtml(historyErrors)} 重新分析可查看回补后的结果。</p><button type="button" class="button secondary compact" data-mongo-recent>改查最近 1 小时，对比前 1 小时</button></div></div>`:'';
-  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>${escapeHtml(metricName)} 上涨排查</h3>${noticeBlock}
+  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>${escapeHtml(metricName)} 上涨排查</h3>${adjustBlock}${noticeBlock}
     ${series.map(s=>`<h4>${escapeHtml(s.role)} · ${escapeHtml(s.node||'节点未标识')} · ${escapeHtml(metricName)}</h4>${mongoSparkline(s.points)}`).join('')||'<p>没有匹配的性能数据。</p>'}
     ${data.order==='attribution'?'<p class="analytics-note">按所选资源对应的成本增量排序，不把耗时增长当成 CPU 增长；IOPS 仅有读取量旁证，响应时间是结果而非原因。缺字段/缺基线的命令不参与增长排名，仍保留已采集成本。候选不是已确认根因；资源均值变化也不代表峰值归因。</p>':''}
     ${data.order==='attribution'&&data.ranking?.available===false?'<p class="notice">没有足够的资源增长证据；下列记录仅供核对，不降级为相关度或耗时根因榜。</p>':''}

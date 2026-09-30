@@ -177,6 +177,37 @@ class MongoStore:
                           missing_ranges=window_ranges(missing),
                           records=sum(m['records'] for _,m in found),source='dds_slow_records')
 
+    def windows_complete(self, instance, start, end, present=None):
+        """Whether every 5-minute source window overlapping [start, end) has a published manifest."""
+        present = {} if present is None else present
+        for t in range(start//WINDOW*WINDOW,((end-1)//WINDOW+1)*WINDOW,WINDOW):
+            if t not in present:
+                present[t]=self.manifest_path(instance,t).exists()
+            if not present[t]:
+                return False
+        return True
+
+    def nearest_complete(self, instance, start, end, base, *, reach=6*3600*1_000_000, now_us=None):
+        """Shift (µs) to the nearest same-length window whose slow-log windows all exist, or None.
+
+        The baseline moves with the window. Windows with both complete are preferred; when none exists, the nearest one
+        whose current window alone is complete is returned with `baseline_complete` False. Never ends in the future.
+        """
+        length = end-start
+        now_us = now_us or time.time_ns()//1000
+        present = {}
+        fallback = None
+        for step in range(1,reach//WINDOW+1):
+            for offset in (-step*WINDOW,step*WINDOW):
+                low = start+offset
+                if low+length > now_us or not self.windows_complete(instance,low,low+length,present):
+                    continue
+                if self.windows_complete(instance,base+offset,base+offset+length,present):
+                    return offset,True
+                if fallback is None:
+                    fallback = offset
+        return (fallback,False) if fallback is not None else None
+
     @staticmethod
     def width(start,end):
         return max(MINUTE,math.ceil((end-start)/MINUTE/180)*MINUTE)

@@ -13,6 +13,8 @@ const RISE_METRICS = [
 ];
 
 const RISE_STATUS = {
+  incomplete_index: "所选时段及前后 6 小时内没有索引完整的同长度时段（索引仍在追平，或该实例暂无采集）",
+  incomplete_baseline_index: "所选时段的昨日对照日索引不完整，前后 6 小时内也没有可用的时段",
   unsupported_metric: "不支持该指标",
   no_collected_executions: "该窗口没有采集到慢 SQL 执行记录",
   metric_or_input_unavailable: "云监控指标或输入校验失败，未计算（详见服务日志）",
@@ -154,6 +156,35 @@ function riseNodeBody(data, node) {
     <p class="analytics-note">共 ${humanCount(node.total_fingerprints)} 个 SQL 家族，显示相关度最高的 ${humanCount(rows.length)} 个。灰显行的耗时没有比昨日同窗增加。</p>`;
 }
 
+function riseSpan(us) {
+  const minutes = Math.round(Math.abs(us) / 60_000_000);
+  const hours = Math.floor(minutes / 60);
+  return hours ? `${hours} 小时${minutes % 60 ? ` ${minutes % 60} 分钟` : ""}` : `${minutes} 分钟`;
+}
+
+// 服务端发现所选时段（或它的昨日对照日）的慢日志索引不完整时，会改查最近的同长度、索引完整的时段。
+function riseAdjustNotice(data) {
+  const moved = data.adjusted;
+  if (!moved) return "";
+  const why = moved.reason === "incomplete_baseline_index" ? "所选时段对应的昨日对照日索引还不完整" : "所选时段的慢日志索引还不完整";
+  const shift = Number(moved.shift_us) < 0 ? `早 ${riseSpan(moved.shift_us)}` : `晚 ${riseSpan(moved.shift_us)}`;
+  return `<div class="notice info compact-notice"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg><div>
+    <strong>已自动改查最近的有索引时段（${shift}）</strong>
+    <span>${why}（${escapeHtml(formatTime(moved.requested_start_us))} → ${escapeHtml(formatTime(moved.requested_end_us))}），以下为 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))} 的结果；时间框已同步。</span></div></div>`;
+}
+
+// 表单和之后按需加载的明细都跟着改到实际查询的窗口。
+function applyRiseAdjustment(data, query) {
+  if (!data.adjusted) return query;
+  const params = new URLSearchParams(query);
+  params.set("startEpochUs", String(data.start_us));
+  params.set("endEpochUs", String(data.end_us));
+  $("#analytics-start").value = toLocalInput(new Date(data.start_us / 1000));
+  $("#analytics-end").value = toLocalInput(new Date(data.end_us / 1000));
+  $("#analytics-range").value = "custom";
+  return params.toString();
+}
+
 function renderRise(data) {
   const panel = $("#analytics-panel-rise");
   $("#analytics-empty").hidden = true;
@@ -167,7 +198,7 @@ function renderRise(data) {
     return;
   }
   const many = nodes.length > 3;
-  panel.innerHTML = `
+  panel.innerHTML = `${riseAdjustNotice(data)}
     <p class="analytics-note">${escapeHtml(metric)}：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照昨日同窗；SQL 只统计已采集的慢日志（含等待时间），相关度是时序关联，不是资源消耗的度量，也不是因果。</p>
     ${nodes.map((node, index) => `<details class="rise-node" ${!many || index === 0 ? "open" : ""}>
       <summary>${riseNodeSummary(data, node)}</summary>${riseNodeBody(data, node)}</details>`).join("")}`;
@@ -185,8 +216,9 @@ function renderRiseCoverage(data) {
 }
 
 async function runRise() {
-  const query = riseQueryString();
-  const data = await api(`/api/slowlog-impact?${query}`);
+  const requested = riseQueryString();
+  const data = await api(`/api/slowlog-impact?${requested}`);
+  const query = applyRiseAdjustment(data, requested);
   state.rise = { data, query };
   state.analyticsRuns = {}; // 明细视图按新的窗口重新加载
   state.analyticsRunsQuery = "";
@@ -198,6 +230,7 @@ async function runRise() {
   $("#analytics-meta").textContent = scope;
   switchAnalyticsTab(state.rdsTab === "rise" || !state.rdsTab ? "rise" : state.rdsTab);
   if (!data.nodes?.length) toast(`无法排查：${riseMessage(data.status)}`, "error", 6000);
+  else if (data.adjusted) toast("所选时段没有完整索引，已改查最近的有索引时段", "info", 6000);
   else toast("排查完成", "success");
 }
 

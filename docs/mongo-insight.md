@@ -80,3 +80,9 @@ For queries longer than 180 minutes, cost/count statistics use coarser buckets. 
 ## Rollback
 
 Disable the Mongo entry and roll back the web image to the retained previous image/container. Keep source Parquet, manifests and additive ClickHouse tables. There are no business-database rollback commands. Do not replace the existing MySQL collectors or re-create unrelated containers during this rollout.
+
+## Window alignment (1.29.22)
+
+When a slow-log source window overlapping the requested period has no published manifest, the query moves to the nearest same-length period whose windows all exist, within 6 hours either way (5-minute steps, earlier first at equal distance, never ending in the future). The baseline moves by the same offset. A period whose baseline is also complete is preferred; when none exists the nearest one with a complete current period is used and `adjusted.baseline_complete` is `false`. A request whose current period is already complete is never moved, even when its baseline is incomplete.
+
+The response carries `adjusted = {reason, requested_start_us, requested_end_us, requested_baseline_start_us, shift_us, baseline_complete}` (`null` when nothing moved) and the effective `start_us`, `end_us`, `baseline_start`. When no complete period exists nearby the request is served as before (partial coverage, unchanged notice) and a warning is logged. The page rewrites the time fields and the baseline start and switches the range selector to custom.

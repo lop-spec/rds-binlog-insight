@@ -3,7 +3,8 @@ from unittest.mock import Mock, patch
 
 from app.config import Settings
 from app.slowlog_impact import DAY_US, execution_series, order_by_correlation, rank_resource_overlap, rank_performance_growth
-from app.slowlog_impact_service import RDS_METRICS, load_iops_points, load_metric_points, query_resource_overlap
+from app.slowlog_impact_service import (RDS_METRICS, load_iops_points, load_metric_points,
+                                       nearest_indexed_window, query_resource_overlap)
 
 W = 60_000_000
 
@@ -256,6 +257,103 @@ class MetricSelectionTests(unittest.TestCase):
                                    Settings(), loader)
             self.assertEqual(loader.call_args_list[0].kwargs, expect)
             self.assertEqual(loader.call_args_list[1].kwargs, expect)  # the baseline day uses the same metric
+
+MIN = 60_000_000
+
+
+class IndexedWindowTests(unittest.TestCase):
+    """A window whose slow-log index (or day-before baseline index) is incomplete moves to the nearest one that is."""
+    NOW = 1_790_000_040_000_000  # a whole minute
+    STEP = 10 * MIN
+    FIRST = NOW - NOW % STEP - 3 * DAY_US
+
+    def setUp(self):
+        count = (self.NOW - self.FIRST) // self.STEP + 2
+        self.parts = [dict(path=f"p{k}", logical_part_id=f"id{k}", min_event_epoch_us=self.FIRST + k * self.STEP,
+                           max_event_epoch_us=self.FIRST + (k + 1) * self.STEP) for k in range(count)]
+        patcher = patch("app.slowlog_impact_service.time.time_ns", return_value=self.NOW * 1000)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def overlapping(self, low, high):
+        return [p for p in self.parts if p["max_event_epoch_us"] >= low and p["min_event_epoch_us"] <= high]
+
+    def fixture(self, not_ready=(), reconciled=True):
+        metadata, backend = Mock(), Mock()
+        backend.serving_enabled = True
+        metadata.parts_in_range.side_effect = lambda *, start_epoch_us, end_epoch_us, source, instance, **_: (
+            self.overlapping(start_epoch_us, end_epoch_us) if (source, instance) == ("slowlog", "x") else [])
+
+        def coverage(parts):
+            expected = [p for p in parts if p.get("logical_part_id")]
+            missing = [p["path"] for p in expected if p["path"] in not_ready]
+            return dict(complete=reconciled and not missing, total_parts=len(expected), covered_parts=len(expected) - len(missing),
+                        missing_parts=missing, reconcile_completed_at_us=1 if reconciled else 0)
+        backend._manifest_coverage.side_effect = coverage
+        backend._window.side_effect = lambda q, days: (max(q["start_epoch_us"], self.NOW - days * DAY_US), min(q["end_epoch_us"], self.NOW))
+        backend._scope_sql.side_effect = lambda q, low, high: ("SELECT 1", {"low": low, "high": high})
+        backend._rows.side_effect = lambda sql, params, _: [dict(event_id=f"e{params['low']}", start_us=params["low"] + MIN, node_id="a",
+                                                                database_name="d", fingerprint="f", sql_id="s", duration_ms=1000,
+                                                                rows_examined=1, lock_time_ms=1)]
+        return metadata, backend
+
+    def test_window_running_past_the_ready_index_moves_earlier_to_the_last_indexed_minute(self):
+        ready_until = (self.NOW - 25 * MIN) // self.STEP * self.STEP
+        metadata, backend = self.fixture({p["path"] for p in self.parts if p["max_event_epoch_us"] > ready_until})
+        found = nearest_indexed_window(metadata, backend, "x", self.NOW - 60 * MIN, self.NOW, 60)
+        # a window ending on the first unready part's start would still touch it, so the last clean minute is one earlier
+        self.assertEqual(found, (ready_until - 61 * MIN, ready_until - MIN))
+
+    def test_incomplete_baseline_day_moves_to_the_nearer_side_of_the_hole(self):
+        start, end = self.NOW - 5 * 3600 * 1_000_000, self.NOW - 4 * 3600 * 1_000_000
+        hole = self.overlapping(self.NOW - DAY_US - 290 * MIN, self.NOW - DAY_US - 265 * MIN)
+        metadata, backend = self.fixture({p["path"] for p in hole})
+        early = min(p["min_event_epoch_us"] for p in hole) + DAY_US - end - MIN
+        late = max(p["max_event_epoch_us"] for p in hole) + DAY_US - start + MIN
+        shift = early if abs(early) <= abs(late) else late
+        self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 60), (start + shift, end + shift))
+        # served through the analysis, the move is reported with its reason and the baseline stays a day behind
+        loader = Mock(return_value=[])
+        result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "start_epoch_us": start,
+                                                            "end_epoch_us": end}, Settings(), loader)
+        self.assertEqual(result["adjusted"], dict(reason="incomplete_baseline_index", requested_start_us=start,
+                                                  requested_end_us=end, shift_us=shift))
+        self.assertEqual((result["start_us"], result["end_us"]), (start + shift, end + shift))
+        self.assertEqual(loader.call_args_list[0].args[1:3], (start + shift, end + shift))
+        self.assertEqual(loader.call_args_list[1].args[1:3], (start + shift - DAY_US, end + shift - DAY_US))
+        self.assertTrue(result["coverage"]["complete"] and result["baseline_coverage"]["complete"])
+
+    def test_indexed_window_is_left_alone(self):
+        metadata, backend = self.fixture()
+        start, end = self.NOW - 3 * 3600 * 1_000_000, self.NOW - 2 * 3600 * 1_000_000
+        loader = Mock(return_value=[])
+        result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "start_epoch_us": start,
+                                                            "end_epoch_us": end}, Settings(), loader)
+        self.assertIsNone(result["adjusted"])
+        self.assertEqual((result["start_us"], result["end_us"]), (start, end))
+        self.assertEqual(metadata.parts_in_range.call_count, 2)  # the window and its baseline, no search
+
+    def test_nothing_indexed_within_reach_is_reported_not_guessed(self):
+        metadata, backend = self.fixture({p["path"] for p in self.parts})
+        start, end = self.NOW - 3 * 3600 * 1_000_000, self.NOW - 2 * 3600 * 1_000_000
+        self.assertIsNone(nearest_indexed_window(metadata, backend, "x", start, end, 60))
+        with self.assertLogs("app.slowlog_impact_service", "WARNING") as logs:
+            result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "start_epoch_us": start,
+                                                                "end_epoch_us": end}, Settings(), Mock())
+        self.assertEqual(result["status"], "incomplete_index")
+        self.assertIn("incomplete_index", logs.output[0])
+
+    def test_unreconciled_index_never_yields_a_window(self):
+        metadata, backend = self.fixture(reconciled=False)
+        self.assertIsNone(nearest_indexed_window(metadata, backend, "x", self.NOW - 3 * 3600 * 1_000_000, self.NOW - 2 * 3600 * 1_000_000, 60))
+
+    def test_baseline_day_must_stay_inside_retention(self):
+        metadata, backend = self.fixture()
+        start, end = self.NOW - 30 * 3600 * 1_000_000, self.NOW - 29 * 3600 * 1_000_000
+        # plenty of retention: the neighbouring minute is already indexed
+        self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 60), (start - MIN, end - MIN))
+        # two days of retention: an earlier window's baseline day would be expired, so only the far later side qualifies
+        self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 2), (self.NOW - DAY_US, self.NOW - DAY_US + 3600 * 1_000_000))
 
 
 if __name__ == "__main__":

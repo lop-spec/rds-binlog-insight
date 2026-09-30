@@ -61,7 +61,19 @@ class MongoService:
         if kind not in ('command','suboperation',''):raise ValueError('invalid_record_kind')
         metric=get('metric','CPUUtilization')
         if metric not in (*METRICS, 'LockWaits'):raise ValueError('unsupported_mongo_metric')
-        store=self.stores[instance];width=store.width(start,end)
+        store=self.stores[instance]
+        adjusted=None
+        if not store.windows_complete(instance,start,end):
+            found=store.nearest_complete(instance,start,end,base)
+            if found is None:
+                LOGGER.warning('mongo_query no complete window within 6h of the request: instance=%s start=%s end=%s',instance,start,end)
+            else:
+                offset,baseline_complete=found
+                adjusted=dict(reason='incomplete_windows',requested_start_us=start,requested_end_us=end,requested_baseline_start_us=base,
+                              shift_us=offset,baseline_complete=baseline_complete)
+                LOGGER.info('mongo_query window shifted: instance=%s shift_min=%s baseline_complete=%s',instance,offset//MINUTE,baseline_complete)
+                start+=offset;end+=offset;base+=offset;base_end+=offset
+        width=store.width(start,end)
         rows,coverage=store.read(instance,start,end,role=role,kind=kind,command=command,namespace=namespace,width=width)
         before,baseline=store.read(instance,base,base_end,role=role,kind=kind,command=command,namespace=namespace,width=width)
         optional={}
@@ -102,7 +114,7 @@ class MongoService:
         counter_rows=sorted(counter_groups.values(),key=lambda x:-(x['qps_delta'] if x['qps_delta'] is not None else x['qps']))
         if not counter_rows or any(r['qps_delta'] is None for r in counter_rows):
             LOGGER.warning('mongo_native_comparison unavailable: instance=%s missing_or_insufficient_observed_intervals',instance)
-        result.update(instance=instance,baseline_start=base,baseline_end=base_end,coverage=coverage,baseline_coverage=baseline,
+        result.update(adjusted=adjusted,start_us=start,end_us=end,instance=instance,baseline_start=base,baseline_end=base_end,coverage=coverage,baseline_coverage=baseline,
                       metric_points=points,native_counters=counter_rows,native_gaps=counter_gaps[:20],native_baseline_gaps=baseline_gaps[:20],
                       native_latest=latest,client_aggregates=clients,namespace_top=namespaces,optional_unavailable=optional,
                       collection_status=next((c.status() for c in self.collectors if c.instance==instance),{}))

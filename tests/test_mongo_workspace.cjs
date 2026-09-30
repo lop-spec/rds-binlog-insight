@@ -73,6 +73,28 @@ test('24h19m yesterday selection becomes an explicit non-overlapping equal basel
  assert.match(nodes['#mongo-baseline-hint'].textContent,/等长、不重叠/);assert.equal(nodes['#mongo-baseline-start'].disabled,true);
  assert.equal(nodes['#analytics-meta'].textContent,'分析完成');
 });
+test('a window the server moved is applied to the form and baseline, and announced above the ranking',async()=>{
+ const {c,nodes,notices,run}=requestContext();
+ c.toLocalInput=d=>d.toISOString().slice(0,19);
+ const start=Date.parse('2026-09-16T08:00:00Z')*1000,end=start+3600*1e6;
+ c.api=async()=>({total_groups:0,start_us:start,end_us:end,baseline_start:start-86400*1e6,
+  adjusted:{reason:'incomplete_windows',requested_start_us:start+7200*1e6,requested_end_us:end+7200*1e6,shift_us:-7200*1e6,baseline_complete:false}});
+ await run();
+ assert.equal(nodes['#analytics-start'].value,'2026-09-16T08:00:00');assert.equal(nodes['#analytics-end'].value,'2026-09-16T09:00:00');
+ assert.equal(nodes['#analytics-range'].value,'custom');
+ assert.equal(nodes['#mongo-baseline-start'].value,'2026-09-15T08:00:00');
+ assert.ok(notices.some(([message,kind])=>kind==='info'&&/已改查最近的完整时段/.test(message)));
+ const c2=context(),page={};c2.$=s=>page[s]??={value:s==='#mongo-role'?'Primary':''};
+ c2.analyticsTable=(headers,rows)=>headers.join('|')+rows.map(r=>r.join('|')).join('\n');
+ c2.detailBlock=(a,b)=>a+b;c2.switchAnalyticsTab=()=>{};vm.runInContext(source,c2);
+ c2.data={order:'correlation',metric:'LockWaits',total_groups:0,coverage:{complete:true},baseline_coverage:{complete:false},ranking:{available:true},
+  start_us:start,end_us:end,adjusted:{reason:'incomplete_windows',requested_start_us:start+7200*1e6,requested_end_us:end+7200*1e6,shift_us:-7200*1e6,baseline_complete:false}};
+ vm.runInContext('renderMongoAnalytics(data)',c2);
+ assert.match(page['#analytics-panel-sql'].innerHTML,/已自动改查最近的完整时段（早 2 小时）/);
+ assert.match(page['#analytics-panel-sql'].innerHTML,/对照窗口仍不完整/);
+ c2.data.adjusted=null;vm.runInContext('renderMongoAnalytics(data)',c2);
+ assert.doesNotMatch(page['#analytics-panel-sql'].innerHTML,/已自动改查/);
+});
 test('exactly 24 hours preserves yesterday; 24h plus one second and seven days use previous',()=>{
  const c=context();vm.runInContext(source,c);c.start=Date.parse('2026-09-16T09:40:29Z')*1000;
  for(const hours of [1,24,24+1/3600,168]) {

@@ -221,6 +221,43 @@ class CollectorGates(unittest.TestCase):
             old.pop()
             self.assertIsNone(service.query(params)['native_counters'][0]['qps_delta'])
 
+    def query_with_store(self, service, **store_options):
+        store=Mock();service.stores['dds-example']=store
+        store.width.return_value=MINUTE;store.read.return_value=([],{'complete':True});store.latest_native.return_value=[]
+        store.read_telemetry.return_value=[]
+        for name,value in store_options.items():getattr(store,name).return_value=value
+        base=T-86400*1_000_000
+        params=dict(instance='dds-example',startEpochUs=T,endEpochUs=T+5*MINUTE,baselineStart=base)
+        return store,base,service.query(params)
+
+    def test_incomplete_window_moves_to_the_nearest_complete_one_and_says_so(self):
+        with tempfile.TemporaryDirectory() as td:
+            service=MongoService(Path(td),lambda:None,start=False)
+            shift=-15*MINUTE
+            store,base,result=self.query_with_store(service,windows_complete=False,nearest_complete=(shift,True))
+            self.assertEqual(result['adjusted'],dict(reason='incomplete_windows',requested_start_us=T,requested_end_us=T+5*MINUTE,
+                                                     requested_baseline_start_us=base,shift_us=shift,baseline_complete=True))
+            self.assertEqual((result['start_us'],result['end_us'],result['baseline_start']),(T+shift,T+5*MINUTE+shift,base+shift))
+            # both the window and its baseline are read at the moved position
+            self.assertEqual([call.args[1:3] for call in store.read.call_args_list],[(T+shift,T+5*MINUTE+shift),(base+shift,base+5*MINUTE+shift)])
+
+    def test_complete_window_is_not_searched_or_moved(self):
+        with tempfile.TemporaryDirectory() as td:
+            service=MongoService(Path(td),lambda:None,start=False)
+            store,base,result=self.query_with_store(service,windows_complete=True)
+            self.assertIsNone(result['adjusted'])
+            store.nearest_complete.assert_not_called()
+            self.assertEqual((result['start_us'],result['end_us'],result['baseline_start']),(T,T+5*MINUTE,base))
+
+    def test_no_complete_window_nearby_keeps_the_request_and_logs_why(self):
+        with tempfile.TemporaryDirectory() as td:
+            service=MongoService(Path(td),lambda:None,start=False)
+            with self.assertLogs('app.mongo_service','WARNING') as logs:
+                store,base,result=self.query_with_store(service,windows_complete=False,nearest_complete=None)
+            self.assertIsNone(result['adjusted'])
+            self.assertEqual((result['start_us'],result['end_us']),(T,T+5*MINUTE))
+            self.assertIn('no complete window',logs.output[0])
+
     def test_history_fills_missing_windows_without_rewinding_live_checkpoint(self):
         from app.mongo_store import MongoStore,atomic_json
         window=5*MINUTE

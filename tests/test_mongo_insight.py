@@ -285,6 +285,57 @@ class MongoGates(unittest.TestCase):
             self.assertEqual(sum(x['count'] for x in store.read('dds-example',t,t+300_000_000)[0]),2)
             self.assertFalse(store.read('dds-example',t,t+600_000_000)[1]['complete'])
 
+class NearestCompleteWindowTests(unittest.TestCase):
+    W = 5 * MINUTE
+    DAY = 86400 * 1_000_000
+
+    def publish_manifests(self, store, starts):
+        for t in starts:
+            path = store.manifest_path('dds-example', t)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{}', encoding='utf-8')
+
+    def store_with_gaps(self, td):
+        # windows are indexed from T (relative window numbers); the current period lacks 14 and 15, the day before lacks 11
+        store = MongoStore(Path(td), backend='parquet')
+        self.publish_manifests(store, [T + i * self.W for i in range(-10, 40) if i not in (14, 15)])
+        self.publish_manifests(store, [T - self.DAY + i * self.W for i in range(-10, 60) if i != 11])
+        return store
+
+    def test_windows_complete_needs_every_overlapping_manifest(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = MongoStore(Path(td), backend='parquet')
+            self.publish_manifests(store, [T, T + self.W, T + 3 * self.W])
+            self.assertTrue(store.windows_complete('dds-example', T, T + 2 * self.W))
+            self.assertFalse(store.windows_complete('dds-example', T, T + 4 * self.W))
+            self.assertFalse(store.windows_complete('dds-example', T + self.W + 1, T + 3 * self.W - 1))  # partial edges still need their window
+
+    def test_nearest_complete_prefers_both_windows_earlier_first(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self.store_with_gaps(td)
+            start, end, base = T + 13 * self.W, T + 17 * self.W, T + 13 * self.W - self.DAY
+            now = T + 40 * self.W
+            # -3 windows is complete now but its day-before window hits 11, so the next candidate, +3, wins
+            self.assertEqual(store.nearest_complete('dds-example', start, end, base, now_us=now), (3 * self.W, True))
+            # a shifted window never ends after now: +3 is out, so the answer moves to the far side of the baseline gap
+            self.assertEqual(store.nearest_complete('dds-example', start, end, base, now_us=T + 17 * self.W), (-6 * self.W, True))
+
+    def test_baseline_that_never_completes_falls_back_to_the_current_period_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = self.store_with_gaps(td)
+            for i in range(-100, 100):
+                path = store.manifest_path('dds-example', T - self.DAY + i * self.W)
+                if path.exists():
+                    path.unlink()
+            start, end, base = T + 13 * self.W, T + 17 * self.W, T + 13 * self.W - self.DAY
+            self.assertEqual(store.nearest_complete('dds-example', start, end, base, now_us=T + 40 * self.W), (-3 * self.W, False))
+
+    def test_nothing_published_yields_no_window(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = MongoStore(Path(td), backend='parquet')
+            self.assertIsNone(store.nearest_complete('dds-example', T, T + 4 * self.W, T - self.DAY, now_us=T + 100 * self.W))
+
+
 
 class CorrelationRankingGates(unittest.TestCase):
     def signals(self):

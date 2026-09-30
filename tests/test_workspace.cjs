@@ -168,6 +168,39 @@ test('unavailable impact analysis says why instead of an empty table', async () 
   assert.equal(none.calls.length, 0);
 });
 
+test('a window the server moved to the nearest indexed period is applied to the form and the detail query, and announced', async () => {
+  const moved = {...impactResult, adjusted: {reason: 'incomplete_index', requested_start_us: 1789990000000000,
+    requested_end_us: 1789997200000000, shift_us: -10_000_000_000}};
+  const {c, nodes, toasts} = rdsContext(async () => moved);
+  await vm.runInContext('runAnalytics()', c);
+  const local = (us) => vm.runInContext(`toLocalInput(new Date(${us / 1000}))`, c);
+  assert.equal(nodes['#analytics-start'].value, local(moved.start_us));
+  assert.equal(nodes['#analytics-end'].value, local(moved.end_us));
+  assert.equal(nodes['#analytics-range'].value, 'custom');
+  const query = new URLSearchParams(vm.runInContext('state.rise.query', c));
+  assert.equal(query.get('startEpochUs'), String(moved.start_us));   // the on-demand detail views read the same window
+  assert.equal(query.get('endEpochUs'), String(moved.end_us));
+  assert.equal(query.get('metric'), 'cpu');
+  const html = nodes['#analytics-panel-rise'].innerHTML;
+  assert.match(html, /已自动改查最近的有索引时段（早 2 小时 47 分钟）/);
+  assert.match(html, /慢日志索引还不完整/);
+  assert.ok(toasts.some(([kind, m]) => kind === 'info' && /已改查/.test(m)));
+  // the baseline-day reason is named as such
+  moved.adjusted.reason = 'incomplete_baseline_index';
+  vm.runInContext('renderRise(state.rise.data)', c);
+  assert.match(nodes['#analytics-panel-rise'].innerHTML, /昨日对照日索引还不完整/);
+});
+
+test('an indexed window is neither moved nor announced; a missing index names the 6-hour search', async () => {
+  const {c, nodes} = rdsContext(async () => ({...impactResult, adjusted: null}));
+  await vm.runInContext('runAnalytics()', c);
+  assert.doesNotMatch(nodes['#analytics-panel-rise'].innerHTML, /已自动改查/);
+  assert.equal(nodes['#analytics-start'].value, '2026-09-28T10:00');
+  const none = rdsContext(async () => ({status: 'incomplete_index', nodes: []}));
+  await vm.runInContext('runAnalytics()', none.c);
+  assert.match(none.nodes['#analytics-panel-rise'].innerHTML, /前后 6 小时内没有索引完整/);
+});
+
 test('detail views load once, on demand, from the same conditions as the investigation', async () => {
   const {c, nodes, calls} = rdsContext(async (url) => (url.includes('/api/slowlog-impact') ? impactResult
     : url.includes('source=slowlog') ? slowResult : binlogResult));
