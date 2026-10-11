@@ -11,6 +11,7 @@ import signal
 import shutil
 import sys
 import threading
+import time
 import urllib.parse
 from datetime import UTC, date, datetime, timedelta
 from http import HTTPStatus
@@ -45,6 +46,8 @@ from .credentials import (
 from .general_log_collector import GeneralLogCollector, GeneralLogConfig
 from .slow_log_collector import SlowLogCollector, SlowLogConfig
 from .slowlog_impact_service import query_resource_overlap
+from .node_roles import NodeRoleBook
+from .window_align import align_binlog_query
 from .pod_lookup import attach_pod_detail
 from .metadata import MetadataStore
 from .pipeline import PipelineError, SyncManager
@@ -336,6 +339,15 @@ class Application:
         # 兼容既有调用与状态字段：第一个采集器仍作为 general_log 暴露。
         self.general_log = self.general_logs[0]
         self.slow_logs = self._start_slow_log_collectors(credential_loader)
+        # Primary / secondary label of each collected node. Refreshed off the request path (the server is single-threaded
+        # and the page polls /api/status); skipped in the mock-API test mode, which has no cloud to ask.
+        self.node_roles = NodeRoleBook(
+            self.metadata.load_settings, credential_loader,
+            lambda: [item.config.instance_id for item in self.slow_logs if item.config.instance_id],
+            RdsRpcClient,
+        )
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self.node_roles.start()
         from .mongo_service import MongoService
         self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
         try:
@@ -536,6 +548,12 @@ class Application:
         else:
             root.addHandler(handler)
 
+    def _slow_log_status(self, collector: SlowLogCollector) -> dict[str, Any]:
+        """Collector status plus the node's current role (empty until the first role refresh, or off cluster edition)."""
+        status = collector.status()
+        known = self.node_roles.lookup(status.get("instanceId") or "").get(status.get("nodeId") or "") or {}
+        return {**status, "role": known.get("role", ""), "zone": known.get("zone", "")}
+
     def public_status(self) -> dict[str, Any]:
         settings = self.metadata.load_settings()
         stats = self.metadata.storage_metadata_stats()
@@ -609,7 +627,7 @@ class Application:
             "generalLogs": [
                 item.status() for item in getattr(self, "general_logs", [])
             ],
-            "slowLogs": [item.status() for item in getattr(self, "slow_logs", [])],
+            "slowLogs": [self._slow_log_status(item) for item in getattr(self, "slow_logs", [])],
             "instances": (
                 self.metadata.known_instances()
                 if callable(getattr(self.metadata, "known_instances", None))
@@ -628,6 +646,8 @@ class Application:
         }
 
     def stop(self) -> None:
+        if getattr(self, 'node_roles', None) is not None:
+            self.node_roles.shutdown()
         if getattr(self, 'mongo', None) is not None:
             self.mongo.shutdown()
         for collector in self.general_logs:
@@ -926,11 +946,18 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.app.metadata,
                     self.app.storage.clickhouse_slowlog_backend,
                     impact_query, settings,
+                    roles=self.app.node_roles.lookup,
                 )
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/analytics":
                 settings = self.app.metadata.load_settings()
                 analytics_query = _analytics_query(query)
+                # Binlog windows the row store does not fully cover are repaired here (cut back to the indexed edge, or
+                # moved to the nearest covered period) and the change is reported next to the result.
+                binlog_window = analytics_query["source"] in ("", "binlog")
+                adjusted, ready_through = (align_binlog_query(
+                    getattr(self.app.storage, "binlog_rows", None), analytics_query, settings.retention_days)
+                    if binlog_window else (None, None))
                 archive = None
                 archive_options = {}
                 if str(analytics_query.get("source") or "").lower() == "slowlog":
@@ -946,6 +973,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     scan_limit=int(analytics_query.pop("scan_limit")),
                     **archive_options,
                 )
+                if binlog_window and isinstance(result, dict):
+                    result["adjusted"], result["ready_through_us"] = adjusted, ready_through
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/storage":
                 settings = self.app.metadata.load_settings()

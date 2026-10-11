@@ -25,16 +25,16 @@ on:
         default: false
   push:
     tags:
-      - v1.29.22-rawoss
+      - v1.30.0-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.29.22-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.29.22-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.29.22-rawoss
+  VERSION: 1.30.0-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.30.0-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.30.0-rawoss
 
 jobs:
   recovery-isolation:
@@ -211,6 +211,9 @@ jobs:
             tests.test_slowlog_correlation \
             tests.test_slowlog_correlation_engines \
             tests.test_slowlog_impact \
+            tests.test_node_roles \
+            tests.test_window_align \
+            tests.test_server_roles_and_windows \
             tests.test_mongo_insight \
             tests.test_resource_attribution \
             tests.test_mongo_collector \

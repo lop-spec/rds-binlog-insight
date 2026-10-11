@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.29.22-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.29.22-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.30.0-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.30.0-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -177,10 +177,15 @@
           </div>
 
           <form id="analytics-form" class="query-grid">
-            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="RDS：慢日志提供真实扫描行数和耗时，Binlog 提供写入与事务推断，一次分析同时取回；MongoDB 单独分析"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option></select></label>
+            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="RDS：下面勾选慢日志 / Binlog 写入作为证据来源，只请求勾选的；MongoDB 单独分析"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option></select></label>
             <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
-            <label id="rds-controls" class="field span-2"><span>性能指标</span><select id="rds-metric" title="选一个上涨的主要指标：按 SQL 执行耗时与该指标曲线的相关度从高到低排查，并对比昨日同窗的耗时增量（时间窗需小于 24 小时）"></select></label>
-            <label id="analytics-node-field" class="field span-2" hidden><span>Node ID（慢日志）</span><input id="analytics-node" type="text" list="analytics-node-options" maxlength="128" autocomplete="off" placeholder="留空表示全部已采集节点" title="阿里云 DAS Node ID；可从已配置节点中选择，也可直接填写"><datalist id="analytics-node-options"></datalist></label>
+            <fieldset id="rds-sources" class="operation-filter span-2" title="证据来源：慢日志给出真实扫描行数和耗时（上涨排查），Binlog 给出写入与事务推断（写入 SQL / 事务 / 锁争用推断）。只请求勾选的。">
+              <legend>证据来源</legend>
+              <label><input id="analytics-use-slowlog" type="checkbox" checked><span>慢日志</span></label>
+              <label><input id="analytics-use-binlog" type="checkbox" checked><span>Binlog 写入</span></label>
+            </fieldset>
+            <label id="rds-controls" class="field span-2"><span>性能指标</span><select id="rds-metric" title="选一个上涨的主要指标：先看扫描行比昨日增加的慢 SQL，再按增长份额排查，并对比昨日同窗的耗时增量（时间窗需小于 24 小时，超出会自动压到 23 小时 55 分）"></select></label>
+            <label id="analytics-node-field" class="field span-2" hidden><span>Node ID（慢日志）</span><input id="analytics-node" type="text" list="analytics-node-options" maxlength="128" autocomplete="off" placeholder="留空表示全部已采集节点" title="阿里云 DAS Node ID；下拉里标注了每个节点当前的数据库角色（主节点 / 备节点）和可用区，也可直接填写"><datalist id="analytics-node-options"></datalist></label>
             <label class="field span-2"><span>开始时间</span><input id="analytics-start" type="datetime-local" step="1"></label>
             <label class="field span-2"><span>结束时间</span><input id="analytics-end" type="datetime-local" step="1"></label>
             <details id="analytics-filters" class="filter-disclosure span-8"><summary>更多筛选 <span class="filter-count"></span></summary><div class="query-grid">
@@ -230,10 +235,10 @@
             <div class="segmented" id="analytics-tabs" aria-label="分析维度">
               <button data-analytics-tab="rise" class="is-active" type="button">上涨排查</button>
               <button data-analytics-tab="sql" class="is-detail" type="button" hidden>慢日志</button>
-              <button data-analytics-tab="writes" class="is-detail" type="button" hidden>写入 SQL</button>
+              <button data-analytics-tab="writes" type="button">写入 SQL</button>
               <button data-analytics-tab="transactions" class="is-detail" type="button" hidden>事务</button>
               <button data-analytics-tab="locks" class="is-detail" type="button" hidden>锁争用推断</button>
-              <button id="analytics-more-views" class="is-more" type="button" aria-expanded="false" title="慢日志、Binlog 写入、事务、锁争用的原始明细（按需加载）">更多视图</button>
+              <button id="analytics-more-views" class="is-more" type="button" aria-expanded="false" title="慢日志明细、事务、锁争用推断（按需展开；Binlog 写入已在左侧页签）">更多视图</button>
             </div>
           </div>
 
@@ -473,10 +478,10 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.29.22-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.29.22-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.29.22-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.29.22-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.29.22-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.30.0-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.30.0-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.30.0-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.30.0-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.30.0-rawoss" defer></script>
 </body>
 </html>

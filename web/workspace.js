@@ -1,11 +1,5 @@
 /* Progressive disclosure and SQL-level detail; existing form IDs/API stay intact. */
 function setupWorkspaceControls() {
-  $('#analytics-form .menu-content').insertAdjacentHTML('beforeend', '<button id="resource-analysis" class="button ghost" type="button">对齐节点 IOPS（性能关联）</button>');
-  $('#resource-analysis').addEventListener('click', openResourceAnalysis);
-  document.addEventListener('click', async event => {
-    const button = event.target.closest('[data-resource-event]');
-    if (button) await openDetail(button.dataset.resourceEvent, '', button.dataset.instance);
-  });
   // Node is an optional scope, not a second instance selector.
   document.querySelector('#analytics-filters .query-grid').prepend($('#analytics-node-field'));
   const maintenance = document.createElement('details');
@@ -67,7 +61,6 @@ function compactStatTiles(items) {
 }
 
 function sqlSorter(labels, order) {
-  if (labels === SLOWLOG_ORDER_LABELS) labels = [['performance', '性能关联（昨日基线）'], ...labels];
   return `<label class="range-picker">排序<select data-sql-sort aria-label="SQL 排序">${labels.map(([key, label]) => `<option value="${key}"${key === order ? ' selected' : ''}>${escapeHtml(label)}</option>`).join('')}</select></label>`;
 }
 
@@ -75,8 +68,6 @@ async function changeSqlOrder(select) {
   const sql = state.analytics?.sql;
   if (!sql || select.value === sql.order) return;
   const key = select.value;
-  state.performanceRequest = (state.performanceRequest || 0) + 1;
-  if (key === 'performance') { await showPerformanceRanking(); return; }
   if (!sql.orders?.[key]) {
     console.warn('SQL order snapshot unavailable; keeping existing result:', key);
     toast('当前结果缺少该排序快照，请重新分析', 'error');
@@ -131,68 +122,6 @@ function podDetail(value) {
       + detailMeta('Node / Host IP', `${pod.node} / ${pod.host_ip}`)
       + detailMeta('Pod UID', pod.uid)
       + detailMeta('绑定观测区间', `${epochMicrosText(pod.first_seen_us)} → ${epochMicrosText(pod.last_seen_us)}`)).join('');
-}
-
-function renderResourceAnalysis(result) {
-  const nodes = result.nodes || [];
-  const intro = '<p class="analytics-note">确定性计算，不调用模型。先核对昨日同窗的实际扫描增量，再以耗时增长和 IOPS 时序重合作辅助排序。扫描增长只是相关工作量，不等于物理 IOPS；锁等待增加可能说明 SQL 是拥堵受害者。保留原重合计算供复算，但重合份额不是 IOPS 贡献率，r 不是根因概率。同库同 SQL ID 的数字分表归为一家族。分钟指标 t 对齐前一分钟，不搜索延迟；仅覆盖已采集慢 SQL，索引 100% 不代表来源完整或全量执行。旧索引无法区分成本字段的零值与缺报，因此不以这些零值计算成本增量；“—”表示无法可靠比较，不是零。</p>';
-  if (!nodes.length) return intro + `<p>${escapeHtml(RESOURCE_STATUS[result.status] || result.status || '结果不可用')}</p>`;
-  return intro + `<p>${epochMicrosText(result.start_us)} → ${epochMicrosText(result.end_us)} · 当前 / 昨日同窗 ${humanCount(result.executions)} / ${humanCount(result.baseline_executions)} 条执行 · 每节点所有 SQL 家族先排名，再展示前 10</p>` + nodes.map(node => {
-    const rows = (node.statements || []).map(row => [String(row.rank ?? '—'),
-      `<details><summary>${escapeHtml((row.normalized_sql || row.fingerprint).slice(0, 100))}</summary><p>${row.member_fingerprints?.length || 1} 个实际指纹；SQL 为最慢执行样本，不将家族总量归给样本表。</p>${detailBlock('实际指纹', (row.member_fingerprints || []).join('\n'))}${detailBlock('SQL', row.normalized_sql)}${detailBlock('SQL ID', row.sql_id)}${detailMeta('当前 / 昨日窗口耗时', `${millisText(row.runtime_us_total / 1000)} / ${millisText(row.baseline_runtime_us_total / 1000)}`)}${row.sample_event_id ? `<button type="button" class="button secondary compact" data-resource-event="${escapeHtml(row.sample_event_id)}" data-instance="${escapeHtml(result.instance_id)}">执行样本 / Pod</button>` : ''}</details>`,
-      row.attribution?`${escapeHtml(({scan_growth_related_evidence:'扫描增长旁证（未证明 IOPS 因果）',no_scan_growth:'已记录扫描未增长',elapsed_overlap_only:'仅耗时重合，资源成本不足'})[row.attribution.status]||'证据不足')}<br>扫描增量 ${row.attribution.rows_examined.delta==null?'—':humanCount(row.attribution.rows_examined.delta)}<br>锁等待增量 ${row.attribution.lock_time_ms.delta==null?'—':millisText(row.attribution.lock_time_ms.delta)}${row.attribution.warnings.includes('lock_wait_increased_possible_victim')?'<br>等待增加，可能是受害者':''}${row.attribution.warnings.includes('resource_window_mean_not_increased')?'<br>资源均值并未上涨':''}`:'证据不足',
-      row.growth_share == null ? '—' : `${(row.growth_share * 100).toFixed(4)}%`, coefficient(row.resource_r, 4),
-      millisText(row.runtime_us_total / 1000), humanCount(row.executions),
-    ]);
-    const audit = {period_us: result.period_us, sample_end_us: result.sample_end_us, metric_scale: node.metric_scale, metric_values: node.metric_values,
-      statements: (node.statements || []).map(({fingerprint, runtime_us, score_numerator, baseline_runtime_us_total, growth_score_numerator, growth_score_denominator}) => ({fingerprint, runtime_us, score_numerator, baseline_runtime_us_total, growth_score_numerator, growth_score_denominator}))};
-    return `<section class="detail-block"><h3>${escapeHtml(node.node_id || '未知节点')}</h3><p>IOPS 基线 ${node.baseline ?? '—'}% / 峰值 ${node.peak ?? '—'}%${node.status !== 'ok' ? ' · ' + escapeHtml(RESOURCE_STATUS[node.status] || node.status) : ''}</p>${analyticsTable(['排查顺序', 'SQL', '工作量与等待证据', '耗时增长重合份额（非贡献）', '时序 r', '窗口内执行耗时', '慢记录次数'], rows)}<details class="analytics-more"><summary>核对分钟计算序列</summary>${detailBlock('资源基线与本期比较（均值非峰值）', JSON.stringify(node.resource_comparison||{},null,2))}${detailBlock('整数序列；metric_values ÷ metric_scale = IOPS 使用率 %', JSON.stringify(audit, null, 2))}</details></section>`;
-  }).join('');
-}
-
-async function loadPerformanceAnalysis(query) {
-  const params = new URLSearchParams(query || analyticsQueryString('executions'));
-  params.set('order', 'executions'); params.delete('limit');
-  const key = params.toString();
-  if (state.performanceCache?.key === key) return state.performanceCache.promise;
-  const promise = api(`/api/slowlog-impact?${key}`);
-  state.performanceCache = {key, promise};
-  try { return await promise; } catch (error) {
-    if (state.performanceCache?.promise === promise) state.performanceCache = null;
-    throw error;
-  }
-}
-
-async function showPerformanceRanking() {
-  const analytics = state.analytics, sql = analytics.sql;
-  const request = state.performanceRequest;
-  sql.order = 'performance';
-  const header = `<div class="section-heading"><h3>慢 SQL · 性能关联排序</h3>${sqlSorter(SLOWLOG_ORDER_LABELS, 'performance')}</div>`;
-  $('#analytics-panel-sql').innerHTML = header + '<p>正在读取当前 / 昨日同窗执行与节点 IOPS…</p>';
-  try {
-    const result = await loadPerformanceAnalysis(state.analyticsQuery);
-    if (state.analytics !== analytics || request !== state.performanceRequest || sql.order !== 'performance') return;
-    $('#analytics-panel-sql').innerHTML = header + renderResourceAnalysis(result);
-  } catch (error) {
-    if (state.analytics === analytics && request === state.performanceRequest && sql.order === 'performance')
-      $('#analytics-panel-sql').innerHTML = header + `<p>${escapeHtml(error.message)}</p>`;
-  }
-}
-
-async function openResourceAnalysis() {
-  let query;
-  try { query = analyticsQueryString(); } catch (error) { toast(error.message, 'error'); return; }
-  const request = state.detailRequest = (state.detailRequest || 0) + 1;
-  $('#detail-title').textContent = '节点 IOPS · 性能关联';
-  $('#detail-body').innerHTML = '<p>正在读取已采集执行与云监控分钟指标…</p>';
-  showDetailDrawer();
-  try {
-    const result = await loadPerformanceAnalysis(query);
-    if (request !== state.detailRequest) return;
-    $('#detail-body').innerHTML = renderResourceAnalysis(result);
-  } catch (error) {
-    if (request === state.detailRequest) $('#detail-body').innerHTML = `<p>${escapeHtml(error.message)}</p>`;
-  }
 }
 
 function sqlAggregateDetail(item, data) {

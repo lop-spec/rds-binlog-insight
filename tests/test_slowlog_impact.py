@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 from app.config import Settings
 from app.slowlog_impact import DAY_US, execution_series, order_by_correlation, rank_resource_overlap, rank_performance_growth
 from app.slowlog_impact_service import (RDS_METRICS, load_iops_points, load_metric_points,
-                                       nearest_indexed_window, query_resource_overlap)
+                                       nearest_indexed_window, query_resource_overlap, truncate_to_ready)
 
 W = 60_000_000
 
@@ -316,7 +316,7 @@ class IndexedWindowTests(unittest.TestCase):
         loader = Mock(return_value=[])
         result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "start_epoch_us": start,
                                                             "end_epoch_us": end}, Settings(), loader)
-        self.assertEqual(result["adjusted"], dict(reason="incomplete_baseline_index", requested_start_us=start,
+        self.assertEqual(result["adjusted"], dict(kind="shifted", reason="incomplete_baseline_index", requested_start_us=start,
                                                   requested_end_us=end, shift_us=shift))
         self.assertEqual((result["start_us"], result["end_us"]), (start + shift, end + shift))
         self.assertEqual(loader.call_args_list[0].args[1:3], (start + shift, end + shift))
@@ -330,8 +330,64 @@ class IndexedWindowTests(unittest.TestCase):
         result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "start_epoch_us": start,
                                                             "end_epoch_us": end}, Settings(), loader)
         self.assertIsNone(result["adjusted"])
+        self.assertIsNone(result["ready_through_us"])  # an old window says nothing about how far behind the index is
         self.assertEqual((result["start_us"], result["end_us"]), (start, end))
         self.assertEqual(metadata.parts_in_range.call_count, 2)  # the window and its baseline, no search
+
+    def query(self, metadata, backend, start, end, **kw):
+        loader = Mock(return_value=[])
+        result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "start_epoch_us": start,
+                                                            "end_epoch_us": end}, Settings(), loader, **kw)
+        return result, loader
+
+    def test_window_ending_now_is_cut_back_to_the_indexed_edge_and_keeps_its_start(self):
+        ready_until = (self.NOW - 12 * MIN) // self.STEP * self.STEP
+        metadata, backend = self.fixture({p["path"] for p in self.parts if p["max_event_epoch_us"] > ready_until})
+        start, end = self.NOW - 60 * MIN, self.NOW
+        result, loader = self.query(metadata, backend, start, end)
+        cut = ready_until - MIN  # the first unready part starts at ready_until, so the last clean minute is one earlier
+        self.assertEqual(result["adjusted"], dict(kind="truncated", reason="incomplete_index", requested_start_us=start,
+                                                  requested_end_us=end, truncated_us=end - cut))
+        self.assertEqual((result["start_us"], result["end_us"]), (start, cut))
+        self.assertEqual(loader.call_args_list[0].args[1:3], (start, cut))
+        self.assertEqual(loader.call_args_list[1].args[1:3], (start - DAY_US, cut - DAY_US))  # the baseline day is cut the same
+        self.assertTrue(result["coverage"]["complete"] and result["baseline_coverage"]["complete"])
+        self.assertEqual(result["ready_through_us"], ready_until)  # how far behind the index is, for the page
+
+    def test_a_cut_shorter_than_six_minutes_moves_the_window_instead(self):
+        ready_until = (self.NOW - 12 * MIN) // self.STEP * self.STEP
+        metadata, backend = self.fixture({p["path"] for p in self.parts if p["max_event_epoch_us"] > ready_until})
+        start = ready_until - 4 * MIN  # only 3 clean minutes would be left
+        result, _loader = self.query(metadata, backend, start, self.NOW)
+        self.assertEqual(result["adjusted"]["kind"], "shifted")
+        self.assertLessEqual(result["end_us"], ready_until - MIN)
+        self.assertEqual(result["end_us"] - result["start_us"], self.NOW - start)
+
+    def test_truncate_to_ready_needs_an_indexed_start_and_stops_before_the_first_unready_part(self):
+        hole = self.overlapping(self.NOW - 40 * MIN, self.NOW - 31 * MIN)
+        metadata, backend = self.fixture({p["path"] for p in hole})
+        hole_low = min(p["min_event_epoch_us"] for p in hole)
+        self.assertEqual(truncate_to_ready(metadata, backend, "x", self.NOW - 90 * MIN, self.NOW - 20 * MIN), hole_low - MIN)
+        # the start inside the hole, or an index that was never reconciled: nothing to keep
+        self.assertIsNone(truncate_to_ready(metadata, backend, "x", hole_low + 3 * MIN, self.NOW - 20 * MIN))
+        unreconciled, backend2 = self.fixture(reconciled=False)
+        self.assertIsNone(truncate_to_ready(unreconciled, backend2, "x", self.NOW - 90 * MIN, self.NOW - 20 * MIN))
+
+    def test_nodes_carry_their_role_and_a_broken_lookup_only_drops_the_label(self):
+        metadata, backend = self.fixture()
+        start, end = self.NOW - 3 * 3600 * 1_000_000, self.NOW - 2 * 3600 * 1_000_000
+        seen = []
+        result, _loader = self.query(metadata, backend, start, end, roles=lambda instance: (
+            seen.append(instance) or {"a": {"role": "primary", "zone": "cn-chengdu-a", "status": "active"}}))
+        self.assertEqual(seen, ["x"])
+        self.assertEqual([(n["node_id"], n["role"], n["zone"]) for n in result["nodes"]], [("a", "primary", "cn-chengdu-a")])
+
+        def broken(_instance):
+            raise RuntimeError("lookup down")
+        with self.assertLogs("app.slowlog_impact_service", "WARNING") as logs:
+            result, _loader = self.query(metadata, backend, start, end, roles=broken)
+        self.assertTrue(any("node roles unavailable" in line for line in logs.output))
+        self.assertEqual([(n["role"], n["zone"]) for n in result["nodes"]], [("", "")])
 
     def test_nothing_indexed_within_reach_is_reported_not_guessed(self):
         metadata, backend = self.fixture({p["path"] for p in self.parts})

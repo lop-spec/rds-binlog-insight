@@ -13,6 +13,7 @@ from .clickhouse_manifest import part_identity
 from .credentials import load_credential
 from .slow_log_collector import DasRpcClient
 from .slowlog_impact import DAY_US, MAX_EVENTS, PERIOD_US, family_key, order_by_correlation, rank_performance_growth
+from .window_align import adjusted_payload
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,6 +36,10 @@ TOP_PER_NODE = 10
 TOP_PER_NODE_CORRELATION = 20
 # How far from the requested window to look for one whose index is complete.
 SEARCH_REACH_US = 6 * 3600 * 1_000_000
+# A window cut back to the indexed edge still needs the ranker's six complete minutes.
+MIN_TRUNCATED_US = 6 * PERIOD_US
+# Windows ending this close to now report how far behind the index is (older windows are long since indexed).
+FRESHNESS_WINDOW_US = 30 * PERIOD_US
 
 
 def load_metric_points(settings: Any, start_us: int, end_us: int, instance: str,
@@ -148,8 +153,53 @@ def nearest_indexed_window(metadata: Any, backend: Any, instance: str, start_us:
     return None
 
 
+def _node_roles(roles: Any, instance: str) -> dict[str, dict[str, str]]:
+    """Roles are a label on the answer, never a reason to fail it: a broken lookup is logged and the nodes stay unlabeled."""
+    if roles is None:
+        return {}
+    try:
+        return roles(instance) or {}
+    except Exception:  # noqa: BLE001
+        LOGGER.warning("slowlog_resource_query node roles unavailable for %s; nodes are shown without a role", instance, exc_info=True)
+        return {}
+
+
+def truncate_to_ready(metadata: Any, backend: Any, instance: str, start_us: int, end_us: int,
+                      min_span_us: int = MIN_TRUNCATED_US) -> int | None:
+    """The end of the longest prefix of [start, end] the index fully covers, on a whole minute.
+
+    Only a missing tail can be cut: the newest slow-log parts are still being indexed, so the requested start stays and the
+    analysis simply stops at the last clean minute. None when the start itself is not indexed, or the prefix left is
+    shorter than ``min_span_us`` (the caller then looks for another window).
+    """
+    index = _index_map(metadata, backend, instance, start_us, end_us)
+    if index is None or index["first"] is None or index["first"] > start_us:
+        return None
+    limit = min(end_us, index["last"])
+    for low, high in zip(*index["blocked"]):
+        if high < start_us:
+            continue
+        if low > limit:
+            break
+        if low <= start_us:
+            return None
+        limit = low - 1  # the first part still waiting for the index starts a gap
+        break
+    cut = limit // PERIOD_US * PERIOD_US
+    return cut if cut - start_us >= min_span_us else None
+
+
+def ready_through(metadata: Any, backend: Any, instance: str, end_us: int, now_us: int) -> int | None:
+    """Newest event the index serves, for a window that ends close to now (None for older windows)."""
+    if end_us < now_us - FRESHNESS_WINDOW_US:
+        return None
+    index = _index_map(metadata, backend, instance, end_us - FRESHNESS_WINDOW_US, now_us)
+    return None if index is None else index["last"]
+
+
 def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
-                           settings: Any, metrics_loader: Any = load_metric_points) -> dict[str, Any]:
+                           settings: Any, metrics_loader: Any = load_metric_points,
+                           roles: Any = None) -> dict[str, Any]:
     def unavailable(reason: str) -> dict[str, Any]:
         LOGGER.warning("slowlog_resource_query unavailable: %s", reason)
         return {"status": reason, "nodes": []}
@@ -191,18 +241,30 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     adjusted = None
     if not usable(coverage) or (baseline_coverage is not None and not usable(baseline_coverage)):
         reason = "incomplete_index" if not usable(coverage) else "incomplete_baseline_index"
-        shifted = nearest_indexed_window(metadata, backend, instance, start_us, end_us, settings.retention_days)
-        if shifted is None:
-            return unavailable(reason)
-        coverage, baseline_coverage = index_state(*shifted)
-        if not usable(coverage) or not usable(baseline_coverage):
-            LOGGER.warning("slowlog_resource_query window shift not confirmed by the manifest: %s", reason)
-            return unavailable(reason)
-        adjusted = {"reason": reason, "requested_start_us": start_us, "requested_end_us": end_us,
-                    "shift_us": shifted[0] - start_us}
-        LOGGER.info("slowlog_resource_query window shifted: reason=%s shift_min=%s instance=%s",
-                    reason, adjusted["shift_us"] // PERIOD_US, instance)
-        start_us, end_us = shifted
+        requested = (start_us, end_us)
+        # A window that ends close to now usually misses only its tail (the newest parts are still being indexed): keep the
+        # requested start and stop at the last indexed minute rather than moving the whole window off the time point asked for.
+        cut = None if usable(coverage) else truncate_to_ready(metadata, backend, instance, start_us, end_us)
+        if cut is not None:
+            cut_coverage, cut_baseline = index_state(start_us, cut)
+            if usable(cut_coverage) and (cut_baseline is None or usable(cut_baseline)):
+                coverage, baseline_coverage = cut_coverage, cut_baseline
+                adjusted = adjusted_payload("truncated", reason, *requested, start_us, cut)
+                LOGGER.warning("slowlog_resource_query window truncated to the indexed edge: reason=%s cut_min=%s instance=%s",
+                               reason, adjusted["truncated_us"] // PERIOD_US, instance)
+                end_us = cut
+        if adjusted is None:
+            shifted = nearest_indexed_window(metadata, backend, instance, start_us, end_us, settings.retention_days)
+            if shifted is None:
+                return unavailable(reason)
+            coverage, baseline_coverage = index_state(*shifted)
+            if not usable(coverage) or not usable(baseline_coverage):
+                LOGGER.warning("slowlog_resource_query window shift not confirmed by the manifest: %s", reason)
+                return unavailable(reason)
+            adjusted = adjusted_payload("shifted", reason, *requested, *shifted)
+            LOGGER.warning("slowlog_resource_query window shifted: reason=%s shift_min=%s instance=%s",
+                           reason, adjusted["shift_us"] // PERIOD_US, instance)
+            start_us, end_us = shifted
     def read_events(start: int, end: int) -> list[dict[str, Any]]:
         scope, parameters = backend._scope_sql(query, start, end)
         return backend._rows("SELECT scope_event_id AS event_id, "
@@ -253,9 +315,12 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     selected = {(instance, samples[node["node_id"], row["fingerprint"]]["fingerprint"])
                 for node in result.get("nodes", []) for row in node.get("statements", [])[:top]}
     profiles = backend.statement_index.statement_profiles(selected)
+    node_roles = _node_roles(roles, instance)
     for node in result.get("nodes", []):
         node["total_fingerprints"] = len(node.get("statements", []))
         node["statements"] = node.get("statements", [])[:top]
+        known = node_roles.get(node["node_id"]) or {}
+        node["role"], node["zone"] = known.get("role", ""), known.get("zone", "")
         for row in node["statements"]:
             key = node["node_id"], row["fingerprint"]
             row.update(profiles.get((instance, samples[key]["fingerprint"]), {}))
@@ -265,6 +330,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             # Preserve exact sufficient statistics across JavaScript's 53-bit boundary.
             row["score_numerator"] = str(row["score_numerator"])
     result.update(instance_id=instance, start_us=start_us, end_us=end_us,
+                  ready_through_us=ready_through(metadata, backend, instance, end_us, time.time_ns() // 1000),
                   coverage=coverage, baseline_coverage=baseline_coverage, adjusted=adjusted,
                   executions=len(rows), baseline_executions=len(baseline), metric=metric_name,
                   metric_id=metric_id, metric_label=metric_label,

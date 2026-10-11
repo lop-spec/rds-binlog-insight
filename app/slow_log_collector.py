@@ -167,8 +167,10 @@ class SlowLogConfig:
         self.label = str(data.get("label") or default_label).strip()
         self.enabled = bool(data.get("enabled", False))
         self.poll_seconds = self._int(data, "pollSeconds", 120, 30, 3600)
-        # RDS 侧落库延迟裕量：水位线只推进到 now - lag，避免短时晚到。
-        self.lag_seconds = self._int(data, "lagSeconds", 300, 60, 3600)
+        # RDS 侧落库延迟裕量：水位线只推进到 now - lag，避免短时晚到。晚到记录由下面的
+        # 回放兜底，所以裕量只需覆盖 DAS 的发布抖动；它直接决定页面能看到多新的慢日志
+        # （1.30.0 起默认 90 秒，之前 300 秒让水位恒落后约 6 分钟）。
+        self.lag_seconds = self._int(data, "lagSeconds", 90, 60, 3600)
         # DAS 按 QueryStartTime 过滤、但慢日志可能到语句结束后才发布。每轮回放
         # 已提交水位之前的窗口，默认两小时覆盖当前最长 25 分钟样本并保留余量。
         self.replay_seconds = self._int(data, "replaySeconds", 7200, 300, 86400)

@@ -1140,6 +1140,16 @@ function syncInstanceOptions(instances, labels = new Map()) {
   });
 }
 
+// 节点的数据库角色（主 / 备）取自云上实例的节点信息，是「当前」角色；还没取到时标「角色未知」。
+function nodeRoleText(role) {
+  return role === "primary" ? "主节点" : role === "secondary" ? "备节点" : role || "角色未知";
+}
+
+function nodeZoneText(zone) {
+  const match = /-([a-z])$/.exec(String(zone || ""));
+  return match ? `可用区 ${match[1].toUpperCase()}` : String(zone || "");
+}
+
 function syncSlowLogNodeOptions(slowLogs) {
   const list = $("#analytics-node-options");
   if (!list) return;
@@ -1147,10 +1157,14 @@ function syncSlowLogNodeOptions(slowLogs) {
   for (const item of slowLogs || []) {
     const nodeId = String(item.nodeId || "").trim();
     if (!nodeId || nodes.has(nodeId)) continue;
-    nodes.set(nodeId, item.label || item.instanceId || nodeId);
+    const name = item.label || item.instanceId || nodeId;
+    const rank = item.role === "primary" ? 0 : item.role === "secondary" ? 1 : 2;
+    nodes.set(nodeId, { rank, name, label: [nodeRoleText(item.role), nodeZoneText(item.zone), name].filter(Boolean).join(" · ") });
   }
+  // 主节点在前，同类按名称；每 3 秒刷新一次状态，顺序必须稳定。
   list.innerHTML = [...nodes.entries()]
-    .map(([nodeId, label]) => `<option value="${escapeHtml(nodeId)}" label="${escapeHtml(label)}"></option>`)
+    .sort(([idA, a], [idB, b]) => a.rank - b.rank || a.name.localeCompare(b.name) || idA.localeCompare(idB))
+    .map(([nodeId, item]) => `<option value="${escapeHtml(nodeId)}" label="${escapeHtml(item.label)}"></option>`)
     .join("");
 }
 
@@ -1788,11 +1802,8 @@ function syncAnalyticsMode() {
   if (typeof syncRdsControls === 'function') syncRdsControls(!mongo);
   if (mongo) return;
   $("#analytics-tabs").hidden = false;
-  const nodeField = $("#analytics-node-field");
-  const nodeInput = $("#analytics-node");
-  if (nodeField) nodeField.hidden = false;
-  if (nodeInput) nodeInput.disabled = false;
   switchAnalyticsTab(state.rdsTab || "rise");
+  syncAnalyticsSources(); // 性能指标 / Node ID / 页签跟着勾选的证据来源走
 }
 
 function switchAnalyticsTab(name) {
@@ -1858,6 +1869,7 @@ function setAnalyticsRange(range) {
   const units = { "1h": 60 * 60_000, "6h": 6 * 60 * 60_000, "24h": 24 * 60 * 60_000, "7d": 7 * 24 * 60 * 60_000, "30d": 30 * 24 * 60 * 60_000 };
   const latestEpochUs = $("#analytics-source").value === "mongodb" ? 0 : Number(state.status?.summary?.latestEpochUs || 0);
   const end = latestEpochUs > 0 ? new Date(latestEpochUs / 1000) : new Date();
+  end.setSeconds(0, 0); // 整分钟：和排查实际使用的窗口一致，起止点不带零头秒数
   $("#analytics-end").value = toLocalInput(end);
   $("#analytics-start").value = toLocalInput(new Date(end.getTime() - units[range]));
   $("#analytics-range").value = range;
@@ -1897,7 +1909,8 @@ async function runAnalytics(orderOverride = "") {
   return runRise();
 }
 
-// 更多视图（慢日志 / 写入 SQL / 事务 / 锁争用）：按上涨排查同一份条件按需加载，不在每次排查时多发请求。
+// 慢日志明细（更多视图里的「慢日志」页签）：沿用上涨排查实际查询的窗口，第一次打开才请求。
+// Binlog 写入、事务、锁争用由勾选的 Binlog 来源在排查时一次取回，这里不再重复请求。
 function analyticsDetailQuery(base, kind) {
   const params = new URLSearchParams(base);
   params.set("source", kind);
@@ -1908,39 +1921,30 @@ function analyticsDetailQuery(base, kind) {
 
 async function loadAnalyticsDetails() {
   const base = state.rise?.query;
-  if (!base || state.analyticsRunsQuery === base) return;
+  if (!base || !riseUses("slowlog") || state.analyticsRunsQuery === base) return;
   state.analyticsRunsQuery = base;
-  for (const id of ["sql", "writes", "transactions", "locks"]) {
-    $(`#analytics-panel-${id}`).innerHTML = '<p class="analytics-note">正在加载明细…</p>';
-  }
-  const kinds = ["slowlog", "binlog"];
+  $("#analytics-panel-sql").innerHTML = '<p class="analytics-note">正在加载明细…</p>';
   const scope = $("#analytics-meta").textContent;
-  const queries = Object.fromEntries(kinds.map((kind) => [kind, analyticsDetailQuery(base, kind)]));
-  const settled = await Promise.allSettled(kinds.map((kind) => api(`/api/analytics?${queries[kind]}`)));
-  if (state.analyticsRunsQuery !== base) return; // 期间已重新排查
-  const runs = {};
-  kinds.forEach((kind, index) => {
-    const outcome = settled[index];
-    runs[kind] = outcome.status === "fulfilled"
-      ? { query: queries[kind], result: outcome.value }
-      : { query: queries[kind], error: outcome.reason };
-  });
-  state.analyticsRuns = runs;
-  for (const kind of kinds) {
-    if (runs[kind].result) renderAnalytics(runs[kind].result);
-    else renderAnalyticsFailure(kind, runs[kind].error);
+  const query = analyticsDetailQuery(base, "slowlog");
+  let run;
+  try {
+    run = { query, result: await api(`/api/analytics?${query}`) };
+  } catch (error) {
+    run = { query, error };
   }
+  if (state.analyticsRunsQuery !== base) return; // 期间已重新排查
+  state.analyticsRuns = { ...state.analyticsRuns, slowlog: run };
+  if (run.result) renderAnalytics(run.result);
+  else renderAnalyticsFailure("slowlog", run.error);
   $("#analytics-meta").textContent = scope;
   switchAnalyticsTab(state.analyticsTab || "rise");
-  for (const kind of kinds.filter((item) => runs[item].error)) {
-    toast(`${kind === "slowlog" ? "慢日志" : "Binlog 写入"}明细加载失败：${runs[kind].error?.message || runs[kind].error}`, "error", 6000);
-  }
+  if (run.error) toast(`慢日志明细加载失败：${run.error?.message || run.error}`, "error", 6000);
 }
 
-// 点标签：明细视图第一次打开时才请求；上涨排查本身不需要。
+// 点标签：慢日志明细第一次打开时才请求；上涨排查与 Binlog 页签的数据排查时已取回。
 async function openAnalyticsTab(name) {
   switchAnalyticsTab(name);
-  if (name === "rise" || $("#analytics-source").value === "mongodb") return;
+  if (name !== "sql" || $("#analytics-source").value === "mongodb") return;
   await loadAnalyticsDetails();
 }
 
@@ -1949,8 +1953,7 @@ function toggleAnalyticsMoreViews(force) {
   const open = typeof force === "boolean" ? force : button.getAttribute("aria-expanded") !== "true";
   button.setAttribute("aria-expanded", String(open));
   button.textContent = open ? "收起视图" : "更多视图";
-  $$("[data-analytics-tab].is-detail").forEach((item) => { item.hidden = !open; });
-  if (!open && state.analyticsTab !== "rise") switchAnalyticsTab("rise");
+  syncAnalyticsTabs(); // 明细页签只在展开且对应来源勾选时出现；当前页签被收起时回到主页签
 }
 
 /* ------------------------------ 结构对比 ------------------------------ */
@@ -2281,6 +2284,7 @@ function bindEvents() {
   }));
   $("#analytics-more-views").addEventListener("click", () => toggleAnalyticsMoreViews());
   $("#analytics-source").addEventListener("change", () => syncAnalyticsMode());
+  for (const id of ["slowlog", "binlog"]) $(`#analytics-use-${id}`).addEventListener("change", () => syncAnalyticsSources());
   $("#analytics-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     try {
@@ -2314,6 +2318,8 @@ function bindEvents() {
   $("#analytics-reset").addEventListener("click", () => {
     $("#analytics-source").value = "rds";
     $("#analytics-instance").value = "";
+    $("#analytics-use-slowlog").checked = true;
+    $("#analytics-use-binlog").checked = true;
     state.rdsTab = "rise";
     syncAnalyticsMode();
     $("#analytics-node").value = "";

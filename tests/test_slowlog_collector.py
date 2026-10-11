@@ -189,5 +189,15 @@ class SlowLogCollectorReliabilityTests(unittest.TestCase):
             ingest.assert_not_called()
 
 
+class SlowLogConfigDefaultsTests(unittest.TestCase):
+    def test_watermark_margin_defaults_to_90_seconds_and_stays_overridable_within_bounds(self) -> None:
+        # 1.30.0: the margin was 300 s, which kept the newest slow logs ~6 minutes behind now; late-published records are
+        # caught by the replay window, so the margin only has to cover DAS publication jitter.
+        config = SlowLogConfig({"instanceId": "rm-prod", "nodeId": "rn-prod-01", "enabled": True})
+        self.assertEqual((config.lag_seconds, config.poll_seconds, config.replay_seconds), (90, 120, 7200))
+        self.assertEqual(SlowLogConfig({"instanceId": "rm", "lagSeconds": 300}).lag_seconds, 300)  # explicit values win
+        self.assertEqual(SlowLogConfig({"instanceId": "rm", "lagSeconds": 30}).lag_seconds, 60)  # clamped to the 60 s floor
+
+
 if __name__ == "__main__":
     unittest.main()
