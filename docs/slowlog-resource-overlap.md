@@ -147,3 +147,7 @@ python tools/backtest_slowlog_impact.py --events private-events.json --baseline 
 - 返回的 SQL 文本最多 2000 字符（`sql_chars` 给出原长）；它和慢日志样本 SQL 属同一类数据，访问控制与其它接口一致。
 
 验证：`python -m unittest tests.test_slowlog_impact tests.test_live_sessions tests.test_clickhouse_slowlog tests.test_slowlog_index tests.test_server_roles_and_windows -q`；`node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_indexed_range.cjs`。
+
+## 审计页操作类型误带 operation=on（1.30.2）
+
+1.30.0 的分析洞察「证据来源」两个勾选框复用了审计页「操作类型」的样式类 `operation-filter`，而审计查询用全局选择器 `.operation-filter input:checked` 收集操作类型：证据来源的勾选框默认勾选、没有 `value`（浏览器取值 `on`），于是默认每次审计查询都带 `operation=on`，什么都匹配不上，结果 0 条（手动勾上某个操作类型时才有结果）。1.30.2 起审计页读取和清空操作类型都限定在 `#view-audit` 内（审计查询、事务钻取、重置条件三处），分析洞察的勾选框不再被审计页读到或清掉。回归测试用「按选择器返回匹配项」的假 `document` 复现旧行为，并检查源码里每处 `operation-filter` 查找都带 `#view-audit` 前缀。

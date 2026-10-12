@@ -62,6 +62,22 @@ test('audit rows carry a user column: the account where the source records one, 
   assert.match(html, /<table class="data-table audit-table">\s*<thead><tr><th>事件时间<\/th><th>SQL \/ 行变更<\/th><th>用户<\/th><th>对象<\/th>/);
 });
 
+test('the audit operation filter reads only the audit form, never the analysis evidence-source chips that share its style', () => {
+  const {run, node} = uiFixture();
+  node('filter-query-mode').value = 'keyword';   // the fixture starts in the strict indexed mode, which needs coverage first
+  node('filter-source').value = 'slowlog';
+  run('syncQueryMode()');
+  // A browser answers a selector with what it matches: the analysis chips (checked by default, no value) match the old global
+  // selector, so every audit query used to carry operation=on and came back empty.
+  run(`document.querySelectorAll = (selector) => (selector.startsWith('#view-audit') ? [] : [{value: 'on', checked: true}])`);
+  assert.equal(run('eventQueryPayload().operation'), '');
+  run(`document.querySelectorAll = (selector) => (selector.startsWith('#view-audit') ? [{value: 'UPDATE', checked: true}] : [{value: 'on', checked: true}])`);
+  assert.equal(run('eventQueryPayload().operation'), 'UPDATE');
+  const source = fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8');
+  assert.deepEqual([...source.matchAll(/\$\$\("([^"]*operation-filter[^"]*)"\)/g)].filter((m) => !m[1].startsWith('#view-audit ')), [],
+    'every operation-filter lookup must be scoped to the audit view');
+});
+
 test('fast scope is visible without opening advanced filters', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const visibleForm = html.slice(html.indexOf('<form id="query-form"'), html.indexOf('<details id="audit-filters"'));

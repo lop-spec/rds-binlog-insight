@@ -295,7 +295,9 @@ function eventQueryString(includePage = true) {
   if ($("#filter-connection").value.trim()) params.set("connection", $("#filter-connection").value.trim());
   if ($("#filter-account").value.trim()) params.set("account", $("#filter-account").value.trim());
   if ($("#filter-status").value) params.set("status", $("#filter-status").value);
-  const operations = $$(".operation-filter input:checked").map((item) => item.value);
+  // Only the audit form's own operation boxes: the analysis page's evidence-source chips share the chip style (class), are
+  // checked by default and carry no value, and used to turn every audit query into operation=on (0 rows).
+  const operations = $$("#view-audit .operation-filter input:checked").map((item) => item.value);
   if (operations.length) params.set("operation", operations.join(","));
   if (includePage) {
     params.set("limit", String(state.queryLimit));
@@ -1552,7 +1554,7 @@ async function openTransactionDrill(identity, startEpochUs, endEpochUs) {
     $("#filter-start").value = toLocalInput(new Date(startEpochUs / 1000));
     $("#filter-end").value = toLocalInput(new Date(endEpochUs / 1000));
   }
-  $$(".operation-filter input").forEach((item) => { item.checked = false; });
+  $$("#view-audit .operation-filter input").forEach((item) => { item.checked = false; });
   state.queryOffset = 0;
   renderTxnDrillChip();
   switchView("audit");
@@ -2396,7 +2398,7 @@ function bindEvents() {
     $("#filter-keyword-mode").value = "AND";
     $("#filter-query-mode").value = "keyword";
     syncQueryMode();
-    $$(".operation-filter input").forEach((item) => { item.checked = false; });
+    $$("#view-audit .operation-filter input").forEach((item) => { item.checked = false; });
     setQuickRange("24h");
     state.queryOffset = 0;
     state.activeQuery = null;
