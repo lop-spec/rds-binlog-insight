@@ -604,6 +604,7 @@ class SlowLogIndexTests(unittest.TestCase):
             statement = summary["sql"]["statements"][0]
             self.assertEqual(statement["max_scan_event_id"], "max-scan")
             self.assertEqual(statement["max_query_event_id"], "max-query")
+            self.assertEqual((statement["accounts"], statement["account_count"]), (["api_writer", "batch_export"], 2))
             samples = summary["sql"]["sample_events"]
             self.assertEqual(samples["max-scan"]["database_account"], "api_writer")
             self.assertEqual(samples["max-scan"]["client_ip"], "10.0.0.62")

@@ -107,7 +107,7 @@ python tools/backtest_slowlog_impact.py --events private-events.json --baseline 
 
 起因：一次集群版备节点 IOPS 90%+ 的事件里，上涨排查按 r 排序把「耗时 2 秒的小查询」排第 1，真正的元凶（三条缺店铺条件的统计查询，各自全表扫描）排第 2/5/6，而旧的「对齐节点 IOPS（性能关联）」排序里它们是第 1–3；同时采集水位恒落后约 6 分钟，窗口末尾没入库时整个窗口被前移到更早的时段，「同一时间点」查不到。
 
-- **排序合并**：页面默认请求 `order=growth`，旧的「对齐节点 IOPS」按钮、抽屉和慢日志页的「性能关联」排序项删除。接口的三种取值都保留：`order=correlation`（按 r）、`order=executions`（旧名，与 `growth` 等价；外部的告警卡片调用方在用）、`order=growth`。增长排序每节点内先列相比昨日同窗**扫描行增加**的 SQL（按增加量），再按**增长份额**（每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向耗时增长比例，在节点内占比）；r 只是核对列。五个指标（cpu / iops / rows_read / row_lock / threads）共用同一套。份额不是资源贡献率，耗时含等待，也不是因果。
+- **排序合并**：页面默认请求 `order=growth`，旧的「对齐节点 IOPS」按钮、抽屉和慢日志页的「性能关联」排序项删除。接口的三种取值都保留：`order=correlation`（按 r）、`order=executions`（旧名，与 `growth` 等价；外部的告警卡片调用方在用）、`order=growth`。增长排序每节点内先列相比昨日同窗**扫描行增加**的 SQL（按增加量），再按**增长份额**（每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向耗时增长比例，在节点内占比）；r 只是核对列。**（1.30.1 起不再以扫描行增加为第一级，见文末「增长排序修正」。）**五个指标（cpu / iops / rows_read / row_lock / threads）共用同一套。份额不是资源贡献率，耗时含等待，也不是因果。
 - **节点角色**：`GET /api/status` 的 `slowLogs[]` 多 `role`（`primary` / `secondary`，未取到为空）和 `zone`；`/api/slowlog-impact` 每个节点多 `role`、`zone`。来源是 `DescribeDBInstanceAttribute` 的 `DBClusterNodes.DBClusterNode[]`（`NodeId` 与云监控/DAS 的 `rn-…` 一致，`NodeRole`、`NodeZoneId`）——服务本来就为核验实例调用的只读接口，不需要新权限；`DescribeDBInstanceHAConfig` 返回的是数字 ID，不能用。后台线程每 5 分钟刷新，请求路径只读内存；刷新失败保留上次结果并按失败段记一次警告，主备变化记警告。显示的是**当前**角色，主备切换后事故当时的角色可能不同。
 - **窗口末尾截断**：所选窗口的慢日志索引不完整时，先看是不是只缺末尾（最新分区还在入库）：是则保留起点、截到最近已入库的整分钟，`adjusted.kind = "truncated"`、`truncated_us`；起点本身没入库、截完不足 6 个完整分钟、或昨日对照日有洞，才按 1.29.22 的规则前后 6 小时内改查最近的同长度窗口（`kind = "shifted"`）。`adjusted` 现在统一为 `{kind, reason, requested_start_us, requested_end_us, shift_us | truncated_us}`；缺 `kind` 的旧响应按 `shifted` 处理。离现在不到 30 分钟的窗口另返回 `ready_through_us`（最新已入库的慢日志事件时间），页面写「数据截至 HH:MM，落后约 N 分钟」。挪窗、截断的日志从 INFO 改为 WARNING。
 - **Binlog 来源同样对齐**：`/api/analytics?source=binlog`（单个实例）按 Binlog 行存储的覆盖区间做同样两步，`step` 为 5 分钟，响应带 `adjusted`（`reason = incomplete_binlog_coverage`）和 `ready_through_us`；覆盖读不到或前后 6 小时内没有同长度的覆盖窗口时按所选窗口照常查询并写警告日志，不失败。
@@ -116,3 +116,34 @@ python tools/backtest_slowlog_impact.py --events private-events.json --baseline 
 - **时间框**：开始/结束取整到整分钟（只勾 Binlog 时 5 分钟）；上涨排查要和昨日同窗不重叠，窗口会压到最近 23 小时 55 分并提示——默认的「最近 24 小时」不再直接报「与昨日同窗重叠」。
 
 验证：`python -m unittest tests.test_slowlog_impact tests.test_node_roles tests.test_window_align tests.test_slowlog_collector -q`；`node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs`。
+
+## 增长排序修正、用户列与在途长查询（1.30.1）
+
+起因：一次集群版备节点 IOPS 使用率 100% 持续约 14 分钟，元凶是同一个分析账号的两条各约 885 秒的全表扫描语句（`NOT EXISTS` 子查询没走索引）。慢日志和上涨排查的数据是齐的——该语句家族的增长份额 94%、相关度 r=0.97、运行重叠占 89%——但 1.30.0 的增长排序把它排在 118 个 SQL 家族里的第 87 位，每节点只显示前 10 条，页面上看不到。两个原因：
+
+- 排序第一级是「扫描行比昨日同窗有增加（哪怕只多几行）」，86 条几乎没成本的语句靠它排到前面。
+- DAS 对含物化子查询或递归 CTE 的语句，记录的 `Rows_examined` 可能远小于真实扫描量：这两条各只记了几百行和几行。**慢日志的扫描行不是真实 IO 的下界。** 1.30.0 的起因事件里三条全表扫描的扫描行记全了，所以当时没暴露。
+
+**排序（`method = growth_overlap_net_of_lock_v4`）**
+
+- 每节点内按增长份额降序；扫描行增量只在份额相同（份额为零的尾部）时决定先后，仍用作 `attribution.status` 和「扫描 / 锁等待增量」列的证据，不再是门槛。`order=growth` / `executions` / `correlation` 三种取值和响应字段（`rank`、`growth_share`…）不变，告警卡片等调用方无需改动。
+- 增长份额的口径不变（每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向增长比例，节点内占比），但**增长是扣掉慢日志记录的锁等待之后的**：每次执行按「锁等待 / 耗时」平均摊在整个执行区间里扣除，窗口和昨日同窗同样处理。没有记录锁等待（缺失或 0）时，与旧口径逐位相同；只因等锁变慢的语句份额为零，响应里 `lock_wait_excluded_us` 给出被扣掉的增长。这保住了回归用例「扫描量真增长的语句排在只因锁等待变慢的语句之前」。
+- 回测（离线，用真实慢日志事件和云监控指标序列重放）：同一次事故的两个备节点上，元凶都从第 87 位升到第 1；另一次事故里三条全表扫描仍是前三，份额数字与旧口径一致。脚本和原始证据留在运维私有目录，不进公共仓库。
+- 单测覆盖：长耗时语句只记了几行扫描时不被三十条各扫百万行的语句压后；扫描增量只分同分；锁等待不算增长且缺失锁时间不当成 0；无锁等待时份额与旧公式逐位相同。
+
+**用户列**
+
+- 审计查询表、上涨排查表、「更多视图 → 慢日志」表各加一列「用户」：数据库账号来自慢日志的 `AccountName`（索引里的 `database_account`）和本地执行日志。审计表里 Binlog 行显示「—」并说明 Binlog 不记录执行账号；写入 SQL / 事务 / 锁争用三个 Binlog 页签没有账号数据，不加这一列。MongoDB 的采集里没有账号字段，也不加。
+- 一个 SQL 家族有多个账号时，上涨排查和慢日志表显示执行次数最多的账号加「+N」，悬停看全部。接口：`/api/slowlog-impact` 的每条语句多 `accounts`（最多 3 个，次数多的在前）和 `account_count`（去重后的总数）；`/api/analytics?source=slowlog` 的每条语句同样多这两个字段（ClickHouse 路径在同一次汇总里用 `topKIf` / `uniqExactIf`，回退到 SQLite 时对选出的指纹补一次分组查询）。ClickHouse 的规范事件元组追加第 13 个元素 `database_account`，没有第二次扫描。
+- 审计表的 CSV 导出本来就含 `database_account`，不变。
+
+**在途长查询**
+
+慢日志要等语句结束才出现，事故进行中看不到还在跑的元凶。上涨排查每个节点多一个「看正在跑的查询」按钮：点一下才调用 DAS `GetMySQLAllSessionAsync`（只读的异步会话快照，约 2–3 秒），列出该节点正在执行的语句（用户、来源 IP、库、已运行时间、状态、SQL），空闲连接和复制线程不列。
+
+- 接口：`GET /api/live-sessions?instance=<实例 ID>&nodeId=<节点 ID>`；只接受本服务已登记采集慢日志的 (实例, 节点)，其余返回 400 `LIVE_SESSIONS_UNKNOWN_NODE`，不会拿服务的云身份去问任意实例。凭据与慢日志采集同源（ECS 角色），不新增权限。
+- 不新增定时采集、不落盘：每个节点同一时刻只读一次（并发点击合并），10 秒内重复点击用缓存，同时最多读两个节点，单次最长等 25 秒。
+- 失败有原因：缺权限 403 `DAS_PERMISSION_DENIED`，超时或接口失败 502 `DAS_TIMEOUT` / `DAS_UNREACHABLE` / `DAS_FAILED`，都写 WARNING 日志。
+- 返回的 SQL 文本最多 2000 字符（`sql_chars` 给出原长）；它和慢日志样本 SQL 属同一类数据，访问控制与其它接口一致。
+
+验证：`python -m unittest tests.test_slowlog_impact tests.test_live_sessions tests.test_clickhouse_slowlog tests.test_slowlog_index tests.test_server_roles_and_windows -q`；`node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_indexed_range.cjs`。

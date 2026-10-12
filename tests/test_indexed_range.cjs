@@ -46,6 +46,22 @@ test('actual row click and keyboard preserve raw and legacy detail locators', ()
     ['legacy-id', 'legacy-part', 'fixture'], ['legacy-id', 'legacy-part', 'fixture']]);
 });
 
+test('audit rows carry a user column: the account where the source records one, the reason where it cannot', () => {
+  const {run, node} = uiFixture();
+  run(`renderEvents({rows: [
+    {event_id: 'slow-1', raw_event_type: 'SLOW_LOG', database_account: 'analyst', connection_name: '10.0.0.8', instance_id: 'fixture'},
+    {event_id: 'audit-1', raw_event_type: 'TABULARIS_AUDIT', database_account: '', connection_name: 'local-connection', instance_id: 'fixture'},
+    {event_id: 'bin-1', raw_event_type: 'UpdateRows', instance_id: 'fixture'}]});`);
+  const [slow, audit, binlog] = node('event-rows').children.map((row) => row.innerHTML);
+  assert.match(slow, /<td><span class="primary-cell" title="analyst">analyst<\/span><\/td>/);
+  assert.match(slow, /10\.0\.0\.8/);
+  assert.doesNotMatch(slow, /10\.0\.0\.8 · analyst/);                      // the account no longer hides in the source cell
+  assert.match(audit, /title="该记录没有账号信息">—/);
+  assert.match(binlog, /title="Binlog 不记录执行账号">—/);
+  const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
+  assert.match(html, /<table class="data-table audit-table">\s*<thead><tr><th>事件时间<\/th><th>SQL \/ 行变更<\/th><th>用户<\/th><th>对象<\/th>/);
+});
+
 test('fast scope is visible without opening advanced filters', () => {
   const html = fs.readFileSync(path.join(__dirname, '../web/index.html'), 'utf8');
   const visibleForm = html.slice(html.indexOf('<form id="query-form"'), html.indexOf('<details id="audit-filters"'));

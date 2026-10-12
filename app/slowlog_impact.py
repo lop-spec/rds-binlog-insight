@@ -4,6 +4,13 @@ The ranking uses exact logged execution intervals, not an estimated per-second
 scan rate. CMS sample t is paired with the preceding period (t-period, t].
 Metric gaps are not zero-filled. No SQL text, incident label, LLM, lag search,
 or fitted coefficient participates in the calculation.
+
+Order within a node: growth score (overlap with the metric excess x growth of
+non-waiting execution time over the same window yesterday), then measured scan
+growth only to separate equal scores. Scan counts are evidence, not a gate: DAS
+can record almost no rows for a statement that ran for minutes (materialized
+subqueries), so "scanned more rows than yesterday" must not outrank a statement
+that held the node for fourteen minutes.
 """
 from __future__ import annotations
 
@@ -32,6 +39,30 @@ def family_key(event: dict[str, Any]) -> str:
                        sql_id or str(event["fingerprint"])], separators=(",", ":"))
 
 
+def clipped_runtime_net_of_lock(events: list[dict[str, Any]], start_us: int, end_us: int,
+                                period_us: int = PERIOD_US) -> dict[tuple[str, str], Fraction]:
+    """Per (node, family): execution time inside the complete minutes of the window, minus the lock wait the slow log recorded.
+
+    Same clipping as ``execution_series`` (executions starting in scope, whole minutes only). Each execution keeps the
+    share of its time that was not lock wait, spread evenly over its run. A missing or zero lock time leaves the
+    execution whole, so with no recorded waits this equals the plain runtime total.
+    """
+    first = ((start_us + period_us - 1) // period_us) * period_us
+    stop = ((end_us + 1) // period_us) * period_us
+    totals: dict[tuple[str, str], Fraction] = defaultdict(Fraction)
+    for event in events:
+        begin = int(event["start_us"])
+        duration = int(event["duration_ms"]) * 1000
+        clipped = max(0, min(begin + duration, stop) - max(begin, first))
+        if not clipped or duration <= 0:
+            continue
+        lock = event.get("lock_time_ms")
+        known = isinstance(lock, (int, float)) and not isinstance(lock, bool) and math.isfinite(lock) and lock > 0
+        waited = min(int(lock) * 1000, duration) if known else 0
+        totals[str(event.get("node_id") or ""), str(event["fingerprint"])] += Fraction(clipped * (duration - waited), duration)
+    return dict(totals)
+
+
 def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[dict[str, Any]],
                             points: list[dict[str, Any]], *, start_us: int, end_us: int,
                             index_complete: bool, baseline_complete: bool,
@@ -40,7 +71,9 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
 
     Identical full-minute windows exactly 24 hours apart. All SQL families are
     treated identically. There is no incident-specific threshold or SQL allowlist.
-    Fraction preserves the exact ordering before conversion to display shares.
+    Growth is measured on execution time without the lock wait the slow log
+    recorded, so a statement that only waits longer scores nothing. Fraction
+    preserves the exact ordering before conversion to display shares.
     """
     if end_us - start_us >= DAY_US:
         LOGGER.warning('slowlog_performance_growth unavailable: overlapping_baseline')
@@ -57,6 +90,8 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
     result = rank_resource_overlap(families, points, start_us=start_us, end_us=end_us,
                                    index_complete=index_complete)
     previous_series = execution_series(previous, start_us - DAY_US, end_us - DAY_US)
+    net_now = clipped_runtime_net_of_lock(families, start_us, end_us)
+    net_before = clipped_runtime_net_of_lock(previous, start_us - DAY_US, end_us - DAY_US)
     members: dict[tuple[str, str], set[str]] = defaultdict(set)
     ids = {}
     for event in events:
@@ -87,10 +122,12 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
             key = node["node_id"], row["fingerprint"]
             before = sum(previous_series.get(key, {}).values())
             current = row["runtime_us_total"]
-            delta = max(0, current - before)
-            scores[row["fingerprint"]] = Fraction(row["score_numerator"] * delta, current or 1)
+            # Elapsed growth minus the lock wait inside it: time spent waiting is not work the statement added.
+            grown = max(Fraction(0), net_now.get(key, Fraction(0)) - net_before.get(key, Fraction(0)))
+            scores[row["fingerprint"]] = Fraction(row["score_numerator"]) * grown / (current or 1)
             row.update(raw_overlap_rank=row["rank"], baseline_runtime_us_total=before,
                        runtime_delta_us=current - before, sql_id=ids[key],
+                       lock_wait_excluded_us=int(max(Fraction(0), max(0, current - before) - grown)),
                        member_fingerprints=sorted(members[key]))
             now = now_costs[key]; old = before_costs.get(key, dict(count=0,rows_examined=0,lock_time_ms=0,rows_examined_known=0,lock_time_ms_known=0))
             evidence = dict(status='elapsed_overlap_only', causal=False, scope='collected_slow_records',
@@ -111,10 +148,10 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
             if node['resource_comparison'].get('delta') is not None and node['resource_comparison']['delta']<=0:
                 evidence['warnings'].append('resource_window_mean_not_increased')
             row['attribution'] = evidence
-        # Related work evidence precedes elapsed-time overlap; neither is IOPS attribution.
-        rows.sort(key=lambda row: (-(1 if (row['attribution']['rows_examined']['delta'] or 0)>0 else 0),
+        # Growth score first; measured scan growth only separates equal scores (the zero-score tail). Neither is IOPS attribution.
+        rows.sort(key=lambda row: (-scores[row["fingerprint"]],
                                    -max(0,row['attribution']['rows_examined']['delta'] or 0),
-                                   -scores[row["fingerprint"]], row["fingerprint"]))
+                                   row["fingerprint"]))
         total = sum(scores.values(), Fraction())
         for rank, row in enumerate(rows, 1):
             score = scores[row["fingerprint"]]
@@ -129,8 +166,9 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
             LOGGER.warning("slowlog_performance_growth unavailable: node=%s no growth overlap", node["node_id"])
     if result.get("nodes"):
         result["status"] = "ok" if all(n["status"] == "ok" for n in result["nodes"]) else "partial"
-    result.update(method="resource_evidence_then_overlap_v3", rank_unit="database_and_cloud_sql_id",
-                  ranking_warning='Scan growth is related work, not physical IOPS contribution; overlap includes waits.',
+    result.update(method="growth_overlap_net_of_lock_v4", rank_unit="database_and_cloud_sql_id",
+                  ranking_warning='Growth share is overlap with the metric excess, not physical IOPS contribution; '
+                                  'recorded lock wait is excluded, other waits are not; DAS scan counts can be far below the real scan.',
                   baseline_start_us=start_us - DAY_US, baseline_end_us=end_us - DAY_US)
     return result
 

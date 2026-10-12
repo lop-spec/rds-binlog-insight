@@ -115,6 +115,8 @@ class _Client:
                     "action": "SELECT",
                     "instance_ids": ["rm-prod"],
                     "fingerprints": 1,
+                    "accounts": ["analyst", "root"],
+                    "account_count": 2,
                 },
                 {
                     "grouping_mask": 19,
@@ -1012,6 +1014,7 @@ class ClickHouseSlowLogQueryTests(unittest.TestCase):
             )
             self.assertEqual(statement["max_scan_event_id"], "event-scan")
             self.assertEqual(statement["max_query_event_id"], "event-query")
+            self.assertEqual((statement["accounts"], statement["account_count"]), (["analyst", "root"], 2))
             self.assertEqual(
                 result["sql"]["sample_events"]["event-scan"]["client_ip"],
                 "10.0.0.16",
@@ -1022,6 +1025,11 @@ class ClickHouseSlowLogQueryTests(unittest.TestCase):
             self.assertIn("GROUP BY instance_id,event_epoch_us,event_id", rollup)
             self.assertIn("argMin(tuple(", rollup)
             self.assertEqual(rollup.count("argMin("), 1)
+            # who ran it rides along in the canonical event (13th element) and is summarized without a second scan
+            self.assertIn("tupleElement(canonical,13) AS metric_database_account", rollup)
+            self.assertIn("rows_examined,rows_sent,database_account", rollup)
+            self.assertIn("topKIf(3)(", rollup)
+            self.assertIn("uniqExactIf(", rollup)
             self.assertEqual(rollup.count("argMax("), 2)
             self.assertTrue(
                 all(

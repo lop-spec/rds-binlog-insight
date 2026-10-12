@@ -3,11 +3,13 @@ import json
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.config import Settings
+from app.live_sessions import LiveSessionsError
 from app.server import Application, AppHTTPServer
 from app.window_align import HOUR_US, MINUTE_US, floor_to
 
@@ -49,6 +51,14 @@ def get(application, path):
         thread.join(timeout=2)
 
 
+def get_error(application, path):
+    try:
+        get(application, path)
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read().decode("utf-8"))
+    raise AssertionError("the request was expected to fail")
+
+
 class StatusRoleTests(unittest.TestCase):
     def test_status_labels_each_collected_node_with_its_current_role_and_zone(self):
         def collector(node):
@@ -87,6 +97,39 @@ class ImpactEndpointTests(unittest.TestCase):
             with patch("app.server.query_resource_overlap", fake_query):
                 get(application, f"/api/slowlog-impact?source=slowlog&instance=rm-x&order={order}")
             self.assertEqual(captured["query"]["impact_order"], order)
+
+
+class LiveSessionsEndpointTests(unittest.TestCase):
+    @staticmethod
+    def serve(snapshot):
+        collectors = [SimpleNamespace(config=SimpleNamespace(instance_id="rm-x", node_id="rn-1")),
+                      SimpleNamespace(config=SimpleNamespace(instance_id="rm-x", node_id=""))]
+        return SimpleNamespace(metadata=Metadata(), sync=Sync(), slow_logs=collectors, live_sessions=SimpleNamespace(snapshot=snapshot))
+
+    def test_a_collected_node_is_read_and_returned(self):
+        calls = []
+
+        def snapshot(instance, node):
+            calls.append((instance, node))
+            return {"status": "ok", "sessions": []}
+        payload = get(self.serve(snapshot), "/api/live-sessions?instance=rm-x&nodeId=rn-1")
+        self.assertEqual((payload["ok"], payload["data"]["status"], calls), (True, "ok", [("rm-x", "rn-1")]))
+
+    def test_only_nodes_whose_slow_log_is_collected_here_can_be_read(self):
+        calls = []
+        application = self.serve(lambda instance, node: calls.append((instance, node)))
+        for path in ("/api/live-sessions?instance=rm-x&nodeId=rn-other", "/api/live-sessions?instance=rm-other&nodeId=rn-1",
+                     "/api/live-sessions?instance=rm-x", "/api/live-sessions"):
+            status, body = get_error(application, path)
+            self.assertEqual((status, body["error"]["code"]), (400, "LIVE_SESSIONS_UNKNOWN_NODE"))
+        self.assertEqual(calls, [])   # DAS is never asked about a node this service does not collect
+
+    def test_a_missing_permission_and_a_failing_api_are_different_errors(self):
+        for code, status in (("das_permission_denied", 403), ("das_timeout", 502)):
+            def snapshot(_instance, _node, code=code):
+                raise LiveSessionsError(code, "reason " + code)
+            got, body = get_error(self.serve(snapshot), "/api/live-sessions?instance=rm-x&nodeId=rn-1")
+            self.assertEqual((got, body["error"]["code"], body["error"]["message"]), (status, code.upper(), "reason " + code))
 
 
 class BinlogWindowEndpointTests(unittest.TestCase):

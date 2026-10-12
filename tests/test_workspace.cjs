@@ -16,16 +16,18 @@ function context() {
 }
 const item = {fingerprint:'f', sql_id:'das-id', normalized_sql:'SELECT <script>alert(1)</script>',
   executions:12, scan_rows:600, rows_sent:20, query_time_ms_total:500, sample_event_id:'e',
-  max_scan_event_id:'max-scan', max_query_event_id:'max-time',
+  max_scan_event_id:'max-scan', max_query_event_id:'max-time', accounts:['analyst','root'], account_count:2,
   correlation:{value:0, status:'ok', level_value:0.1, without_self_value:-0.4, without_self_status:'ok',
     counts:[1,2,3,0,4,2], event_share:0.1}};
 
-test('slow table has seven columns, correlation replaces ID, source badge occurs once', () => {
+test('slow table has eight columns incl. the user, correlation replaces ID, source badge occurs once', () => {
   const c=context(); c.item=item;
   const rendered=vm.runInContext('renderAnalyticsSlowlogSql({statements:[item],order:"scan_rows"})',c);
   assert.match(rendered, /相关度 r/);
   assert.doesNotMatch(rendered, /<th>SQL ID<\/th>/);
-  assert.equal((rendered.match(/<th>/g)||[]).length,7);
+  assert.equal((rendered.match(/<th>/g)||[]).length,8);
+  assert.match(rendered, /<th>SQL<\/th><th>用户<\/th><th>相关度 r<\/th>/);
+  assert.match(rendered, /title="共 2 个账号：analyst、root">analyst <span class="muted">\+1<\/span>/);
   assert.equal((rendered.match(/慢日志实测/g)||[]).length,1);
   assert.match(rendered,/0\.0000/);
   assert.match(rendered,/data-slow-event-id="max-scan"/);
@@ -126,8 +128,8 @@ const impactResult = {status: 'ok', metric_id: 'cpu', metric: 'Cluster_CpuUsage'
       resource_comparison: {baseline_mean: 10, current_mean: 11, delta: 1}, total_fingerprints: 1, statements: [stmt('quiet', 0.3, 5_000_000, 5_000_000)]},
     {node_id: 'rn-hot', role: 'primary', zone: 'cn-chengdu-a', status: 'ok', peak: 99, metric_scale: 1000, metric_values: [30000, 60000, 90000],
       resource_comparison: {baseline_mean: 30, current_mean: 60, delta: 30}, total_fingerprints: 3,
-      statements: [stmt('ramp', 0.97, 180_000_000, 60_000_000, {...growing(1200), growth_share: 0.8}),
-                   stmt('steady', 0.4, 90_000_000, 90_000_000),
+      statements: [stmt('ramp', 0.97, 180_000_000, 60_000_000, {...growing(1200), growth_share: 0.8, accounts: ['analyst'], account_count: 1, lock_wait_excluded_us: 3_000_000}),
+                   stmt('steady', 0.4, 90_000_000, 90_000_000, {accounts: ['root', 'report', 'etl'], account_count: 4}),
                    stmt('flat', null, 60_000_000, 0, {growth_share: 0.2})]},
   ]};
 
@@ -161,12 +163,56 @@ test('the hottest node comes first; SQL keep the API order and show share, r and
   assert.match(htmlOut, /title="constant_x|每分钟耗时恒定/);  // uncomputable r explained, not shown as 0
   assert.match(htmlOut, /窗口均值 <strong>60<\/strong>/);
   assert.match(htmlOut, /class="is-flat"/);                // steady/quiet rows: neither runtime nor scans grew -> dimmed
-  assert.equal((htmlOut.match(/<th>/g) || []).length, 14, 'seven columns in each of the two node tables');
+  assert.equal((htmlOut.match(/<th>/g) || []).length, 16, 'eight columns in each of the two node tables');
+  assert.match(htmlOut, /<th>SQL（按增长份额排序）<\/th><th>用户<\/th><th>增长份额<\/th>/);
+  assert.match(htmlOut, /<span class="account-cell" title="analyst">analyst<\/span>/);                       // one account: just the name
+  assert.match(htmlOut, /title="共 4 个账号：root、report、etl …">root <span class="muted">\+3<\/span>/);   // more accounts than listed: +N and a hint
+  assert.match(htmlOut, /title="慢日志没有记录这条 SQL 的执行账号">—/);                                       // no account recorded: a dash with the reason
+  assert.match(htmlOut, /已扣除慢日志记录的锁等待增长 3\.00 s/);                                              // the lock wait taken out of the growth is disclosed
+  assert.equal((htmlOut.match(/data-live-node=/g) || []).length, 2, 'every node can show what is running now');
   assert.match(htmlOut, /共 3 个 SQL 家族，显示前 3 个，合计占本节点增长份额 100%/);
   // the node's database role and zone sit next to its id
   assert.match(htmlOut, /<strong>rn-hot<\/strong> <span class="chip role-primary"[^>]*>主节点<\/span><span class="muted">可用区 A<\/span>/);
   assert.match(htmlOut, /<strong>rn-quiet<\/strong> <span class="chip role-secondary"[^>]*>备节点<\/span><span class="muted">可用区 B<\/span>/);
-  assert.match(htmlOut, /先看扫描行比昨日增加的 SQL/);
+  assert.match(htmlOut, /排序：按增长份额（该 SQL 在指标超额分钟里跑了多久/);
+  assert.doesNotMatch(htmlOut, /先看扫描行比昨日增加的 SQL/);   // scan growth is no longer the first key
+});
+
+test('running statements are read on demand for one node and shown with their user, source and runtime', async () => {
+  const live = {status: 'ok', instance_id: 'rm-main', node_id: 'rn-hot', observed_at_us: 1790000100000000, cached: false, total_sessions: 1066,
+    running_sessions: 2, longest_running_seconds: 885, truncated: false, sessions: [
+      {session_id: 1, user: 'analyst', client: '10.0.0.8', database: 'app', command: 'Query', state: 'executing', seconds: 885, sql: 'SELECT <b>x</b>\n FROM t', sql_chars: 24},
+      {session_id: 2, user: 'root', client: '10.0.1.1', database: 'app', command: 'Execute', state: 'statistics', seconds: 0, sql: 'SELECT 1', sql_chars: 8}]};
+  const {c, calls} = rdsContext(async (url) => (url.startsWith('/api/live-sessions') ? live : impactResult));
+  await vm.runInContext('runAnalytics()', c);
+  const result = {hidden: true, innerHTML: ''};
+  const button = {disabled: false, textContent: '看正在跑的查询', closest: () => ({querySelector: () => result})};
+  c.button = button;
+  await vm.runInContext('loadLiveSessions("rn-hot", button)', c);
+  const url = new URL(calls[calls.length - 1], 'http://fixture');
+  assert.equal(url.pathname, '/api/live-sessions');
+  assert.equal(url.searchParams.get('instance'), 'rm-main');
+  assert.equal(url.searchParams.get('nodeId'), 'rn-hot');
+  assert.equal(result.hidden, false);
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, '刷新正在跑的查询');
+  assert.match(result.innerHTML, /共 1,066 个会话，2 个在执行，最长已运行 885 秒/);
+  assert.match(result.innerHTML, /<th>用户<\/th><th>来源 IP<\/th><th>库<\/th><th>已运行<\/th><th>状态<\/th><th>SQL<\/th>/);
+  assert.match(result.innerHTML, /<td>analyst<\/td><td>10\.0\.0\.8<\/td><td>app<\/td><td><strong>14 分 45 秒<\/strong><\/td>/);
+  assert.doesNotMatch(result.innerHTML, /<b>x<\/b>/);                  // statement text is escaped
+  assert.match(result.innerHTML, /SELECT &lt;b&gt;x&lt;\/b&gt; FROM t/);   // and its whitespace folded
+});
+
+test('a failed live read says why and re-enables the button', async () => {
+  const {c} = rdsContext(async (url) => { if (url.startsWith('/api/live-sessions')) throw new Error('DAS 会话快照超时未完成'); return impactResult; });
+  await vm.runInContext('runAnalytics()', c);
+  const result = {hidden: true, innerHTML: ''};
+  const button = {disabled: false, textContent: '看正在跑的查询', closest: () => ({querySelector: () => result})};
+  c.button = button;
+  await vm.runInContext('loadLiveSessions("rn-hot", button)', c);
+  assert.match(result.innerHTML, /读取失败。<\/strong>DAS 会话快照超时未完成/);
+  assert.equal(button.disabled, false);
+  assert.equal(button.textContent, '看正在跑的查询');
 });
 
 test('a node without a known role shows no chip', async () => {

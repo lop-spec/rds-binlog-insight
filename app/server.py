@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import urllib.parse
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,7 +45,8 @@ from .credentials import (
     save_credential,
 )
 from .general_log_collector import GeneralLogCollector, GeneralLogConfig
-from .slow_log_collector import SlowLogCollector, SlowLogConfig
+from .live_sessions import LiveSessions, LiveSessionsError
+from .slow_log_collector import DAS_ENDPOINT, DasRpcClient, SlowLogCollector, SlowLogConfig
 from .slowlog_impact_service import query_resource_overlap
 from .node_roles import NodeRoleBook
 from .window_align import align_binlog_query
@@ -348,6 +350,16 @@ class Application:
         )
         if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
             self.node_roles.start()
+
+        def das_client(instance_id: str) -> DasRpcClient:
+            """DAS client for one request, same identity as the slow-log collectors; built only when someone asks."""
+            base = self.metadata.load_settings()
+            credential = credential_loader(base.credential_target)
+            if credential is None:
+                raise RuntimeError(f"读不到凭据: target={base.credential_target}")
+            return DasRpcClient(replace(base, db_instance_id=instance_id, endpoint=DAS_ENDPOINT), credential, timeout=20)
+
+        self.live_sessions = LiveSessions(das_client)
         from .mongo_service import MongoService
         self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
         try:
@@ -948,6 +960,20 @@ class RequestHandler(BaseHTTPRequestHandler):
                     impact_query, settings,
                     roles=self.app.node_roles.lookup,
                 )
+                self._json({"ok": True, "data": result})
+            elif parsed.path == "/api/live-sessions":
+                # Running statements of one node, read from DAS when asked; only nodes whose slow log is collected here.
+                instance = _query_value(query, "instance").strip()
+                node_id = _query_value(query, "nodeId").strip()
+                known = {(item.config.instance_id, item.config.node_id) for item in self.app.slow_logs if item.config.node_id}
+                if (instance, node_id) not in known or not NODE_ID_RE.fullmatch(node_id):
+                    self._error(400, "LIVE_SESSIONS_UNKNOWN_NODE", "只能查已登记采集慢日志的实例节点")
+                    return
+                try:
+                    result = self.app.live_sessions.snapshot(instance, node_id)
+                except LiveSessionsError as exc:
+                    self._error(403 if exc.code == "das_permission_denied" else 502, exc.code.upper(), str(exc))
+                    return
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/analytics":
                 settings = self.app.metadata.load_settings()

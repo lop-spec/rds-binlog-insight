@@ -424,6 +424,24 @@ function rowSql(row) {
   return row.raw_event_type || "Binlog event";
 }
 
+// 「用户」列：慢日志和本地执行日志记录了数据库账号；Binlog 不记录执行账号，显示 — 并说明原因。
+function auditUserCell(row) {
+  const account = String(row.database_account || "").trim();
+  if (account) return `<span class="primary-cell" title="${escapeHtml(account)}">${escapeHtml(account)}</span>`;
+  const reason = ["SLOW_LOG", "TABULARIS_AUDIT"].includes(row.raw_event_type) ? "该记录没有账号信息" : "Binlog 不记录执行账号";
+  return `<span class="primary-cell muted" title="${reason}">—</span>`;
+}
+
+// 分析洞察的「用户」列：该 SQL 在窗口内执行次数最多的账号；还有别的账号时写「首个 +N」，悬停看全部。
+function accountCell(row) {
+  const names = Array.isArray(row?.accounts) ? row.accounts.filter(Boolean) : [];
+  const total = Math.max(Number(row?.account_count) || 0, names.length);
+  if (!names.length) return '<span class="muted" title="慢日志没有记录这条 SQL 的执行账号">—</span>';
+  const more = total > 1 ? ` <span class="muted">+${total - 1}</span>` : "";
+  const title = total > 1 ? `共 ${total} 个账号：${names.join("、")}${total > names.length ? " …" : ""}` : names[0];
+  return `<span class="account-cell" title="${escapeHtml(title)}">${escapeHtml(names[0])}${more}</span>`;
+}
+
 function renderEvents(result) {
   const tbody = $("#event-rows");
   tbody.innerHTML = "";
@@ -449,10 +467,7 @@ function renderEvents(result) {
     // SLOW_LOG，之前落到 else 分支去显示 binlog 的 start/end_position（恒为
     // 0 → 0），把已经采到的客户端 IP 与账号盖住了。binlog 事件三个字段都空，
     // 仍然显示位置，行为不变。
-    const sourceOrigin =
-      [row.connection_name, row.database_account].filter(Boolean).join(" · ") ||
-      row.connection_id ||
-      "";
+    const sourceOrigin = row.connection_name || row.connection_id || "";
     const sourceMeta =
       sourceOrigin || (auditEvent ? "—" : `${row.start_position} → ${row.end_position}`);
     const sqlKind = String(row.sql_kind || "").toUpperCase();
@@ -471,6 +486,7 @@ function renderEvents(result) {
     tr.innerHTML = `
       <td><span class="primary-cell mono">${escapeHtml(formatTime(row.event_time_utc, true))}</span><span class="secondary-cell mono">${escapeHtml(String(row.event_time_utc || "").slice(0, 10))}</span></td>
       <td><span class="primary-cell sql-preview"><span class="kind-label">${escapeHtml(sqlLabel)}</span>${escapeHtml(sql)}</span><span class="secondary-cell">${escapeHtml(row.raw_event_type || "")}</span></td>
+      <td>${auditUserCell(row)}</td>
       <td><span class="primary-cell">${escapeHtml(object)}</span><span class="secondary-cell">${escapeHtml(row.host_instance_id || "主/备编号未知")}</span></td>
       <td><span class="operation-chip ${operationClass(row.operation)}">${escapeHtml(row.operation || "OTHER")}</span>${status ? `<span class="status-chip audit-${executionStatusClass(row.execution_status)}">${escapeHtml(status)}</span>` : ""}</td>
       <td><span class="primary-cell mono">${escapeHtml(transaction)}</span><span class="secondary-cell">${auditEvent ? escapeHtml(row.connection_id || "连接 ID 未知") : row.thread_id ? `thread ${escapeHtml(row.thread_id)}` : "无连接身份字段"}</span></td>
@@ -1381,13 +1397,14 @@ function renderAnalyticsSlowlogSql(data) {
   ]);
   const sorter = sqlSorter(SLOWLOG_ORDER_LABELS, order);
   const statements = analyticsTable(
-    ["SQL", "相关度 r", "执行次数", "实际扫描", "返回行数", "累计耗时", "最近出现"],
+    ["SQL", "用户", "相关度 r", "执行次数", "实际扫描", "返回行数", "累计耗时", "最近出现"],
     (data.statements || []).map((item) => {
       const count = Number(item.executions || 0);
       const scanned = Number(item.scan_rows || 0);
       const sent = Number(item.rows_sent || 0);
       return [
         slowSqlDetailCell(item, order),
+        accountCell(item),
         correlationCell(item),
         `<strong>${humanCount(count)}</strong>`,
         `<strong>${humanCount(scanned)}</strong>`,
@@ -2293,6 +2310,11 @@ function bindEvents() {
   });
   // 排序与事务下钻都在重渲染后的节点上，用事件委托绑定一次。
   $("#view-analytics").addEventListener("click", async (event) => {
+    const liveButton = event.target.closest("[data-live-node]");
+    if (liveButton) {
+      await loadLiveSessions(liveButton.dataset.liveNode, liveButton);
+      return;
+    }
     const riseRow = event.target.closest("[data-rise-fp]");
     if (riseRow) {
       await openRiseDetail(riseRow.dataset.riseNode, riseRow.dataset.riseFp);

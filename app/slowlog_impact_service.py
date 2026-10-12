@@ -273,7 +273,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                              "metric_fingerprint AS fingerprint, metric_sql_id AS sql_id, "
                              # Legacy index maps unreported costs to 0: zero lacks presence proof.
                              "metric_query_time_ms AS duration_ms, nullIf(metric_rows_examined,0) AS rows_examined, "
-                             "nullIf(metric_lock_time_ms,0) AS lock_time_ms FROM (" + scope + ") "
+                             "nullIf(metric_lock_time_ms,0) AS lock_time_ms, "
+                             "metric_database_account AS account FROM (" + scope + ") "
                              f"LIMIT {MAX_EVENTS + 1}", parameters, None)
     rows = read_events(start_us, end_us)
     if len(rows) > MAX_EVENTS:
@@ -306,6 +307,10 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         order_by_correlation(result)
     top = TOP_PER_NODE_CORRELATION if by_correlation else TOP_PER_NODE
     counts = Counter((row["node_id"], family_key(row)) for row in rows)
+    accounts: dict[tuple[str, str], Counter] = {}
+    for event in rows:
+        if event.get("account"):
+            accounts.setdefault((event["node_id"], family_key(event)), Counter())[str(event["account"])] += 1
     samples = {}
     for event in rows:
         key = event["node_id"], family_key(event)
@@ -325,6 +330,10 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             key = node["node_id"], row["fingerprint"]
             row.update(profiles.get((instance, samples[key]["fingerprint"]), {}))
             row["executions"] = counts[key]
+            # Who ran it: the accounts with the most executions in the window (at most three) and how many there are.
+            ranked = sorted(accounts.get(key, {}).items(), key=lambda item: (-item[1], item[0]))
+            row["accounts"] = [name for name, _ in ranked[:3]]
+            row["account_count"] = len(ranked)
             row["sql_id"] = samples[key]["sql_id"]
             row["sample_event_id"] = samples[key]["event_id"]
             # Preserve exact sufficient statistics across JavaScript's 53-bit boundary.

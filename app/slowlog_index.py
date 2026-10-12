@@ -1889,7 +1889,7 @@ class SlowLogIndex:
                        e.operation, e.database_name, e.table_name,
                        e.fingerprint, e.sql_id, e.query_time_ms,
                        e.lock_time_ms, e.rows_examined, e.rows_sent,
-                       e.sql_bytes
+                       e.sql_bytes, e.database_account
                 FROM slowlog_events e{analytics_index_hint}
                 WHERE e.is_canonical = 1 AND {where}
                 """,
@@ -2007,6 +2007,28 @@ class SlowLogIndex:
                     (width, width, *selected),
                 ):
                     series[point["fingerprint"]][int(point["ts"])] = int(point["events"])
+            # Accounts per selected statement: most executions first, at most three names plus the distinct count.
+            accounts: dict[str, list[tuple[str, int]]] = {fp: [] for fp in selected}
+            if selected:
+                placeholders = ",".join("?" for _ in selected)
+                for point in conn.execute(
+                    "SELECT fingerprint, database_account, COUNT(*) AS executions "
+                    "FROM temp.slow_events_scope "
+                    f"WHERE fingerprint IN ({placeholders}) AND database_account != '' "
+                    "GROUP BY fingerprint, database_account",
+                    tuple(selected),
+                ):
+                    accounts[point["fingerprint"]].append(
+                        (str(point["database_account"]), int(point["executions"]))
+                    )
+            for rows in orders.values():
+                for row in rows:
+                    ranked = sorted(
+                        accounts.get(row["fingerprint"], []),
+                        key=lambda item: (-item[1], item[0]),
+                    )
+                    row["accounts"] = [name for name, _ in ranked[:3]]
+                    row["account_count"] = len(ranked)
             trend, correlation_meta = attach_correlations(
                 orders, [dict(row) for row in trend], series,
                 start_us=start_epoch_us, end_us=end_epoch_us, width_us=width,

@@ -1,8 +1,9 @@
 "use strict";
 
 /* 上涨排查（RDS）：选一个时间窗和一个主要指标，看窗口内哪些慢 SQL 比昨日同窗多花了成本、并与该指标曲线重合。
-   排序是服务端的「扫描增量证据优先，再按增长份额」——原「对齐节点 IOPS（性能关联）」，现为默认；相关度 r 只是时序关联的
-   核对列，不是排序依据，也不是资源消耗的度量或因果。
+   排序是服务端的「增长份额」：该 SQL 在指标超额分钟里跑了多久，乘以比昨日同窗多出来的执行时间（已扣除慢日志记录的锁等待）；
+   扫描行增量只在份额相同时决定先后；相关度 r 只是时序关联的核对列，不是排序依据，也不是资源消耗的度量或因果。
+   慢日志要等语句结束才出现，正在跑的查询由「看正在跑的查询」按需读取 DAS 实时会话。
    证据来源可勾选：慢日志（上涨排查）与 Binlog 写入（写入 SQL / 事务 / 锁争用推断），只请求勾选的。 */
 
 const RISE_METRICS = [
@@ -130,11 +131,12 @@ function riseCorrelation(row) {
 // 增长份额：该 SQL 在本节点「超额指标 × 耗时增长」里占的比例，份额不是资源贡献率。
 function riseShare(row) {
   if (row.growth_share === null || row.growth_share === undefined) {
-    return '<span class="muted" title="没有相比昨日同窗的正向耗时增长">—</span>';
+    return '<span class="muted" title="没有相比昨日同窗的正向增长（只因锁等待变长的不计入）">—</span>';
   }
   const percent = Number(row.growth_share) * 100;
   const text = percent >= 10 ? riseNumber(percent, 0) : percent >= 1 ? riseNumber(percent, 1) : riseNumber(percent, 2);
-  return `<strong title="增长份额：每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向耗时增长比例，在本节点内的占比；不是资源贡献率">${text}%</strong>`;
+  const lock = Number(row.lock_wait_excluded_us) > 0 ? `；已扣除慢日志记录的锁等待增长 ${humanMicros(row.lock_wait_excluded_us)}` : "";
+  return `<strong title="增长份额：每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向增长比例（已扣除慢日志记录的锁等待），在本节点内的占比；不是资源贡献率${lock}">${text}%</strong>`;
 }
 
 function riseCost(row) {
@@ -167,6 +169,7 @@ function riseStatement(node, row, position) {
   return `<tr class="${growing ? "" : "is-flat"}">
     <td class="rise-rank">${position}</td>
     <td><button class="slow-sql-link" type="button" data-rise-node="${escapeHtml(node.node_id)}" data-rise-fp="${escapeHtml(row.fingerprint)}" title="查看样本执行与逐分钟序列"><code class="sql-cell">${escapeHtml(sql)}</code></button></td>
+    <td>${accountCell(row)}</td>
     <td>${riseShare(row)}</td>
     <td>${riseCorrelation(row)}<br><span class="muted" title="窗口内有该 SQL 执行的分钟数">${humanCount(row.active_minutes)} / ${humanCount(minutes)} 分钟有执行</span></td>
     <td>${riseCost(row)}</td>
@@ -209,9 +212,9 @@ function riseNodeBody(data, node) {
     ? `<p class="analytics-note">${escapeHtml(RESOURCE_STATUS[node.status])}；下表按扫描增量和增长份额列出，仅供核对。</p>` : "";
   const shown = rows.reduce((sum, row) => sum + (Number(row.growth_share) || 0), 0);
   const covered = shown > 0 ? `，合计占本节点增长份额 ${riseNumber(shown * 100, 0)}%` : "";
-  return `${riseNodeSpark(data, node)}${note}
+  return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${note}
     <div class="table-wrap"><table class="data-table analytics-table rise-table">
-      <thead><tr><th>#</th><th>SQL（先看扫描行比昨日增加的，再按增长份额）</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>执行次数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
+      <thead><tr><th>#</th><th>SQL（按增长份额排序）</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>执行次数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
       <tbody>${rows.map((row, index) => riseStatement(node, row, index + 1)).join("")}</tbody>
     </table></div>
     <p class="analytics-note">共 ${humanCount(node.total_fingerprints)} 个 SQL 家族，显示前 ${humanCount(rows.length)} 个${covered}。灰显行的耗时和扫描都没有比昨日同窗增加。</p>`;
@@ -249,7 +252,7 @@ function riseAdjustNotice(data) {
 function riseFreshness(data) {
   if (!data.ready_through_us) return "";
   const behind = Math.max(0, Math.round((Date.now() - Number(data.ready_through_us) / 1000) / 60_000));
-  return `<p class="analytics-note">数据截至 <strong>${escapeHtml(formatTime(data.ready_through_us))}</strong>（最新已入库的慢日志，落后现在约 ${behind} 分钟）；慢日志在语句结束后才出现，窗口末尾仍在执行的长查询暂未计入。</p>`;
+  return `<p class="analytics-note">数据截至 <strong>${escapeHtml(formatTime(data.ready_through_us))}</strong>（最新已入库的慢日志，落后现在约 ${behind} 分钟）；慢日志在语句结束后才出现，窗口末尾仍在执行的长查询暂未计入，可点节点里的「看正在跑的查询」。</p>`;
 }
 
 // 表单和之后按需加载的明细都跟着改到实际查询的窗口。
@@ -283,7 +286,7 @@ function renderRise(data) {
   }
   const many = nodes.length > 3;
   panel.innerHTML = `${prefix}
-    <p class="analytics-note">${escapeHtml(metric)}：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照昨日同窗。排序：先看扫描行比昨日增加的 SQL（按增加量），再按增长份额；相关度 r 只是时序关联的核对列，不是排序依据。份额不是资源贡献率，耗时含等待，也不是因果。SQL 只统计已采集的慢日志，看不到写入型和不够慢的查询负载，可勾选「Binlog 写入」对照。</p>
+    <p class="analytics-note">${escapeHtml(metric)}：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照昨日同窗。排序：按增长份额（该 SQL 在指标超额分钟里跑了多久，乘以比昨日同窗多出来的部分，已扣除慢日志记录的锁等待）；扫描行增量只在份额相同时决定先后，相关度 r 只是时序关联的核对列。份额不是资源贡献率，除锁等待外的等待仍算在耗时里，也不是因果；慢日志的扫描行可能远小于真实扫描（含物化子查询的语句）。SQL 只统计已采集的慢日志，看不到写入型和不够慢的查询负载，可勾选「Binlog 写入」对照；语句结束后才会进慢日志，正在跑的点节点里的「看正在跑的查询」。</p>
     ${riseFreshness(data)}
     ${nodes.map((node, index) => `<details class="rise-node" ${!many || index === 0 ? "open" : ""}>
       <summary>${riseNodeSummary(data, node)}</summary>${riseNodeBody(data, node)}</details>`).join("")}`;
@@ -426,6 +429,51 @@ async function runRise() {
   }
 }
 
+/* ---------------------------- 正在跑的查询（按需读取 DAS 实时会话） ---------------------------- */
+
+function riseLiveBox(node) {
+  const id = escapeHtml(node.node_id);
+  return `<div class="rise-live" data-live-box="${id}">
+    <button class="button ghost compact" type="button" data-live-node="${id}" title="实时读取该节点的会话列表（DAS，只读，约 2–3 秒；10 秒内重复点击用缓存）">看正在跑的查询</button>
+    <span class="muted">慢日志要等语句结束才出现，事故进行中点这里</span>
+    <div class="rise-live-result" hidden></div>
+  </div>`;
+}
+
+function liveSessionsHtml(data) {
+  const rows = data.sessions || [];
+  const observed = data.observed_at_us ? formatTime(data.observed_at_us, true) : "—";
+  const head = `<p class="analytics-note">${escapeHtml(observed)} 的会话快照${data.cached ? "（10 秒内缓存）" : ""}：共 ${humanCount(data.total_sessions)} 个会话，${humanCount(data.running_sessions)} 个在执行，最长已运行 ${humanCount(data.longest_running_seconds)} 秒。${data.truncated ? "只列运行最久的 50 个。" : ""}</p>`;
+  if (!rows.length) return `${head}<p class="analytics-empty">此刻没有在执行的语句。</p>`;
+  return head + analyticsTable(["用户", "来源 IP", "库", "已运行", "状态", "SQL"], rows.map((row) => [
+    escapeHtml(row.user || "—"),
+    escapeHtml(row.client || "—"),
+    escapeHtml(row.database || "—"),
+    `<strong>${escapeHtml(humanMicros(Number(row.seconds || 0) * 1_000_000))}</strong>`,
+    escapeHtml(row.state || row.command || "—"),
+    `<code class="sql-cell" title="${escapeHtml(row.sql || "")}">${escapeHtml(String(row.sql || "").replace(/\s+/g, " "))}</code>`,
+  ]));
+}
+
+async function loadLiveSessions(nodeId, button) {
+  const box = button.closest("[data-live-box]");
+  const result = box?.querySelector(".rise-live-result");
+  const instance = state.rise?.data?.instance_id || "";
+  if (!result || !instance) return;
+  button.disabled = true;
+  result.hidden = false;
+  result.innerHTML = '<p class="analytics-note">正在读取该节点的实时会话…</p>';
+  try {
+    const data = await api(`/api/live-sessions?instance=${encodeURIComponent(instance)}&nodeId=${encodeURIComponent(nodeId)}`);
+    result.innerHTML = liveSessionsHtml(data);
+    button.textContent = "刷新正在跑的查询";
+  } catch (error) {
+    result.innerHTML = `<p class="analytics-unavailable"><strong>读取失败。</strong>${escapeHtml(error.message)}</p>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function riseDetailSeries(data, node, row) {
   const scale = Number(node.metric_scale) || 1;
   const times = data.sample_end_us || [];
@@ -452,5 +500,5 @@ async function openRiseDetail(nodeId, fingerprint) {
     <p>增长份额 ${riseShare(row)} · 相关度 ${riseCorrelation(row)} · ${escapeHtml(riseMetricLabel(data.metric_id))} · 节点 ${escapeHtml(node.node_id)} ${riseRoleChip(node)}</p>
     <p>耗时 ${humanMicros(row.baseline_runtime_us_total)} → ${humanMicros(row.runtime_us_total)}；执行 ${humanCount(row.attribution?.baseline_count)} → ${humanCount(row.executions)} 次${members > 1 ? `；合并 ${members} 个物理指纹（分表族）` : ""}。</p>
     ${analyticsTable(["分钟结束", `${riseMetricLabel(data.metric_id)}`, "该 SQL 当分钟执行耗时"], riseDetailSeries(data, node, row))}
-    <p class="analytics-note">增长份额 = 每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向耗时增长比例，在本节点内的占比，不是资源贡献率；相关度是上表两列的皮尔逊系数，只说明时间上同涨同落，不证明因果，也不衡量该 SQL 消耗了多少资源。</p></section>`);
+    <p class="analytics-note">增长份额 = 每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向增长比例（扣除慢日志记录的锁等待），在本节点内的占比，不是资源贡献率；相关度是上表两列的皮尔逊系数，只说明时间上同涨同落，不证明因果，也不衡量该 SQL 消耗了多少资源。</p></section>`);
 }

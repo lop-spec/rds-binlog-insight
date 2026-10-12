@@ -781,14 +781,15 @@ class ClickHouseSlowLogQueryBackend:
                    tupleElement(canonical,9) AS metric_query_time_ms,
                    tupleElement(canonical,10) AS metric_lock_time_ms,
                    tupleElement(canonical,11) AS metric_rows_examined,
-                   tupleElement(canonical,12) AS metric_rows_sent
+                   tupleElement(canonical,12) AS metric_rows_sent,
+                   tupleElement(canonical,13) AS metric_database_account
             FROM (
                 SELECT instance_id,event_epoch_us,event_id,
                        argMin(tuple(
                            node_id,operation,database_name,table_name,
                            fingerprint,sql_id,action,
                            sql_bytes,query_time_ms,lock_time_ms,
-                           rows_examined,rows_sent
+                           rows_examined,rows_sent,database_account
                        ),{key}) AS canonical
                 FROM {self.table}
                 WHERE {' AND '.join(clauses)}
@@ -985,7 +986,13 @@ class ClickHouseSlowLogQueryBackend:
                    min(metric_operation) AS operation,
                    max(metric_sql_id) AS sql_id,
                    min(scope_event_id) AS sample_event_id,
-                   min(metric_action) AS action
+                   min(metric_action) AS action,
+                   topKIf(3)(
+                       metric_database_account, metric_database_account != ''
+                   ) AS accounts,
+                   uniqExactIf(
+                       metric_database_account, metric_database_account != ''
+                   ) AS account_count
             FROM (
                 SELECT *,
                        intDiv(
@@ -1056,6 +1063,10 @@ class ClickHouseSlowLogQueryBackend:
                             row.get("max_query_event_id") or ""
                         ),
                         "action": str(row.get("action") or ""),
+                        "accounts": [
+                            str(value) for value in row.get("accounts") or []
+                        ],
+                        "account_count": self._integer(row, "account_count"),
                         "normalized_sql": "",
                         "sample_sql": "",
                     }

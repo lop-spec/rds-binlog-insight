@@ -1,4 +1,5 @@
 import unittest
+from fractions import Fraction
 from unittest.mock import Mock, patch
 
 from app.config import Settings
@@ -129,6 +130,47 @@ class GrowthTests(unittest.TestCase):
             result=rank_performance_growth([],[],[],start_us=0,end_us=W,index_complete=True,baseline_complete=False)
         self.assertEqual(result['status'],'incomplete_baseline_index')
 
+    def test_a_long_run_with_almost_no_recorded_scan_outranks_many_small_scan_growers(self):
+        # DAS can log a few rows for a statement that ran for minutes (materialized subqueries). "Scanned more rows than
+        # yesterday" is evidence, not a gate: thirty statements that scanned a million rows each must not bury it.
+        long_run = dict(event('long', 3*W, 180000), rows_examined=9)
+        noise = [dict(event(f'noise-{i}', 3*W, 1000), rows_examined=1_000_000 + i) for i in range(30)]
+        rows = self.rank([long_run, *noise], [])['nodes'][0]['statements']
+        self.assertEqual((rows[0]['sql_id'], rows[0]['rank']), ('long', 1))
+        self.assertAlmostEqual(rows[0]['growth_share'], 180 / 210)
+        self.assertEqual(rows[0]['attribution']['status'], 'scan_growth_related_evidence')   # its own few rows still count as evidence
+        self.assertTrue(all(row['rank'] > 1 for row in rows[1:]))
+
+    def test_measured_scan_growth_only_separates_statements_with_equal_scores(self):
+        before = [dict(event('small', 3*W, 60000), rows_examined=10), dict(event('big', 3*W, 60000), rows_examined=10)]
+        now = [dict(event('small', 3*W, 60000), rows_examined=110), dict(event('big', 3*W, 60000), rows_examined=5010)]
+        node = self.rank(now, before)['nodes'][0]
+        self.assertEqual([row['sql_id'] for row in node['statements']], ['big', 'small'])
+        self.assertEqual([row['rank'] for row in node['statements']], [1, 2])
+        self.assertTrue(all(row['growth_share'] is None for row in node['statements']))   # no runtime grew: no share is invented
+        self.assertEqual(node['status'], 'ok')
+
+    def test_growth_that_is_only_recorded_lock_wait_scores_nothing(self):
+        before = [dict(event('waits', 3*W, 10000), lock_time_ms=0), event('works', 3*W, 10000)]
+        now = [dict(event('waits', 3*W, 70000), lock_time_ms=60000), dict(event('works', 3*W, 70000), lock_time_ms=None)]
+        by = {row['sql_id']: row for row in self.rank(now, before)['nodes'][0]['statements']}
+        self.assertEqual(by['works']['rank'], 1)
+        self.assertEqual(by['waits']['growth_share'], 0)
+        self.assertIsNone(by['waits']['rank'])
+        self.assertEqual(by['waits']['lock_wait_excluded_us'], 60_000_000)   # the page can say how much was taken out
+        self.assertEqual(by['works']['lock_wait_excluded_us'], 0)            # an unreported lock time is no evidence of waiting
+        self.assertIn('lock_wait_increased_possible_victim', by['waits']['attribution']['warnings'])
+
+    def test_without_lock_time_the_score_is_exactly_the_plain_runtime_growth(self):
+        steady, growing = event('steady', 3*W, 180000), event('growing', 3*W, 90000)
+        rows = self.rank([steady, growing], [steady, event('growing', 3*W, 30000)])['nodes'][0]['statements']
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            plain = Fraction(row['score_numerator'] * max(0, row['runtime_us_total'] - row['baseline_runtime_us_total']),
+                             row['runtime_us_total'])
+            self.assertEqual(Fraction(int(row['growth_score_numerator']), int(row['growth_score_denominator'])), plain)
+            self.assertEqual(row['lock_wait_excluded_us'], 0)
+
 
 class ServiceTests(unittest.TestCase):
     def test_pagination_and_node_identity(self):
@@ -154,6 +196,28 @@ class ServiceTests(unittest.TestCase):
             result = query_resource_overlap(Mock(), None, {}, Settings(), loader)
         self.assertEqual(result["status"], "clickhouse_backend_required")
         loader.assert_not_called()
+
+    def test_statements_carry_the_accounts_that_ran_them(self):
+        backend, metadata = Mock(), Mock()
+        backend.serving_enabled = True
+        backend._window.side_effect = lambda q, retention: ((q["start_epoch_us"], q["end_epoch_us"])
+                                                             if "start_epoch_us" in q else (0, 6 * W - 1))
+        backend._manifest_coverage.return_value = {"complete": True, "total_parts": 1}
+        backend._scope_sql.side_effect = lambda q, low, high: ("SELECT 1", {"low": low})
+        backend.statement_index.statement_profiles.return_value = {}
+
+        def make(i, sql_id, account):
+            return dict(event_id=f"{sql_id}-{i}", start_us=3 * W + i * 1000, node_id="a", database_name="d", fingerprint=sql_id,
+                        sql_id=sql_id, duration_ms=30000, rows_examined=1, lock_time_ms=None, account=account)
+        current = [make(i, "mixed", "analyst") for i in range(3)] + [make(3, "mixed", "root")] + [make(i, "plain", "") for i in range(2)]
+        backend._rows.side_effect = lambda sql, params, _: (
+            [dict(e, start_us=e["start_us"] - DAY_US) for e in current[:1]] if params["low"] < 0 else current)
+        loader = Mock(return_value=points([10, 10, 10, 90, 90, 90]))
+        result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x"}, Settings(), loader)
+        rows = {row["sql_id"]: row for row in result["nodes"][0]["statements"]}
+        self.assertEqual((rows["mixed"]["accounts"], rows["mixed"]["account_count"]), (["analyst", "root"], 2))   # most executions first
+        self.assertEqual((rows["plain"]["accounts"], rows["plain"]["account_count"]), ([], 0))                    # unknown stays unknown
+        self.assertIn("metric_database_account AS account", backend._rows.call_args_list[0].args[0])
 
     def test_bound_enforced_before_cloud_call(self):
         backend, metadata, loader = Mock(), Mock(), Mock()
