@@ -115,7 +115,7 @@ class SlowLogTableFiltersClickHouse(unittest.TestCase):
             node_id String, operation String, database_name String, table_name String,
             fingerprint String, sql_id String, action String, sql_bytes UInt64,
             query_time_ms UInt64, lock_time_ms UInt64, rows_examined UInt64, rows_sent UInt64,
-            _source_part_path String, _source_part_id String
+            database_account String, _source_part_path String, _source_part_id String
         ) ENGINE=Memory''')
         fixture = []
         for number, (event_id, table_name) in enumerate(TABLES.items()):
@@ -123,7 +123,7 @@ class SlowLogTableFiltersClickHouse(unittest.TestCase):
                 event_id=event_id, node_id='fixture-node', operation='SELECT',
                 database_name='example_app', table_name=table_name, fingerprint=event_id,
                 sql_id=event_id, action='SELECT', sql_bytes=100, query_time_ms=200+number,
-                lock_time_ms=7, rows_examined=100+number, rows_sent=number,
+                lock_time_ms=7, rows_examined=100+number, rows_sent=number, database_account='analyst',
                 _source_part_path='main', _source_part_id='main'))
         fixture.append({**fixture[1], '_source_part_path': 'duplicate', '_source_part_id': 'duplicate'})
         try:
@@ -137,6 +137,8 @@ class SlowLogTableFiltersClickHouse(unittest.TestCase):
                     rows = client.json_rows(sql, parameters=parameters)
                     self.assertEqual({row['scope_event_id'] for row in rows}, expected)
                     self.assertEqual(len(rows), len(expected))
+                    # who ran it comes back with the canonical event (13th tuple element), duplicates included
+                    self.assertTrue(all(row['metric_database_account'] == 'analyst' for row in rows))
                     self.assertEqual(sum(int(row['metric_rows_examined']) for row in rows),
                         sum(100 + number for number, key in enumerate(TABLES) if key in expected))
         finally:
