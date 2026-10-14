@@ -49,10 +49,12 @@ SEARCH_REACH_US = 6 * 3600 * 1_000_000
 MIN_TRUNCATED_US = 6 * PERIOD_US
 # Windows ending this close to now report how far behind the index is (older windows are long since indexed).
 FRESHNESS_WINDOW_US = 30 * PERIOD_US
-# What the primary wrote is looked up from this long before a lag episode's first sample (the writes come before their lag),
-# and for at most this many distinct episode windows per answer.
+# What the primary wrote is looked up from this long before a lag episode's first sample (the writes come before their lag), on
+# the binlog aggregates' five-minute buckets (so the episodes of different nodes, which differ by a few minutes, share one lookup),
+# and for at most this many distinct windows per answer.
 WRITES_LEAD_US = 5 * PERIOD_US
-MAX_WRITE_LOOKUPS = 6
+WRITES_BUCKET_US = 5 * PERIOD_US
+MAX_WRITE_LOOKUPS = 12
 
 
 def load_metric_points(settings: Any, start_us: int, end_us: int, instance: str,
@@ -278,20 +280,26 @@ def _add_peer_health(nodes: list[dict[str, Any]], replicas: list[str], settings:
 
 def _add_write_hotspots(nodes: list[dict[str, Any]], instance: str,
                         writes_lookup: Callable[[str, int, int], dict[str, Any] | None] | None) -> None:
-    """Attach to every lag episode what the primary wrote while it lasted (the busiest tables of the binlog row store)."""
+    """Attach to every lag episode what the primary wrote while it lasted (the busiest tables of the binlog row store).
+
+    A stall is left out: an applier stuck on one event says nothing about the volume written, and the page does not show it.
+    """
     if writes_lookup is None:
         return
     found: dict[tuple[int, int], dict[str, Any] | None] = {}
     for node in nodes:
         for episode in (node.get("lag_origin") or {}).get("episodes", []):
-            window = int(episode["first_us"]), int(episode["last_us"])
+            if episode.get("kind") == "stall":
+                continue
+            window = ((int(episode["first_us"]) - WRITES_LEAD_US) // WRITES_BUCKET_US * WRITES_BUCKET_US,
+                      -(-int(episode["last_us"]) // WRITES_BUCKET_US) * WRITES_BUCKET_US)
             if window not in found:
                 if len(found) >= MAX_WRITE_LOOKUPS:
                     LOGGER.warning("slowlog_resource_query write hotspots skipped for later episodes: instance=%s limit=%d", instance, MAX_WRITE_LOOKUPS)
                     found[window] = None
                 else:
                     try:
-                        found[window] = writes_lookup(instance, window[0] - WRITES_LEAD_US, window[1])
+                        found[window] = writes_lookup(instance, *window)
                     except Exception:  # noqa: BLE001 - same: evidence, not a reason to fail
                         LOGGER.warning("slowlog_resource_query write hotspots unavailable: instance=%s window=%s", instance, window, exc_info=True)
                         found[window] = {"status": "unavailable"}

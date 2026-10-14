@@ -5,8 +5,9 @@ from unittest.mock import Mock, patch
 from app.config import Settings
 from app.slowlog_impact import DAY_US, execution_series, order_by_correlation, rank_resource_overlap, rank_performance_growth
 from app.lag_peers import LOOKBACK_US, METRIC_NAMES
-from app.slowlog_impact_service import (RDS_METRICS, WRITES_LEAD_US, lag_candidates, lag_increase_points, load_iops_points,
-                                       load_metric_points, nearest_indexed_window, query_resource_overlap, truncate_to_ready)
+from app.slowlog_impact_service import (MAX_WRITE_LOOKUPS, RDS_METRICS, WRITES_BUCKET_US, WRITES_LEAD_US, _add_write_hotspots, lag_candidates,
+                                       lag_increase_points, load_iops_points, load_metric_points, nearest_indexed_window,
+                                       query_resource_overlap, truncate_to_ready)
 
 W = 60_000_000
 
@@ -673,9 +674,35 @@ class LagPeerEvidenceTests(unittest.TestCase):
         table = {"database_name": "shop", "table_name": "t", "events": 10, "deletes": 6, "inserts": 4, "updates": 0}
         nodes, _ = self.analyse(writes_lookup=lambda instance, low, high: asked.append((instance, low, high)) or {"status": "ok", "tables": [table]})
         episode = nodes["r"]["lag_origin"]["episodes"][0]
-        self.assertEqual(asked, [("x", episode["first_us"] - WRITES_LEAD_US, episode["last_us"])])
+        low = (episode["first_us"] - WRITES_LEAD_US) // WRITES_BUCKET_US * WRITES_BUCKET_US             # the aggregates' own five-minute buckets
+        high = -(-episode["last_us"] // WRITES_BUCKET_US) * WRITES_BUCKET_US
+        self.assertEqual(asked, [("x", low, high)])
+        self.assertTrue(low <= episode["first_us"] - WRITES_LEAD_US and high >= episode["last_us"])    # rounded outwards, never inwards
         self.assertEqual(episode["writes"]["tables"], [table])
         self.assertTrue(all("writes" not in e for n in ("r2", "r3") for e in nodes[n]["lag_origin"]["episodes"]))
+
+    def test_episodes_of_different_nodes_a_few_minutes_apart_share_one_lookup(self):
+        shifted = [0] + self.LEVELS[:-1]                                                                  # r2 lags the same way, one minute later
+        everyone = lag_points(self.LEVELS, "r") + lag_points(shifted, "r2") + lag_points([0] * self.MINUTES, "r3")
+        asked = []
+        nodes, _ = self.analyse(lag_loader=Mock(side_effect=lambda settings, start, end, instance, node="", **o: everyone),
+                                writes_lookup=lambda *args: asked.append(args) or {"status": "ok", "tables": []})
+        r, r2 = (nodes[n]["lag_origin"]["episodes"][0] for n in ("r", "r2"))
+        self.assertNotEqual((r["first_us"], r["last_us"]), (r2["first_us"], r2["last_us"]))
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(r["writes"], r2["writes"])
+
+    def test_a_stall_is_not_looked_up_and_the_number_of_windows_is_bounded(self):
+        calls, hour = [], 3_600_000_000
+        stall = {"first_us": 0, "last_us": 10 * hour, "kind": "stall"}
+        behind = [{"first_us": i * hour, "last_us": i * hour + 600_000_000, "kind": "behind"} for i in range(1, MAX_WRITE_LOOKUPS + 4)]
+        nodes = [{"node_id": "r", "lag_origin": {"episodes": [stall, *behind]}}]
+        with self.assertLogs("app.slowlog_impact_service", "WARNING") as logs:
+            _add_write_hotspots(nodes, "x", lambda *args: calls.append(args) or {"status": "ok", "tables": []})
+        self.assertEqual(len(calls), MAX_WRITE_LOOKUPS)                                                   # no call for the stall, none past the limit
+        self.assertNotIn("writes", stall)
+        self.assertEqual(sum("writes" in e for e in behind), MAX_WRITE_LOOKUPS)
+        self.assertTrue(any("skipped for later episodes" in line for line in logs.output))
 
     def test_a_failing_or_absent_row_store_is_logged_and_never_fails_the_analysis(self):
         def broken(*_args):
