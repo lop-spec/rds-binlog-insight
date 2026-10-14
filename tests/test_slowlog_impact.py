@@ -566,6 +566,13 @@ class LagMetricTests(unittest.TestCase):
         # one extra minute is requested ahead of the window (and of its baseline day) so the first growth can be told
         self.assertEqual([c.args[1] for c in loader.call_args_list], [-W, -W - DAY_US])
 
+    def test_active_minutes_come_with_the_growth_order_too(self):
+        # the page prints "n / total minutes with executions" next to every statement; only the correlation order used to set n
+        result, _loader = self.run_lag()
+        rows = result["nodes"][0]["statements"]
+        self.assertTrue(rows and all(row["active_minutes"] == sum(1 for value in row["runtime_us"] if value) for row in rows))
+        self.assertGreater(rows[0]["active_minutes"], 0)
+
     def test_the_lag_origin_gets_the_replicas_own_events_and_the_other_replicas_peaks(self):
         seen = {}
         with patch("app.slowlog_impact_service.describe_lag",

@@ -168,7 +168,9 @@ python tools/backtest_slowlog_impact.py --events private-events.json --baseline 
   - `queued` / `holders`：该备节点自己的慢日志里，**随卡顿一起结束**（结束时刻与放行相差 ≤90 秒）且运行 ≥60 秒的语句：开始于起点之后的是被堵在同一把锁后面的受害者（`queued`，运行最久的在前，最多列 5 条，另给总数），开始于起点之前的是持锁者候选（`holders`）。`holders.count = 0` 的含义是**持锁者不在慢日志里**：慢日志要等语句结束才出现，空闲事务 / 连接永远不会出现。只统计窗口内开始且已执行完的慢日志。
   - `node_local`：其他备节点在同一窗口里的峰值都低于 30 秒为 `true`（问题在这个节点上，不是主库写入量）；有别的备节点也过阈值为 `false`；没有其他备节点为 `null`。
 - **接口**：`GET /api/slowlog-impact?metric=replication_lag&order=growth`（`order` 三种取值都可用，其余参数不变）；响应多 `candidate_scope = "primary_statements"`、`primary_nodes`，每个备节点多 `lag_origin`。服务端新增只读的 `BinlogRows.ddl_events(instance, start_us, end_us)`（一条 ClickHouse 聚合表查询），`/api/slowlog-impact` 通过 `ddl_lookup` 注入给 `query_resource_overlap`；没有行存储时 `trigger` 为 `none`。不新增权限、不新增采集、不落盘；云监控仍只调用 `DescribeMetricList`。
-- **页面**：节点卡片里，曲线下面是「复制延迟溯源」：每段延迟一块，写明峰值、是否卡在同一个事件上、事件在主库的时间、那一刻的 DDL（语句文本转义显示）、被堵语句（可点「明细」打开慢日志详情）、没有持锁者时直说「持锁的不在慢日志里」，以及其他备节点是否也延迟；其后才是主库候选语句表（列名「SQL（主库执行，按增长份额排序）」）。节点里仍保留「看正在跑的查询」。
+- **页面**：节点卡片里，曲线下面是「复制延迟溯源」：每段延迟一块，写明峰值、是否卡在同一个事件上、事件在主库的时间、那一刻的 DDL（语句文本转义显示）、被堵语句（可点「明细」打开慢日志详情）、没有持锁者时直说「持锁的不在慢日志里」，以及其他备节点是否也延迟；其后才是主库候选语句表（列名「SQL（主库执行，按增长份额排序）」）。节点里仍保留「看正在跑的查询」。延迟段是卡住型的节点，候选表上方多一行说明：下表只是同期主库上跑得久的慢 SQL，份额和相关度说明不了原因。
 - **回归**：`tests/test_lag_origin.py` 用 10-14 事件的真实云监控分钟序列（实例级均值×5，含其他节点的噪声和 12:23 的删除尖峰）复现：一段 `stall`、起点落在 ALTER 的 90 秒内、命中那条 `ALTER TABLE … ADD INDEX` 的 DDL；另有合成序列覆盖慢速落后、短尖峰、缺分钟、两段延迟、DDL 查询失败、持锁者在 / 不在慢日志里。`tests/test_slowlog_impact.py::LagMetricTests` 覆盖增长序列打分（节点仍报水位）、主库候选按备节点复制且不与备节点自己的同 SQL 合并、主节点不出现在结果里、角色未知、只有主节点有点。节点测试覆盖溯源卡各分支与转义。
+
+- **1.31.1**：`active_minutes`（页面「n / m 分钟有执行」的 n）以前只有相关度排序会算，页面默认的增长排序一直显示 0 / m；现在每种排序的每条语句都带它。
 
 验证：`python -m unittest tests.test_lag_origin tests.test_slowlog_impact tests.test_server_roles_and_windows tests.test_binlog_rows -q`；`node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_indexed_range.cjs`。

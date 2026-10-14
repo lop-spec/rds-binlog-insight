@@ -216,9 +216,12 @@ function riseNodeBody(data, node) {
   }
   const note = node.status && node.status !== "ok" && RESOURCE_STATUS[node.status]
     ? `<p class="analytics-note">${escapeHtml(RESOURCE_STATUS[node.status])}；下表按扫描增量和增长份额列出，仅供核对。</p>` : "";
+  // A stuck applier is not caused by what the primary wrote: say so right above the table that would suggest otherwise.
+  const stalled = lag && (node.lag_origin?.episodes || []).some((episode) => episode.kind === "stall");
+  const stallNote = stalled ? '<p class="analytics-note"><strong>这个节点的延迟是回放线程卡住，不是主库写得太多</strong>：下表只是同期主库上跑得久的慢 SQL，份额和相关度说明不了原因，原因看上面的溯源。</p>' : "";
   const shown = rows.reduce((sum, row) => sum + (Number(row.growth_share) || 0), 0);
   const covered = shown > 0 ? `，合计占本节点增长份额 ${riseNumber(shown * 100, 0)}%` : "";
-  return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${origin}${note}
+  return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${origin}${note}${stallNote}
     <div class="table-wrap"><table class="data-table analytics-table rise-table">
       <thead><tr><th>#</th><th>${lag ? "SQL（主库执行，按增长份额排序）" : "SQL（按增长份额排序）"}</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>执行次数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
       <tbody>${rows.map((row, index) => riseStatement(node, row, index + 1)).join("")}</tbody>

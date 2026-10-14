@@ -262,6 +262,7 @@ test('replication lag: the origin card names the stuck event, the DDL at it, the
   assert.match(html, /主库上的慢 SQL/);               // the page says why the candidates are the primary's statements
   assert.doesNotMatch(html, /窗口 .* 对照昨日同窗。排序：按增长份额/);   // not the generic metric paragraph
   assert.match(html, /data-live-node="rn-lag"/);      // the running-query button stays: it helps while a stall is on
+  assert.match(html, /这个节点的延迟是回放线程卡住，不是主库写得太多/);   // the table below must not read as the cause of a stall
 });
 
 test('replication lag: holders found in the slow log are listed, other lagging replicas change the verdict, unexplained stalls say so', async () => {
@@ -285,6 +286,7 @@ test('replication lag: a slow replica and a blip are described as what they are,
   await vm.runInContext('runAnalytics()', behind.c);
   assert.match(behind.nodes['#analytics-panel-rise'].innerHTML, /回放速度跟不上主库的写入/);
   assert.doesNotMatch(behind.nodes['#analytics-panel-rise'].innerHTML, /<strong>卡在同一个事件上<\/strong>/);
+  assert.doesNotMatch(behind.nodes['#analytics-panel-rise'].innerHTML, /不是主库写得太多/);   // for a slow replica the primary's writes are the lead
   const blip = rdsContext(async () => lagResult({...lagEpisode, kind: 'spike', stall: null}));
   await vm.runInContext('runAnalytics()', blip.c);
   assert.match(blip.nodes['#analytics-panel-rise'].innerHTML, /短时尖峰/);

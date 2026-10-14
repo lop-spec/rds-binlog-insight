@@ -405,6 +405,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             key = node["node_id"], row["fingerprint"]
             row.update(profiles.get((instance, samples[key]["fingerprint"]), {}))
             row["executions"] = counts[key]
+            # Minutes with any execution time: the page shows it next to every ranking, not only the correlation order's.
+            row["active_minutes"] = sum(1 for value in row.get("runtime_us", []) if value)
             # Who ran it: the accounts with the most executions in the window (at most three) and how many there are.
             ranked = sorted(accounts.get(key, {}).items(), key=lambda item: (-item[1], item[0]))
             row["accounts"] = [name for name, _ in ranked[:3]]
