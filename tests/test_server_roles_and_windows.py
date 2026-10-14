@@ -1,10 +1,12 @@
 """HTTP-level wiring of 1.30.0: node roles on /api/status and /api/slowlog-impact, repaired Binlog windows on /api/analytics."""
 import json
+import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -160,6 +162,52 @@ class DdlLookupTests(unittest.TestCase):
         with self.assertLogs("app.server", "WARNING") as logs:
             self.assertIsNone(captured["kwargs"]["writes_lookup"]("rm-x", 5, 9))
         self.assertIn("write hotspots unavailable", logs.output[0])
+
+
+class LiveTailEndpointTests(unittest.TestCase):
+    """The live tail (slowlog_tail) reaches the analysis, the detail drawer and the status; an app without one behaves as before."""
+
+    @staticmethod
+    def impact(application):
+        captured = {}
+
+        def fake_query(_metadata, _backend, _query, _settings, **kwargs):
+            captured.update(kwargs=kwargs)
+            return {"status": "ok", "nodes": []}
+        with patch("app.server.query_resource_overlap", fake_query):
+            get(application, "/api/slowlog-impact?source=slowlog&instance=rm-x&metric=iops")
+        return captured["kwargs"]
+
+    def test_the_analysis_gets_the_tail_and_an_app_without_one_still_answers(self):
+        tails = object()
+        application = SimpleNamespace(metadata=Metadata(), sync=Sync(), storage=SimpleNamespace(clickhouse_slowlog_backend=object()),
+                                      node_roles=SimpleNamespace(lookup=lambda instance: {}), slow_tails=tails)
+        self.assertIs(self.impact(application)["tail"], tails)
+        del application.slow_tails
+        self.assertIsNone(self.impact(application)["tail"])
+
+    def test_a_statement_only_the_tail_holds_still_opens_in_the_detail_drawer(self):
+        detail = {"event_id": "slow-1", "raw_event_type": "SLOW_LOG", "instance_id": "rm-x", "tiers_used": ["live-tail"],
+                  "connection_name": "10.0.0.8", "event_epoch_us": 1}
+        asked = []
+        with tempfile.TemporaryDirectory() as directory:
+            storage = SimpleNamespace(local_execution_event_detail=lambda *_: None, slowlog_event_detail=lambda *_: None,
+                                      paths={"root": Path(directory)})
+            tails = SimpleNamespace(event_detail=lambda event_id, instance: asked.append((event_id, instance)) or detail)
+            application = SimpleNamespace(metadata=Metadata(), sync=Sync(), storage=storage, slow_tails=tails)
+            payload = get(application, "/api/event?id=slow-1&instance=rm-x")
+        self.assertEqual(payload["data"]["tiers_used"], ["live-tail"])
+        self.assertEqual(asked, [("slow-1", "rm-x")])
+
+    def test_the_status_lists_the_tails_and_is_empty_without_them(self):
+        application = Application.__new__(Application)
+        application.metadata, application.storage, application.sync = Metadata(), SimpleNamespace(), Sync()
+        application.slow_logs = []
+        application.node_roles = SimpleNamespace(lookup=lambda instance: {})
+        with patch("app.server.credential_status", return_value={"configured": True}):
+            self.assertEqual(application.public_status()["slowTail"], [])
+            application.slow_tails = SimpleNamespace(status=lambda: [{"nodeId": "rn-1", "scans": 3}])
+            self.assertEqual(application.public_status()["slowTail"], [{"nodeId": "rn-1", "scans": 3}])
 
 
 class FakeSessions:

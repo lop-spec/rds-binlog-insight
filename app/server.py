@@ -52,6 +52,7 @@ from .session_store import SessionStore
 from .session_view import parse_thresholds
 from .slow_log_collector import DAS_ENDPOINT, DasRpcClient, SlowLogCollector, SlowLogConfig
 from .slowlog_impact_service import load_metric_points, query_resource_overlap
+from .slowlog_tail import SlowLogTails
 from .node_roles import NodeRoleBook
 from .window_align import align_binlog_query
 from .pod_lookup import attach_pod_detail
@@ -345,6 +346,10 @@ class Application:
         # 兼容既有调用与状态字段：第一个采集器仍作为 general_log 暴露。
         self.general_log = self.general_logs[0]
         self.slow_logs = self._start_slow_log_collectors(credential_loader)
+        # The newest slow statements, read straight from DAS every 20 s and merged into the rise analysis (``slowlog_tail``).
+        self.slow_tails = SlowLogTails(self.slow_logs)
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self.slow_tails.start()
         # Primary / secondary label of each collected node. Refreshed off the request path (the server is single-threaded
         # and the page polls /api/status); skipped in the mock-API test mode, which has no cloud to ask.
         self.node_roles = NodeRoleBook(
@@ -655,6 +660,7 @@ class Application:
                 item.status() for item in getattr(self, "general_logs", [])
             ],
             "slowLogs": [self._slow_log_status(item) for item in getattr(self, "slow_logs", [])],
+            "slowTail": getattr(self, "slow_tails", None).status() if getattr(self, "slow_tails", None) is not None else [],
             "instances": (
                 self.metadata.known_instances()
                 if callable(getattr(self.metadata, "known_instances", None))
@@ -673,6 +679,8 @@ class Application:
         }
 
     def stop(self) -> None:
+        if getattr(self, 'slow_tails', None) is not None:
+            self.slow_tails.shutdown()
         if getattr(self, 'node_roles', None) is not None:
             self.node_roles.shutdown()
         if getattr(self, 'session_collector', None) is not None:
@@ -960,6 +968,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     result = self.app.storage.slowlog_event_detail(
                         event_id, settings, instance
                     )
+                if result is None and getattr(self.app, "slow_tails", None) is not None:
+                    # A statement of the last minutes may exist only in the live tail.
+                    result = self.app.slow_tails.event_detail(event_id, instance)
                 if result is None and locator.startswith('ch:') and self.app.storage.binlog_rows is not None:
                     result = self.app.storage.binlog_rows.detail(locator)
                 if result is None and locator.startswith('raw:'):
@@ -994,6 +1005,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     ddl_lookup=self._ddl_lookup,
                     peer_loader=load_metric_points,
                     writes_lookup=self._write_hotspots,
+                    tail=getattr(self.app, "slow_tails", None),
                 )
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/live-sessions":

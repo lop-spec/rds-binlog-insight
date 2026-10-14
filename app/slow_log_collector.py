@@ -17,6 +17,9 @@
   event_id、已提交集合和 serving index 三层去重保证回放幂等。
 - **每轮必须翻完窗口内所有页**：DAS 的 OrderBy 只支持耗时/行数，没有按时间排序，
   拿不到"最后一条的时间"，所以水位线按窗口末尾推进，而不是按最大事件时间。
+- **接口默认按开始时间倒序（最新在前）**：页数触顶时丢掉的是窗口里最老的记录。只要读到的最老一条已经不晚于
+  旧水位线，窗口里新的部分就是完整的，水位线照常推进（1.33.0 之前触顶一律不推进，一个繁忙节点的回放窗口
+  超过 3 万条后水位线永远停住）；回放窗口也按上一轮看到的速率收缩，使每轮大约不超过 _PAGE_BUDGET 页。
 """
 
 from __future__ import annotations
@@ -63,6 +66,11 @@ _SLOWLOG_INGEST_LOCK = threading.Lock()
 # silently unqueued one.
 _ENQUEUE_ATTEMPTS = 4
 _ENQUEUE_RETRY_SECONDS = 5.0
+# One poll is sized for about this many pages (100 records each). The replay window shrinks to fit it on a busy node and
+# grows back to the configured length when the node calms down.
+_PAGE_BUDGET = 120
+_MIN_ADAPTIVE_REPLAY_SECONDS = 600
+_MIN_FORWARD_SECONDS = 120
 _OPERATIONS = {
     "select": "SELECT",
     "insert": "INSERT",
@@ -148,6 +156,146 @@ def _epoch_us(record: dict[str, Any]) -> int:
         except ValueError:
             return 0
     return int(parsed.timestamp() * 1_000_000)
+
+
+def build_slow_events(
+    records: list[dict[str, Any]],
+    *,
+    instance_id: str,
+    default_node_id: str = "",
+    exclude_accounts: tuple[str, ...] = (),
+    seen_ids: set[str] | frozenset[str] = frozenset(),
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """DAS slow-log records -> pipeline events, plus the ids of every record that was looked at.
+
+    Ids in ``seen_ids`` are looked at but not returned; the collector passes the ids of its previous poll, the live tail
+    passes the ids it already holds. Both build events with this one function, so an event has the same id, fingerprint
+    and cost fields whichever of them saw it first.
+    """
+
+    events: list[dict[str, Any]] = []
+    observed_ids: set[str] = set()
+    for record in records:
+        sql_text = str(record.get("SQLText") or "").strip()
+        if not sql_text:
+            continue
+        epoch_us = _epoch_us(record)
+        if epoch_us <= 0:
+            continue
+        account = str(record.get("AccountName") or "").strip()
+        client_ip = str(record.get("HostAddress") or "").strip()
+        node_id = str(record.get("NodeId") or default_node_id).strip()
+        if account and account.lower() in exclude_accounts:
+            continue
+        sql_hash = str(record.get("SqlId") or "")
+        digest = hashlib.sha256(
+            "\x1f".join(
+                (
+                    instance_id,
+                    node_id,
+                    str(epoch_us),
+                    sql_hash,
+                    client_ip,
+                    str(record.get("ThreadId") or ""),
+                    str(record.get("QueryTime") or 0),
+                    sql_text[:512],
+                )
+            ).encode("utf-8", "replace")
+        ).hexdigest()
+        event_id = f"slow-{digest[:40]}"
+        already_observed = event_id in observed_ids
+        observed_ids.add(event_id)
+        if event_id in seen_ids or already_observed:
+            continue
+        database = str(record.get("DBName") or "")
+        prefix_parts = [part for part in (account, client_ip) if part]
+        prefix = f"/* {'@'.join(prefix_parts)}" if prefix_parts else "/* slow-log"
+        if database:
+            prefix += f" db={database}"
+        prefix += " */ "
+        try:
+            thread_id = int(record.get("ThreadId") or 0)
+        except (TypeError, ValueError):
+            thread_id = 0
+        table_name = str(record.get("TableName") or "")
+        operation = (
+            _OPERATIONS.get(str(record.get("SqlType") or "").lower())
+            or _operation_of(sql_text)
+        )
+        profile = statement_profile(
+            sql_kind="ORIGINAL",
+            sql_text=sql_text,
+            row_query="",
+            operation=operation,
+            database=database,
+            table=table_name,
+        )
+        events.append(
+            {
+                "event_id": event_id,
+                "event_epoch_us": epoch_us,
+                "raw_event_type": "SLOW_LOG",
+                # SqlType 是 DAS 给的语句类型(select/delete/...)，比解析文本可靠；
+                # 缺失时才回退到按首词判断。
+                "operation": operation,
+                "database_name": database,
+                "table_name": table_name,
+                "table_map_id": 0,
+                "schema_version_id": "",
+                "server_id": 0,
+                "thread_id": thread_id,
+                "transaction_id": "",
+                "gtid": "",
+                "xid": "",
+                "start_position": 0,
+                "end_position": 0,
+                "row_index": 0,
+                "execution_time_ms": int(float(record.get("QueryTime") or 0)),
+                "error_code": 0,
+                # ORIGINAL：statement_profile 只在这个取值下把 sql_text 当
+                # 真实语句进入「全量 SQL」聚合；注释前缀会被 normalize 剥掉。
+                "sql_kind": "ORIGINAL",
+                "sql_text": prefix + sql_text,
+                "sql_bytes_base64": "",
+                "before_json": "",
+                "after_json": "",
+                # binlog 语境的列元数据，慢日志没有，用来承载它独有的指标。
+                "columns_json": json.dumps(
+                    {
+                        "rows_examined": int(record.get("RowsExamined") or 0),
+                        "rows_sent": int(record.get("RowsSent") or 0),
+                        "lock_time_ms": int(float(record.get("LockTime") or 0)),
+                        "sql_id": sql_hash,
+                        "node_id": node_id,
+                        "statement_profile": {
+                            "format_version": FINGERPRINT_FORMAT_VERSION,
+                            **profile,
+                        },
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "row_query": "",
+                "header_epoch_us": epoch_us,
+                "commit_epoch_us": epoch_us,
+                "txn_last_committed": 0,
+                "txn_sequence_number": 0,
+                "txn_length_bytes": 0,
+                "connection_id": "",
+                "connection_name": client_ip,
+                "database_account": account,
+                "execution_status": "success",
+                "error_message": "",
+                "affected_rows": int(record.get("RowsSent") or 0),
+                "started_epoch_us": epoch_us,
+                "finished_epoch_us": epoch_us
+                + int(float(record.get("QueryTime") or 0)) * 1000,
+                "batch_id": "",
+                "statement_index": -1,
+                "transaction_context_id": "",
+            }
+        )
+    return events, observed_ids
 
 
 class SlowLogConfig:
@@ -236,6 +384,9 @@ class SlowLogCollector:
         )
         # 只保留水位线附近的 event_id，用于跨轮去重（lag 窗口内会重复拉到）。
         self._seen_ids: set[str] = set()
+        # Window sizes the next poll uses; they follow the node's record rate (see _tune_window).
+        self._replay_now = config.replay_seconds
+        self._forward_seconds = config.max_window_minutes * 60
         self._status_lock = threading.Lock()
         self._status: dict[str, Any] = {
             "enabled": config.enabled,
@@ -249,6 +400,8 @@ class SlowLogCollector:
             "watermarkEpochUs": 0,
             "lastWindow": "",
             "replaySeconds": config.replay_seconds,
+            "replayNowSeconds": config.replay_seconds,
+            "windowRecords": 0,
             "lastQueuedParts": 0,
             "lastIndexedParts": 0,
             "lastIndexError": "",
@@ -384,6 +537,10 @@ class SlowLogCollector:
             elapsed = time.monotonic() - started
             self._stop.wait(max(self.config.poll_seconds - elapsed, 5.0))
 
+    def das_client(self) -> DasRpcClient:
+        """A DAS client with this collector's credential (the live tail reads through the same one)."""
+        return self._client()
+
     def _client(self) -> DasRpcClient:
         base = self.metadata.load_settings()
         credential = self.credential_loader(base.credential_target)
@@ -414,12 +571,12 @@ class SlowLogCollector:
         forward_start = watermark_epoch_us / 1_000_000
         if forward_end <= forward_start:
             return watermark_epoch_us, 0
-        limit = self.config.max_window_minutes * 60
+        limit = min(self.config.max_window_minutes * 60, self._forward_seconds)
         forward_end = min(forward_end, forward_start + limit)
         # Watermark advancement and query start are deliberately separate:
         # replay must not slow forward progress, but it must revisit records whose
         # QueryStartTime predates the point at which DAS finally published them.
-        query_start = max(forward_start - self.config.replay_seconds, 0)
+        query_start = max(forward_start - self._replay_now, 0)
         start_ms = int(query_start * 1000)
         end_ms = int(forward_end * 1000)
         self._set_status(
@@ -464,6 +621,7 @@ class SlowLogCollector:
                 break
             page += 1
 
+        oldest_us = min((value for value in map(_epoch_us, records) if value > 0), default=0)
         events, observed_ids = self._build_event_batch(records)
         if events:
             try:
@@ -494,139 +652,51 @@ class SlowLogCollector:
         else:
             self._set_status(lastBatchRows=0)
         self._seen_ids = observed_ids
+        # The answer is newest first. When the page cap cut it, the oldest records are the ones missing: if the oldest one read
+        # is not later than the old watermark, everything the watermark was waiting for was read and only the replay was cut.
+        reached_old_watermark = not truncated or (0 < oldest_us <= int(forward_start * 1_000_000))
+        self._tune_window(len(records), forward_end - query_start, forward_end - forward_start, truncated, reached_old_watermark)
         # DAS 的 OrderBy 不支持按时间排序，拿不到"最后一条的时间"，所以水位线按
-        # 前向窗口末尾推进。页数触顶时不推进，下一轮重来。
-        if truncated:
+        # 前向窗口末尾推进。读到的最老一条还晚于旧水位线时不推进，下一轮用更短的前向窗口重来。
+        if not reached_old_watermark:
             return watermark_epoch_us, len(events)
+        if truncated:
+            LOGGER.warning(
+                "慢日志回放窗口被页数上限截断(只回放到最近 %.0f 分钟)，新部分已读全，水位线照常推进：instance=%s node=%s",
+                (forward_end - oldest_us / 1_000_000) / 60,
+                self.config.instance_id,
+                self.config.node_id or "(默认)",
+            )
         return int(forward_end * 1_000_000), len(events)
+
+    def _tune_window(self, records: int, window_seconds: float, forward_seconds: float, truncated: bool, reached: bool) -> None:
+        """Size the next poll's windows from this poll: keep a poll near _PAGE_BUDGET pages without losing the new part."""
+        floor = min(self.config.replay_seconds, _MIN_ADAPTIVE_REPLAY_SECONDS)
+        if truncated:
+            self._replay_now = max(floor, self._replay_now // 2)
+            if not reached:
+                self._forward_seconds = max(_MIN_FORWARD_SECONDS, self._forward_seconds // 2)
+        else:
+            rate = records / max(window_seconds, 1.0)
+            if rate > 0:
+                fit = int(_PAGE_BUDGET * _API_PAGE_SIZE / rate - forward_seconds)
+                self._replay_now = min(self.config.replay_seconds, max(floor, fit))
+            else:
+                self._replay_now = self.config.replay_seconds
+            self._forward_seconds = min(self.config.max_window_minutes * 60, self._forward_seconds * 2)
+        self._set_status(replayNowSeconds=int(self._replay_now), windowRecords=int(records))
 
     def _build_event_batch(
         self,
         records: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], set[str]]:
-        events: list[dict[str, Any]] = []
-        observed_ids: set[str] = set()
-        for index, record in enumerate(records):
-            sql_text = str(record.get("SQLText") or "").strip()
-            if not sql_text:
-                continue
-            epoch_us = _epoch_us(record)
-            if epoch_us <= 0:
-                continue
-            account = str(record.get("AccountName") or "").strip()
-            client_ip = str(record.get("HostAddress") or "").strip()
-            node_id = str(record.get("NodeId") or self.config.node_id).strip()
-            if account and account.lower() in self.config.exclude_accounts:
-                continue
-            sql_hash = str(record.get("SqlId") or "")
-            digest = hashlib.sha256(
-                "\x1f".join(
-                    (
-                        self.config.instance_id,
-                        node_id,
-                        str(epoch_us),
-                        sql_hash,
-                        client_ip,
-                        str(record.get("ThreadId") or ""),
-                        str(record.get("QueryTime") or 0),
-                        sql_text[:512],
-                    )
-                ).encode("utf-8", "replace")
-            ).hexdigest()
-            event_id = f"slow-{digest[:40]}"
-            already_observed = event_id in observed_ids
-            observed_ids.add(event_id)
-            if event_id in self._seen_ids or already_observed:
-                continue
-            database = str(record.get("DBName") or "")
-            prefix_parts = [part for part in (account, client_ip) if part]
-            prefix = f"/* {'@'.join(prefix_parts)}" if prefix_parts else "/* slow-log"
-            if database:
-                prefix += f" db={database}"
-            prefix += " */ "
-            try:
-                thread_id = int(record.get("ThreadId") or 0)
-            except (TypeError, ValueError):
-                thread_id = 0
-            table_name = str(record.get("TableName") or "")
-            operation = (
-                _OPERATIONS.get(str(record.get("SqlType") or "").lower())
-                or _operation_of(sql_text)
-            )
-            profile = statement_profile(
-                sql_kind="ORIGINAL",
-                sql_text=sql_text,
-                row_query="",
-                operation=operation,
-                database=database,
-                table=table_name,
-            )
-            events.append(
-                {
-                    "event_id": event_id,
-                    "event_epoch_us": epoch_us,
-                    "raw_event_type": "SLOW_LOG",
-                    # SqlType 是 DAS 给的语句类型(select/delete/...)，比解析文本可靠；
-                    # 缺失时才回退到按首词判断。
-                    "operation": operation,
-                    "database_name": database,
-                    "table_name": table_name,
-                    "table_map_id": 0,
-                    "schema_version_id": "",
-                    "server_id": 0,
-                    "thread_id": thread_id,
-                    "transaction_id": "",
-                    "gtid": "",
-                    "xid": "",
-                    "start_position": 0,
-                    "end_position": 0,
-                    "row_index": 0,
-                    "execution_time_ms": int(float(record.get("QueryTime") or 0)),
-                    "error_code": 0,
-                    # ORIGINAL：statement_profile 只在这个取值下把 sql_text 当
-                    # 真实语句进入「全量 SQL」聚合；注释前缀会被 normalize 剥掉。
-                    "sql_kind": "ORIGINAL",
-                    "sql_text": prefix + sql_text,
-                    "sql_bytes_base64": "",
-                    "before_json": "",
-                    "after_json": "",
-                    # binlog 语境的列元数据，慢日志没有，用来承载它独有的指标。
-                    "columns_json": json.dumps(
-                        {
-                            "rows_examined": int(record.get("RowsExamined") or 0),
-                            "rows_sent": int(record.get("RowsSent") or 0),
-                            "lock_time_ms": int(float(record.get("LockTime") or 0)),
-                            "sql_id": sql_hash,
-                            "node_id": node_id,
-                            "statement_profile": {
-                                "format_version": FINGERPRINT_FORMAT_VERSION,
-                                **profile,
-                            },
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
-                    "row_query": "",
-                    "header_epoch_us": epoch_us,
-                    "commit_epoch_us": epoch_us,
-                    "txn_last_committed": 0,
-                    "txn_sequence_number": 0,
-                    "txn_length_bytes": 0,
-                    "connection_id": "",
-                    "connection_name": client_ip,
-                    "database_account": account,
-                    "execution_status": "success",
-                    "error_message": "",
-                    "affected_rows": int(record.get("RowsSent") or 0),
-                    "started_epoch_us": epoch_us,
-                    "finished_epoch_us": epoch_us
-                    + int(float(record.get("QueryTime") or 0)) * 1000,
-                    "batch_id": "",
-                    "statement_index": -1,
-                    "transaction_context_id": "",
-                }
-            )
-        return events, observed_ids
+        return build_slow_events(
+            records,
+            instance_id=self.config.instance_id,
+            default_node_id=self.config.node_id,
+            exclude_accounts=self.config.exclude_accounts,
+            seen_ids=self._seen_ids,
+        )
 
     def _build_events(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Pure compatibility helper used by focused parser tests."""

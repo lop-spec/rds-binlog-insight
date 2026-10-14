@@ -307,12 +307,46 @@ def _add_write_hotspots(nodes: list[dict[str, Any]], instance: str,
                 episode["writes"] = found[window]
 
 
+def tail_plan(metadata: Any, backend: Any, instance: str, start_us: int, end_us: int, view: dict[str, Any] | None,
+              index_state: Callable[[int, int], tuple[dict[str, Any], dict[str, Any] | None]],
+              usable: Callable[[dict[str, Any] | None], bool]) -> dict[str, Any] | None:
+    """The window the live tail (``slowlog_tail``) can complete, or None when it cannot help.
+
+    ClickHouse must be complete wherever the tail does not reach: the parts still on their way in may only lie inside the
+    stretch the tail covers, and the day-before baseline (read from ClickHouse as always) must be complete. The window then
+    ends on the last whole minute the source has finished publishing, which is later than the indexed edge by the time the
+    collector, the indexer and the copy into ClickHouse take.
+    """
+    if view is None or end_us < time.time_ns() // 1000 - FRESHNESS_WINDOW_US:
+        return None
+    cut = min(end_us, int(view["complete_through_us"])) // PERIOD_US * PERIOD_US
+    if cut - start_us < MIN_TRUNCATED_US:
+        return None
+    index = _index_map(metadata, backend, instance, start_us, cut)
+    if index is None:
+        return None
+    covered_from = int(view["covered_from_us"])
+    # Before the tail begins ClickHouse must have everything, the start of the window included; from there on the tail has it all,
+    # so a part that is still missing may only reach into the window from where the tail covers.
+    if covered_from > start_us and (index["first"] is None or index["first"] > start_us):
+        return None
+    if any(high >= start_us and max(low, start_us) < covered_from for low, high in zip(*index["blocked"])):
+        return None
+    coverage, baseline = index_state(start_us, cut)
+    if not coverage.get("total_parts") or (baseline is not None and not usable(baseline)):
+        return None
+    pending = len(coverage.get("missing_parts") or [])
+    return {"end_us": cut, "covered_from_us": covered_from, "newest_us": int(view["newest_us"]), "pending_parts": pending,
+            "coverage": {**coverage, "complete": True, "tail_parts": pending}, "baseline_coverage": baseline}
+
+
 def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                            settings: Any, metrics_loader: Any = load_metric_points,
                            roles: Any = None,
                            ddl_lookup: Callable[[str, int, int], list[dict[str, Any]]] | None = None,
                            peer_loader: Callable[..., list[dict[str, Any]]] | None = None,
-                           writes_lookup: Callable[[str, int, int], dict[str, Any] | None] | None = None) -> dict[str, Any]:
+                           writes_lookup: Callable[[str, int, int], dict[str, Any] | None] | None = None,
+                           tail: Any = None) -> dict[str, Any]:
     def unavailable(reason: str) -> dict[str, Any]:
         LOGGER.warning("slowlog_resource_query unavailable: %s", reason)
         return {"status": reason, "nodes": []}
@@ -353,6 +387,18 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
 
     coverage, baseline_coverage = index_state(start_us, end_us)
     adjusted = None
+    tail_used: dict[str, Any] | None = None
+    if not usable(coverage) and tail is not None:
+        # The newest parts are still on their way into ClickHouse; the live tail may hold exactly that stretch.
+        try:
+            tail_used = tail_plan(metadata, backend, instance, start_us, end_us, tail.view(instance), index_state, usable)
+        except Exception:  # noqa: BLE001 - extra evidence, never a reason to fail: without it the window is cut at the indexed edge
+            LOGGER.warning("slowlog_resource_query live tail unavailable: instance=%s", instance, exc_info=True)
+        if tail_used is not None:
+            requested_end = end_us
+            coverage, baseline_coverage, end_us = tail_used["coverage"], tail_used["baseline_coverage"], tail_used["end_us"]
+            if end_us < requested_end:
+                adjusted = adjusted_payload("truncated", "source_delay", start_us, requested_end, start_us, end_us)
     if not usable(coverage) or (baseline_coverage is not None and not usable(baseline_coverage)):
         reason = "incomplete_index" if not usable(coverage) else "incomplete_baseline_index"
         requested = (start_us, end_us)
@@ -391,6 +437,14 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                              "metric_database_account AS account FROM (" + scope + ") "
                              f"LIMIT {MAX_EVENTS + 1}", parameters, None)
     rows = read_events(start_us, end_us)
+    if tail_used is not None:
+        known = {row["event_id"] for row in rows}
+        fresh = [row for row in tail.rows(instance, max(start_us, tail_used["covered_from_us"]), end_us, query)
+                 if row["event_id"] not in known]
+        rows.extend(fresh)
+        tail_used["events"] = len(fresh)
+        LOGGER.info("slowlog_resource_query window completed by the live tail: instance=%s events=%d pending_parts=%d end_behind_s=%d",
+                    instance, len(fresh), tail_used["pending_parts"], max(time.time_ns() // 1000 - end_us, 0) // 1_000_000)
     if len(rows) > MAX_EVENTS:
         return unavailable("event_limit_exceeded")
     # A lag episode can be explained by the lag series and the binlog alone, so an empty slow log does not end that analysis.
@@ -460,6 +514,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     selected = {(instance, samples[node["node_id"], row["fingerprint"]]["fingerprint"])
                 for node in result.get("nodes", []) for row in node.get("statements", [])[:top]}
     profiles = backend.statement_index.statement_profiles(selected)
+    if tail_used is not None:
+        # A fingerprint first seen in the last minutes is not in the SQLite statement table yet; the tail kept its text.
+        profiles.update(tail.profiles(selected - set(profiles)))
     for node in result.get("nodes", []):
         node["total_fingerprints"] = len(node.get("statements", []))
         node["statements"] = node.get("statements", [])[:top]
@@ -495,8 +552,14 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         _add_write_hotspots(result.get("nodes", []), instance, writes_lookup)
         result.update(candidate_scope="primary_statements", primary_nodes=sorted(
             node for node, info in node_roles.items() if info.get("role") == "primary"))
+    ready = ready_through(metadata, backend, instance, end_us, time.time_ns() // 1000)
+    if tail_used is not None:
+        ready = max(ready or 0, tail_used["newest_us"])
     result.update(instance_id=instance, start_us=start_us, end_us=end_us,
-                  ready_through_us=ready_through(metadata, backend, instance, end_us, time.time_ns() // 1000),
+                  ready_through_us=ready,
+                  tail=None if tail_used is None else {"from_us": max(start_us, tail_used["covered_from_us"]), "through_us": end_us,
+                                                       "newest_us": tail_used["newest_us"], "events": tail_used.get("events", 0),
+                                                       "pending_parts": tail_used["pending_parts"]},
                   coverage=coverage, baseline_coverage=baseline_coverage, adjusted=adjusted,
                   executions=len(rows), baseline_executions=len(baseline), metric=metric_name,
                   metric_id=metric_id, metric_label=metric_label,

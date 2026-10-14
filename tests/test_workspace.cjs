@@ -445,6 +445,25 @@ test('a window cut back to the indexed edge keeps its start, says where it ends 
   assert.ok(toasts.some(([kind, m]) => kind === 'info' && /已截到/.test(m)));
 });
 
+test('a window completed by the live tail says where the newest minutes come from and why it ends where it does', async () => {
+  const newestUs = Date.now() * 1000 - 30_000_000;
+  const live = {...impactResult, ready_through_us: newestUs,
+    tail: {from_us: impactResult.end_us - 600_000_000, through_us: impactResult.end_us, newest_us: newestUs, events: 17, pending_parts: 3},
+    coverage: {complete: true, total_parts: 40, covered_parts: 37, tail_parts: 3},
+    adjusted: {kind: 'truncated', reason: 'source_delay', requested_start_us: impactResult.start_us,
+      requested_end_us: impactResult.end_us + 120_000_000, truncated_us: 120_000_000}};
+  const {c, nodes, toasts} = rdsContext(async () => live);
+  await vm.runInContext('runAnalytics()', c);
+  const html = nodes['#analytics-panel-rise'].innerHTML;
+  assert.match(html, /已截到最近放齐的整分钟（比所选结束早 2 分钟）/);
+  assert.match(html, /阿里云每分钟才放出一批慢日志/);
+  assert.doesNotMatch(html, /还在入库|已自动改查/);
+  assert.match(html, /数据截至 <strong>[^<]+<\/strong>（最新一条慢日志，其中最近的 17 条是直接从阿里云实时读到的、还没进入库，落后现在约 3[0-9] 秒）/);
+  assert.ok(toasts.some(([kind, m]) => kind === 'info' && /阿里云还没放齐/.test(m)));
+  assert.match(nodes['#analytics-coverage'].innerHTML, /37\/40 个分区（另 3 个在途，由实时读取补上）/);
+  assert.equal(nodes['#analytics-end'].value, local(c, live.end_us));
+});
+
 test('an indexed window is neither moved nor announced; a missing index names the 6-hour search', async () => {
   const {c, nodes} = rdsContext(async () => ({...impactResult, adjusted: null}));
   await vm.runInContext('runAnalytics()', c);

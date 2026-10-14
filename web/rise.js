@@ -413,6 +413,10 @@ function riseAdjustNotice(data) {
   if (!moved) return "";
   const why = moved.reason === "incomplete_baseline_index" ? "所选时段对应的昨日对照日索引还不完整" : "所选时段的慢日志索引还不完整";
   const asked = `${escapeHtml(formatTime(moved.requested_start_us))} → ${escapeHtml(formatTime(moved.requested_end_us))}`;
+  if (moved.reason === "source_delay") {
+    return riseNotice(`已截到最近放齐的整分钟（比所选结束早 ${riseSpan(moved.truncated_us)}）`,
+      `阿里云每分钟才放出一批慢日志，最近约 80 秒的语句可能还没放齐（${asked}）：起点不变，结果只到 ${escapeHtml(formatTime(data.end_us))}。`);
+  }
   if (moved.kind === "truncated") {
     return riseNotice(`已截到最近已入库的时刻（比所选结束早 ${riseSpan(moved.truncated_us)}）`,
       `${why}（${asked}）：最新的慢日志还在入库，起点不变，结果只到 ${escapeHtml(formatTime(data.end_us))}；过几分钟再排查即可补上末尾。`);
@@ -425,8 +429,11 @@ function riseAdjustNotice(data) {
 // 离现在不远的窗口才报「数据截至」：更老的窗口早已入库，落后多少与它无关。
 function riseFreshness(data) {
   if (!data.ready_through_us) return "";
-  const behind = Math.max(0, Math.round((Date.now() - Number(data.ready_through_us) / 1000) / 60_000));
-  return `<p class="analytics-note">数据截至 <strong>${escapeHtml(formatTime(data.ready_through_us))}</strong>（最新已入库的慢日志，落后现在约 ${behind} 分钟）；慢日志在语句结束后才出现，窗口末尾仍在执行的长查询暂未计入，可点节点里的「看正在跑的查询」。</p>`;
+  const behindMs = Math.max(0, Date.now() - Number(data.ready_through_us) / 1000);
+  // With the live tail the label can honestly be a matter of seconds; without it the index is minutes behind, as before.
+  const behind = data.tail && behindMs < 120_000 ? `约 ${Math.round(behindMs / 1000)} 秒` : `约 ${Math.round(behindMs / 60_000)} 分钟`;
+  const what = data.tail ? `最新一条慢日志，其中最近的 ${humanCount(data.tail.events)} 条是直接从阿里云实时读到的、还没进入库` : "最新已入库的慢日志";
+  return `<p class="analytics-note">数据截至 <strong>${escapeHtml(formatTime(data.ready_through_us))}</strong>（${what}，落后现在${behind}）；慢日志在语句结束后才出现，窗口末尾仍在执行的长查询暂未计入，可点节点里的「看正在跑的查询」。</p>`;
 }
 
 // 表单和之后按需加载的明细都跟着改到实际查询的窗口。
@@ -470,7 +477,7 @@ function renderRise(data) {
 function renderRiseCoverage(data) {
   const node = $("#analytics-coverage");
   const cover = (label, coverage) => coverage
-    ? `${label} ${humanCount(coverage.covered_parts ?? coverage.total_parts)}/${humanCount(coverage.total_parts)} 个分区${coverage.complete ? "" : "（未完整）"}` : "";
+    ? `${label} ${humanCount(coverage.covered_parts ?? coverage.total_parts)}/${humanCount(coverage.total_parts)} 个分区${coverage.complete ? "" : "（未完整）"}${coverage.tail_parts ? `（另 ${humanCount(coverage.tail_parts)} 个在途，由实时读取补上）` : ""}` : "";
   const complete = data.coverage?.complete !== false && data.baseline_coverage?.complete !== false;
   node.className = `notice ${complete ? "info" : "warning"} compact-notice`;
   const text = [cover("慢日志", data.coverage), cover("对照日", data.baseline_coverage),
@@ -596,6 +603,7 @@ async function runRise() {
   if (target === "sql") await loadAnalyticsDetails();
   if (data) {
     if (!data.nodes?.length) toast(`无法排查：${riseMessage(data.status)}`, "error", 6000);
+    else if (data.adjusted?.reason === "source_delay") toast(`所选时段末尾阿里云还没放齐，已截到 ${formatTime(data.end_us)}`, "info", 6000);
     else if (data.adjusted?.kind === "truncated") toast(`所选时段末尾还没入库，已截到 ${formatTime(data.end_us)}`, "info", 6000);
     else if (data.adjusted) toast("所选时段没有完整索引，已改查最近的有索引时段", "info", 6000);
     else if (!failures.length) toast("排查完成", "success");

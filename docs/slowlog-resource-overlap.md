@@ -192,3 +192,17 @@ python tools/backtest_slowlog_impact.py --events private-events.json --baseline 
 - **回归**：`tests/test_lag_peers.py` 用合成序列覆盖：节点在某一分钟后慢查询率变成数倍（判慢、起点在 5 分钟内）、所有备节点一起延迟（不冤枉）、延迟段内读流量被摘除（单列、不进比值、不打断起点）、整段无读流量（`no_reads`）、小样本不判、缺样本不当零、无兄弟/无数据、指标读取失败只报告。`tests/test_slowlog_impact.py` 的 `LagPeerEvidenceTests` 覆盖按需读取、失败只记日志、写入热点按窗口去重；`tests/test_binlog_rows.py` 覆盖聚合查询的窗口与前一段；`tests/test_workspace.cjs` 覆盖卡片文案与转义。真实事件离线回放（云监控分钟序列，只含数值）：慢查询率每千次读 3.44 对 0.10（×35），起点与人工读曲线得到的时刻相差 3 分钟内；「所有备节点一起延迟」的晚上五个节点比值 0.64–1.23，都不判慢。
 
 验证：`python -m unittest tests.test_lag_peers tests.test_lag_origin tests.test_slowlog_impact tests.test_server_roles_and_windows tests.test_binlog_rows -q`；`node --test tests/test_workspace.cjs`。
+
+## 慢日志实时尾部：最近几分钟直接从阿里云读（1.33.0）
+
+起因：慢日志从语句结束到能在页面里查到，中位约 3.9 分钟，「数据截至」落后 3 到 4 分钟，排查刚发生的事时窗口末尾被截掉；要求落后不超过 1 分钟。拆开看：采集器要等到「现在往前 90 秒」之前再每 120 秒轮一次，约 3 分钟；采集提交到 ClickHouse 中位 55 秒（慢日志 indexer / ingester 受主机 I/O 压力闸门限速，磁盘压力长期在 10% 上下）。
+
+- **源头下限**：RDS 的 logagent 每分钟从 `mysql.slow_log` 取走一次并清表。2026-10-14 实测 DAS `DescribeSlowLogRecords`（5 个节点、6353 条，语句结束到接口里首次出现）：中位 41 秒，85% 在 60 秒内，98.5% 在 75 秒内，最长 83 秒。所以「最新一条语句距现在」每 20 秒直读一次可以压到约 50 秒内，但「一条不缺」最快也要 60 到 80 秒，这是源头的下限，采集再快也过不去。
+- **做法**（`app/slowlog_tail.py`）：每个登记采集的节点一个只读线程，每 20 秒读一次 DAS（接口默认最新在前，窗口按该节点的记录速率取 150 到 600 秒，启动时回填 15 分钟），内存里留 30 分钟。事件用采集器同一个构造函数（`build_slow_events`）生成，事件编号、指纹和各字段与入库后完全一致。某次读取失败或变慢造成停顿后，下一次读取会向回读过这段停顿，覆盖仍是一段（停顿超过回填窗口 15 分钟才重新起算）。不写任何文件；`RDS_BINLOG_SLOWLOG_TAIL=0` 整个关掉（没有线程、没有调用）。
+- **分析怎么用**：`query_resource_overlap(tail=…)`，只在窗口结束于最近 30 分钟内、且 ClickHouse 覆盖不完整时使用。条件：ClickHouse 在尾部覆盖开始之前完整（窗口起点在其中），还没进库的分区只能落在尾部覆盖的范围内，昨日对照日完整。窗口末尾取「最近一次读取开始时间减 90 秒」之前的最后一个整分钟（`adjusted.reason=source_delay`）；尾部事件按 `event_id` 与 ClickHouse 行去重后并入，节点、库、表、操作的过滤条件在内存里按同样规则再套一遍；SQLite 语句表里还没有的指纹，文本由尾部补上。任何一个节点最近 90 秒内没成功读过，整个实例的尾部就不作数，行为和 1.32 完全一样。
+- **响应字段**：多 `tail`（`from_us / through_us / newest_us / events / pending_parts`），`ready_through_us` 变成尾部最新一条语句的时间，`coverage.tail_parts` 是在途分区数；`GET /api/status` 多 `slowTail`（每个节点的事件数、覆盖起点、窗口、最近一次读取的用时与页数、失败次数和最近错误）。页面点开只存在于尾部的语句时，`/api/event` 在索引里找不到会去尾部取。
+- **保证与不保证**：开始时间早于「读取开始时间减 90 秒」、已经结束并被放出、且执行时间不超过读取窗口减 90 秒的语句都在尾部里（忙节点 150 秒窗口约 47 秒，闲节点 10 分钟窗口约 8 分钟）；更长的语句仍走常规入库，晚几分钟出现，和以前一样。仍在执行的语句慢日志里没有，页面照旧提示用「看正在跑的查询」。
+- **采集器同时修了一个卡死**：每轮要把水位线前 `replaySeconds`（默认 2 小时）整窗的所有页重翻一遍，窗口超过 3 万条（300 页）时旧代码一律不推进水位线，窗口只会越来越大，一个繁忙节点会永远卡住、每轮白翻 300 页；前向窗口又封顶在水位线之后 `maxWindowMinutes`（默认 120 分钟），封顶以后连新数据也不再读（2026-10-14 一个繁忙节点就这样在 17:46 之后停止入库）。现在利用接口按开始时间倒序：页数触顶丢的是最老的记录，读到的最老一条不晚于旧水位线就照常推进（只记一条警告），否则缩短前向窗口再来；回放窗口按上一轮看到的速率收缩到每轮约 120 页以内，慢下来再长回配置值。状态里多 `replayNowSeconds` 与 `windowRecords`。
+- **回归**：`tests/test_slowlog_tail.py`（读取、迟到记录、窗口随速率、保留期、停读失效、间隔过大重起覆盖、页数触顶只保证读到的部分、失败日志、总开关、线程）；`tests/test_slowlog_collector.py`（页数触顶仍推进水位线、新部分被截时缩短前向窗口且不丢、回放窗口随速率、共用事件构造函数）；`tests/test_slowlog_impact.py`（尾部补齐窗口、去重、范围传给尾部、指纹文本、无尾部与尾部失败的回退、旧窗口与完整索引不用尾部）；`tests/test_server_roles_and_windows.py`（接线、详情、状态）；`tests/test_workspace.cjs`（页面文案）。
+
+验证：`python -m unittest tests.test_slowlog_tail tests.test_slowlog_collector tests.test_slowlog_impact tests.test_server_roles_and_windows -q`；`node --test tests/test_workspace.cjs`。

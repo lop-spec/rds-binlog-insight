@@ -328,6 +328,28 @@ class MetricSelectionTests(unittest.TestCase):
 MIN = 60_000_000
 
 
+class FakeTail:
+    """What ``SlowLogTails`` offers the analysis: a view of what the live tail vouches for, its rows and the texts it kept."""
+
+    def __init__(self, view, rows=(), profiles=None, fail=False):
+        self._view, self._rows, self._profiles, self.fail = view, list(rows), dict(profiles or {}), fail
+        self.views, self.row_asks, self.profile_asks = [], [], []
+
+    def view(self, instance):
+        self.views.append(instance)
+        if self.fail:
+            raise RuntimeError("tail down")
+        return self._view
+
+    def rows(self, instance, low, high, query):
+        self.row_asks.append((instance, low, high, dict(query)))
+        return [dict(row) for row in self._rows if low <= row["start_us"] <= high]
+
+    def profiles(self, keys):
+        self.profile_asks.append(set(keys))
+        return {key: self._profiles[key] for key in keys if key in self._profiles}
+
+
 class IndexedWindowTests(unittest.TestCase):
     """A window whose slow-log index (or day-before baseline index) is incomplete moves to the nearest one that is."""
     NOW = 1_790_000_040_000_000  # a whole minute
@@ -477,6 +499,121 @@ class IndexedWindowTests(unittest.TestCase):
         self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 60), (start - MIN, end - MIN))
         # two days of retention: an earlier window's baseline day would be expired, so only the far later side qualifies
         self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 2), (self.NOW - DAY_US, self.NOW - DAY_US + 3600 * 1_000_000))
+
+    # --- the live tail (slowlog_tail): a window ending now takes the part ClickHouse does not have yet from it ---
+
+    def tail_window(self):
+        ready_until = (self.NOW - 12 * MIN) // self.STEP * self.STEP
+        metadata, backend = self.fixture({p["path"] for p in self.parts if p["max_event_epoch_us"] > ready_until})
+        backend.statement_index.statement_profiles.return_value = {}
+        return metadata, backend, ready_until
+
+    def tail_view(self, **fields):
+        base = dict(covered_from_us=self.NOW - 30 * MIN, complete_through_us=self.NOW - 100_000_000, newest_us=self.NOW - 30_000_000,
+                    nodes=1, events=3)
+        return {**base, **fields}
+
+    @staticmethod
+    def live(name, start, node="a", fingerprint="fz"):
+        return dict(event_id=name, start_us=start, node_id=node, database_name="d", fingerprint=fingerprint, sql_id=fingerprint,
+                    duration_ms=60000, rows_examined=None, lock_time_ms=None, account="app")
+
+    def test_the_live_tail_completes_a_window_ending_now_where_the_index_cannot(self):
+        metadata, backend, ready_until = self.tail_window()
+        start, end = self.NOW - 60 * MIN, self.NOW
+        tail = FakeTail(self.tail_view(), [self.live("live-1", self.NOW - 3 * MIN), self.live("live-2", self.NOW - 90_000_000),
+                                           self.live("too-old", ready_until - 40 * MIN), self.live("too-new", self.NOW - 30_000_000)])
+        result, loader = self.query(metadata, backend, start, end, tail=tail)
+        cut = self.NOW - 2 * MIN  # the last whole minute before "scan start - 90 s"
+        self.assertEqual(result["adjusted"], dict(kind="truncated", reason="source_delay", requested_start_us=start,
+                                                  requested_end_us=end, truncated_us=end - cut))
+        self.assertEqual((result["start_us"], result["end_us"]), (start, cut))
+        self.assertEqual(loader.call_args_list[0].args[1:3], (start, cut))
+        self.assertEqual(loader.call_args_list[1].args[1:3], (start - DAY_US, cut - DAY_US))  # the baseline day is read from ClickHouse
+        self.assertTrue(result["coverage"]["complete"])
+        self.assertGreater(result["coverage"]["tail_parts"], 0)
+        self.assertEqual(result["tail"], dict(from_us=self.NOW - 30 * MIN, through_us=cut, newest_us=self.NOW - 30_000_000, events=1,
+                                              pending_parts=result["coverage"]["tail_parts"]))
+        # one ClickHouse row and live-1; live-2 and too-new start after the cut, too-old before the tail's coverage
+        self.assertEqual(result["executions"], 2)
+        self.assertEqual(result["ready_through_us"], self.NOW - 30_000_000)  # the newest statement the tail holds
+        self.assertEqual(tail.views, ["x"])
+        self.assertEqual(tail.row_asks[0][:3], ("x", self.NOW - 30 * MIN, cut))
+
+    def test_a_row_clickhouse_already_has_is_counted_once_and_the_scope_goes_to_the_tail(self):
+        metadata, backend, _ready = self.tail_window()
+        start = self.NOW - 60 * MIN
+        known = f"e{start}"  # the id the fixture gives the row it reads for this window
+        tail = FakeTail(self.tail_view(), [self.live(known, start + MIN), self.live("live-1", self.NOW - 3 * MIN)])
+        result, _loader = self.query(metadata, backend, start, self.NOW, tail=tail)
+        self.assertEqual((result["executions"], result["tail"]["events"]), (2, 1))
+        scoped = FakeTail(self.tail_view(), [])
+        query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "node_id": "a", "database": "d",
+                                                   "start_epoch_us": start, "end_epoch_us": self.NOW}, Settings(), Mock(return_value=[]),
+                               tail=scoped)
+        asked = scoped.row_asks[0][3]
+        self.assertEqual({key: asked[key] for key in ("node_id", "database", "instance")}, {"node_id": "a", "database": "d", "instance": "x"})
+
+    def test_a_fingerprint_only_the_tail_has_seen_gets_its_text_from_the_tail(self):
+        metadata, backend, _ready = self.tail_window()
+        start, cut = self.NOW - 12 * MIN, self.NOW - 2 * MIN
+        window = [dict(event_id="ch-1", start_us=start + 6 * MIN, node_id="a", database_name="d", fingerprint="fch", sql_id="fch",
+                       duration_ms=60000, rows_examined=1, lock_time_ms=None, account="app")]
+        backend._rows.side_effect = lambda sql, params, _: window if params["low"] == start else []
+        values = [10, 10, 10, 10, 10, 10, 90, 90, 90, 90]
+        loader = Mock(side_effect=[[dict(timestamp=(start + (i + 1) * MIN) // 1000, nodeId="a", Average=v) for i, v in enumerate(values)],
+                                   [dict(timestamp=(start - DAY_US + (i + 1) * MIN) // 1000, nodeId="a", Average=10) for i in range(10)]])
+        profile = {"action": "SELECT", "normalized_sql": "select ? from fresh_table", "sample_sql": "SELECT 1 FROM fresh_table",
+                   "sql_id": "fz", "instance_id": "x", "fingerprint": "fz", "first_seen_us": 1, "last_seen_us": 2}
+        tail = FakeTail(self.tail_view(), [self.live("live-1", start + 8 * MIN, fingerprint="fz")], {("x", "fz"): profile})
+        result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "start_epoch_us": start,
+                                                            "end_epoch_us": self.NOW}, Settings(), loader, tail=tail)
+        self.assertEqual((result["start_us"], result["end_us"]), (start, cut))
+        rows = {row["sql_id"]: row for row in result["nodes"][0]["statements"]}
+        self.assertEqual(sorted(rows), ["fch", "fz"])
+        self.assertEqual(rows["fz"]["normalized_sql"], "select ? from fresh_table")  # not in the statement table, so the tail's text
+        self.assertNotIn("normalized_sql", rows["fch"])
+        self.assertEqual(tail.profile_asks, [{("x", "fch"), ("x", "fz")}])
+
+    def test_without_a_usable_tail_the_window_is_cut_at_the_indexed_edge_as_before(self):
+        metadata, backend, ready_until = self.tail_window()
+        start, end = self.NOW - 60 * MIN, self.NOW
+        cut = ready_until - MIN
+        for tail in (FakeTail(None), None):  # no tail vouching for the instance, or no tail service at all
+            result, _loader = self.query(metadata, backend, start, end, tail=tail)
+            self.assertEqual(result["adjusted"], dict(kind="truncated", reason="incomplete_index", requested_start_us=start,
+                                                      requested_end_us=end, truncated_us=end - cut))
+            self.assertIsNone(result["tail"])
+            self.assertEqual(result["ready_through_us"], ready_until)
+        with self.assertLogs("app.slowlog_impact_service", "WARNING") as logs:
+            result, _loader = self.query(metadata, backend, start, end, tail=FakeTail(None, fail=True))
+        self.assertTrue(any("live tail unavailable" in line for line in logs.output))
+        self.assertEqual(result["adjusted"]["reason"], "incomplete_index")
+
+    def test_a_part_still_missing_before_the_tail_starts_keeps_the_old_behaviour(self):
+        metadata, backend, ready_until = self.tail_window()
+        start, end = self.NOW - 60 * MIN, self.NOW
+        late = FakeTail(self.tail_view(covered_from_us=ready_until + 5 * MIN))  # the first missing part starts at ready_until
+        result, _loader = self.query(metadata, backend, start, end, tail=late)
+        self.assertEqual(result["adjusted"]["reason"], "incomplete_index")
+        self.assertIsNone(result["tail"])
+        self.assertEqual(late.row_asks, [])
+        short = FakeTail(self.tail_view(complete_through_us=start + 4 * MIN))  # less than the ranker's six clean minutes
+        result, _loader = self.query(metadata, backend, start, end, tail=short)
+        self.assertEqual(result["adjusted"]["reason"], "incomplete_index")
+
+    def test_a_complete_index_or_an_old_window_never_uses_the_tail(self):
+        metadata, backend = self.fixture()
+        start, end = self.NOW - 3 * 3600 * 1_000_000, self.NOW - 2 * 3600 * 1_000_000
+        tail = FakeTail(self.tail_view())
+        result, _loader = self.query(metadata, backend, start, end, tail=tail)
+        self.assertIsNone(result["tail"])
+        self.assertEqual(tail.views, [])  # a complete index does not ask
+        metadata2, backend2, _ready = self.tail_window()
+        hole = FakeTail(self.tail_view())
+        result, _loader = self.query(metadata2, backend2, self.NOW - 3 * 3600 * 1_000_000,
+                                     self.NOW - 2 * 3600 * 1_000_000 + 30 * MIN, tail=hole)
+        self.assertIsNone(result["tail"])
 
 
 def lag_points(levels, node="r", first_ms=0):
