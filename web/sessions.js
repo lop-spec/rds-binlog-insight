@@ -24,6 +24,9 @@ const SESSION_ERROR_TEXT = {
 
 const sessionsState = {
   initialized: false,
+  autoLoaded: false,
+  instanceHtml: "",
+  nodeHtml: "",
   mode: "live",
   data: null,
   history: null,
@@ -256,21 +259,49 @@ function sessionNodesOf(instanceId) {
   return [...nodes.values()].sort((a, b) => ((a.role === "primary" ? 0 : a.role === "secondary" ? 1 : 2) - (b.role === "primary" ? 0 : b.role === "secondary" ? 1 : 2)) || String(a.nodeId).localeCompare(String(b.nodeId)));
 }
 
+// The status poll calls this every few seconds: a list is only rewritten when its options changed, so an open dropdown stays open.
 function syncSessionControls() {
   const instances = sessionInstances();
   const instance = $("#sessions-instance");
-  if (instance && !instance.options?.length) {
-    instance.innerHTML = instances.map(([id, label]) => `<option value="${escapeHtml(id)}">${escapeHtml(label)}</option>`).join("");
-    const primary = sessionsPrimaryInstance();
-    instance.value = instances.some(([id]) => id === primary) ? primary : (instances[0]?.[0] || "");
+  if (instance) {
+    const html = instances.map(([id, label]) => `<option value="${escapeHtml(id)}">${escapeHtml(label)}</option>`).join("");
+    if (html !== sessionsState.instanceHtml) {
+      const keep = instance.value || "";
+      const primary = sessionsPrimaryInstance();
+      sessionsState.instanceHtml = html;
+      instance.innerHTML = html;
+      instance.value = [keep, primary, instances[0]?.[0] || ""].find((id) => id && instances.some(([known]) => known === id)) || "";
+    }
   }
   const picked = instance?.value || "";
   const node = $("#sessions-node");
   if (node) {
-    const keep = node.value || "";
-    node.innerHTML = `<option value="">全部节点</option>${sessionNodesOf(picked).map((item) =>
+    const items = sessionNodesOf(picked);
+    const html = `<option value="">全部节点</option>${items.map((item) =>
       `<option value="${escapeHtml(item.nodeId)}">${escapeHtml([nodeRoleText(item.role), nodeZoneText(item.zone), item.nodeId].filter(Boolean).join(" · "))}</option>`).join("")}`;
-    node.value = [...(sessionNodesOf(picked))].some((item) => item.nodeId === keep) ? keep : "";
+    if (html !== sessionsState.nodeHtml) {
+      const keep = node.value || "";
+      sessionsState.nodeHtml = html;
+      node.innerHTML = html;
+      node.value = items.some((item) => item.nodeId === keep) ? keep : "";
+    }
+  }
+}
+
+// The page may be opened before the first status answer arrives: the lists fill in and the first read happens when it does.
+function maybeAutoLoadSessions() {
+  if (sessionsState.autoLoaded || sessionsState.mode !== "live" || !($("#sessions-instance")?.value)) return;
+  sessionsState.autoLoaded = true;
+  withBusy($("#sessions-refresh"), runSessions, "读取中…").catch((error) => toast(error.message, "error", 6000));
+}
+
+// refreshStatus() calls this inside its own try block: a fault on this page must not turn the service indicator red.
+function onSessionsStatus() {
+  try {
+    syncSessionControls();
+    if (state.view === "sessions" && sessionsState.initialized) maybeAutoLoadSessions();
+  } catch (error) {
+    console.error("sessions: status sync failed", error);
   }
 }
 
@@ -592,7 +623,7 @@ function sessionsInput(event) {
 }
 
 function initSessionsView() {
-  if (sessionsState.initialized) { syncSessionControls(); return; }
+  if (sessionsState.initialized) { onSessionsStatus(); return; }
   sessionsState.initialized = true;
   syncSessionControls();
   const view = $("#view-sessions");
@@ -605,5 +636,5 @@ function initSessionsView() {
   });
   setSessionsMode("live");
   refreshSessionsRetention();
-  if (sessionInstances().length) withBusy($("#sessions-refresh"), runSessions, "读取中…").catch((error) => toast(error.message, "error", 6000));
+  maybeAutoLoadSessions();
 }

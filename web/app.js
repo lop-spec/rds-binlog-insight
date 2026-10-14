@@ -1196,6 +1196,7 @@ async function refreshStatus() {
     state.status = data;
     syncInstanceOptions(data.instances || [], instanceLabels(data));
     syncSlowLogNodeOptions(data.slowLogs || []);
+    if (typeof onSessionsStatus === "function") onSessionsStatus();
     $("#app-version").textContent =
       `v${data.version || "—"}`;
     const summary = data.summary || {};

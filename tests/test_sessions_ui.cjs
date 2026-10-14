@@ -351,3 +351,88 @@ test('delegated clicks: tabs, stats rows, SQL expand and the mode switch work fr
   run('sessionsClick')({target: target({'data-session-mode': {sessionMode: 'history'}})});
   assert.equal(run('sessionsState.mode'), 'history');
 });
+
+test('opened before the first status answer: the lists fill and the first read happens when it arrives; later polls leave the dropdowns and the data alone', async () => {
+  const status = {primaryInstance: {instanceId: 'rm-prod'}, slowLogs: [
+    {instanceId: 'rm-test', nodeId: 'rn-t1', label: 'demo-test', role: 'primary', zone: 'cn-chengdu-a'},
+    {instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary', zone: 'cn-chengdu-a'},
+    {instanceId: 'rm-prod', nodeId: 'rn-b', label: 'demo-main', role: 'secondary', zone: 'cn-chengdu-b'}]};
+  const retention = {enabled: true, interval_seconds: 60, retention_days: 7, nodes: [], store: {}};
+  const {run, nodes, calls} = context({api: async (url) => (url.startsWith('/api/sessions?') ? payload() : retention)});
+  nodes['#sessions-instance'] = {innerHTML: '', value: '', options: []};
+  nodes['#sessions-node'] = {innerHTML: '', value: ''};
+  const reads = () => calls.filter(([url]) => url.startsWith('/api/sessions?'));
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  run('state.view = "sessions"');
+  run('initSessionsView()');                                                    // the page is open, the status has not been answered yet
+  await settle();
+  assert.equal(reads().length, 0);
+  assert.equal(nodes['#sessions-instance'].value, '');
+
+  run(`state.status = ${JSON.stringify(status)}; onSessionsStatus()`);          // the first answer
+  await settle();
+  assert.equal(nodes['#sessions-instance'].value, 'rm-prod');
+  assert.match(nodes['#sessions-node'].innerHTML, /rn-p[^]*rn-b/);
+  assert.equal(reads().length, 1);
+  assert.equal(new URL(reads()[0][0], 'http://x').searchParams.get('instance'), 'rm-prod');
+
+  nodes['#sessions-instance'].value = 'rm-test';                                // the user picks another instance
+  run('sessionsChange({target: {id: "sessions-instance"}})');
+  assert.match(nodes['#sessions-node'].innerHTML, /rn-t1/);
+  assert.doesNotMatch(nodes['#sessions-node'].innerHTML, /rn-p/);
+
+  nodes['#sessions-instance'].innerHTML = 'untouched-instances';                // the poll comes every few seconds: nothing changed, nothing is rewritten
+  nodes['#sessions-node'].innerHTML = 'untouched-nodes';
+  run('onSessionsStatus()');
+  await settle();
+  assert.equal(nodes['#sessions-instance'].innerHTML, 'untouched-instances');
+  assert.equal(nodes['#sessions-node'].innerHTML, 'untouched-nodes');
+  assert.equal(nodes['#sessions-instance'].value, 'rm-test');
+  assert.equal(reads().length, 1);                                              // and it does not read again
+
+  nodes['#sessions-node'].value = 'rn-t1';                                      // a node is added: that list is rewritten and the picked node stays picked
+  status.slowLogs.push({instanceId: 'rm-test', nodeId: 'rn-t2', label: 'demo-test', role: 'secondary', zone: 'cn-chengdu-b'});
+  run(`state.status = ${JSON.stringify(status)}; onSessionsStatus()`);
+  assert.match(nodes['#sessions-node'].innerHTML, /rn-t1[^]*rn-t2/);
+  assert.equal(nodes['#sessions-node'].value, 'rn-t1');
+  assert.equal(nodes['#sessions-instance'].innerHTML, 'untouched-instances');
+  assert.equal(reads().length, 1);
+
+  status.slowLogs = status.slowLogs.filter((item) => item.instanceId !== 'rm-test');   // the picked instance disappears: back to the primary instance
+  run(`state.status = ${JSON.stringify(status)}; onSessionsStatus()`);
+  assert.equal(nodes['#sessions-instance'].value, 'rm-prod');
+  assert.equal(nodes['#sessions-node'].value, '');
+});
+
+test('status answered while another page is open: the lists are ready and the first visit reads once; the history mode never auto-reads', async () => {
+  const status = {primaryInstance: {instanceId: 'rm-prod'}, slowLogs: [{instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary', zone: 'cn-chengdu-a'}]};
+  const retention = {enabled: true, interval_seconds: 60, retention_days: 7, nodes: [], store: {}};
+  const make = () => {
+    const made = context({api: async (url) => (url.startsWith('/api/sessions?') ? payload() : retention)});
+    made.nodes['#sessions-instance'] = {innerHTML: '', value: '', options: []};
+    made.nodes['#sessions-node'] = {innerHTML: '', value: ''};
+    made.reads = () => made.calls.filter(([url]) => url.startsWith('/api/sessions?'));
+    return made;
+  };
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  const away = make();
+  away.run('state.view = "audit"');
+  away.run(`state.status = ${JSON.stringify(status)}; onSessionsStatus()`);
+  await settle();
+  assert.equal(away.nodes['#sessions-instance'].value, 'rm-prod');
+  assert.equal(away.reads().length, 0);                                         // nobody is looking at the page
+  away.run('state.view = "sessions"; initSessionsView()');
+  await settle();
+  assert.equal(away.reads().length, 1);
+  away.run('state.view = "audit"; state.view = "sessions"; initSessionsView(); onSessionsStatus()');
+  await settle();
+  assert.equal(away.reads().length, 1);                                         // coming back to the page does not read again
+
+  const history = make();
+  history.run('state.view = "sessions"; initSessionsView(); sessionsState.mode = "history"');
+  history.run(`state.status = ${JSON.stringify(status)}; onSessionsStatus()`);
+  await settle();
+  assert.equal(history.reads().length, 0);
+});
