@@ -10,6 +10,11 @@ wait for a metadata lock, the sessions that can be holding it.
 Ending a session is not done here. The service has a read-only cloud identity and no database account, so "kill" is a
 text: ``build_kill_statements`` writes the KILL statements (and the statements to check first) for a person to run on the
 node. Nothing in this module talks to a database.
+
+A cluster-edition instance has no address per node: a person connects to the read/write splitting address, where a plain
+statement lands on a node the proxy picks and the id of a session is only meaningful on its own node. Each statement is
+therefore written with the proxy's routing hint (``/*FORCE_NODE='<node id>'*/`` for a standby, ``/*FORCE_MASTER*/`` for the
+primary); on a direct connection the hint is only a comment.
 """
 from __future__ import annotations
 
@@ -28,6 +33,8 @@ LIST_OTHER_LIMIT = 1500
 STATS_LIMIT = 30
 HOLDER_LIMIT = 20
 MAX_KILL_SESSIONS = 200
+# What a node id must look like to be written inside a hint (they come from the node registry; this is the second lock).
+NODE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 # Waits that are about a lock held by somebody else's transaction or statement (the victims of a stuck DDL).
 LOCK_WAIT_WORDS = ("metadata lock", "global read lock", "backup lock", "commit lock", "table flush")
 INTERNAL_USERS = frozenset({"system user", "event_scheduler", "aliyun_root"})
@@ -204,12 +211,26 @@ def _plain(value: Any, limit: int = 80) -> str:
     return text.replace("/*", "/ *").replace("*/", "* /")[:limit]
 
 
+def route_hint(node: dict[str, Any]) -> tuple[str, str]:
+    """The read/write splitting hint that sends a statement to this node, as (name for a comment, text for the statement).
+
+    Empty when the node id cannot be written inside a hint safely: the text then asks for a connection to the node itself.
+    """
+    if str(node.get("role") or "") == "primary":
+        return "FORCE_MASTER", "/*FORCE_MASTER*/ "
+    node_id = str(node.get("node_id") or "")
+    if NODE_ID_PATTERN.fullmatch(node_id):
+        return f"FORCE_NODE='{node_id}'", f"/*FORCE_NODE='{node_id}'*/ "
+    return "", ""
+
+
 def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], *, mode: str, snapshot_us: int,
                           generated_us: int) -> dict[str, Any]:
     """The statements to end the given sessions on one node, with what to run first to check them.
 
-    ``sessions`` are rows of a snapshot as the page displayed them. Only integers become code; every other value is
-    written inside comments and cleaned first, so a user name cannot smuggle a statement into the text.
+    ``sessions`` are rows of a snapshot as the page displayed them. Only integers become code (and the hint, built from a
+    node id that matched ``NODE_ID_PATTERN``); every other value is written inside comments and cleaned first, so a user
+    name cannot smuggle a statement into the text.
     """
     if mode not in ("connection", "query"):
         raise ValueError("mode 必须是 connection 或 query")
@@ -234,21 +255,35 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
     def stamp(us: int) -> str:
         return datetime.fromtimestamp(us / 1_000_000, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    primary = str(node.get("role") or "") == "primary"
     role = {"primary": "主节点", "secondary": "备节点"}.get(str(node.get("role") or ""), "节点角色未知")
-    lines = [f"-- SQL Insight 会话管理 · 生成于 {stamp(generated_us)} · 会话快照 {stamp(snapshot_us)}",
-             f"-- {role} {_plain(node.get('node_id'), 40)}{' · ' + _plain(node.get('zone'), 24) if node.get('zone') else ''}："
-             "KILL 只对本节点的会话号有效，请连到这个节点执行；读写分离地址会落到不确定的节点。"]
+    hint_name, hint = route_hint(node)
+    where = f"{role} {_plain(node.get('node_id'), 40)}{' · ' + _plain(node.get('zone'), 24) if node.get('zone') else ''}"
+    lines = [f"-- SQL Insight 会话管理 · 生成于 {stamp(generated_us)} · 会话快照 {stamp(snapshot_us)}"]
+    if hint:
+        lines.append(f"-- {where}：会话号只在本节点有效。每条语句都带 Hint {hint_name}：经读写分离地址执行时落到这个节点，"
+                     "直连节点或主地址时它只是注释；用 mysql 命令行要加 -c，否则 Hint 会被命令行工具过滤。")
+    else:
+        lines.append(f"-- {where}：会话号只在本节点有效，请连到这个节点执行；这个节点 ID 不能安全地写进 Hint，读写分离地址会落到不确定的节点。")
     ids = sorted(keep)
     statements: list[str] = []
     if ids:
         listing = ", ".join(str(i) for i in ids)
         check = ("SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
                  f"FROM information_schema.PROCESSLIST WHERE ID IN ({listing});")
-        lines += ["-- 1. 先核对：会话还在，且仍是快照里的那个（用户、来源、命令、时长对得上）再往下执行", check,
+        lines += ["-- 1. 先核对：会话还在，且仍是快照里的那个（用户、来源、命令、时长对得上）再往下执行", hint + check,
                   "-- 2. 会话在等元数据锁时，先找出真正持锁的会话（需要 performance_schema 的 metadata_locks，MySQL 8.0）",
-                  "SELECT * FROM sys.schema_table_lock_waits;"]
-        lines.append("-- 3. 结束会话" + ("（KILL 结束连接并回滚它未提交的事务）" if mode == "connection"
-                                        else "（KILL QUERY 只终止当前语句，空闲会话不受影响）"))
+                  hint + "SELECT * FROM sys.schema_table_lock_waits;"]
+        step = 3
+        guarded = bool(hint) and not primary
+        if guarded:
+            lines += [f"-- {step}. 保险：确认主节点上没有同号线程（阿里云文档没写 KILL 是否遵循 FORCE_NODE，没按 Hint 走时它会落到主节点）；应返回 0 行",
+                      f"/*FORCE_MASTER*/ SELECT ID, USER, HOST, TIME FROM information_schema.PROCESSLIST WHERE ID IN ({listing});"]
+            step += 1
+        lines.append(f"-- {step}. 结束会话" + ("（KILL 结束连接并回滚它未提交的事务）" if mode == "connection"
+                                            else "（KILL QUERY 只终止当前语句，空闲会话不受影响）"))
+        if guarded:
+            lines.append("-- 执行后重跑第 1 步：会话没了才算杀掉；报 Unknown thread id 说明这条 KILL 没落到本节点（第 3 步为 0 行时不会误杀别的会话）。")
         for session_id in ids:
             row = keep[session_id]
             note = " ".join(part for part in (
@@ -256,7 +291,7 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
                 _plain(row.get("command"), 16), f"{_seconds(row.get('seconds'))}s",
                 f"事务 {_seconds(row.get('trx_seconds'))}s" if _seconds(row.get("trx_seconds")) else "",
                 "/".join(KIND_LABELS.get(str(kind), "") for kind in (row.get("kinds") or []) if str(kind) in KIND_LABELS)) if part)
-            statement = f"{verb} {session_id};"
+            statement = f"{hint}{verb} {session_id};"
             statements.append(statement)
             lines.append(f"{statement}  -- {note}")
     for item in skipped:

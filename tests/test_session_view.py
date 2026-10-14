@@ -3,7 +3,7 @@ import unittest
 from datetime import UTC, datetime
 
 from app.session_view import (DEFAULT_THRESHOLDS, HOLDER_LIMIT, LIST_ACTIVE_LIMIT, MAX_KILL_SESSIONS, build_kill_statements,
-                              build_session_view, is_lock_wait, parse_thresholds, protected_reason)
+                              build_session_view, is_lock_wait, parse_thresholds, protected_reason, route_hint)
 
 MDL = "Waiting for table metadata lock"
 
@@ -190,7 +190,7 @@ class KillStatementTests(unittest.TestCase):
 
     def test_the_text_checks_first_then_kills_in_id_order_with_a_comment_per_session(self):
         out = build_kill_statements(self.NODE, self.rows(), mode="connection", snapshot_us=1_790_000_000_000_000, generated_us=1_790_000_060_000_000)
-        self.assertEqual(out["statements"], ["KILL 44;", "KILL 312;"])
+        self.assertEqual(out["statements"], ["/*FORCE_NODE='rn-lagging'*/ KILL 44;", "/*FORCE_NODE='rn-lagging'*/ KILL 312;"])
         self.assertEqual(out["session_ids"], [44, 312])
         text = out["text"]
         self.assertIn("备节点 rn-lagging · cn-chengdu-b", text)
@@ -203,7 +203,7 @@ class KillStatementTests(unittest.TestCase):
 
     def test_query_mode_writes_kill_query(self):
         out = build_kill_statements(self.NODE, self.rows(), mode="query", snapshot_us=1, generated_us=2)
-        self.assertEqual(out["statements"], ["KILL QUERY 44;", "KILL QUERY 312;"])
+        self.assertEqual(out["statements"], ["/*FORCE_NODE='rn-lagging'*/ KILL QUERY 44;", "/*FORCE_NODE='rn-lagging'*/ KILL QUERY 312;"])
         self.assertIn("空闲会话不受影响", out["text"])
 
     def test_protected_sessions_are_skipped_with_the_reason_and_duplicates_collapse(self):
@@ -223,16 +223,57 @@ class KillStatementTests(unittest.TestCase):
         self.assertNotIn("PROCESSLIST", out["text"])
 
     def test_a_user_name_cannot_put_a_statement_into_the_text(self):
-        evil = dict(session_id=5, user="x\nKILL 1; --", client="10.0.0.1 */ DROP TABLE t; /*", database="d\r\nSELECT 1;", command="Query KILL 2;",
+        evil = dict(session_id=5, user="x\nKILL 1; --", client="10.0.0.1 */ DROP TABLE t; /*", database="d\r\nSELECT 1;", command="Query KILL 2;",
                     seconds=99, kinds=[])
         out = build_kill_statements({"node_id": "rn-1\nKILL 3;", "role": "primary", "zone": "z\nKILL 4;"}, [evil], mode="connection", snapshot_us=1, generated_us=2)
+        allowed = ("", "/*FORCE_MASTER*/ SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (5);",
+                   "/*FORCE_MASTER*/ SELECT * FROM sys.schema_table_lock_waits;", "/*FORCE_MASTER*/ KILL 5;")
         for line in out["text"].splitlines():
             if not line.startswith("--"):
-                self.assertIn(line.split("  --")[0], ("", "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (5);",
-                                                    "SELECT * FROM sys.schema_table_lock_waits;", "KILL 5;"))
-        self.assertEqual(out["statements"], ["KILL 5;"])
-        self.assertNotIn("*/", out["text"])
+                self.assertIn(line.split("  --")[0], allowed)
+        self.assertEqual(out["statements"], ["/*FORCE_MASTER*/ KILL 5;"])
+        bare = out["text"].replace("/*FORCE_MASTER*/", "")                  # the hint is the only comment the text may open
+        self.assertNotIn("*/", bare)
+        self.assertNotIn("/*", bare)
+
+    def test_a_node_id_that_cannot_sit_in_a_hint_leaves_the_hint_out(self):
+        out = build_kill_statements({"node_id": "rn-1'*/ KILL 3; /*", "role": "secondary", "zone": "z"}, self.rows()[:1], mode="connection", snapshot_us=1, generated_us=2)
+        self.assertEqual(out["statements"], ["KILL 312;"])
         self.assertNotIn("/*", out["text"])
+        self.assertNotIn("*/", out["text"])
+        self.assertNotIn("FORCE_", out["text"])                            # no hint, and so no primary guard either: nothing to guard
+        self.assertIn("请连到这个节点执行", out["text"])
+
+    def test_a_standby_statement_carries_its_node_and_the_text_guards_the_primary(self):
+        out = build_kill_statements(self.NODE, self.rows(), mode="connection", snapshot_us=1, generated_us=2)
+        hint = "/*FORCE_NODE='rn-lagging'*/ "
+        code = [line for line in out["text"].splitlines() if not line.startswith("--")]
+        self.assertEqual(code[0], hint + "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (44, 312);")
+        self.assertEqual(code[1], hint + "SELECT * FROM sys.schema_table_lock_waits;")
+        self.assertEqual(code[2], "/*FORCE_MASTER*/ SELECT ID, USER, HOST, TIME FROM information_schema.PROCESSLIST WHERE ID IN (44, 312);")
+        self.assertTrue(code[3].startswith(hint + "KILL 44;") and code[4].startswith(hint + "KILL 312;"))
+        self.assertEqual(len(code), 5)
+        text = out["text"]
+        self.assertIn("每条语句都带 Hint FORCE_NODE='rn-lagging'", text)
+        self.assertIn("-- 4. 结束会话", text)
+        self.assertIn("应返回 0 行", text)
+        self.assertIn("报 Unknown thread id 说明这条 KILL 没落到本节点", text)
+        self.assertLess(text.index("/*FORCE_MASTER*/ SELECT ID"), text.index("KILL 44;"))     # the primary is checked before any KILL
+
+    def test_a_primary_uses_force_master_and_needs_no_primary_guard(self):
+        out = build_kill_statements({"node_id": "rn-main", "role": "primary", "zone": "cn-chengdu-a"}, self.rows(), mode="query", snapshot_us=1, generated_us=2)
+        self.assertEqual(out["statements"], ["/*FORCE_MASTER*/ KILL QUERY 44;", "/*FORCE_MASTER*/ KILL QUERY 312;"])
+        self.assertIn("每条语句都带 Hint FORCE_MASTER", out["text"])
+        self.assertNotIn("保险", out["text"])
+        self.assertIn("-- 3. 结束会话", out["text"])
+        self.assertEqual(len([line for line in out["text"].splitlines() if line.startswith("/*FORCE_MASTER*/ SELECT")]), 2)
+
+    def test_route_hint_takes_only_plain_node_ids(self):
+        self.assertEqual(route_hint({"node_id": "rn-2vc30k3p577h52e01", "role": "secondary"}), ("FORCE_NODE='rn-2vc30k3p577h52e01'", "/*FORCE_NODE='rn-2vc30k3p577h52e01'*/ "))
+        self.assertEqual(route_hint({"node_id": "rn-x"}), ("FORCE_NODE='rn-x'", "/*FORCE_NODE='rn-x'*/ "))     # an unknown role still goes to its node
+        self.assertEqual(route_hint({"node_id": "anything'", "role": "primary"}), ("FORCE_MASTER", "/*FORCE_MASTER*/ "))
+        for bad in ("", None, "rn-1'*/", "rn 1", "rn-1\n", "-rn", "r" * 65, "节点"):
+            self.assertEqual(route_hint({"node_id": bad, "role": "secondary"}), ("", ""), repr(bad))
 
     def test_inputs_are_checked(self):
         for kwargs, rows in ((dict(mode="drop"), self.rows()), (dict(mode="connection"), []),

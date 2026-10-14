@@ -106,7 +106,7 @@ class ServiceTests(unittest.TestCase):
     def test_kill_statements_are_written_never_run_and_leave_a_log_line(self):
         with self.assertLogs("app.session_service", "INFO") as logs:
             out = self.service.kill_statements(self.payload())
-        self.assertEqual(out["statements"], ["KILL 2;"])
+        self.assertEqual(out["statements"], ["/*FORCE_NODE='rn-b'*/ KILL 2;"])
         self.assertIn("备节点 rn-b · cn-b", out["text"])
         self.assertIn("nothing was executed", logs.output[0])
         self.assertIn("sessions=1", logs.output[0])

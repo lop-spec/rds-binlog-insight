@@ -3,7 +3,7 @@
 /* 会话管理（RDS）：对齐阿里云 DAS 的会话管理——实例会话（异常 / 运行中 / 总数 / 最长运行）、会话统计（按用户 / 来源 / 数据库）、
    会话列表、三类异常会话（语句运行超过 30 秒、事务超过 30 秒、事务开启后 10 秒没再执行语句）；另加一项 DAS 没有的：有会话在等锁时，
    按快照推断「疑似持锁」的会话。实时部分每次点刷新才读 DAS；历史部分是服务后台每分钟留存的异常会话。
-   「结束会话」换成 KILL 语句：服务只有云上只读身份、没有数据库账号，所以本页只生成语句（带核对语句）让你在节点上执行，自己不执行任何 kill。 */
+   「结束会话」换成 KILL 语句：服务只有云上只读身份、没有数据库账号，所以本页只生成语句（带核对语句和路由 Hint）让你执行，自己不执行任何 kill。 */
 
 const SESSION_KIND_LABEL = { long_running: "语句运行过久", lock_wait: "等待锁", long_trx: "事务过长", idle_trx: "未提交事务" };
 const SESSION_KIND_HINT = {
@@ -508,7 +508,7 @@ function sessionKillHtml() {
       <div class="session-kill-actions"><button type="button" class="button primary compact" data-session-copy="${index}"${item.statements.length ? "" : " disabled"}>复制语句</button>
       <span class="muted">${humanCount(item.statements.length)} 条 KILL · 快照 ${escapeHtml(sessionTimeText(item.snapshot_us))}</span></div>${skipped}</section>`;
   }).join("");
-  return `<p class="analytics-note">本页只生成语句，不执行任何 kill：服务只有云上只读身份、没有数据库账号。请连到<strong>对应节点</strong>执行；先跑第 1 条核对语句，确认会话还在、仍是快照里的那个，再杀。</p>
+  return `<p class="analytics-note">本页只生成语句，不执行任何 kill：服务只有云上只读身份、没有数据库账号。语句带读写分离的 Hint（备节点 FORCE_NODE、主节点 FORCE_MASTER），经读写分离地址执行会落到<strong>对应节点</strong>；先跑第 1 条核对语句，确认会话还在、仍是快照里的那个，再杀，杀完重跑核对。</p>
     ${modes}${blocks}`;
 }
 
