@@ -602,18 +602,39 @@ class IndexedWindowTests(unittest.TestCase):
         result, _loader = self.query(metadata, backend, start, end, tail=short)
         self.assertEqual(result["adjusted"]["reason"], "incomplete_index")
 
-    def test_a_complete_index_or_an_old_window_never_uses_the_tail(self):
+    def test_an_old_window_never_uses_the_tail(self):
         metadata, backend = self.fixture()
         start, end = self.NOW - 3 * 3600 * 1_000_000, self.NOW - 2 * 3600 * 1_000_000
         tail = FakeTail(self.tail_view())
         result, _loader = self.query(metadata, backend, start, end, tail=tail)
         self.assertIsNone(result["tail"])
-        self.assertEqual(tail.views, [])  # a complete index does not ask
+        self.assertEqual(tail.views, [])  # a window that ended hours ago does not ask
         metadata2, backend2, _ready = self.tail_window()
         hole = FakeTail(self.tail_view())
         result, _loader = self.query(metadata2, backend2, self.NOW - 3 * 3600 * 1_000_000,
                                      self.NOW - 2 * 3600 * 1_000_000 + 30 * MIN, tail=hole)
         self.assertIsNone(result["tail"])
+        self.assertEqual(hole.views, [])
+
+    def test_a_recent_window_whose_index_is_complete_but_stale_still_gets_the_tail(self):
+        # Every part the collector produced is in ClickHouse, but the collector is behind (a stuck node, or just the poll interval):
+        # nothing is "missing", yet the newest minutes are not there.
+        ready_until = (self.NOW - 12 * MIN) // self.STEP * self.STEP
+        self.parts = [p for p in self.parts if p["max_event_epoch_us"] <= ready_until]
+        metadata, backend = self.fixture()
+        backend.statement_index.statement_profiles.return_value = {}
+        start, end = self.NOW - 60 * MIN, self.NOW
+        tail = FakeTail(self.tail_view(), [self.live("live-1", self.NOW - 3 * MIN), self.live("live-2", self.NOW - 5 * MIN)])
+        result, _loader = self.query(metadata, backend, start, end, tail=tail)
+        cut = self.NOW - 2 * MIN
+        self.assertEqual((result["adjusted"]["reason"], result["end_us"]), ("source_delay", cut))
+        self.assertEqual((result["tail"]["events"], result["tail"]["pending_parts"], result["coverage"]["tail_parts"]), (2, 0, 0))
+        self.assertEqual(result["executions"], 3)
+        self.assertEqual(result["ready_through_us"], self.NOW - 30_000_000)
+        # the same window without a tail is what it always was: whole, and no newer than the index
+        plain, _loader = self.query(metadata, backend, start, end)
+        self.assertEqual((plain["end_us"], plain["adjusted"], plain["tail"]), (end, None, None))
+        self.assertLessEqual(plain["ready_through_us"], ready_until + self.STEP)
 
 
 def lag_points(levels, node="r", first_ms=0):

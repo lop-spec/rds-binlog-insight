@@ -388,8 +388,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     coverage, baseline_coverage = index_state(start_us, end_us)
     adjusted = None
     tail_used: dict[str, Any] | None = None
-    if not usable(coverage) and tail is not None:
-        # The newest parts are still on their way into ClickHouse; the live tail may hold exactly that stretch.
+    if tail is not None and end_us >= time.time_ns() // 1000 - FRESHNESS_WINDOW_US:
+        # A window ending close to now: ClickHouse lacks the newest parts, whether they are still on their way in or the collector has
+        # not produced them yet (a complete index says nothing about that); the live tail may hold exactly that stretch.
         try:
             tail_used = tail_plan(metadata, backend, instance, start_us, end_us, tail.view(instance), index_state, usable)
         except Exception:  # noqa: BLE001 - extra evidence, never a reason to fail: without it the window is cut at the indexed edge
