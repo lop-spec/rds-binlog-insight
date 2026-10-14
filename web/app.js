@@ -131,6 +131,7 @@ async function withBusy(button, work, busyText = "处理中…") {
 const viewMeta = {
   audit: ["AUDIT EXPLORER", "审计查询"],
   analytics: ["WORKLOAD ANALYTICS", "分析洞察"],
+  sessions: ["SESSION CONTROL", "会话管理"],
   schema: ["SCHEMA COMPARE", "结构对比"],
   jobs: ["SEQUENTIAL PIPELINE", "同步任务"],
   storage: ["PHYSICAL DATASET", "物理存储"],
@@ -151,6 +152,7 @@ function switchView(name) {
     state.analyticsInitialized = true;
     setAnalyticsRange("24h");
   }
+  if (name === "sessions" && typeof initSessionsView === "function") initSessionsView();
   if (name === "schema" && !state.schemaInitialized) {
     state.schemaInitialized = true;
     initSchemaView();

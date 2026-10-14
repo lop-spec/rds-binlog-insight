@@ -46,6 +46,10 @@ from .credentials import (
 )
 from .general_log_collector import GeneralLogCollector, GeneralLogConfig
 from .live_sessions import LiveSessions, LiveSessionsError
+from .session_collector import SessionCollector, load_config as load_session_retention
+from .session_service import SessionRequestError, SessionService
+from .session_store import SessionStore
+from .session_view import parse_thresholds
 from .slow_log_collector import DAS_ENDPOINT, DasRpcClient, SlowLogCollector, SlowLogConfig
 from .slowlog_impact_service import query_resource_overlap
 from .node_roles import NodeRoleBook
@@ -360,6 +364,17 @@ class Application:
             return DasRpcClient(replace(base, db_instance_id=instance_id, endpoint=DAS_ENDPOINT), credential, timeout=20)
 
         self.live_sessions = LiveSessions(das_client)
+        # Session management: the page reads through live_sessions; the retention loop keeps abnormal sessions for a week.
+        self.session_store = SessionStore(self.data_dir / "session-history.sqlite3")
+        registered_nodes = lambda: [(item.config.instance_id, item.config.node_id) for item in self.slow_logs if item.config.node_id]  # noqa: E731
+        self.session_collector = SessionCollector(
+            self.live_sessions, self.session_store, config_loader=lambda: load_session_retention(self.data_dir), nodes=registered_nodes,
+            default_instances=lambda: [self.metadata.load_settings().db_instance_id],
+        )
+        self.sessions = SessionService(self.live_sessions, self.session_store, self.session_collector, nodes=registered_nodes,
+                                       roles=self.node_roles.lookup)
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self.session_collector.start()
         from .mongo_service import MongoService
         self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
         try:
@@ -660,6 +675,8 @@ class Application:
     def stop(self) -> None:
         if getattr(self, 'node_roles', None) is not None:
             self.node_roles.shutdown()
+        if getattr(self, 'session_collector', None) is not None:
+            self.session_collector.shutdown()
         if getattr(self, 'mongo', None) is not None:
             self.mongo.shutdown()
         for collector in self.general_logs:
@@ -827,6 +844,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("mongo.js")
             elif parsed.path == "/assets/rise.js":
                 self._serve_static("rise.js")
+            elif parsed.path == "/assets/sessions.js":
+                self._serve_static("sessions.js")
             elif parsed.path == "/api/mongo/status":
                 self._json({"ok": True, "data": self.app.mongo.status()})
             elif parsed.path == "/api/mongo/analytics":
@@ -981,6 +1000,23 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self._error(403 if exc.code == "das_permission_denied" else 502, exc.code.upper(), str(exc))
                     return
                 self._json({"ok": True, "data": result})
+            elif parsed.path == "/api/sessions":
+                # Session management: every collected node of one instance (or one node), read from DAS when asked.
+                node_id = _query_value(query, "nodeId").strip()
+                if node_id and not NODE_ID_RE.fullmatch(node_id):
+                    raise SessionRequestError("SESSIONS_UNKNOWN_NODE", "Node ID 格式无效")
+                thresholds = parse_thresholds({name: _query_value(query, name) for name in ("blockingSeconds", "trxSeconds", "idleTrxSeconds")})
+                self._json({"ok": True, "data": self.app.sessions.overview(_query_value(query, "instance").strip(), node_id, thresholds)})
+            elif parsed.path == "/api/sessions/history":
+                node_id = _query_value(query, "nodeId").strip()
+                if node_id and not NODE_ID_RE.fullmatch(node_id):
+                    raise SessionRequestError("SESSIONS_UNKNOWN_NODE", "Node ID 格式无效")
+                end_us = int(_query_value(query, "endEpochUs") or time.time_ns() // 1000)
+                start_us = int(_query_value(query, "startEpochUs") or end_us - 3600 * 1_000_000)
+                self._json({"ok": True, "data": self.app.sessions.history(_query_value(query, "instance").strip(), node_id, start_us, end_us,
+                                                                          int(_query_value(query, "limit") or 200))})
+            elif parsed.path == "/api/sessions/status":
+                self._json({"ok": True, "data": self.app.sessions.status()})
             elif parsed.path == "/api/analytics":
                 settings = self.app.metadata.load_settings()
                 analytics_query = _analytics_query(query)
@@ -1076,6 +1112,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         except SchemaDiffError as exc:
             self._error(400, "SCHEMA_DIFF_ERROR", str(exc))
+        except SessionRequestError as exc:
+            self._error(400, exc.code, str(exc))
         except (ValueError, TypeError) as exc:
             self._error(400, "INVALID_REQUEST", str(exc))
         except Exception as exc:
@@ -1317,6 +1355,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                     generated_at=utc_now_text(),
                 )
                 self._json({"ok": True, "data": result})
+            elif parsed.path == "/api/sessions/kill-statements":
+                # Ending a session is a text for a person to run on the node: the service has no database account.
+                self._json({"ok": True, "data": self.app.sessions.kill_statements(payload)})
             elif parsed.path == "/api/system/stop":
                 self._json({"ok": True, "data": {"message": "后台服务正在停止"}})
                 self.app.stop()
@@ -1324,6 +1365,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._error(404, "NOT_FOUND", "接口不存在")
         except SchemaDiffError as exc:
             self._error(400, "SCHEMA_DIFF_ERROR", str(exc))
+        except SessionRequestError as exc:
+            self._error(400, exc.code, str(exc))
         except (ValueError, TypeError) as exc:
             self._error(400, "INVALID_REQUEST", str(exc))
         except Exception as exc:

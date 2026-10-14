@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app.config import Settings
 from app.live_sessions import LiveSessionsError
+from app.session_service import SessionRequestError
 from app.server import Application, AppHTTPServer
 from app.window_align import HOUR_US, MINUTE_US, floor_to
 
@@ -45,6 +46,24 @@ def get(application, path):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}{path}", timeout=5) as response:
             return json.loads(response.read().decode("utf-8"))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+def post(application, path, payload):
+    httpd = AppHTTPServer(("127.0.0.1", 0), application)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}{path}", data=json.dumps(payload).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read().decode("utf-8"))
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -126,6 +145,82 @@ class DdlLookupTests(unittest.TestCase):
     def test_without_the_row_store_there_is_nothing_to_find(self):
         captured = self.call(SimpleNamespace(clickhouse_slowlog_backend=object(), binlog_rows=None))
         self.assertEqual(captured["kwargs"]["ddl_lookup"]("rm-x", 5, 9), [])
+
+
+class FakeSessions:
+    def __init__(self, error=None):
+        self.calls, self.error = [], error
+
+    def _go(self, name, *args):
+        self.calls.append((name, *args))
+        if self.error:
+            raise self.error
+        return {"called": name}
+
+    def overview(self, instance, node_id, thresholds):
+        return self._go("overview", instance, node_id, dict(thresholds))
+
+    def history(self, instance, node_id, start_us, end_us, limit):
+        return self._go("history", instance, node_id, start_us, end_us, limit)
+
+    def status(self):
+        return self._go("status")
+
+    def kill_statements(self, payload):
+        return self._go("kill", dict(payload))
+
+
+class SessionEndpointTests(unittest.TestCase):
+    """Session management: the page's reads, the retention history and the KILL text, with the service behind them faked."""
+
+    @staticmethod
+    def app(sessions):
+        return SimpleNamespace(metadata=Metadata(), sync=Sync(), storage=SimpleNamespace(), sessions=sessions)
+
+    def test_the_overview_passes_the_instance_node_and_thresholds_through(self):
+        sessions = FakeSessions()
+        payload = get(self.app(sessions), "/api/sessions?instance=rm-x&nodeId=rn-1&blockingSeconds=45&idleTrxSeconds=5")
+        self.assertEqual((payload["ok"], payload["data"]), (True, {"called": "overview"}))
+        self.assertEqual(sessions.calls, [("overview", "rm-x", "rn-1", {"blocking_s": 45, "trx_s": 30, "idle_trx_s": 5})])
+        get(self.app(sessions), "/api/sessions?instance=rm-x")
+        self.assertEqual(sessions.calls[-1][2], "")          # no node means every collected node of the instance
+
+    def test_bad_thresholds_and_node_ids_are_refused_before_anything_is_read(self):
+        sessions = FakeSessions()
+        for query, status, code in (("blockingSeconds=0", 400, "INVALID_REQUEST"), ("trxSeconds=abc", 400, "INVALID_REQUEST"),
+                                    ("nodeId=rn-1%27%3B--", 400, "SESSIONS_UNKNOWN_NODE")):
+            got, body = get_error(self.app(sessions), f"/api/sessions?instance=rm-x&{query}")
+            self.assertEqual((got, body["error"]["code"]), (status, code), query)
+        self.assertEqual(sessions.calls, [])
+
+    def test_a_request_the_service_refuses_keeps_its_own_code(self):
+        sessions = FakeSessions(SessionRequestError("SESSIONS_UNKNOWN_NODE", "只能查已登记采集慢日志的实例节点"))
+        got, body = get_error(self.app(sessions), "/api/sessions?instance=rm-x&nodeId=rn-9")
+        self.assertEqual((got, body["error"]["code"]), (400, "SESSIONS_UNKNOWN_NODE"))
+        got, body = get_error(self.app(sessions), "/api/sessions/history?instance=rm-x")
+        self.assertEqual((got, body["error"]["code"]), (400, "SESSIONS_UNKNOWN_NODE"))
+
+    def test_the_history_window_defaults_to_the_last_hour_and_takes_explicit_bounds(self):
+        sessions = FakeSessions()
+        get(self.app(sessions), "/api/sessions/history?instance=rm-x&nodeId=rn-1&startEpochUs=1000000&endEpochUs=5000000&limit=50")
+        self.assertEqual(sessions.calls[-1], ("history", "rm-x", "rn-1", 1_000_000, 5_000_000, 50))
+        get(self.app(sessions), "/api/sessions/history?instance=rm-x")
+        _name, _instance, node, start, end, limit = sessions.calls[-1]
+        self.assertEqual((node, end - start, limit), ("", 3600 * 1_000_000, 200))
+
+    def test_the_status_endpoint_reports_the_retention_loop(self):
+        sessions = FakeSessions()
+        self.assertEqual(get(self.app(sessions), "/api/sessions/status")["data"], {"called": "status"})
+
+    def test_kill_statements_are_written_by_post_and_a_bad_request_is_a_400(self):
+        sessions = FakeSessions()
+        status, body = post(self.app(sessions), "/api/sessions/kill-statements", {"instance": "rm-x", "node_id": "rn-1", "sessions": []})
+        self.assertEqual((status, body["data"]), (200, {"called": "kill"}))
+        self.assertEqual(sessions.calls[0][1]["node_id"], "rn-1")
+        status, body = post(self.app(FakeSessions(ValueError("没有选中会话"))), "/api/sessions/kill-statements", {})
+        self.assertEqual((status, body["error"]["code"]), (400, "INVALID_REQUEST"))
+        status, body = post(self.app(FakeSessions(SessionRequestError("SESSIONS_UNKNOWN_NODE", "x"))), "/api/sessions/kill-statements", {})
+        self.assertEqual((status, body["error"]["code"]), (400, "SESSIONS_UNKNOWN_NODE"))
 
 
 class LiveSessionsEndpointTests(unittest.TestCase):

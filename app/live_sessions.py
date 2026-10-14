@@ -1,8 +1,10 @@
-"""Statements running right now on one RDS node, read on demand from DAS ``GetMySQLAllSessionAsync``.
+"""Sessions of one RDS node as they are right now, read from DAS ``GetMySQLAllSessionAsync``.
 
 Slow-log records appear only after a statement finishes, so a query that is still holding the node cannot be seen in them.
-This asks DAS for the node's session list when a person clicks, keeps nothing, and never polls on its own. Reads are
-rate-limited the way a person would not notice: one read per node at a time, a short cache, two nodes at once at most.
+This asks DAS for the node's session list when a person clicks (or when the session retention loop is due), and keeps
+only the last answer for a few seconds. Reads are rate-limited the way a person would not notice: one read per node at a
+time, a short cache shared by every view of the snapshot (running statements, session management, retention), two
+nodes at once at most.
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ SQL_LIMIT = 2000
 # Commands of sessions that are not running a statement: idle clients, replication and background threads.
 IDLE_COMMANDS = frozenset({"sleep", "daemon", "connect", "binlog dump", "binlog dump gtid"})
 _PERMISSION_WORDS = ("forbidden", "nopermission", "not authorized", "unauthorized", "accessdenied", "http 403")
+_THROTTLE_WORDS = ("throttling", "flowcontrol", "flow control", "too many requests", "http 429")
 
 
 class LiveSessionsError(Exception):
@@ -35,6 +38,8 @@ def classify_failure(exc: BaseException) -> str:
     text = str(exc).lower()
     if any(word in text for word in _PERMISSION_WORDS):
         return "das_permission_denied"
+    if any(word in text for word in _THROTTLE_WORDS):
+        return "das_throttled"
     if "timed out" in text or "timeout" in text or "网络错误" in text:
         return "das_unreachable"
     return "das_failed"
@@ -103,15 +108,24 @@ class LiveSessions:
             return self._locks.setdefault(key, threading.Lock())
 
     def snapshot(self, instance_id: str, node_id: str) -> dict[str, Any]:
+        """The statements running on one node (the "看正在跑的查询" view)."""
+        return self.view(instance_id, node_id, normalize_sessions)
+
+    def view(self, instance_id: str, node_id: str, build: Callable[[dict[str, Any], int], dict[str, Any]]) -> dict[str, Any]:
+        """One node's snapshot shaped by ``build(data, now_us)``; the read and the cache are shared by every view."""
         key = (instance_id, node_id)
         with self._node_lock(key):
             hit = self._cache.get(key)
-            if hit and self._clock() < hit[0]:
-                return {**hit[1], "cached": True}
-            with self._gate:
-                payload = self._read(instance_id, node_id)
-            self._cache[key] = (self._clock() + self._cache_seconds, payload)
-        return {**payload, "cached": False}
+            cached = bool(hit and self._clock() < hit[0])
+            if cached:
+                data = hit[1]
+            else:
+                with self._gate:
+                    data = self._read(instance_id, node_id)
+                self._cache[key] = (self._clock() + self._cache_seconds, data)
+        payload = build(data, self._wall_us())
+        payload.update(instance_id=instance_id, node_id=node_id)
+        return {**payload, "cached": cached}
 
     def _fail(self, instance_id: str, node_id: str, exc: BaseException) -> LiveSessionsError:
         code = classify_failure(exc)
@@ -120,6 +134,7 @@ class LiveSessions:
         return LiveSessionsError(code, str(exc)[:300])
 
     def _read(self, instance_id: str, node_id: str) -> dict[str, Any]:
+        """The finished DAS answer (``Data``) of one node."""
         started = self._clock()
         try:
             client = self._client_factory(instance_id)
@@ -140,9 +155,7 @@ class LiveSessions:
                                instance_id, node_id, data.get("State"))
                 raise LiveSessionsError("das_failed", f"DAS 会话快照失败：{data.get('State') or '未知状态'}")
             if data.get("IsFinish") or data.get("Complete"):
-                payload = normalize_sessions(data, self._wall_us())
-                payload.update(instance_id=instance_id, node_id=node_id)
-                return payload
+                return data
             if self._clock() - started >= self._deadline_seconds:
                 LOGGER.warning("live_sessions unavailable: instance=%s node=%s code=das_timeout waited=%.0fs",
                                instance_id, node_id, self._clock() - started)

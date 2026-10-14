@@ -113,6 +113,8 @@ class ReadTests(unittest.TestCase):
 
     def test_failures_keep_their_reason_and_a_missing_permission_is_told_apart(self):
         for error, code in ((RuntimeError("DAS HTTP 403: Forbidden.RAM not authorized"), "das_permission_denied"),
+                            (RuntimeError("DAS 调用失败：Throttling.User: Request was denied due to user flow control"), "das_throttled"),
+                            (RuntimeError("DAS HTTP 429: Too Many Requests"), "das_throttled"),
                             (RuntimeError("DAS 网络错误：timed out"), "das_unreachable"),
                             (RuntimeError("DAS 调用失败：InvalidNode"), "das_failed")):
             self.assertEqual(classify_failure(error), code)
@@ -129,6 +131,18 @@ class ReadTests(unittest.TestCase):
         with self.assertLogs("app.live_sessions", "WARNING"), self.assertRaises(LiveSessionsError) as caught:
             live.snapshot("rm-x", "rn-1")
         self.assertEqual(caught.exception.code, "das_failed")
+
+
+class ViewTests(unittest.TestCase):
+    def test_every_view_of_a_node_shares_one_read_and_one_cache(self):
+        client = Client(finished([session("a", "Query", 7), session("b", "Sleep", 90)]))
+        live, clock = service(client)
+        running = live.snapshot("rm-x", "rn-1")
+        shaped = live.view("rm-x", "rn-1", lambda data, now_us: {"status": "ok", "listed": len(data["SessionData"]["SessionList"]), "now": now_us})
+        self.assertEqual((running["cached"], shaped["cached"]), (False, True))
+        self.assertEqual((shaped["listed"], shaped["now"], shaped["instance_id"], shaped["node_id"]), (2, 5, "rm-x", "rn-1"))
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual([row["session_id"] for row in running["sessions"]], [1])   # the running view is unchanged by the refactor
 
 
 class CacheTests(unittest.TestCase):
