@@ -725,6 +725,11 @@ class BinlogRows:
         from .binlog_rows_analytics import BinlogRowsAnalytics
         return BinlogRowsAnalytics(self).ddl_events(instance, start, end)
 
+    def write_hotspots(self, instance: str, start: int, end: int) -> dict[str, Any]:
+        """The busiest tables of one instance between two instants (see ``BinlogRowsAnalytics.write_hotspots``)."""
+        from .binlog_rows_analytics import BinlogRowsAnalytics
+        return BinlogRowsAnalytics(self).write_hotspots(instance, start, end)
+
     def query(self, query: dict[str, Any], start: int, end: int, *, control: Any | None = None) -> dict[str, Any]:
         database, table = str(query.get("database") or "").strip(), str(query.get("table") or "").strip()
         sql, params, limit, offset = build_query(query, start, end, row_image_key=self.registry(database, table))

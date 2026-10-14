@@ -13,6 +13,7 @@ from typing import Any, Callable
 from .clickhouse_manifest import part_identity
 from .credentials import load_credential
 from .lag_origin import describe_lag
+from .lag_peers import LOOKBACK_US, load_peer_series, peer_health
 from .slow_log_collector import DasRpcClient
 from .slowlog_impact import DAY_US, MAX_EVENTS, PERIOD_US, family_key, order_by_correlation, rank_performance_growth
 from .window_align import adjusted_payload
@@ -48,6 +49,10 @@ SEARCH_REACH_US = 6 * 3600 * 1_000_000
 MIN_TRUNCATED_US = 6 * PERIOD_US
 # Windows ending this close to now report how far behind the index is (older windows are long since indexed).
 FRESHNESS_WINDOW_US = 30 * PERIOD_US
+# What the primary wrote is looked up from this long before a lag episode's first sample (the writes come before their lag),
+# and for at most this many distinct episode windows per answer.
+WRITES_LEAD_US = 5 * PERIOD_US
+MAX_WRITE_LOOKUPS = 6
 
 
 def load_metric_points(settings: Any, start_us: int, end_us: int, instance: str,
@@ -245,10 +250,61 @@ def lag_candidates(events: list[dict[str, Any]], primaries: set[str], replicas: 
     return out
 
 
+def _add_peer_health(nodes: list[dict[str, Any]], replicas: list[str], settings: Any, instance: str,
+                     peer_loader: Callable[..., list[dict[str, Any]]] | None) -> None:
+    """Compare every node that has lag episodes with its siblings (``lag_peers``).
+
+    One set of per-node series is read for all of them. This is evidence next to the lag card, never a reason to fail the
+    analysis: a failure is logged and the nodes simply carry no ``peer_health`` block (or an ``unavailable`` one).
+    """
+    lagging = [node for node in nodes if (node.get("lag_origin") or {}).get("episodes")]
+    if peer_loader is None or not lagging:
+        return
+    episodes = [episode for node in lagging for episode in node["lag_origin"]["episodes"]]
+    high = max(int(episode["last_us"]) for episode in episodes)
+    low = min(int(episode["first_us"]) for episode in episodes) - LOOKBACK_US      # a window is under a day, so under 27 h
+    try:
+        series, failed = load_peer_series(peer_loader, settings, low, high, instance)
+        for node in lagging:
+            block = node["lag_origin"]
+            if "slow" in failed or "reads" in failed:
+                block["peer_health"] = {"status": "unavailable"}
+                continue
+            block["peer_health"] = peer_health(node["node_id"], block["episodes"], series,
+                                               [other for other in replicas if other != node["node_id"]])
+    except Exception:  # noqa: BLE001 - evidence next to the lag card, never a reason to fail the analysis
+        LOGGER.warning("slowlog_resource_query peer health unavailable: instance=%s", instance, exc_info=True)
+
+
+def _add_write_hotspots(nodes: list[dict[str, Any]], instance: str,
+                        writes_lookup: Callable[[str, int, int], dict[str, Any] | None] | None) -> None:
+    """Attach to every lag episode what the primary wrote while it lasted (the busiest tables of the binlog row store)."""
+    if writes_lookup is None:
+        return
+    found: dict[tuple[int, int], dict[str, Any] | None] = {}
+    for node in nodes:
+        for episode in (node.get("lag_origin") or {}).get("episodes", []):
+            window = int(episode["first_us"]), int(episode["last_us"])
+            if window not in found:
+                if len(found) >= MAX_WRITE_LOOKUPS:
+                    LOGGER.warning("slowlog_resource_query write hotspots skipped for later episodes: instance=%s limit=%d", instance, MAX_WRITE_LOOKUPS)
+                    found[window] = None
+                else:
+                    try:
+                        found[window] = writes_lookup(instance, window[0] - WRITES_LEAD_US, window[1])
+                    except Exception:  # noqa: BLE001 - same: evidence, not a reason to fail
+                        LOGGER.warning("slowlog_resource_query write hotspots unavailable: instance=%s window=%s", instance, window, exc_info=True)
+                        found[window] = {"status": "unavailable"}
+            if found[window]:
+                episode["writes"] = found[window]
+
+
 def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                            settings: Any, metrics_loader: Any = load_metric_points,
                            roles: Any = None,
-                           ddl_lookup: Callable[[str, int, int], list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+                           ddl_lookup: Callable[[str, int, int], list[dict[str, Any]]] | None = None,
+                           peer_loader: Callable[..., list[dict[str, Any]]] | None = None,
+                           writes_lookup: Callable[[str, int, int], dict[str, Any] | None] | None = None) -> dict[str, Any]:
     def unavailable(reason: str) -> dict[str, Any]:
         LOGGER.warning("slowlog_resource_query unavailable: %s", reason)
         return {"status": reason, "nodes": []}
@@ -427,6 +483,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             node["lag_origin"] = describe_lag(node["node_id"], _lag_series(points, node["node_id"]), events=own[node["node_id"]],
                                               other_peaks={other: peak for other, peak in peaks.items() if other != node["node_id"]},
                                               instance=instance, ddl_lookup=ddl_lookup)
+        _add_peer_health(result.get("nodes", []), replicas, settings, instance, peer_loader)
+        _add_write_hotspots(result.get("nodes", []), instance, writes_lookup)
         result.update(candidate_scope="primary_statements", primary_nodes=sorted(
             node for node, info in node_roles.items() if info.get("role") == "primary"))
     result.update(instance_id=instance, start_us=start_us, end_us=end_us,

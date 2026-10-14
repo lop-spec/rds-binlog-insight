@@ -219,9 +219,12 @@ function riseNodeBody(data, node) {
   // A stuck applier is not caused by what the primary wrote: say so right above the table that would suggest otherwise.
   const stalled = lag && (node.lag_origin?.episodes || []).some((episode) => episode.kind === "stall");
   const stallNote = stalled ? '<p class="analytics-note"><strong>这个节点的延迟是回放线程卡住，不是主库写得太多</strong>：下表只是同期主库上跑得久的慢 SQL，份额和相关度说明不了原因，原因看上面的溯源。</p>' : "";
+  // The same for a node that is simply slower than its siblings while they replay the same writes without lagging.
+  const slower = lag && riseNodeSlower(node.lag_origin);
+  const slowerNote = slower && !stalled ? '<p class="analytics-note"><strong>这个节点的延迟是它自己比其他备节点慢，不是主库写得太多</strong>：下表只是同期主库上跑得久的慢 SQL，份额和相关度说明不了原因，原因看上面「和其他备节点比」。</p>' : "";
   const shown = rows.reduce((sum, row) => sum + (Number(row.growth_share) || 0), 0);
   const covered = shown > 0 ? `，合计占本节点增长份额 ${riseNumber(shown * 100, 0)}%` : "";
-  return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${origin}${note}${stallNote}
+  return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${origin}${note}${stallNote}${slowerNote}
     <div class="table-wrap"><table class="data-table analytics-table rise-table">
       <thead><tr><th>#</th><th>${lag ? "SQL（主库执行，按增长份额排序）" : "SQL（按增长份额排序）"}</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>执行次数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
       <tbody>${rows.map((row, index) => riseStatement(node, row, index + 1)).join("")}</tbody>
@@ -263,14 +266,107 @@ function riseLagTrigger(episode) {
   return "<p>主库 binlog 在这个时刻附近<strong>没有 DDL</strong>：卡住的是同一个事件的回放（超大事务，或回放时等锁）。行存储没有逐事务明细，需要看那一刻前后主库提交的大事务。</p>";
 }
 
+// Minute resolution: Cloud Monitor samples and the five-minute binlog aggregates say nothing about seconds.
+function riseStamp(us) {
+  return formatTime(us, true).replace(/:\d{2}$/, "");
+}
+
+function riseClock(us) {
+  const date = new Date(Number(us) / 1000);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+// What the primary wrote while the lag lasted: its busiest tables in the binlog row store, and whether they were busy before.
+function riseLagWrites(episode) {
+  const writes = episode.writes;
+  if (!writes) return "";
+  if (writes.status === "unavailable") return '<p class="muted">同期主库的写入热点读不到（详见服务日志）。</p>';
+  const tables = (writes.tables || []).filter((table) => Number(table.events) > 0).slice(0, 3);
+  if (!tables.length) return '<p class="muted">Binlog 行存储里这段时间没有这个实例的写入记录（可能还没入库）。</p>';
+  const items = tables.map((table) => {
+    const name = [table.database_name, table.table_name].filter(Boolean).join(".");
+    const parts = [["删", table.deletes], ["插", table.inserts], ["改", table.updates]].filter(([, count]) => Number(count) > 0)
+      .map(([label, count]) => `${label} ${humanCount(count)}`).join(" / ");
+    const share = Number(table.share) > 0 ? `，占全部行事件 ${riseNumber(table.share * 100, 0)}%` : "";
+    const before = Number(table.before_events) > 0
+      ? `；前一段同长时间 ${humanCount(table.before_events)}（这一段是 ${riseNumber(table.events / table.before_events, 1)} 倍）`
+      : "；前一段同长时间几乎没有写入";
+    return `<li><code>${escapeHtml(name)}</code>：${humanCount(table.events)} 行事件${parts ? `（${parts}）` : ""}${share}${before}</li>`;
+  });
+  return `<p>同期主库写得最多的表（Binlog 行事件，${escapeHtml(riseStamp(writes.start_us))} → ${escapeHtml(riseStamp(writes.end_us))}）：</p><ul class="rise-lag-list">${items.join("")}</ul>`;
+}
+
+// The node is slower than its siblings and only it lagged: the verdict that moves the blame off the primary's writes.
+function riseNodeSlower(block) {
+  const episodes = block?.episodes || [];
+  return block?.peer_health?.diverged === true && episodes.length > 0 && episodes.every((episode) => episode.node_local === true);
+}
+
+function riseReadsRemoved(health) {
+  const spans = (health.reads_removed || []).map((span) => `${riseClock(span.start_us)}–${riseClock(span.end_us)}`);
+  if (!spans.length) return "";
+  return `<p class="analytics-note">读流量被摘除的时段：${spans.join("、")}。读写分离在备节点延迟越过阈值后会把它从读路由里摘掉，这些分钟里它几乎没有读，上表没有计入。</p>`;
+}
+
+function riseLagPeerRow(label, row, digits, flag = false, hint = "") {
+  if (!row) return "";
+  const ratio = row.ratio === null || row.ratio === undefined ? "—" : `×${riseNumber(row.ratio, 1)}`;
+  const title = hint ? ` title="${escapeHtml(hint)}"` : "";
+  return `<tr><td${title}>${escapeHtml(label)}</td><td>${riseNumber(row.node, digits)}</td><td>${riseNumber(row.peers, digits)}</td><td>${flag ? `<strong>${ratio}</strong>` : ratio}</td></tr>`;
+}
+
+// The node against the other replicas of the same instance, on what Cloud Monitor records per node.
+function riseLagPeers(block) {
+  const health = block.peer_health;
+  if (!health) return "";
+  const title = "<h4>和其他备节点比</h4>";
+  if (health.status === "unavailable") return `${title}<p class="muted">读不到云监控的节点指标（详见服务日志），没能和其他备节点比较。</p>`;
+  if (health.status === "no_peers" || health.status === "no_data") return `${title}<p class="muted">这个实例里没有可比较的其他备节点，或云监控缺少这个节点的读指标。</p>`;
+  if (health.status === "no_reads") {
+    return `${title}<p>延迟期间这个节点几乎没有读流量（只有 ${humanCount(health.period?.read_minutes)} 分钟可比，不足以判断它自己是不是变慢了）。</p>${riseReadsRemoved(health)}`;
+  }
+  const episodes = block.episodes || [];
+  const metrics = health.metrics || {};
+  const slow = metrics.slow_per_1000_reads;
+  const local = episodes.length > 0 && episodes.every((episode) => episode.node_local === true);
+  const shared = episodes.some((episode) => episode.node_local === false);
+  const rates = slow ? `每 1000 次读有 ${riseNumber(slow.node, 2)} 条慢查询，其他备节点是 ${riseNumber(slow.peers, 2)}（×${riseNumber(slow.ratio, 1)}）` : "";
+  let verdict;
+  if (health.diverged) {
+    const first = Math.min(...episodes.map((episode) => Number(episode.first_us)));
+    const since = health.diverged_since_us
+      ? `，从约 ${escapeHtml(riseStamp(health.diverged_since_us))} 起一直如此${first > health.diverged_since_us ? `（比第一段延迟早 ${riseSpan(first - health.diverged_since_us)}）` : ""}` : "";
+    const scope = local ? "问题在这个节点自己：其他备节点回放同样的写入，延迟都没到阈值。"
+      : shared ? "其他备节点也出现了延迟，主库写入是共同原因，这个节点另外还比它们慢。" : "";
+    verdict = `<p><strong>这个节点自己比其他备节点慢</strong>：延迟期间${rates}${since}。${scope}</p>`;
+    const idle = Number(metrics.cpu_pct?.ratio) <= 1.2 && Number(metrics.iops_pct?.ratio) <= 1.2;
+    if (idle) verdict += "<p>CPU 和 IOPS 都没有比它们高，却更慢：多半是在等（存储、锁或宿主机），不是在算。这里看不到盘延迟，要到这个节点上看复制线程状态和 IO 延迟，或向云厂商查盘。</p>";
+  } else {
+    const scope = local ? "延迟出在回放线程本身而不是读请求；这里没有它的复制线程状态。"
+      : shared ? "其他备节点也延迟了，主库写入是共同原因，看上面的写入热点。" : "";
+    verdict = `<p><strong>这个节点的读表现和其他备节点一致</strong>${rates ? `（${rates}）` : ""}。${scope}</p>`;
+  }
+  const table = `<table class="rise-peers"><thead><tr><th>指标（延迟期间均值）</th><th>这个节点</th><th>其他备节点（中位数）</th><th>倍数</th></tr></thead><tbody>
+    ${riseLagPeerRow("慢查询 / 1000 次读", slow, 2, health.diverged)}
+    ${riseLagPeerRow("读 QPS", metrics.reads_per_s, 0)}
+    ${riseLagPeerRow("单次读耗时 ms（粗估）", metrics.ms_per_read, 2, false, "并发线程数 ÷ 读速率；线程数里含复制线程，只作参考")}
+    ${riseLagPeerRow("CPU %", metrics.cpu_pct, 1)}
+    ${riseLagPeerRow("IOPS 使用率 %", metrics.iops_pct, 1)}
+  </tbody></table>`;
+  const basis = `<p class="analytics-note">比较的是延迟段内两边都有读流量的 ${humanCount(health.period?.read_minutes)} 分钟（延迟段共 ${humanCount(health.period?.minutes)} 分钟），对象是同实例其他 ${humanCount(health.peers)} 个备节点的中位数。慢查询按各节点的 long_query_time 记，同一实例各节点相同。</p>`;
+  return `${title}${verdict}${table}${basis}${riseReadsRemoved(health)}`;
+}
+
 function riseLagEpisode(block, episode) {
   const when = `${escapeHtml(formatTime(episode.first_us, true))} → ${escapeHtml(formatTime(episode.last_us, true))}`;
   const head = `<p><strong>${when}</strong>：延迟峰值 <strong>${riseNumber(episode.peak_s, 0)} 秒</strong>（${escapeHtml(formatTime(episode.peak_us, true))}）${episode.recovery_rate ? `，之后以每秒追 ${riseNumber(episode.recovery_rate, 2)} 秒的速度赶回` : ""}。</p>`;
   if (episode.kind === "behind") {
-    return `${head}<p>延迟以每秒约 ${riseNumber(episode.growth_rate, 2)} 秒的速度增长而不是一口气卡住：备节点的回放速度跟不上主库的写入。下表是同期主库上的慢语句。</p>`;
+    const where = episode.node_local === true ? "同一时段其他备节点的延迟都没到阈值：只有这个节点落后。"
+      : episode.node_local === false ? "同一时段其他备节点也出现了延迟。" : "";
+    return `${head}<p>延迟以每秒约 ${riseNumber(episode.growth_rate, 2)} 秒的速度增长而不是一口气卡住：备节点的回放速度跟不上主库的写入。${where}下表是同期主库上的慢语句。</p>${riseLagWrites(episode)}`;
   }
   if (episode.kind !== "stall") {
-    return `${head}<p>短时尖峰，既没有持续卡住也没有持续落后，多半是一次性的大事务。</p>`;
+    return `${head}<p>短时尖峰，既没有持续卡住也没有持续落后，多半是一次性的大事务。</p>${riseLagWrites(episode)}`;
   }
   const stall = episode.stall || {};
   const slack = Number(block.origin_slack_s) || 30;
@@ -293,6 +389,7 @@ function riseLagOrigin(data, node) {
   }
   const more = Number(block.episode_count || 0) - episodes.length;
   return `<div class="rise-lag"><h4>复制延迟溯源</h4>${episodes.map((episode) => riseLagEpisode(block, episode)).join("")}
+    ${riseLagPeers(block)}
     ${more > 0 ? `<p class="muted">还有 ${humanCount(more)} 段较小的延迟未列出。</p>` : ""}
     <p class="analytics-note">起点由「样本分钟的中点 − 延迟」推出：回放线程卡在一个事件上时，它正在回放的那个事件在主库的时间不动。云监控是一分钟一个点，所以起点有 ±${riseNumber(block.origin_slack_s, 0)} 秒的误差；受害者与持锁者只统计窗口内开始且已执行完的慢日志。</p></div>`;
 }

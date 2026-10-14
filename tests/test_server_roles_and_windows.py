@@ -146,6 +146,21 @@ class DdlLookupTests(unittest.TestCase):
         captured = self.call(SimpleNamespace(clickhouse_slowlog_backend=object(), binlog_rows=None))
         self.assertEqual(captured["kwargs"]["ddl_lookup"]("rm-x", 5, 9), [])
 
+    def test_the_peer_series_come_from_cloud_monitor_and_the_writes_from_the_row_store(self):
+        from app.slowlog_impact_service import load_metric_points
+        asked = []
+        rows = SimpleNamespace(ddl_events=lambda *_: [], write_hotspots=lambda instance, low, high: asked.append((instance, low, high)) or {"status": "ok"})
+        captured = self.call(SimpleNamespace(clickhouse_slowlog_backend=object(), binlog_rows=rows))
+        self.assertIs(captured["kwargs"]["peer_loader"], load_metric_points)
+        self.assertEqual(captured["kwargs"]["writes_lookup"]("rm-x", 5, 9), {"status": "ok"})
+        self.assertEqual(asked, [("rm-x", 5, 9)])
+
+    def test_without_the_row_store_the_writes_are_unavailable_and_say_so_in_the_log(self):
+        captured = self.call(SimpleNamespace(clickhouse_slowlog_backend=object(), binlog_rows=None))
+        with self.assertLogs("app.server", "WARNING") as logs:
+            self.assertIsNone(captured["kwargs"]["writes_lookup"]("rm-x", 5, 9))
+        self.assertIn("write hotspots unavailable", logs.output[0])
+
 
 class FakeSessions:
     def __init__(self, error=None):

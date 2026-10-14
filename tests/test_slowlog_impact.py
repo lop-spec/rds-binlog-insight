@@ -4,8 +4,9 @@ from unittest.mock import Mock, patch
 
 from app.config import Settings
 from app.slowlog_impact import DAY_US, execution_series, order_by_correlation, rank_resource_overlap, rank_performance_growth
-from app.slowlog_impact_service import (RDS_METRICS, lag_candidates, lag_increase_points, load_iops_points, load_metric_points,
-                                       nearest_indexed_window, query_resource_overlap, truncate_to_ready)
+from app.lag_peers import LOOKBACK_US, METRIC_NAMES
+from app.slowlog_impact_service import (RDS_METRICS, WRITES_LEAD_US, lag_candidates, lag_increase_points, load_iops_points,
+                                       load_metric_points, nearest_indexed_window, query_resource_overlap, truncate_to_ready)
 
 W = 60_000_000
 
@@ -601,6 +602,91 @@ class LagMetricTests(unittest.TestCase):
             result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "metric": "replication_lag"},
                                             Settings(), loader, roles=lambda _i: self.ROLES)
         self.assertEqual((result["status"], result["nodes"]), ("no_replica_lag_samples", []))
+
+
+class LagPeerEvidenceTests(unittest.TestCase):
+    """The evidence next to the lag card: the lagging node against its siblings, and what the primary wrote meanwhile."""
+
+    ROLES = {"p": {"role": "primary", "zone": "a"}, "r": {"role": "secondary", "zone": "b"},
+             "r2": {"role": "secondary", "zone": "b"}, "r3": {"role": "secondary", "zone": "a"}}
+    MINUTES = 21
+    LEVELS = [0] * 3 + [40 + 2 * i for i in range(14)] + [0] * 4                      # r lags 40-66 s for 14 minutes; r2 and r3 do not
+    HEALTHY = dict(Cluster_ComSelect=5000.0, Cluster_SlowQueries=0.4, Cluster_ThreadsRunning=3.0, Cluster_CpuUsage=29.0, Cluster_IOPSUsage=40.0)
+    SLOWER = dict(Cluster_ComSelect=2300.0, Cluster_SlowQueries=7.0, Cluster_ThreadsRunning=9.0, Cluster_CpuUsage=17.0, Cluster_IOPSUsage=29.0)
+
+    def lag_loader(self, levels=None):
+        levels = self.LEVELS if levels is None else levels
+        everyone = lag_points(levels, "r") + lag_points([0] * self.MINUTES, "r2") + lag_points([0] * self.MINUTES, "r3")
+        return Mock(side_effect=lambda settings, start, end, instance, node="", **o: everyone)
+
+    def peer_loader(self, fail=()):
+        def load(settings, start, end, instance, node="", metric_name=""):
+            if metric_name in fail:
+                raise RuntimeError("metric_api_error:500")
+            return [dict(timestamp=i * 60000, nodeId=name, Average=(self.SLOWER if name == "r" else self.HEALTHY)[metric_name])
+                    for name in ("r", "r2", "r3") for i in range(self.MINUTES)]
+        return Mock(side_effect=load)
+
+    def analyse(self, lag_loader=None, **kw):
+        metadata, backend = LagMetricTests.fixture(self)
+        query = {"source": "slowlog", "instance": "x", "metric": "replication_lag", "start_epoch_us": 0, "end_epoch_us": (self.MINUTES - 1) * W - 1}
+        result = query_resource_overlap(metadata, backend, query, Settings(), lag_loader or self.lag_loader(), roles=lambda _i: self.ROLES, **kw)
+        return {node["node_id"]: node for node in result["nodes"]}, result
+
+    def test_a_node_that_lags_is_compared_with_its_siblings_and_the_others_are_not(self):
+        peers = self.peer_loader()
+        nodes, result = self.analyse(peer_loader=peers)
+        health = nodes["r"]["lag_origin"]["peer_health"]
+        self.assertEqual((health["status"], health["diverged"], health["peers"]), ("ok", True, 2))
+        self.assertGreater(health["metrics"]["slow_per_1000_reads"]["ratio"], 20)
+        self.assertEqual(nodes["r"]["lag_origin"]["episodes"][0]["node_local"], True)
+        self.assertNotIn("peer_health", nodes["r2"]["lag_origin"])                  # no episode, nothing to explain
+        self.assertEqual(sorted(c.kwargs["metric_name"] for c in peers.call_args_list), sorted(METRIC_NAMES.values()))
+        self.assertTrue(all(c.args[3:5] == ("x", "") for c in peers.call_args_list))   # one call per metric, every node at once
+        first = nodes["r"]["lag_origin"]["episodes"][0]["first_us"]
+        self.assertTrue(all(c.args[1] == first - LOOKBACK_US for c in peers.call_args_list))   # looks back before the episode
+        self.assertEqual(result["nodes"][0]["statements"][0]["sql_id"], "bulk-write")   # the ranking itself is untouched
+
+    def test_without_a_loader_or_without_a_lag_episode_nothing_is_read(self):
+        nodes, _ = self.analyse()
+        self.assertTrue(all("peer_health" not in node["lag_origin"] for node in nodes.values()))
+        peers = self.peer_loader()
+        quiet, _ = self.analyse(lag_loader=self.lag_loader([0] * self.MINUTES), peer_loader=peers)
+        peers.assert_not_called()
+        self.assertTrue(all(not node["lag_origin"]["episodes"] for node in quiet.values()))
+
+    def test_a_metric_that_cannot_be_read_is_logged_and_the_card_says_so_without_failing_the_analysis(self):
+        with self.assertLogs("app.lag_peers", "WARNING"):
+            nodes, result = self.analyse(peer_loader=self.peer_loader(fail=(METRIC_NAMES["slow"],)))
+        self.assertEqual(nodes["r"]["lag_origin"]["peer_health"], {"status": "unavailable"})
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(nodes["r"]["statements"])
+        # a metric that only decorates the table (CPU) leaves the verdict standing
+        with self.assertLogs("app.lag_peers", "WARNING"):
+            nodes, _ = self.analyse(peer_loader=self.peer_loader(fail=(METRIC_NAMES["cpu"],)))
+        health = nodes["r"]["lag_origin"]["peer_health"]
+        self.assertEqual((health["status"], health["diverged"]), ("ok", True))
+        self.assertNotIn("cpu_pct", health["metrics"])
+
+    def test_what_the_primary_wrote_is_attached_to_each_episode_once_per_window(self):
+        asked = []
+        table = {"database_name": "shop", "table_name": "t", "events": 10, "deletes": 6, "inserts": 4, "updates": 0}
+        nodes, _ = self.analyse(writes_lookup=lambda instance, low, high: asked.append((instance, low, high)) or {"status": "ok", "tables": [table]})
+        episode = nodes["r"]["lag_origin"]["episodes"][0]
+        self.assertEqual(asked, [("x", episode["first_us"] - WRITES_LEAD_US, episode["last_us"])])
+        self.assertEqual(episode["writes"]["tables"], [table])
+        self.assertTrue(all("writes" not in e for n in ("r2", "r3") for e in nodes[n]["lag_origin"]["episodes"]))
+
+    def test_a_failing_or_absent_row_store_is_logged_and_never_fails_the_analysis(self):
+        def broken(*_args):
+            raise RuntimeError("clickhouse down")
+        with self.assertLogs("app.slowlog_impact_service", "WARNING") as logs:
+            nodes, result = self.analyse(writes_lookup=broken)
+        self.assertEqual(nodes["r"]["lag_origin"]["episodes"][0]["writes"], {"status": "unavailable"})
+        self.assertTrue(any("write hotspots unavailable" in line for line in logs.output))
+        self.assertEqual(result["status"], "ok")
+        nodes, _ = self.analyse(writes_lookup=lambda *_: None)                                   # the server returns None without the store
+        self.assertNotIn("writes", nodes["r"]["lag_origin"]["episodes"][0])
 
 
 if __name__ == "__main__":

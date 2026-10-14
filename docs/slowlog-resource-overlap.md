@@ -174,3 +174,21 @@ python tools/backtest_slowlog_impact.py --events private-events.json --baseline 
 - **1.31.1**：`active_minutes`（页面「n / m 分钟有执行」的 n）以前只有相关度排序会算，页面默认的增长排序一直显示 0 / m；现在每种排序的每条语句都带它。
 
 验证：`python -m unittest tests.test_lag_origin tests.test_slowlog_impact tests.test_server_roles_and_windows tests.test_binlog_rows -q`；`node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_indexed_range.cjs`。
+
+## 复制延迟：和其他备节点比、同期主库写入（1.32.1）
+
+起因：10-14 下午同一个备节点连续落后（14:00 起，峰值 93 秒，拖到 15:36 才回落），其余备节点全程不到 3 秒。1.31.1 的卡片对这种「追不上」只写「备节点的回放速度跟不上主库的写入，下表是同期主库上的慢语句」：没说只有这个节点落后（那句话只在卡死型里显示），下表列的是 COMMIT 和订单表 INSERT，那是主库最忙的几条，没延迟的节点同样在回放，不是原因；真正的触发（对一张表的大批量删除加插入重建，每条不到 100 毫秒，进不了慢日志）和「这个节点自己比兄弟节点慢」都看不到。
+
+- **`lag_origin.peer_health`（每个有延迟段的备节点一块）**：把这个节点和同实例其他备节点逐分钟比，数据只用云监控已有的节点指标，不新增权限、不连数据库。每个答案对五个指标各发一次云监控请求（`Cluster_SlowQueries`、`Cluster_ComSelect`、`Cluster_ThreadsRunning`、`Cluster_CpuUsage`、`Cluster_IOPSUsage`，并行，每个请求取全部节点），回看第一段延迟之前 3 小时；没有任何节点有延迟段时一个请求都不发；读不到时 `peer_health = {status: "unavailable"}` 并写 WARNING，不影响排名。
+  - 判定只看一个量：**每 1000 次 SELECT 的慢查询数**（`Cluster_SlowQueries` ÷ `Cluster_ComSelect`），延迟段内、两边都有读流量的分钟合计；节点是兄弟节点中位数的 3 倍以上、且这些分钟里它自己记了至少 60 条慢查询才算 `diverged`（兄弟节点比值低于 0.05 时按 0.05 算，免得一个零慢查询的兄弟让任何节点都显得慢）。阈值依据：在一个生产集群的平静上午和「所有备节点一起延迟」的晚上，每个节点相对其余节点的这个比值（5 分钟平滑）中位数在 0.85–1.2 之间，最大 1.76。
+  - `ms_per_read`（并发线程 ÷ 读速率，毫秒）、读 QPS、CPU、IOPS 使用率一并给出，但**不参与判定**：运行线程数里含复制线程自己，回放忙的节点会虚高。页面把它标成「粗估」。
+  - **读流量被摘除的分钟单独列出**（`reads_removed`，≥3 分钟一段）：延迟越过读写分离阈值后，代理把节点从读路由里摘掉（它的 SELECT 速率塌到兄弟节点的 5% 以下，而兄弟节点每秒还有 50 次以上）。这些分钟的数字说明不了节点的健康，不进任何比值；缺样本的分钟是 unknown，不是摘除。延迟段内可比的分钟少于 5 个时 `status = "no_reads"`，页面直说「不足以判断」。
+  - `diverged_since_us`：判定为慢时，回溯到「到最后一段延迟结束时仍在持续」的那一段慢的起点（5 个可比分钟平滑，容忍 2 个好分钟），告诉你它是不是在第一段延迟之前就已经比兄弟节点慢；中间被摘除的分钟不打断它。
+  - `status`：`ok`、`no_peers`、`no_data`（云监控没有这个节点的读指标）、`no_reads`、`unavailable`；`peers` 是参与比较的兄弟节点数。
+- **`episodes[].writes`（`behind` 与 `spike` 型的每段延迟）**：主库在这段延迟（向前多取 5 分钟）里写得最多的 5 张表，取自 Binlog 行存储的 5 分钟聚合表（`binlog_agg_5m_v1`）：行事件数、删/插/改拆分、负载字节、占全部行事件的比例，以及**紧挨在前面的同长时间段**里同一张表的行事件数（`before_events`），页面据此写「是前一段的 N 倍」或「前一段几乎没有写入」。按行事件算：一条删一千行的 DELETE 记一千。DDL 不计入（有自己的列表）。同一答案最多查 6 个不同的延迟窗口。行存储读不到时 `writes = {status: "unavailable"}`（WARNING），实例没有行存储则不出现这个字段（WARNING 一条）。`stall` 型不显示：卡在一个事件上与写入量无关。
+- **页面**：`behind` 型多一句「同一时段其他备节点的延迟都没到阈值：只有这个节点落后」（或「其他备节点也出现了延迟」）；延迟段下面列写入热点；卡片底部「和其他备节点比」给一句结论（「这个节点自己比其他备节点慢」/「读表现和其他备节点一致」）、一张五行小表、比较依据和被摘除的时段。只有「只有这个节点落后 + 判为更慢」时，主库慢语句表上方才写「这个节点的延迟是它自己比其他备节点慢，不是主库写得太多」，与卡死型的同类提示并列。CPU 和 IOPS 都不高于兄弟节点却更慢时，多一句「多半是在等（存储、锁或宿主机），不是在算」，并说明这里看不到盘延迟。
+- **接口**：`GET /api/slowlog-impact?metric=replication_lag` 的响应在 `nodes[].lag_origin` 里多 `peer_health`，在 `episodes[]` 里多 `writes`；老字段不变。服务端新增 `BinlogRows.write_hotspots(instance, start_us, end_us)`（三条 ClickHouse 聚合查询，读已有聚合表）和注入函数 `query_resource_overlap(peer_loader=…, writes_lookup=…)`，默认不传，不传就不读。
+- **做不到的**：节点为什么慢（存储延迟、限流、宿主机）；没有复制线程状态（调度线程在等什么、worker 空闲数）；两者都需要连到具体节点或看云厂商的盘指标，这里不做。结论停在「这个节点自己慢，且在等」。
+- **回归**：`tests/test_lag_peers.py` 用合成序列覆盖：节点在某一分钟后慢查询率变成数倍（判慢、起点在 5 分钟内）、所有备节点一起延迟（不冤枉）、延迟段内读流量被摘除（单列、不进比值、不打断起点）、整段无读流量（`no_reads`）、小样本不判、缺样本不当零、无兄弟/无数据、指标读取失败只报告。`tests/test_slowlog_impact.py` 的 `LagPeerEvidenceTests` 覆盖按需读取、失败只记日志、写入热点按窗口去重；`tests/test_binlog_rows.py` 覆盖聚合查询的窗口与前一段；`tests/test_workspace.cjs` 覆盖卡片文案与转义。真实事件离线回放（云监控分钟序列，只含数值）：慢查询率每千次读 3.44 对 0.10（×35），起点与人工读曲线得到的时刻相差 3 分钟内；「所有备节点一起延迟」的晚上五个节点比值 0.64–1.23，都不判慢。
+
+验证：`python -m unittest tests.test_lag_peers tests.test_lag_origin tests.test_slowlog_impact tests.test_server_roles_and_windows tests.test_binlog_rows -q`；`node --test tests/test_workspace.cjs`。

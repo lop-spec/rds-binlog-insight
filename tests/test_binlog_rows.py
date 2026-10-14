@@ -979,6 +979,52 @@ class Release12918Tests(unittest.TestCase):
         self.assertEqual(ddl[0]["sample_sql"], "（历史数据未记录语句）")
         self.assertTrue(SQL_ORDERS)
 
+    def test_write_hotspots_lists_the_busiest_tables_with_the_stretch_before_them(self):
+        from app.binlog_rows_analytics import BinlogRowsAnalytics
+
+        seen = []
+
+        def responder(sql, params, settings, timeout):
+            seen.append((sql, params))
+            if "sumIf(events, operation = 'INSERT')" in sql:
+                return [{"db_name": "shop", "tbl_name": "goods_index", "a_events": 9000, "a_inserts": 4000, "a_updates": 0,
+                         "a_deletes": 5000, "a_payload": 123456},
+                        {"db_name": "shop", "tbl_name": "orders", "a_events": 1000, "a_inserts": 600, "a_updates": 400,
+                         "a_deletes": 0, "a_payload": 99}]
+            if sql.startswith("SELECT sum(events) AS a_events FROM"):
+                return [{"a_events": 12000}]
+            return [{"db_name": "shop", "tbl_name": "goods_index", "a_events": 900}]     # the stretch before: orders is absent
+
+        rows = mock.Mock()
+        rows.ch.rows.side_effect = responder
+        start, end = 1791950400000000, 1791951600000000                                  # twenty minutes
+        out = BinlogRowsAnalytics(rows).write_hotspots("rm-x", start, end)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual((out["start_us"], out["end_us"], out["before_start_us"], out["total_events"]),
+                         (start, end, start - (end - start), 12000))
+        self.assertEqual(out["tables"][0], {"database_name": "shop", "table_name": "goods_index", "events": 9000, "inserts": 4000,
+                                             "updates": 0, "deletes": 5000, "payload_bytes": 123456, "share": 0.75, "before_events": 900})
+        self.assertEqual((out["tables"][1]["table_name"], out["tables"][1]["before_events"]), ("orders", 0))   # new in this window
+        windows = [params for sql, params in seen]
+        self.assertTrue(all("operation != 'DDL'" in sql for sql, _ in seen))             # DDL has its own list
+        self.assertEqual(len(seen), 3)
+        current = next(p for sql, p in seen if "sumIf(events, operation = 'INSERT')" in sql)
+        before = next(p for sql, p in seen if "LIMIT 1000" in sql)
+        self.assertEqual((current["lo"], current["hi"]), (start // 300_000_000 * 300_000_000, end))
+        self.assertEqual(before["hi"], start - 1)                                         # ends where the window begins
+        self.assertEqual(before["lo"], (start - (end - start)) // 300_000_000 * 300_000_000)
+        self.assertEqual({p["i"] for p in windows}, {"rm-x"})
+
+    def test_write_hotspots_without_rows_is_empty_not_an_error_and_the_limit_is_bounded(self):
+        from app.binlog_rows_analytics import BinlogRowsAnalytics
+
+        limits = []
+        rows = mock.Mock()
+        rows.ch.rows.side_effect = lambda sql, params, settings, timeout: limits.append(params.get("n")) or []
+        out = BinlogRowsAnalytics(rows).write_hotspots("rm-x", 0, 600_000_000, limit=500)
+        self.assertEqual((out["status"], out["tables"], out["total_events"]), ("empty", [], 0))
+        self.assertIn(20, limits)                                                        # a caller cannot ask for more than 20 tables
+
     def test_ddl_events_returns_the_ddl_inside_a_window_with_its_event_time(self):
         from app.binlog_rows_analytics import BinlogRowsAnalytics
 

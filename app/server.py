@@ -51,7 +51,7 @@ from .session_service import SessionRequestError, SessionService
 from .session_store import SessionStore
 from .session_view import parse_thresholds
 from .slow_log_collector import DAS_ENDPOINT, DasRpcClient, SlowLogCollector, SlowLogConfig
-from .slowlog_impact_service import query_resource_overlap
+from .slowlog_impact_service import load_metric_points, query_resource_overlap
 from .node_roles import NodeRoleBook
 from .window_align import align_binlog_query
 from .pod_lookup import attach_pod_detail
@@ -758,6 +758,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         rows = getattr(self.app.storage, "binlog_rows", None)
         return rows.ddl_events(instance, start_us, end_us) if rows is not None else []
 
+    def _write_hotspots(self, instance: str, start_us: int, end_us: int) -> dict[str, Any] | None:
+        """The busiest tables the binlog row store holds for an instance between two instants (what the primary wrote while a replica lagged)."""
+        rows = getattr(self.app.storage, "binlog_rows", None)
+        if rows is None:
+            LOGGER.warning("slowlog_resource_query write hotspots unavailable: the binlog row store is not configured")
+            return None
+        return rows.write_hotspots(instance, start_us, end_us)
+
     def _error(self, status: int, code: str, message: str) -> None:
         try:
             self._json(
@@ -984,6 +992,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     impact_query, settings,
                     roles=self.app.node_roles.lookup,
                     ddl_lookup=self._ddl_lookup,
+                    peer_loader=load_metric_points,
+                    writes_lookup=self._write_hotspots,
                 )
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/live-sessions":

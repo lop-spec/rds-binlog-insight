@@ -295,6 +295,95 @@ test('replication lag: a slow replica and a blip are described as what they are,
   assert.match(quiet.nodes['#analytics-panel-rise'].innerHTML, /没有达到 30 秒（告警阈值）/);
 });
 
+// ---- 1.32.1: the lagging node against its siblings, and what the primary wrote meanwhile ----
+const slowerHealth = (extra = {}) => ({status: 'ok', peers: 4, diverged: true, diverged_since_us: 1789996000000000,
+  period: {start_us: 1790000060000000, end_us: 1790006000000000, minutes: 61, read_minutes: 41},
+  reads_removed: [{start_us: 1790001000000000, end_us: 1790002200000000, minutes: 20}],
+  metrics: {slow_per_1000_reads: {node: 3.04, peers: 0.08, ratio: 38}, ms_per_read: {node: 3.9, peers: 0.66, ratio: 5.9},
+    reads_per_s: {node: 2300, peers: 4900, ratio: 0.47}, cpu_pct: {node: 17, peers: 29, ratio: 0.59}, iops_pct: {node: 29, peers: 40, ratio: 0.73}}, ...extra});
+const lagWrites = {status: 'ok', start_us: 1790000000000000, end_us: 1790006000000000, total_events: 34000000, tables: [
+  {database_name: 'shop', table_name: 'goods_index<b>', events: 11109637, deletes: 5538254, inserts: 5571383, updates: 0, share: 0.32, before_events: 1200000},
+  {database_name: 'shop', table_name: 'orders', events: 8000000, deletes: 0, inserts: 400000, updates: 7600000, share: 0.24, before_events: 0}]};
+const behindLag = (episode, health) => {
+  const result = lagResult({...lagEpisode, kind: 'behind', stall: null, trigger: undefined, growth_rate: 0.1, ...episode});
+  if (health !== undefined) result.nodes[0].lag_origin.peer_health = health;
+  return result;
+};
+
+test('replication lag: a node that is slower than its siblings is named as such and the table below says it is not the primary\'s writes', async () => {
+  const {c, nodes} = rdsContext(async () => behindLag({writes: lagWrites}, slowerHealth()));
+  await vm.runInContext('runAnalytics()', c);
+  const html = nodes['#analytics-panel-rise'].innerHTML;
+  assert.match(html, /<h4>和其他备节点比<\/h4>/);
+  assert.match(html, /<strong>这个节点自己比其他备节点慢<\/strong>：延迟期间每 1000 次读有 3\.04 条慢查询，其他备节点是 0\.08（×38）/);
+  assert.match(html, /从约 \d{2}-\d{2} \d{2}:\d{2} 起一直如此（比第一段延迟早 (\d+ 小时 )?\d+ 分钟）/);    // minutes, no seconds          // it was already like this before the lag began
+  assert.match(html, /问题在这个节点自己：其他备节点回放同样的写入，延迟都没到阈值/);
+  assert.match(html, /CPU 和 IOPS 都没有比它们高，却更慢/);
+  assert.match(html, /<td><strong>×38<\/strong><\/td>/);
+  assert.match(html, /<td>慢查询 \/ 1000 次读<\/td><td>3\.04<\/td><td>0\.08<\/td>/);
+  assert.match(html, /<td>读 QPS<\/td><td>2,300<\/td><td>4,900<\/td><td>×0\.5<\/td>/);
+  assert.match(html, /<td title="[^"]*线程数里含复制线程[^"]*">单次读耗时 ms（粗估）<\/td>/);
+  assert.match(html, /读流量被摘除的时段：\d{2}:\d{2}–\d{2}:\d{2}/);
+  assert.match(html, /同一时段其他备节点的延迟都没到阈值：只有这个节点落后/);
+  assert.match(html, /这个节点的延迟是它自己比其他备节点慢，不是主库写得太多/);    // right above the primary's slow statements
+  assert.doesNotMatch(html, /这个节点的延迟是回放线程卡住/);
+});
+
+test('replication lag: the busiest tables the primary wrote are listed with the stretch before them, escaped', async () => {
+  const {c, nodes} = rdsContext(async () => behindLag({writes: lagWrites}, slowerHealth()));
+  await vm.runInContext('runAnalytics()', c);
+  const html = nodes['#analytics-panel-rise'].innerHTML;
+  assert.match(html, /同期主库写得最多的表（Binlog 行事件，/);
+  assert.match(html, /<code>shop\.goods_index&lt;b&gt;<\/code>：11,109,637 行事件（删 5,538,254 \/ 插 5,571,383），占全部行事件 32%；前一段同长时间 1,200,000（这一段是 9\.3 倍）/);
+  assert.doesNotMatch(html, /goods_index<b>/);
+  assert.match(html, /<code>shop\.orders<\/code>：8,000,000 行事件（插 400,000 \/ 改 7,600,000），占全部行事件 24%；前一段同长时间几乎没有写入/);
+  for (const [writes, expected] of [[{status: 'unavailable'}, /同期主库的写入热点读不到/], [{status: 'empty', tables: []}, /没有这个实例的写入记录/]]) {
+    const other = rdsContext(async () => behindLag({writes}, undefined));
+    await vm.runInContext('runAnalytics()', other.c);
+    assert.match(other.nodes['#analytics-panel-rise'].innerHTML, expected);
+  }
+  const stall = rdsContext(async () => lagResult({...lagEpisode, writes: lagWrites}));
+  await vm.runInContext('runAnalytics()', stall.c);
+  assert.doesNotMatch(stall.nodes['#analytics-panel-rise'].innerHTML, /同期主库写得最多的表/);   // a stuck applier is not about volume
+});
+
+test('replication lag: when every replica lagged, or the node looks like its siblings, the page does not blame the node', async () => {
+  const same = slowerHealth({diverged: false, diverged_since_us: null,
+    metrics: {slow_per_1000_reads: {node: 0.09, peers: 0.08, ratio: 1.1}, cpu_pct: {node: 20, peers: 20, ratio: 1}}});
+  const shared = rdsContext(async () => behindLag({node_local: false}, same));
+  await vm.runInContext('runAnalytics()', shared.c);
+  const sharedHtml = shared.nodes['#analytics-panel-rise'].innerHTML;
+  assert.match(sharedHtml, /<strong>这个节点的读表现和其他备节点一致<\/strong>（每 1000 次读有 0\.09 条慢查询，其他备节点是 0\.08（×1\.1））/);
+  assert.match(sharedHtml, /其他备节点也延迟了，主库写入是共同原因/);
+  assert.doesNotMatch(sharedHtml, /这个节点自己比其他备节点慢/);
+  const local = rdsContext(async () => behindLag({node_local: true}, same));
+  await vm.runInContext('runAnalytics()', local.c);
+  assert.match(local.nodes['#analytics-panel-rise'].innerHTML, /延迟出在回放线程本身而不是读请求/);
+  assert.doesNotMatch(local.nodes['#analytics-panel-rise'].innerHTML, /不是主库写得太多/);
+  const both = rdsContext(async () => behindLag({node_local: false}, slowerHealth()));
+  await vm.runInContext('runAnalytics()', both.c);
+  assert.match(both.nodes['#analytics-panel-rise'].innerHTML, /主库写入是共同原因，这个节点另外还比它们慢/);
+  assert.doesNotMatch(both.nodes['#analytics-panel-rise'].innerHTML, /这个节点的延迟是它自己比其他备节点慢，不是主库写得太多/);   // the primary still matters here
+});
+
+test('replication lag: a comparison that could not be made says why', async () => {
+  for (const [health, expected] of [
+    [{status: 'unavailable'}, /读不到云监控的节点指标/],
+    [{status: 'no_peers', peers: 0}, /没有可比较的其他备节点/],
+    [{status: 'no_data', peers: 4}, /没有可比较的其他备节点，或云监控缺少这个节点的读指标/],
+    [{status: 'no_reads', peers: 4, period: {minutes: 31, read_minutes: 2}, reads_removed: [{start_us: 1790000000000000, end_us: 1790003000000000, minutes: 50}]},
+      /几乎没有读流量（只有 2 分钟可比，不足以判断它自己是不是变慢了）/]]) {
+    const {c, nodes} = rdsContext(async () => behindLag({}, health));
+    await vm.runInContext('runAnalytics()', c);
+    const html = nodes['#analytics-panel-rise'].innerHTML;
+    assert.match(html, expected);
+    assert.doesNotMatch(html, /这个节点自己比其他备节点慢/);
+  }
+  const absent = rdsContext(async () => behindLag({}, undefined));
+  await vm.runInContext('runAnalytics()', absent.c);
+  assert.doesNotMatch(absent.nodes['#analytics-panel-rise'].innerHTML, /和其他备节点比/);          // older answers carry no comparison
+});
+
 test('replication lag without any statement still shows the origin; a primary-only answer has its own message', async () => {
   const bare = lagResult(lagEpisode);
   bare.nodes[0].statements = [];

@@ -31,6 +31,8 @@ FINGERPRINT_EXPR = "if(fp = 0, concat('t:', operation, ':', database_name, '.', 
 QUERY_SETTINGS = {"max_threads": 4, "max_execution_time": 60, "max_memory_usage": 1_200_000_000,
                   "log_comment": "binlog-agg-query"}
 DDL_WINDOW_ROWS = 20
+WRITE_HOTSPOT_TABLES = 5
+WRITE_HOTSPOT_BEFORE_ROWS = 1000   # tables read back from the stretch before, to find the top ones' earlier figures
 ALL_ROWS = f"database_name = '{ALL_TABLES}' AND table_name = '{ALL_TABLES}'"
 PARALLEL_QUERIES = 4
 UNAVAILABLE_TXN_FIELDS = ("max_duration_us", "max_row_events", "cross_second_transactions",
@@ -165,6 +167,53 @@ class BinlogRowsAnalytics:
             "ORDER BY a_first LIMIT {n:UInt32}", params)
         return [{"event_epoch_us": _int(row["a_first"]), "database_name": row["db_name"], "table_name": row["tbl_name"],
                  "sample_sql": str(row["a_sample"] or "")} for row in rows]
+
+    def write_hotspots(self, instance: str, start_us: int, end_us: int, limit: int = WRITE_HOTSPOT_TABLES) -> dict[str, Any]:
+        """What the instance wrote between two instants: its busiest tables by row events, split by operation.
+
+        Each table also carries its row events in the equally long stretch just before (``before_events``), so the page
+        can tell a table that was always busy from one that became busy. Row events, not statements: one multi-row INSERT
+        or one DELETE of a thousand rows counts as the rows it changed. Aggregates of five-minute buckets, so the edges
+        are rounded to buckets; DDL is left out (``ddl_events`` lists it).
+        """
+        start_us, end_us = int(start_us), int(end_us)
+        length = max(end_us - start_us, AGG_BUCKET_US)
+        before_start = start_us - length
+
+        def scope(low: int, high: int) -> tuple[str, dict[str, Any]]:
+            return ("instance_id = {i:String} AND event_date BETWEEN {d0:Date} AND {d1:Date} AND bucket_us BETWEEN {lo:Int64} AND {hi:Int64} "
+                    "AND operation != 'DDL'",
+                    {"i": str(instance), "lo": (low // AGG_BUCKET_US) * AGG_BUCKET_US, "hi": high,
+                     "d0": datetime.fromtimestamp(low / 1e6, UTC).date().isoformat(),
+                     "d1": datetime.fromtimestamp(high / 1e6, UTC).date().isoformat()})
+
+        window, params = scope(start_us, end_us)
+        before_window, before_params = scope(before_start, start_us - 1)
+        n = max(1, min(int(limit), 20))
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="binlog-writes") as pool:
+            top = pool.submit(self._q,
+                              "SELECT database_name AS db_name, table_name AS tbl_name, sum(events) AS a_events, "
+                              "sumIf(events, operation = 'INSERT') AS a_inserts, sumIf(events, operation = 'UPDATE') AS a_updates, "
+                              "sumIf(events, operation = 'DELETE') AS a_deletes, sum(payload_bytes) AS a_payload "
+                              f"FROM {AGG_TABLE} WHERE {window} GROUP BY db_name, tbl_name ORDER BY a_events DESC LIMIT {{n:UInt32}}",
+                              {**params, "n": n})
+            total = pool.submit(self._q, f"SELECT sum(events) AS a_events FROM {AGG_TABLE} WHERE {window}", params)
+            earlier = pool.submit(self._q,
+                                  "SELECT database_name AS db_name, table_name AS tbl_name, sum(events) AS a_events "
+                                  f"FROM {AGG_TABLE} WHERE {before_window} GROUP BY db_name, tbl_name ORDER BY a_events DESC "
+                                  f"LIMIT {WRITE_HOTSPOT_BEFORE_ROWS}", before_params)
+            rows, total_rows, earlier_rows = top.result(), total.result(), earlier.result()
+        everything = _int(total_rows[0]["a_events"]) if total_rows else 0
+        before = {(row["db_name"], row["tbl_name"]): _int(row["a_events"]) for row in earlier_rows}
+        tables = []
+        for row in rows:
+            events = _int(row["a_events"])
+            tables.append({"database_name": row["db_name"], "table_name": row["tbl_name"], "events": events,
+                           "inserts": _int(row["a_inserts"]), "updates": _int(row["a_updates"]), "deletes": _int(row["a_deletes"]),
+                           "payload_bytes": _int(row["a_payload"]), "share": round(events / everything, 4) if everything else None,
+                           "before_events": before.get((row["db_name"], row["tbl_name"]), 0)})
+        return {"status": "ok" if tables else "empty", "start_us": start_us, "end_us": end_us, "before_start_us": before_start,
+                "total_events": everything, "tables": tables}
 
     @staticmethod
     def _ddl_dml_sql() -> str:
