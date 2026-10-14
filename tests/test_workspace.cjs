@@ -222,6 +222,89 @@ test('a node without a known role shows no chip', async () => {
   assert.doesNotMatch(nodes['#analytics-panel-rise'].innerHTML, /class="chip role-/);
 });
 
+// ---- 1.31.0: replication lag as a main metric, with the origin of the lag episode ----
+const lagEpisode = {first_us: 1790000060000000, peak_us: 1790004000000000, peak_s: 4079.6, last_us: 1790006000000000,
+  kind: 'stall', growth_rate: 1, recovery_rate: 0.5, node_local: true,
+  stall: {start_us: 1790000120000000, end_us: 1790003990000000, minutes: 64, origin_us: 1790000050000000, origin_spread_s: 0},
+  trigger: {type: 'ddl', event_us: 1790000051000000, offset_s: 1, database: '', table: '', sql: 'ALTER TABLE shop.shop_jobs ADD INDEX idx_x (a) <b>x</b>'},
+  queued: {count: 16, samples: [{event_id: 'ev-q1', account: 'root', start_us: 1790000052000000, duration_ms: 4077000}]},
+  holders: {count: 0, samples: []}};
+const lagResult = (episode, extra = {}) => ({...impactResult, metric_id: 'replication_lag', metric: 'Cluster_DataDelay', candidate_scope: 'primary_statements',
+  nodes: [{node_id: 'rn-lag', role: 'secondary', zone: 'cn-chengdu-b', status: 'ok', peak: 4079.6, metric_scale: 10, metric_values: [0, 100, 40796],
+    resource_comparison: {baseline_mean: 0, current_mean: 900, delta: 900}, total_fingerprints: 1,
+    lag_origin: {floor_s: 30, episode_count: episode ? 1 : 0, origin_slack_s: 30, episodes: episode ? [episode] : []},
+    statements: [stmt('bulk', 0.9, 60_000_000, 0, {...growing(5), growth_share: 1, origin: 'primary', source_node_id: 'rn-p'})]}], ...extra});
+
+test('replication lag is a selectable metric and its request is the ordinary growth request', async () => {
+  const {c, nodes, calls} = rdsContext(async () => lagResult(lagEpisode));
+  assert.ok(vm.runInContext('RISE_METRICS.map(([id]) => id)', c).includes('replication_lag'));
+  nodes['#rds-metric'].value = 'replication_lag';
+  await vm.runInContext('runAnalytics()', c);
+  const url = new URL(calls[0], 'http://fixture');
+  assert.equal(url.searchParams.get('metric'), 'replication_lag');
+  assert.equal(url.searchParams.get('order'), 'growth');
+});
+
+test('replication lag: the origin card names the stuck event, the DDL at it, the queued statements and the missing holder', async () => {
+  const {c, nodes} = rdsContext(async () => lagResult(lagEpisode));
+  await vm.runInContext('runAnalytics()', c);
+  const html = nodes['#analytics-panel-rise'].innerHTML;
+  assert.match(html, /复制延迟溯源/);
+  assert.match(html, /<strong>卡在同一个事件上<\/strong>/);
+  assert.match(html, /<strong>DDL<\/strong>/);
+  assert.match(html, /ALTER TABLE shop\.shop_jobs ADD INDEX idx_x \(a\) &lt;b&gt;x&lt;\/b&gt;/);   // the statement text is escaped
+  assert.doesNotMatch(html, /<b>x<\/b>/);
+  assert.match(html, /16 条<\/strong>语句开始于卡顿之后/);
+  assert.match(html, /data-lag-event="ev-q1"/);
+  assert.match(html, /持锁的不在慢日志里/);
+  assert.match(html, /其他备节点的延迟都没到阈值/);
+  assert.match(html, /SQL（主库执行，按增长份额排序）/);
+  assert.match(html, /主库上的慢 SQL/);               // the page says why the candidates are the primary's statements
+  assert.doesNotMatch(html, /窗口 .* 对照昨日同窗。排序：按增长份额/);   // not the generic metric paragraph
+  assert.match(html, /data-live-node="rn-lag"/);      // the running-query button stays: it helps while a stall is on
+});
+
+test('replication lag: holders found in the slow log are listed, other lagging replicas change the verdict, unexplained stalls say so', async () => {
+  const holder = {...lagEpisode, node_local: false, trigger: {type: 'none'},
+    holders: {count: 1, samples: [{event_id: 'ev-h', account: 'etl', start_us: 1790000000000000, duration_ms: 4100000}]}};
+  const {c, nodes} = rdsContext(async () => lagResult(holder));
+  await vm.runInContext('runAnalytics()', c);
+  const html = nodes['#analytics-panel-rise'].innerHTML;
+  assert.match(html, /持锁者候选/);
+  assert.match(html, /data-lag-event="ev-h"/);
+  assert.doesNotMatch(html, /持锁的不在慢日志里/);
+  assert.match(html, /其他备节点也出现了延迟/);
+  assert.match(html, /没有 DDL<\/strong>/);
+  const unavailable = rdsContext(async () => lagResult({...lagEpisode, trigger: {type: 'unavailable'}}));
+  await vm.runInContext('runAnalytics()', unavailable.c);
+  assert.match(unavailable.nodes['#analytics-panel-rise'].innerHTML, /未能核对那一刻有没有 DDL/);
+});
+
+test('replication lag: a slow replica and a blip are described as what they are, a quiet node says nothing happened', async () => {
+  const behind = rdsContext(async () => lagResult({...lagEpisode, kind: 'behind', stall: null, trigger: undefined, growth_rate: 0.3}));
+  await vm.runInContext('runAnalytics()', behind.c);
+  assert.match(behind.nodes['#analytics-panel-rise'].innerHTML, /回放速度跟不上主库的写入/);
+  assert.doesNotMatch(behind.nodes['#analytics-panel-rise'].innerHTML, /<strong>卡在同一个事件上<\/strong>/);
+  const blip = rdsContext(async () => lagResult({...lagEpisode, kind: 'spike', stall: null}));
+  await vm.runInContext('runAnalytics()', blip.c);
+  assert.match(blip.nodes['#analytics-panel-rise'].innerHTML, /短时尖峰/);
+  const quiet = rdsContext(async () => lagResult(null));
+  await vm.runInContext('runAnalytics()', quiet.c);
+  assert.match(quiet.nodes['#analytics-panel-rise'].innerHTML, /没有达到 30 秒（告警阈值）/);
+});
+
+test('replication lag without any statement still shows the origin; a primary-only answer has its own message', async () => {
+  const bare = lagResult(lagEpisode);
+  bare.nodes[0].statements = [];
+  const {c, nodes} = rdsContext(async () => bare);
+  await vm.runInContext('runAnalytics()', c);
+  assert.match(nodes['#analytics-panel-rise'].innerHTML, /<strong>卡在同一个事件上<\/strong>/);
+  assert.match(nodes['#analytics-panel-rise'].innerHTML, /主库没有采集到可与延迟增长对照的慢 SQL/);
+  const none = rdsContext(async () => ({status: 'no_replica_lag_samples', nodes: []}));
+  await vm.runInContext('runAnalytics()', none.c);
+  assert.match(none.nodes['#analytics-panel-rise'].innerHTML, /没有取到备节点的复制延迟指标/);
+});
+
 test('unavailable impact analysis says why instead of an empty table', async () => {
   const {c, nodes, toasts} = rdsContext(async () => ({status: 'overlapping_baseline', nodes: []}));
   await vm.runInContext('runAnalytics()', c);

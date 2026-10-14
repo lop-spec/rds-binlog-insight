@@ -12,6 +12,7 @@ const RISE_METRICS = [
   ["rows_read", "InnoDB 读取行数 / 秒"],
   ["row_lock", "行锁等待 ms / 秒"],
   ["threads", "活跃线程数"],
+  ["replication_lag", "复制延迟 秒（备节点）"],
 ];
 
 const RISE_STATUS = {
@@ -22,6 +23,7 @@ const RISE_STATUS = {
   metric_or_input_unavailable: "云监控指标或输入校验失败，未计算（详见服务日志）",
   insufficient_complete_periods: "窗口不足 6 个完整分钟，不计算相关度",
   no_metric_or_execution_data: "没有指标或执行数据",
+  no_replica_lag_samples: "没有取到备节点的复制延迟指标（主节点没有复制延迟；所选节点若是主节点请换成备节点）",
 };
 
 const RISE_CORRELATION_REASON = {
@@ -207,17 +209,89 @@ function riseNodeBody(data, node) {
     return `<p class="analytics-unavailable">该节点云监控指标缺点（${humanCount(node.actual_points)} / ${humanCount(node.expected_points)}），不补零、不排名。</p>`;
   }
   const rows = node.statements || [];
-  if (!rows.length) return '<p class="analytics-empty">窗口内该节点没有采集到慢 SQL。</p>';
+  const lag = data.metric_id === "replication_lag";
+  const origin = lag ? riseLagOrigin(data, node) : "";
+  if (!rows.length) {
+    return `${origin}<p class="analytics-empty">${lag ? "窗口内主库没有采集到可与延迟增长对照的慢 SQL。" : "窗口内该节点没有采集到慢 SQL。"}</p>`;
+  }
   const note = node.status && node.status !== "ok" && RESOURCE_STATUS[node.status]
     ? `<p class="analytics-note">${escapeHtml(RESOURCE_STATUS[node.status])}；下表按扫描增量和增长份额列出，仅供核对。</p>` : "";
   const shown = rows.reduce((sum, row) => sum + (Number(row.growth_share) || 0), 0);
   const covered = shown > 0 ? `，合计占本节点增长份额 ${riseNumber(shown * 100, 0)}%` : "";
-  return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${note}
+  return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${origin}${note}
     <div class="table-wrap"><table class="data-table analytics-table rise-table">
-      <thead><tr><th>#</th><th>SQL（按增长份额排序）</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>执行次数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
+      <thead><tr><th>#</th><th>${lag ? "SQL（主库执行，按增长份额排序）" : "SQL（按增长份额排序）"}</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>执行次数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
       <tbody>${rows.map((row, index) => riseStatement(node, row, index + 1)).join("")}</tbody>
     </table></div>
     <p class="analytics-note">共 ${humanCount(node.total_fingerprints)} 个 SQL 家族，显示前 ${humanCount(rows.length)} 个${covered}。灰显行的耗时和扫描都没有比昨日同窗增加。</p>`;
+}
+
+/* ---------------------------- 复制延迟溯源 ---------------------------- */
+
+// 备节点的延迟不是它自己的读查询造成的：要么是主库写了什么，要么是备节点的回放线程卡在某个事件上。
+function riseLagNote(data) {
+  return `<p class="analytics-note">复制延迟：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照昨日同窗。
+    延迟出在主库写入或备节点的回放线程，不在备节点自己的读查询，所以下表列的是<strong>主库上的慢 SQL</strong>，按它们在「延迟增长的分钟」里跑了多久排序（延迟本身是累积量，只在涨的那几分钟里算重合），再乘以比昨日同窗多出来的部分。
+    表上方的「复制延迟溯源」先回答更关键的问题：延迟是从主库的哪个时刻开始的、是不是回放线程卡在同一个事件上、那一刻 binlog 里有没有 DDL。份额和相关度只是时间上的同涨同落，不是因果；
+    慢日志只含已执行完且够慢的语句，一条几毫秒就执行完的 DDL 不会出现在表里，要看溯源。</p>`;
+}
+
+function riseLagWho(item) {
+  const id = escapeHtml(item.event_id || "");
+  const detail = item.event_id ? ` <button class="slow-sql-link" type="button" data-lag-event="${id}" title="查看这条慢日志的明细">明细</button>` : "";
+  return `<li>${escapeHtml(item.account || "用户未知")} · ${escapeHtml(formatTime(item.start_us, true))} 开始 · 运行 <strong>${escapeHtml(humanMicros(Number(item.duration_ms || 0) * 1000))}</strong>${detail}</li>`;
+}
+
+function riseLagList(block, text) {
+  const items = block?.samples || [];
+  const more = Number(block?.count || 0) - items.length;
+  return `<p>${text}</p><ul class="rise-lag-list">${items.map(riseLagWho).join("")}${more > 0 ? `<li class="muted">另有 ${humanCount(more)} 条</li>` : ""}</ul>`;
+}
+
+function riseLagTrigger(episode) {
+  const trigger = episode.trigger || {};
+  if (trigger.type === "ddl") {
+    const where = [trigger.database, trigger.table].filter(Boolean).join(".");
+    const offset = Number(trigger.offset_s);
+    return `<p>主库 binlog 在这个时刻有一条 <strong>DDL</strong>（${escapeHtml(formatTime(trigger.event_us))}，与估算起点相差 ${riseNumber(Math.abs(offset), 0)} 秒）${where ? `，对象 ${escapeHtml(where)}` : ""}：<code class="sql-cell">${escapeHtml(trigger.sql || "（未记录语句）")}</code><br>
+      DDL 在备节点回放时要拿到这张表的元数据锁：所有先开始、还没结束的查询或事务放手之前它一直等，复制线程停在它身上；它排在前面时，这张表上随后到的查询也会排在它后面一起等。</p>`;
+  }
+  if (trigger.type === "unavailable") return "<p>Binlog 行存储这时读不到 DDL 记录（详见服务日志），未能核对那一刻有没有 DDL。</p>";
+  return "<p>主库 binlog 在这个时刻附近<strong>没有 DDL</strong>：卡住的是同一个事件的回放（超大事务，或回放时等锁）。行存储没有逐事务明细，需要看那一刻前后主库提交的大事务。</p>";
+}
+
+function riseLagEpisode(block, episode) {
+  const when = `${escapeHtml(formatTime(episode.first_us, true))} → ${escapeHtml(formatTime(episode.last_us, true))}`;
+  const head = `<p><strong>${when}</strong>：延迟峰值 <strong>${riseNumber(episode.peak_s, 0)} 秒</strong>（${escapeHtml(formatTime(episode.peak_us, true))}）${episode.recovery_rate ? `，之后以每秒追 ${riseNumber(episode.recovery_rate, 2)} 秒的速度赶回` : ""}。</p>`;
+  if (episode.kind === "behind") {
+    return `${head}<p>延迟以每秒约 ${riseNumber(episode.growth_rate, 2)} 秒的速度增长而不是一口气卡住：备节点的回放速度跟不上主库的写入。下表是同期主库上的慢语句。</p>`;
+  }
+  if (episode.kind !== "stall") {
+    return `${head}<p>短时尖峰，既没有持续卡住也没有持续落后，多半是一次性的大事务。</p>`;
+  }
+  const stall = episode.stall || {};
+  const slack = Number(block.origin_slack_s) || 30;
+  let body = `<p>延迟每秒涨 ${riseNumber(episode.growth_rate, 2)} 秒、持续 ${humanCount(stall.minutes)} 分钟：这个节点的复制线程<strong>卡在同一个事件上</strong>，回放没有前进。该事件在主库的时间约 <strong>${escapeHtml(formatTime(stall.origin_us))}</strong>（±${riseNumber(slack, 0)} 秒），放行在 ${escapeHtml(formatTime(stall.release_us || stall.end_us, true))} 前后。</p>`;
+  body += riseLagTrigger(episode);
+  if (episode.node_local === true) body += "<p>同一时段其他备节点的延迟都没到阈值：问题只在这个节点上，不是主库写入量引起的。</p>";
+  else if (episode.node_local === false) body += "<p>同一时段其他备节点也出现了延迟：除了这个节点自己，也要看主库当时的写入。</p>";
+  if (episode.queued?.count) body += riseLagList(episode.queued, `这个节点上有 <strong>${humanCount(episode.queued.count)} 条</strong>语句开始于卡顿之后、又恰好随卡顿一起结束（被堵在同一把锁后面的受害者，运行时间最长的在前）：`);
+  if (episode.holders?.count) body += riseLagList(episode.holders, "开始于卡顿之前、随卡顿一起结束的语句（持锁者候选）：");
+  else if (episode.holders) body += "<p>没有任何语句开始于卡顿之前、又随卡顿一起结束：<strong>持锁的不在慢日志里</strong>。常见原因是一个没提交的空闲事务或连接（慢日志要等语句结束才出现，空闲会话不会出现）。再出现时，卡顿进行中可点本节点的「看正在跑的查询」；但空闲事务不在其中，要到该节点上查元数据锁。</p>";
+  return `${head}${body}`;
+}
+
+function riseLagOrigin(data, node) {
+  const block = node.lag_origin;
+  if (!block) return "";
+  const episodes = block.episodes || [];
+  if (!episodes.length) {
+    return `<div class="rise-lag"><p><strong>复制延迟溯源</strong>：本窗口内该节点的延迟没有达到 ${riseNumber(block.floor_s, 0)} 秒（告警阈值），没有可溯源的延迟段。</p></div>`;
+  }
+  const more = Number(block.episode_count || 0) - episodes.length;
+  return `<div class="rise-lag"><h4>复制延迟溯源</h4>${episodes.map((episode) => riseLagEpisode(block, episode)).join("")}
+    ${more > 0 ? `<p class="muted">还有 ${humanCount(more)} 段较小的延迟未列出。</p>` : ""}
+    <p class="analytics-note">起点由「样本分钟的中点 − 延迟」推出：回放线程卡在一个事件上时，它正在回放的那个事件在主库的时间不动。云监控是一分钟一个点，所以起点有 ±${riseNumber(block.origin_slack_s, 0)} 秒的误差；受害者与持锁者只统计窗口内开始且已执行完的慢日志。</p></div>`;
 }
 
 function riseSpan(us) {
@@ -285,8 +359,9 @@ function renderRise(data) {
     return;
   }
   const many = nodes.length > 3;
+  const lag = data.metric_id === "replication_lag";
   panel.innerHTML = `${prefix}
-    <p class="analytics-note">${escapeHtml(metric)}：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照昨日同窗。排序：按增长份额（该 SQL 在指标超额分钟里跑了多久，乘以比昨日同窗多出来的部分，已扣除慢日志记录的锁等待）；扫描行增量只在份额相同时决定先后，相关度 r 只是时序关联的核对列。份额不是资源贡献率，除锁等待外的等待仍算在耗时里，也不是因果；慢日志的扫描行可能远小于真实扫描（含物化子查询的语句）。SQL 只统计已采集的慢日志，看不到写入型和不够慢的查询负载，可勾选「Binlog 写入」对照；语句结束后才会进慢日志，正在跑的点节点里的「看正在跑的查询」。</p>
+    ${lag ? riseLagNote(data) : `<p class="analytics-note">${escapeHtml(metric)}：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照昨日同窗。排序：按增长份额（该 SQL 在指标超额分钟里跑了多久，乘以比昨日同窗多出来的部分，已扣除慢日志记录的锁等待）；扫描行增量只在份额相同时决定先后，相关度 r 只是时序关联的核对列。份额不是资源贡献率，除锁等待外的等待仍算在耗时里，也不是因果；慢日志的扫描行可能远小于真实扫描（含物化子查询的语句）。SQL 只统计已采集的慢日志，看不到写入型和不够慢的查询负载，可勾选「Binlog 写入」对照；语句结束后才会进慢日志，正在跑的点节点里的「看正在跑的查询」。</p>`}
     ${riseFreshness(data)}
     ${nodes.map((node, index) => `<details class="rise-node" ${!many || index === 0 ? "open" : ""}>
       <summary>${riseNodeSummary(data, node)}</summary>${riseNodeBody(data, node)}</details>`).join("")}`;

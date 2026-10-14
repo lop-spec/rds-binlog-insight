@@ -99,6 +99,35 @@ class ImpactEndpointTests(unittest.TestCase):
             self.assertEqual(captured["query"]["impact_order"], order)
 
 
+class DdlLookupTests(unittest.TestCase):
+    """The replication-lag origin asks the Binlog row store which DDL sat at a timestamp; without the store it finds none."""
+
+    @staticmethod
+    def call(storage):
+        captured = {}
+
+        def fake_query(_metadata, _backend, query, _settings, **kwargs):
+            captured.update(query=dict(query), kwargs=kwargs)
+            return {"status": "ok", "nodes": []}
+        application = SimpleNamespace(metadata=Metadata(), sync=Sync(), storage=storage,
+                                      node_roles=SimpleNamespace(lookup=lambda instance: {}))
+        with patch("app.server.query_resource_overlap", fake_query):
+            get(application, "/api/slowlog-impact?source=slowlog&instance=rm-x&metric=replication_lag&order=growth")
+        return captured
+
+    def test_the_lookup_reads_the_row_store(self):
+        asked = []
+        rows = SimpleNamespace(ddl_events=lambda instance, low, high: asked.append((instance, low, high)) or [{"event_epoch_us": low}])
+        captured = self.call(SimpleNamespace(clickhouse_slowlog_backend=object(), binlog_rows=rows))
+        self.assertEqual(captured["query"]["metric"], "replication_lag")
+        self.assertEqual(captured["kwargs"]["ddl_lookup"]("rm-x", 5, 9), [{"event_epoch_us": 5}])
+        self.assertEqual(asked, [("rm-x", 5, 9)])
+
+    def test_without_the_row_store_there_is_nothing_to_find(self):
+        captured = self.call(SimpleNamespace(clickhouse_slowlog_backend=object(), binlog_rows=None))
+        self.assertEqual(captured["kwargs"]["ddl_lookup"]("rm-x", 5, 9), [])
+
+
 class LiveSessionsEndpointTests(unittest.TestCase):
     @staticmethod
     def serve(snapshot):

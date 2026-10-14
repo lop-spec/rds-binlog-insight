@@ -736,6 +736,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _ddl_lookup(self, instance: str, start_us: int, end_us: int) -> list[dict[str, Any]]:
+        """DDL the binlog row store holds for an instance between two instants (replication-lag origin); none without the store."""
+        rows = getattr(self.app.storage, "binlog_rows", None)
+        return rows.ddl_events(instance, start_us, end_us) if rows is not None else []
+
     def _error(self, status: int, code: str, message: str) -> None:
         try:
             self._json(
@@ -959,6 +964,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     self.app.storage.clickhouse_slowlog_backend,
                     impact_query, settings,
                     roles=self.app.node_roles.lookup,
+                    ddl_lookup=self._ddl_lookup,
                 )
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/live-sessions":

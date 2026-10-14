@@ -5,12 +5,14 @@ import json
 import logging
 import time
 from bisect import bisect_right
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import replace
-from typing import Any
+from decimal import Decimal
+from typing import Any, Callable
 
 from .clickhouse_manifest import part_identity
 from .credentials import load_credential
+from .lag_origin import describe_lag
 from .slow_log_collector import DasRpcClient
 from .slowlog_impact import DAY_US, MAX_EVENTS, PERIOD_US, family_key, order_by_correlation, rank_performance_growth
 from .window_align import adjusted_payload
@@ -30,8 +32,14 @@ RDS_METRICS = {
     "rows_read": ("Cluster_InnoDBRowRead", "InnoDB 读取行数 / 秒"),
     "row_lock": ("Cluster_InnoDBRowLockTimePs", "行锁等待 ms / 秒"),
     "threads": ("Cluster_ThreadsRunning", "活跃线程数"),
+    # Replication lag of a replica node, seconds. A level that accumulates, so it is handled differently: see LAG_METRIC.
+    "replication_lag": ("Cluster_DataDelay", "复制延迟 秒"),
 }
 DEFAULT_METRIC = "iops"
+# The lag of a replica is produced on the primary (what it wrote) or on the replica's applier (what it is stuck on), never by
+# the replica's own readers. So for this metric the candidates are the primary's slow statements, the score uses the minutes
+# in which the lag grew (not the minutes in which it stayed high), and each node gets a `lag_origin` block.
+LAG_METRIC = "replication_lag"
 TOP_PER_NODE = 10
 TOP_PER_NODE_CORRELATION = 20
 # How far from the requested window to look for one whose index is complete.
@@ -197,9 +205,50 @@ def ready_through(metadata: Any, backend: Any, instance: str, end_us: int, now_u
     return None if index is None else index["last"]
 
 
+def lag_increase_points(points: list[dict[str, Any]], period_us: int = PERIOD_US) -> list[dict[str, Any]]:
+    """Per node, the seconds of lag each minute added: ``max(lag(t) - lag(t - 1 min), 0)``.
+
+    A minute whose predecessor is missing has no value (a gap is never read as zero growth), which is why the loader
+    asks for one sample before the window.
+    """
+    period_ms = period_us // 1000
+    by_node: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
+    for point in points:
+        by_node[str(point.get("nodeId") or "")][int(point["timestamp"])] = point
+    out = []
+    for samples in by_node.values():
+        for stamp, point in samples.items():
+            before = samples.get(stamp - period_ms)
+            if before is not None:
+                out.append({**point, "Average": max(Decimal(str(point["Average"])) - Decimal(str(before["Average"])), Decimal(0))})
+    return out
+
+
+def _lag_series(points: list[dict[str, Any]], node: str) -> list[tuple[int, float]]:
+    return sorted((int(point["timestamp"]) * 1000, float(point["Average"])) for point in points
+                  if str(point.get("nodeId") or "") == node)
+
+
+def lag_candidates(events: list[dict[str, Any]], primaries: set[str], replicas: list[str]) -> list[dict[str, Any]]:
+    """The primary's statements, once per replica whose lag they are ranked against.
+
+    Each copy keeps the real event id in ``source_event_id`` (the detail drawer needs it) and is marked ``origin`` so its
+    family never merges with the same SQL on the replica itself.
+    """
+    out = []
+    for event in events:
+        if event.get("node_id") not in primaries:
+            continue
+        for node in replicas:
+            out.append({**event, "node_id": node, "event_id": f"{event['event_id']}@{node}",
+                        "source_event_id": event["event_id"], "source_node_id": event["node_id"], "origin": "primary"})
+    return out
+
+
 def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                            settings: Any, metrics_loader: Any = load_metric_points,
-                           roles: Any = None) -> dict[str, Any]:
+                           roles: Any = None,
+                           ddl_lookup: Callable[[str, int, int], list[dict[str, Any]]] | None = None) -> dict[str, Any]:
     def unavailable(reason: str) -> dict[str, Any]:
         LOGGER.warning("slowlog_resource_query unavailable: %s", reason)
         return {"status": reason, "nodes": []}
@@ -215,6 +264,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     if metric_id not in RDS_METRICS:
         return unavailable("unsupported_metric")
     metric_name, metric_label = RDS_METRICS[metric_id]
+    lag_mode = metric_id == LAG_METRIC
     # Only a non-default metric passes the name, so a caller-supplied loader for IOPS keeps its old signature.
     loader_options = {} if metric_id == DEFAULT_METRIC else {"metric_name": metric_name}
     by_correlation = str(query.get("impact_order") or "") == "correlation"
@@ -279,7 +329,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     rows = read_events(start_us, end_us)
     if len(rows) > MAX_EVENTS:
         return unavailable("event_limit_exceeded")
-    if not rows:
+    # A lag episode can be explained by the lag series and the binlog alone, so an empty slow log does not end that analysis.
+    if not rows and not lag_mode:
         return unavailable("no_collected_executions")
     baseline_start, baseline_end = start_us - DAY_US, end_us - DAY_US
     if baseline_coverage is None:
@@ -287,32 +338,57 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     baseline = read_events(baseline_start, baseline_end)
     if len(baseline) > MAX_EVENTS:
         return unavailable("baseline_event_limit_exceeded")
+    node_roles = _node_roles(roles, instance)
     try:
-        points = metrics_loader(settings, start_us, end_us, instance,
+        # One sample before the window, so the first minute's growth can be told for the lag metric.
+        lead = PERIOD_US if lag_mode else 0
+        points = metrics_loader(settings, start_us - lead, end_us, instance,
                                 str(query.get("node_id") or ""), **loader_options)
         try:
-            baseline_points = metrics_loader(settings, baseline_start, baseline_end, instance, str(query.get('node_id') or ''), **loader_options)
+            baseline_points = metrics_loader(settings, baseline_start - lead, baseline_end, instance, str(query.get('node_id') or ''), **loader_options)
         except (RuntimeError, ValueError, KeyError, TypeError, OSError):
             LOGGER.exception('slowlog_resource_query baseline metrics unavailable; not inferring resource growth')
             baseline_points = []
-        unknown=sum(event.get('rows_examined') is None or event.get('lock_time_ms') is None for event in rows+baseline)
+        ranked_rows, ranked_baseline, score_points, replicas = rows, baseline, None, []
+        if lag_mode:
+            with_lag = sorted({str(point.get("nodeId") or "") for point in points} - {""})
+            primaries = {node for node, info in node_roles.items() if info.get("role") == "primary"}
+            if not primaries:
+                LOGGER.warning("slowlog_resource_query lag candidates unavailable: primary node unknown for %s", instance)
+            replicas = [node for node in with_lag if node not in primaries]
+            ranked_rows = lag_candidates(rows, primaries, replicas)
+            ranked_baseline = lag_candidates(baseline, primaries, replicas)
+            if len(ranked_rows) > MAX_EVENTS or len(ranked_baseline) > MAX_EVENTS:
+                return unavailable("event_limit_exceeded")
+            score_points = lag_increase_points(points)
+        unknown=sum(event.get('rows_examined') is None or event.get('lock_time_ms') is None for event in ranked_rows+ranked_baseline)
         if unknown:
             LOGGER.warning('slowlog_cost_provenance incomplete: %s records contain legacy zero or absent costs; not treating as measured zero',unknown)
-        result = rank_performance_growth(rows, baseline, points, start_us=start_us, end_us=end_us,
-                                         index_complete=True, baseline_complete=True, baseline_points=baseline_points)
+        result = rank_performance_growth(ranked_rows, ranked_baseline, points, start_us=start_us, end_us=end_us,
+                                         index_complete=True, baseline_complete=True, baseline_points=baseline_points,
+                                         score_points=score_points)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):
         LOGGER.exception("slowlog_resource_query metric or input validation failed")
         return unavailable("metric_or_input_unavailable")
+    if lag_mode:
+        # The primary (and any node without lag samples) has no lag to explain: leave it out instead of listing it as a gap.
+        kept = [node for node in result.get("nodes", []) if node["node_id"] in replicas]
+        if kept:
+            result["nodes"] = kept
+            result["status"] = "ok" if all(node["status"] == "ok" for node in kept) else "partial"
+        elif not replicas:
+            LOGGER.warning("slowlog_resource_query no replica lag samples: instance=%s node=%s", instance, query.get("node_id") or "")
+            result["nodes"], result["status"] = [], "no_replica_lag_samples"
     if by_correlation:
         order_by_correlation(result)
     top = TOP_PER_NODE_CORRELATION if by_correlation else TOP_PER_NODE
-    counts = Counter((row["node_id"], family_key(row)) for row in rows)
+    counts = Counter((row["node_id"], family_key(row)) for row in ranked_rows)
     accounts: dict[tuple[str, str], Counter] = {}
-    for event in rows:
+    for event in ranked_rows:
         if event.get("account"):
             accounts.setdefault((event["node_id"], family_key(event)), Counter())[str(event["account"])] += 1
     samples = {}
-    for event in rows:
+    for event in ranked_rows:
         key = event["node_id"], family_key(event)
         previous = samples.get(key)
         if previous is None or (int(event["duration_ms"]), event["event_id"]) > (int(previous["duration_ms"]), previous["event_id"]):
@@ -320,7 +396,6 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     selected = {(instance, samples[node["node_id"], row["fingerprint"]]["fingerprint"])
                 for node in result.get("nodes", []) for row in node.get("statements", [])[:top]}
     profiles = backend.statement_index.statement_profiles(selected)
-    node_roles = _node_roles(roles, instance)
     for node in result.get("nodes", []):
         node["total_fingerprints"] = len(node.get("statements", []))
         node["statements"] = node.get("statements", [])[:top]
@@ -335,9 +410,23 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             row["accounts"] = [name for name, _ in ranked[:3]]
             row["account_count"] = len(ranked)
             row["sql_id"] = samples[key]["sql_id"]
-            row["sample_event_id"] = samples[key]["event_id"]
+            row["sample_event_id"] = samples[key].get("source_event_id") or samples[key]["event_id"]
+            if lag_mode:
+                row["origin"], row["source_node_id"] = "primary", samples[key].get("source_node_id", "")
             # Preserve exact sufficient statistics across JavaScript's 53-bit boundary.
             row["score_numerator"] = str(row["score_numerator"])
+    if lag_mode:
+        peaks = {node: max((value for stamp, value in _lag_series(points, node) if start_us <= stamp <= end_us), default=0.0)
+                 for node in replicas}
+        own = defaultdict(list)
+        for event in rows:
+            own[event["node_id"]].append(event)
+        for node in result.get("nodes", []):
+            node["lag_origin"] = describe_lag(node["node_id"], _lag_series(points, node["node_id"]), events=own[node["node_id"]],
+                                              other_peaks={other: peak for other, peak in peaks.items() if other != node["node_id"]},
+                                              instance=instance, ddl_lookup=ddl_lookup)
+        result.update(candidate_scope="primary_statements", primary_nodes=sorted(
+            node for node, info in node_roles.items() if info.get("role") == "primary"))
     result.update(instance_id=instance, start_us=start_us, end_us=end_us,
                   ready_through_us=ready_through(metadata, backend, instance, end_us, time.time_ns() // 1000),
                   coverage=coverage, baseline_coverage=baseline_coverage, adjusted=adjusted,

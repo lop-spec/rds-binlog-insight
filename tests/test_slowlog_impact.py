@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 from app.config import Settings
 from app.slowlog_impact import DAY_US, execution_series, order_by_correlation, rank_resource_overlap, rank_performance_growth
-from app.slowlog_impact_service import (RDS_METRICS, load_iops_points, load_metric_points,
+from app.slowlog_impact_service import (RDS_METRICS, lag_candidates, lag_increase_points, load_iops_points, load_metric_points,
                                        nearest_indexed_window, query_resource_overlap, truncate_to_ready)
 
 W = 60_000_000
@@ -283,7 +283,8 @@ def json_key(sql_id):
 
 class MetricSelectionTests(unittest.TestCase):
     def test_registry_covers_the_main_rds_metrics(self):
-        self.assertEqual(list(RDS_METRICS), ["cpu", "iops", "rows_read", "row_lock", "threads"])
+        self.assertEqual(list(RDS_METRICS), ["cpu", "iops", "rows_read", "row_lock", "threads", "replication_lag"])
+        self.assertEqual(RDS_METRICS["replication_lag"][0], "Cluster_DataDelay")
         self.assertEqual(RDS_METRICS["cpu"][0], "Cluster_CpuUsage")
         self.assertEqual(RDS_METRICS["iops"][0], "Cluster_IOPSUsage")
 
@@ -474,6 +475,125 @@ class IndexedWindowTests(unittest.TestCase):
         self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 60), (start - MIN, end - MIN))
         # two days of retention: an earlier window's baseline day would be expired, so only the far later side qualifies
         self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 2), (self.NOW - DAY_US, self.NOW - DAY_US + 3600 * 1_000_000))
+
+
+def lag_points(levels, node="r", first_ms=0):
+    """Minute samples of a lag level; the first one sits before the window, like the loader's extra minute."""
+    return [dict(timestamp=first_ms + i * 60000, nodeId=node, Average=value) for i, value in enumerate(levels)]
+
+
+class LagMetricTests(unittest.TestCase):
+    """Replication lag: the candidates are the primary's statements, scored on the minutes in which the lag grew."""
+
+    ROLES = {"p": {"role": "primary", "zone": "a"}, "r": {"role": "secondary", "zone": "b"}}
+
+    def test_increase_points_are_the_seconds_each_minute_added_and_a_gap_is_not_zero(self):
+        levels = lag_points([0, 0, 30, 90, 90, 60])
+        grown = {p["timestamp"]: p["Average"] for p in lag_increase_points(levels)}
+        self.assertEqual(grown, {60000: 0, 120000: 30, 180000: 60, 240000: 0, 300000: 0})   # the first sample has no predecessor
+        gap = [p for p in levels if p["timestamp"] != 180000]
+        stamps = {p["timestamp"] for p in lag_increase_points(gap)}
+        self.assertNotIn(180000, stamps)
+        self.assertNotIn(240000, stamps)                                                       # its predecessor is the missing one
+
+    def test_the_score_uses_the_growth_series_while_the_node_still_reports_the_level(self):
+        # the lag level climbs 0 -> 180 in the last three minutes
+        levels = [0, 0, 0, 0, 60, 120, 180]
+        runs_late = [dict(event("late", 3 * W, 180000), event_id="late")]
+        runs_always = [dict(event("always", i * W, 60000), event_id=f"always-{i}") for i in range(6)]
+        result = rank_resource_overlap(runs_late + runs_always, lag_points(levels, "a"), start_us=0, end_us=6 * W - 1,
+                                       index_complete=True, score_points=lag_increase_points(lag_points(levels, "a")))
+        node = result["nodes"][0]
+        self.assertEqual(node["peak"], 180)
+        self.assertEqual([v / node["metric_scale"] for v in node["metric_values"]], [0, 0, 0, 60, 120, 180])
+        self.assertEqual([v / node["score_scale"] for v in node["score_values"]], [0, 0, 0, 60, 60, 60])
+        self.assertEqual(next(r for r in node["statements"] if r["fingerprint"] == "late")["resource_r"], 1.0)   # runs exactly in the growth minutes
+        by = {row["fingerprint"]: row for row in node["statements"]}
+        self.assertIsNone(by["always"]["resource_r"])                                           # constant runtime: no coefficient
+        # Without a separate score series the same call ranks on the level itself (the metric of every other mode)
+        plain = rank_resource_overlap(runs_late + runs_always, lag_points(levels, "a"), start_us=0, end_us=6 * W - 1, index_complete=True)
+        self.assertNotIn("score_values", plain["nodes"][0])
+        self.assertLess(next(r for r in plain["nodes"][0]["statements"] if r["fingerprint"] == "late")["resource_r"], 1.0)   # a level is not the growth
+
+    def test_candidates_are_copied_per_replica_with_their_own_identity(self):
+        rows = [dict(event_id="e1", node_id="p", fingerprint="f", sql_id="s", start_us=0, duration_ms=1),
+                dict(event_id="e2", node_id="r", fingerprint="f", sql_id="s", start_us=0, duration_ms=1)]
+        copies = lag_candidates(rows, {"p"}, ["r", "r2"])
+        self.assertEqual([(c["node_id"], c["event_id"], c["source_event_id"], c["origin"]) for c in copies],
+                         [("r", "e1@r", "e1", "primary"), ("r2", "e1@r2", "e1", "primary")])
+        from app.slowlog_impact import family_key
+        self.assertNotEqual(family_key(copies[0]), family_key(rows[1]))                       # never merges with the replica's own SQL
+        self.assertEqual(family_key(rows[0]), family_key({k: v for k, v in copies[0].items() if k != "origin"}))
+
+    def fixture(self):
+        backend, metadata = Mock(), Mock()
+        backend.serving_enabled = True
+        backend._window.side_effect = lambda q, retention: ((q["start_epoch_us"], q["end_epoch_us"])
+                                                             if "start_epoch_us" in q else (0, 6 * W - 1))
+        backend._manifest_coverage.return_value = {"complete": True, "total_parts": 1}
+        backend._scope_sql.side_effect = lambda q, low, high: ("SELECT 1", {"low": low})
+        backend.statement_index.statement_profiles.return_value = {}
+
+        def make(event_id, node, fingerprint, start, duration, account="app"):
+            return dict(event_id=event_id, start_us=start, node_id=node, database_name="shop", fingerprint=fingerprint,
+                        sql_id=fingerprint, duration_ms=duration, rows_examined=1, lock_time_ms=None, account=account)
+        current = [make("w1", "p", "bulk-write", 4 * W, 180000, "batch"),                       # the primary's write, in the growth minutes
+                   make("w2", "p", "steady-write", 0, 360000),
+                   make("v1", "r", "queued-read", 4 * W, 180000)]                               # the replica's own reader: a victim
+        backend._rows.side_effect = lambda sql, params, _: (
+            [dict(e, start_us=e["start_us"] - DAY_US) for e in current[1:2]] if params["low"] < 0 else current)
+        return metadata, backend
+
+    def run_lag(self, **kw):
+        metadata, backend = self.fixture()
+        loader = Mock(side_effect=lambda settings, start, end, instance, node="", **o: lag_points([0, 0, 0, 0, 60, 120, 180]))
+        result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "metric": "replication_lag"},
+                                        Settings(), loader, roles=lambda _i: self.ROLES, **kw)
+        return result, loader
+
+    def test_a_replica_is_ranked_with_the_primarys_statements_and_the_primary_is_not_listed(self):
+        result, loader = self.run_lag()
+        self.assertEqual([n["node_id"] for n in result["nodes"]], ["r"])
+        node = result["nodes"][0]
+        self.assertEqual([r["sql_id"] for r in node["statements"]][0], "bulk-write")
+        self.assertTrue(all(r["origin"] == "primary" and r["source_node_id"] == "p" for r in node["statements"]))
+        self.assertNotIn("queued-read", [r["sql_id"] for r in node["statements"]])            # the replica's readers are evidence, not candidates
+        self.assertEqual({r["sample_event_id"] for r in node["statements"]} - {"w1", "w2"}, set())   # the detail drawer gets real event ids
+        self.assertEqual((result["metric_id"], result["metric"], result["candidate_scope"]),
+                         ("replication_lag", "Cluster_DataDelay", "primary_statements"))
+        self.assertEqual(result["primary_nodes"], ["p"])
+        self.assertIn("lag_origin", node)
+        # one extra minute is requested ahead of the window (and of its baseline day) so the first growth can be told
+        self.assertEqual([c.args[1] for c in loader.call_args_list], [-W, -W - DAY_US])
+
+    def test_the_lag_origin_gets_the_replicas_own_events_and_the_other_replicas_peaks(self):
+        seen = {}
+        with patch("app.slowlog_impact_service.describe_lag",
+                   lambda node, samples, **kw: seen.update(node=node, samples=samples, **kw) or {"episodes": []}):
+            self.run_lag(ddl_lookup=lambda *_: [])
+        self.assertEqual(seen["node"], "r")
+        self.assertEqual([e["event_id"] for e in seen["events"]], ["v1"])
+        self.assertEqual(seen["other_peaks"], {})
+        self.assertEqual(seen["instance"], "x")
+        self.assertEqual(seen["samples"][-1], (6 * W, 180.0))
+
+    def test_unknown_primary_still_gives_the_lag_and_says_why_there_are_no_candidates(self):
+        metadata, backend = self.fixture()
+        loader = Mock(return_value=lag_points([0, 0, 0, 0, 60, 120, 180]))
+        with self.assertLogs("app.slowlog_impact_service", "WARNING") as logs:
+            result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "metric": "replication_lag"},
+                                            Settings(), loader, roles=lambda _i: {})
+        self.assertTrue(any("primary node unknown" in line for line in logs.output))
+        self.assertEqual(result["nodes"][0]["statements"], [])
+        self.assertIn("lag_origin", result["nodes"][0])
+
+    def test_no_replica_samples_is_its_own_status(self):
+        metadata, backend = self.fixture()
+        loader = Mock(return_value=lag_points([0, 0, 0, 0, 60, 120, 180], node="p"))          # only the primary answers: nothing to explain
+        with self.assertLogs("app.slowlog_impact_service", "WARNING"):
+            result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "metric": "replication_lag"},
+                                            Settings(), loader, roles=lambda _i: self.ROLES)
+        self.assertEqual((result["status"], result["nodes"]), ("no_replica_lag_samples", []))
 
 
 if __name__ == "__main__":

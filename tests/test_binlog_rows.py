@@ -978,3 +978,26 @@ class Release12918Tests(unittest.TestCase):
         self.assertEqual([d["concurrent_dml_events"] for d in ddl], [None, 9])
         self.assertEqual(ddl[0]["sample_sql"], "（历史数据未记录语句）")
         self.assertTrue(SQL_ORDERS)
+
+    def test_ddl_events_returns_the_ddl_inside_a_window_with_its_event_time(self):
+        from app.binlog_rows_analytics import BinlogRowsAnalytics
+
+        seen = {}
+
+        def responder(sql, params, settings, timeout):
+            seen.update(sql=sql, params=params)
+            return [{"a_bucket": 0, "db_name": "", "tbl_name": "", "a_fp": 1, "a_first": 1791947877000000,
+                     "a_sample": "ALTER TABLE csr.biz_shop_job ADD INDEX i (a)"},
+                    {"a_bucket": 0, "db_name": "shop", "tbl_name": "t", "a_fp": 0, "a_first": 1791947890000000, "a_sample": None}]
+
+        rows = mock.Mock()
+        rows.ch.rows.side_effect = responder
+        out = BinlogRowsAnalytics(rows).ddl_events("rm-x", 1791947700000000, 1791948000000000)
+        self.assertEqual(out, [{"event_epoch_us": 1791947877000000, "database_name": "", "table_name": "",
+                                "sample_sql": "ALTER TABLE csr.biz_shop_job ADD INDEX i (a)"},
+                               {"event_epoch_us": 1791947890000000, "database_name": "shop", "table_name": "t", "sample_sql": ""}])
+        self.assertIn("operation = 'DDL'", seen["sql"])
+        self.assertIn("HAVING a_first BETWEEN {a:Int64} AND {b:Int64}", seen["sql"])
+        self.assertEqual((seen["params"]["i"], seen["params"]["a"], seen["params"]["b"]),
+                         ("rm-x", 1791947700000000, 1791948000000000))
+        self.assertEqual(seen["params"]["d0"], seen["params"]["d1"])   # one UTC day for a few minutes

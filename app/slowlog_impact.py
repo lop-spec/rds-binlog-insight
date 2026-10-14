@@ -32,11 +32,16 @@ DAY_US = 86400 * 1_000_000
 
 
 def family_key(event: dict[str, Any]) -> str:
-    """DAS SQL IDs can intentionally normalize numeric physical table suffixes."""
+    """DAS SQL IDs can intentionally normalize numeric physical table suffixes.
+
+    A statement ranked against another node's metric (replication lag: the primary's writes against a replica's lag)
+    carries ``origin`` so it never merges with the same SQL running on the node itself; without it the key is unchanged.
+    """
     sql_id = str(event.get("sql_id") or "")
-    return json.dumps([str(event.get("database_name") or ""),
-                       "sql_id" if sql_id else "fingerprint",
-                       sql_id or str(event["fingerprint"])], separators=(",", ":"))
+    key = [str(event.get("database_name") or ""), "sql_id" if sql_id else "fingerprint", sql_id or str(event["fingerprint"])]
+    if event.get("origin"):
+        key.append(str(event["origin"]))
+    return json.dumps(key, separators=(",", ":"))
 
 
 def clipped_runtime_net_of_lock(events: list[dict[str, Any]], start_us: int, end_us: int,
@@ -66,7 +71,8 @@ def clipped_runtime_net_of_lock(events: list[dict[str, Any]], start_us: int, end
 def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[dict[str, Any]],
                             points: list[dict[str, Any]], *, start_us: int, end_us: int,
                             index_complete: bool, baseline_complete: bool,
-                            baseline_points: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                            baseline_points: list[dict[str, Any]] | None = None,
+                            score_points: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Resource overlap discounted by the non-growing fraction of execution time.
 
     Identical full-minute windows exactly 24 hours apart. All SQL families are
@@ -88,7 +94,7 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
     if missing_ids:
         LOGGER.warning("slowlog_performance_growth missing SQL IDs: %s events use physical fingerprint", missing_ids)
     result = rank_resource_overlap(families, points, start_us=start_us, end_us=end_us,
-                                   index_complete=index_complete)
+                                   index_complete=index_complete, score_points=score_points)
     previous_series = execution_series(previous, start_us - DAY_US, end_us - DAY_US)
     net_now = clipped_runtime_net_of_lock(families, start_us, end_us)
     net_before = clipped_runtime_net_of_lock(previous, start_us - DAY_US, end_us - DAY_US)
@@ -225,14 +231,41 @@ def execution_series(events: list[dict[str, Any]], start_us: int, end_us: int,
     return dict(result)
 
 
+def _node_metrics(points: list[dict[str, Any]], time_set: set[int]) -> tuple[dict[str, dict[int, Decimal]] | None, str]:
+    """Per node, the samples at the complete period ends; ``(None, reason)`` for a value that cannot be used."""
+    metrics: dict[str, dict[int, Decimal]] = defaultdict(dict)
+    for point in points:
+        node = str(point.get("nodeId") or "")
+        t = int(point["timestamp"]) * 1000
+        if t not in time_set:
+            continue
+        value = Decimal(str(point["Average"]))
+        if not value.is_finite() or value < 0 or abs(value.as_tuple().exponent) > 18:
+            return None, "invalid_metric_value"
+        if t in metrics[node] and metrics[node][t] != value:
+            return None, "conflicting_metric_samples"
+        metrics[node][t] = value
+    return metrics, ""
+
+
+def _scaled(samples: dict[int, Decimal], times: list[int]) -> tuple[int, list[int]]:
+    scale = 10 ** max(0, max(-v.as_tuple().exponent for v in samples.values()))
+    return scale, [int(samples[t] * scale) for t in times]
+
+
 def rank_resource_overlap(events: list[dict[str, Any]], points: list[dict[str, Any]], *,
                           start_us: int, end_us: int, index_complete: bool,
-                          period_us: int = PERIOD_US) -> dict[str, Any]:
+                          period_us: int = PERIOD_US,
+                          score_points: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Rank each node independently by sum(runtime_us * positive metric excess).
 
     Baseline is the lower empirical 20th percentile of the SAME selected node
     window, not a fitted quiet-period detector. Shares sum to 1 within a node;
     they are overlap shares, NOT shares of IOPS caused by a SQL statement.
+
+    ``score_points`` (replication lag) replaces the series the excess and the coefficient are taken from; the node
+    still reports ``points`` as its metric. A lag level is an accumulated state: what a statement can be related to is
+    the minutes in which the lag grew, not the minutes in which it merely stayed high.
     """
     def unavailable(reason: str) -> dict[str, Any]:
         LOGGER.warning("slowlog_resource_overlap unavailable: %s", reason)
@@ -249,37 +282,34 @@ def rank_resource_overlap(events: list[dict[str, Any]], points: list[dict[str, A
     if len(times) < 6:
         return unavailable("insufficient_complete_periods")
     time_set = set(times)
-    metrics: dict[str, dict[int, Decimal]] = defaultdict(dict)
-    for point in points:
-        node = str(point.get("nodeId") or "")
-        t = int(point["timestamp"]) * 1000
-        if t not in time_set:
-            continue
-        value = Decimal(str(point["Average"]))
-        if not value.is_finite() or value < 0 or abs(value.as_tuple().exponent) > 18:
-            return unavailable("invalid_metric_value")
-        if t in metrics[node] and metrics[node][t] != value:
-            return unavailable("conflicting_metric_samples")
-        metrics[node][t] = value
+    metrics, reason = _node_metrics(points, time_set)
+    if metrics is None:
+        return unavailable(reason)
+    score_metrics = metrics
+    if score_points is not None:
+        score_metrics, reason = _node_metrics(score_points, time_set)
+        if score_metrics is None:
+            return unavailable(reason)
     nodes = []
     for node in sorted({n for n, _ in series} | set(metrics)):
         samples = metrics.get(node, {})
-        if not node or len(samples) != len(times):
+        scored = score_metrics.get(node, {})
+        if not node or len(samples) != len(times) or len(scored) != len(times):
             LOGGER.warning("slowlog_resource_overlap metric gaps: node=%s actual=%s expected=%s",
-                           node or "unknown", len(samples), len(times))
+                           node or "unknown", min(len(samples), len(scored)), len(times))
             nodes.append({"node_id": node, "status": "metric_gaps", "statements": [],
-                          "expected_points": len(times), "actual_points": len(samples)})
+                          "expected_points": len(times), "actual_points": min(len(samples), len(scored))})
             continue
-        scale = 10 ** max(0, max(-v.as_tuple().exponent for v in samples.values()))
-        y = [int(samples[t] * scale) for t in times]
-        baseline = sorted(y)[(len(y) - 1) // 5]
-        excess = [max(v - baseline, 0) for v in y]
+        scale, y = _scaled(samples, times)
+        score_scale, ys = (scale, y) if scored is samples else _scaled(scored, times)
+        baseline = sorted(ys)[(len(ys) - 1) // 5]
+        excess = [max(v - baseline, 0) for v in ys]
         statements = []
         for (event_node, fingerprint), sparse in series.items():
             if event_node != node:
                 continue
             runtime = [sparse.get(t, 0) for t in times]
-            correlation, reason = pearson(runtime, y)
+            correlation, reason = pearson(runtime, ys)
             score = sum(a * b for a, b in zip(runtime, excess))
             statements.append({"fingerprint": fingerprint, "score_numerator": score,
                                "resource_r": correlation, "correlation_status": reason,
@@ -292,9 +322,12 @@ def rank_resource_overlap(events: list[dict[str, Any]], points: list[dict[str, A
         status = "ok" if total else "no_excess_overlap"
         if status != "ok":
             LOGGER.warning("slowlog_resource_overlap unavailable: node=%s reason=%s", node, status)
-        nodes.append({"node_id": node, "status": status, "baseline": baseline / scale,
-                      "peak": max(y) / scale, "metric_scale": scale,
-                      "metric_values": y, "statements": statements})
+        entry = {"node_id": node, "status": status, "baseline": sorted(y)[(len(y) - 1) // 5] / scale,
+                 "peak": max(y) / scale, "metric_scale": scale,
+                 "metric_values": y, "statements": statements}
+        if scored is not samples:
+            entry.update(score_values=ys, score_scale=score_scale, score_baseline=baseline / score_scale)
+        nodes.append(entry)
     if not nodes:
         return unavailable("no_metric_or_execution_data")
     return {"status": "ok" if all(n["status"] == "ok" for n in nodes) else "partial",

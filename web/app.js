@@ -2317,6 +2317,11 @@ function bindEvents() {
       await loadLiveSessions(liveButton.dataset.liveNode, liveButton);
       return;
     }
+    const lagEvent = event.target.closest("[data-lag-event]");
+    if (lagEvent) {
+      await openDetail(lagEvent.dataset.lagEvent, "", state.rise?.data?.instance_id || "");
+      return;
+    }
     const riseRow = event.target.closest("[data-rise-fp]");
     if (riseRow) {
       await openRiseDetail(riseRow.dataset.riseNode, riseRow.dataset.riseFp);

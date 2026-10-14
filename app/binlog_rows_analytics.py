@@ -145,6 +145,27 @@ class BinlogRowsAnalytics:
             },
         }
 
+    def ddl_events(self, instance: str, start_us: int, end_us: int, limit: int = DDL_WINDOW_ROWS) -> list[dict[str, Any]]:
+        """DDL statements the instance logged between two instants, oldest first, with their exact event time.
+
+        Same aggregate rows as the analytics page's DDL list; a replication-lag stall is matched to the DDL whose event
+        time sits at its origin. Statement text is empty for history before the aggregates carried it.
+        """
+        start_us, end_us = int(start_us), int(end_us)
+        params = {"i": str(instance), "lo": (start_us // AGG_BUCKET_US) * AGG_BUCKET_US, "hi": end_us,
+                  "d0": datetime.fromtimestamp(start_us / 1e6, UTC).date().isoformat(),
+                  "d1": datetime.fromtimestamp(end_us / 1e6, UTC).date().isoformat(),
+                  "a": start_us, "b": end_us, "n": max(1, min(int(limit), 100))}
+        rows = self._q(
+            f"SELECT bucket_us AS a_bucket, database_name AS db_name, table_name AS tbl_name, fp AS a_fp, "
+            f"min(first_epoch_us) AS a_first, any(sample_sql) AS a_sample FROM {AGG_TABLE} "
+            "WHERE instance_id = {i:String} AND event_date BETWEEN {d0:Date} AND {d1:Date} "
+            "AND bucket_us BETWEEN {lo:Int64} AND {hi:Int64} AND operation = 'DDL' "
+            "GROUP BY a_bucket, db_name, tbl_name, a_fp HAVING a_first BETWEEN {a:Int64} AND {b:Int64} "
+            "ORDER BY a_first LIMIT {n:UInt32}", params)
+        return [{"event_epoch_us": _int(row["a_first"]), "database_name": row["db_name"], "table_name": row["tbl_name"],
+                 "sample_sql": str(row["a_sample"] or "")} for row in rows]
+
     @staticmethod
     def _ddl_dml_sql() -> str:
         """Same-table DML in the DDL's bucket +-1 (built per call, like every other statement here)."""

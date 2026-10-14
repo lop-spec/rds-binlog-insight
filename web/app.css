@@ -207,6 +207,11 @@ h2 { margin: 0; font-size: 17px; line-height: 1.3; }
 .rise-table tr.is-flat td { opacity: .55; }
 /* 八列：窄屏横向滚动，不把数字列挤成竖排 */
 .rise-table { min-width: 1040px; }
+.rise-lag { margin: 10px 0 14px; padding: 8px 14px 4px; border-left: 3px solid var(--warning); background: var(--surface); font-size: 13px; line-height: 1.7; }
+.rise-lag h4 { margin: 2px 0 6px; font-size: 13px; }
+.rise-lag p { margin: 4px 0; }
+.rise-lag-list { margin: 2px 0 6px; padding-left: 20px; font-variant-numeric: tabular-nums; }
+.rise-lag + .rise-lag { margin-top: 0; }
 .rise-live { margin: 8px 0 12px; }
 .rise-live .muted { margin-left: 8px; }
 .rise-live-result { margin-top: 8px; }

@@ -151,3 +151,24 @@ python tools/backtest_slowlog_impact.py --events private-events.json --baseline 
 ## 审计页操作类型误带 operation=on（1.30.2）
 
 1.30.0 的分析洞察「证据来源」两个勾选框复用了审计页「操作类型」的样式类 `operation-filter`，而审计查询用全局选择器 `.operation-filter input:checked` 收集操作类型：证据来源的勾选框默认勾选、没有 `value`（浏览器取值 `on`），于是默认每次审计查询都带 `operation=on`，什么都匹配不上，结果 0 条（手动勾上某个操作类型时才有结果）。1.30.2 起审计页读取和清空操作类型都限定在 `#view-audit` 内（审计查询、事务钻取、重置条件三处），分析洞察的勾选框不再被审计页读到或清掉。回归测试用「按选择器返回匹配项」的假 `document` 复现旧行为，并检查源码里每处 `operation-filter` 查找都带 `#view-audit` 前缀。
+
+## 复制延迟与延迟溯源（1.31.0）
+
+起因：集群版备节点 `Cluster_DataDelay` 告警（≥30 秒）。一个备节点的复制线程在一条 `ALTER TABLE … ADD INDEX`（主库 11:17:57 记入 binlog，毫秒级完成）上卡了 4077 秒：这条 DDL 在备节点回放时要这张表的元数据锁，一个没在慢日志里出现的持锁者一直不放手，延迟每秒涨 1 秒，到放行才回落。慢日志里看得到的只有被堵的 15 条 `Prepare` 和一条 `SELECT`（各运行约 4077 / 1696 秒，全是受害者），元凶 DDL 本身几毫秒就执行完，**不会出现在任何慢日志里**。上涨排查原有的五个指标（cpu / iops / rows_read / row_lock / threads）都是「瞬时负载」，对这类事件没有答案，所以加了第六个：复制延迟。
+
+- **指标**：`metric=replication_lag`，云监控 `Cluster_DataDelay`（单位秒，按节点，一分钟点，取值与告警同源）。页面「性能指标」下拉里叫「复制延迟 秒（备节点）」。主节点没有复制延迟，不在结果里；只取到主节点的点时返回 `no_replica_lag_samples`。
+- **候选 SQL 是主库的语句**：备节点的延迟出在主库写入或备节点的回放线程，不在备节点自己的读查询。所以对每个有延迟样本的备节点，候选集 = **主节点**的慢日志语句（主节点由 `DescribeDBInstanceAttribute` 的节点角色确定，角色未知时记 WARNING、候选为空，溯源卡照常给出）；每条候选带 `origin = "primary"` 和 `source_node_id`，`sample_event_id` 仍是真实事件 ID（详情抽屉可打开）。备节点自己的语句不参与排名，只作为溯源里的「被堵 / 持锁」证据。
+- **打分用「延迟增长」而不是「延迟水平」**：延迟是累积量，水位高不代表这几分钟里有什么在写。排名取 `max(lag(t) − lag(t−1 分钟), 0)`（每分钟新增的延迟秒数）作为「指标超额」序列：增长份额、相关度 r 都按它算，节点的曲线与 `metric_values` 仍是延迟水平，增长序列在 `score_values` / `score_scale` / `score_baseline`。窗口前多取一个样本来算第一分钟的增长，缺样本的分钟不补零（沿用「缺点不补零」）。昨日同窗对照、锁等待扣除、20% 分位基线与其他指标完全一致。
+- **`lag_origin`（每个备节点一块）**：只用延迟序列本身做算术。一个复制线程卡在同一个事件上时，延迟每秒涨 1 秒，而它正在回放的事件在主库的时间 `origin(t) = t − lag(t)` 不动；只是追不上写入时涨得比 1 慢、起点一直在移。
+  - 延迟段（episode）：延迟 ≥30 秒的连续分钟，向前取到延迟从 0.5 秒以上开始涨的那一分钟，向后取到回落到 0.5 秒以下；每个节点最多返回峰值最大的 3 段（`episode_count` 给总数）。
+  - `kind`：`stall`（峰值前有 ≥3 分钟斜率 ≥0.85 秒/秒，且起点 `origin_us` 的偏差在一分钟内；个别样本因分钟均值横跨起点/放行而偏离时，只截掉这几个样本，不丢整段）、`behind`（涨得慢，≥3 分钟正增长，没有稳定起点：回放速度跟不上写入）、`spike`（短时尖峰）。另给 `growth_rate`、`recovery_rate`（秒/秒，中位数）。缺一分钟样本时不跨缺口取斜率。
+  - `stall.origin_us`：卡住的那个事件在主库的时间（取该段的中位数），按「样本分钟的中点 − 延迟」估算。云监控的分钟点以该分钟的**结束**为时间戳（用 10-14 的事件核过：11:19:00 的点是 11:18:30 的延迟，ALTER 记在 11:17:57，估算与它相差 0.5 秒），一般情况下误差在 ±30 秒内。
+  - `stall.release_us`：放行时刻。卡住的线程在最后一个「起点不变」的样本之后的那一分钟里放行，所以默认取该样本的时间戳（10-14 的事件里与实际放行差 6 秒）；爬升段比峰值早结束超过一分钟（最后几个样本被别的东西带偏）但不超过 5 分钟时改取峰值。`queued` / `holders` 都以它为准。
+  - `trigger`：用 `origin_us ± 90 秒` 在 Binlog 行存储里查 DDL（聚合表里 `operation = 'DDL'` 的行，事件时间精确到秒，`sample_sql` 是语句文本），取离起点最近且在 90 秒以内的一条：`{type: "ddl", event_us, sql, database, table, offset_s}`；没有则 `{type: "none"}`（卡住的是一个事件的回放：超大事务或回放时等锁，行存储没有逐事务明细，需看那一刻前后的大事务）；行存储查询失败为 `{type: "unavailable"}` 并写 WARNING，其余内容照常返回。
+  - `queued` / `holders`：该备节点自己的慢日志里，**随卡顿一起结束**（结束时刻与放行相差 ≤90 秒）且运行 ≥60 秒的语句：开始于起点之后的是被堵在同一把锁后面的受害者（`queued`，运行最久的在前，最多列 5 条，另给总数），开始于起点之前的是持锁者候选（`holders`）。`holders.count = 0` 的含义是**持锁者不在慢日志里**：慢日志要等语句结束才出现，空闲事务 / 连接永远不会出现。只统计窗口内开始且已执行完的慢日志。
+  - `node_local`：其他备节点在同一窗口里的峰值都低于 30 秒为 `true`（问题在这个节点上，不是主库写入量）；有别的备节点也过阈值为 `false`；没有其他备节点为 `null`。
+- **接口**：`GET /api/slowlog-impact?metric=replication_lag&order=growth`（`order` 三种取值都可用，其余参数不变）；响应多 `candidate_scope = "primary_statements"`、`primary_nodes`，每个备节点多 `lag_origin`。服务端新增只读的 `BinlogRows.ddl_events(instance, start_us, end_us)`（一条 ClickHouse 聚合表查询），`/api/slowlog-impact` 通过 `ddl_lookup` 注入给 `query_resource_overlap`；没有行存储时 `trigger` 为 `none`。不新增权限、不新增采集、不落盘；云监控仍只调用 `DescribeMetricList`。
+- **页面**：节点卡片里，曲线下面是「复制延迟溯源」：每段延迟一块，写明峰值、是否卡在同一个事件上、事件在主库的时间、那一刻的 DDL（语句文本转义显示）、被堵语句（可点「明细」打开慢日志详情）、没有持锁者时直说「持锁的不在慢日志里」，以及其他备节点是否也延迟；其后才是主库候选语句表（列名「SQL（主库执行，按增长份额排序）」）。节点里仍保留「看正在跑的查询」。
+- **回归**：`tests/test_lag_origin.py` 用 10-14 事件的真实云监控分钟序列（实例级均值×5，含其他节点的噪声和 12:23 的删除尖峰）复现：一段 `stall`、起点落在 ALTER 的 90 秒内、命中那条 `ALTER TABLE … ADD INDEX` 的 DDL；另有合成序列覆盖慢速落后、短尖峰、缺分钟、两段延迟、DDL 查询失败、持锁者在 / 不在慢日志里。`tests/test_slowlog_impact.py::LagMetricTests` 覆盖增长序列打分（节点仍报水位）、主库候选按备节点复制且不与备节点自己的同 SQL 合并、主节点不出现在结果里、角色未知、只有主节点有点。节点测试覆盖溯源卡各分支与转义。
+
+验证：`python -m unittest tests.test_lag_origin tests.test_slowlog_impact tests.test_server_roles_and_windows tests.test_binlog_rows -q`；`node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_indexed_range.cjs`。
