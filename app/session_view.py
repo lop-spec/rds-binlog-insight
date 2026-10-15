@@ -205,12 +205,6 @@ def build_session_view(data: dict[str, Any], now_us: int, thresholds: dict[str, 
     }
 
 
-def _plain(value: Any, limit: int = 80) -> str:
-    """Text safe inside a ``--`` comment: one line, no comment openers, bounded."""
-    text = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))).strip()
-    return text.replace("/*", "/ *").replace("*/", "* /")[:limit]
-
-
 def route_hint(node: dict[str, Any]) -> tuple[str, str]:
     """The read/write splitting hint that sends a statement to this node, as (name for a comment, text for the statement).
 
@@ -225,12 +219,14 @@ def route_hint(node: dict[str, Any]) -> tuple[str, str]:
 
 
 def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], *, mode: str, snapshot_us: int,
-                          generated_us: int) -> dict[str, Any]:
-    """The statements to end the given sessions on one node, with what to run first to check them.
+                          generated_us: int, lock_waiters: int = 0) -> dict[str, Any]:
+    """The statements to end the given sessions on one node: one check of all of them, the lock check when sessions on the node
+    wait for a lock (``lock_waiters`` > 0), and one KILL per session. Code only, no comments: the page says what to look at.
 
-    ``sessions`` are rows of a snapshot as the page displayed them. Only integers become code (and the hint, built from a
-    node id that matched ``NODE_ID_PATTERN``); every other value is written inside comments and cleaned first, so a user
-    name cannot smuggle a statement into the text.
+    ``sessions`` are rows of a snapshot as the page displayed them; only their integer ids reach the text (and the hint, built
+    from a node id that matched ``NODE_ID_PATTERN``), so a user name cannot smuggle a statement in. The check carries
+    ``@@read_only`` (1 on a standby, 0 on the primary): on the primary's own address a hint is only a comment and the statements
+    run on the primary, and this column is how that shows. Only ``KILL <id>`` and ``KILL QUERY <id>`` are written.
     """
     if mode not in ("connection", "query"):
         raise ValueError("mode 必须是 connection 或 query")
@@ -238,6 +234,8 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
         raise ValueError("没有选中会话")
     if len(sessions) > MAX_KILL_SESSIONS:
         raise ValueError(f"一次最多 {MAX_KILL_SESSIONS} 个会话")
+    if isinstance(lock_waiters, bool) or not isinstance(lock_waiters, int) or lock_waiters < 0:
+        raise ValueError("lock_waiters 必须是非负整数")
     keep: dict[int, dict[str, Any]] = {}
     skipped: list[dict[str, Any]] = []
     for row in sessions:
@@ -252,49 +250,20 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
         else:
             keep[session_id] = row
     verb = "KILL" if mode == "connection" else "KILL QUERY"
-    def stamp(us: int) -> str:
-        return datetime.fromtimestamp(us / 1_000_000, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    primary = str(node.get("role") or "") == "primary"
-    role = {"primary": "主节点", "secondary": "备节点"}.get(str(node.get("role") or ""), "节点角色未知")
     hint_name, hint = route_hint(node)
-    where = f"{role} {_plain(node.get('node_id'), 40)}{' · ' + _plain(node.get('zone'), 24) if node.get('zone') else ''}"
-    lines = [f"-- SQL Insight 会话管理 · 生成于 {stamp(generated_us)} · 会话快照 {stamp(snapshot_us)}"]
-    if hint:
-        on_primary_address = ("在主地址的连接上它只是注释，语句同样落到主节点" if primary
-                              else "在主地址的连接上它只是注释、语句会落到主节点，所以先跑第 0 步自检")
-        lines.append(f"-- {where}：会话号只在本节点有效。每条语句都带 Hint {hint_name}：经读写分离（代理）地址执行时落到这个节点；"
-                     f"{on_primary_address}；用 mysql 命令行要加 -c，否则 Hint 会被命令行工具过滤。")
-    else:
-        lines.append(f"-- {where}：会话号只在本节点有效，请连到这个节点执行；这个节点 ID 不能安全地写进 Hint，读写分离地址会落到不确定的节点。")
     ids = sorted(keep)
     statements: list[str] = []
+    lines: list[str] = []
     if ids:
         listing = ", ".join(str(i) for i in ids)
-        check = ("SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
-                 f"FROM information_schema.PROCESSLIST WHERE ID IN ({listing});")
-        if hint:
-            expected = {"primary": "read_only 应为 0（主节点）", "secondary": "read_only 应为 1（备节点）"}.get(
-                str(node.get("role") or ""), "返回的 server_id 应是目标节点的（主节点 read_only 为 0，备节点为 1）")
-            way_out = "" if primary else "；报 force hint server node is not found 说明这个代理不认该节点 ID，实例只有一个备节点时可把 Hint 换成 FORCE_SLAVE"
-            lines += [f"-- 0. 先自检路由：{expected}；不对说明这条连接是主地址或 Hint 没生效，别往下执行{way_out}",
-                      hint + "SELECT @@server_id AS server_id, @@read_only AS read_only;"]
-        lines += ["-- 1. 先核对：会话还在，且仍是快照里的那个（用户、来源、命令、时长对得上）再往下执行", hint + check,
-                  "-- 2. 会话在等元数据锁时，先找出真正持锁的会话（需要 performance_schema 的 metadata_locks，MySQL 8.0）",
-                  hint + "SELECT * FROM sys.schema_table_lock_waits;",
-                  "-- 3. 结束会话" + ("（KILL 结束连接并回滚它未提交的事务）" if mode == "connection"
-                                      else "（KILL QUERY 只终止当前语句，空闲会话不受影响）") + "；执行后重跑第 1 步，会话没了才算杀掉"]
+        read_only = "@@read_only AS ro, " if hint else ""
+        lines.append(hint + f"SELECT {read_only}ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
+                     f"FROM information_schema.PROCESSLIST WHERE ID IN ({listing});")
+        if lock_waiters:
+            lines.append(hint + "SELECT * FROM sys.schema_table_lock_waits;")
         for session_id in ids:
-            row = keep[session_id]
-            note = " ".join(part for part in (
-                f"{_plain(row.get('user'), 32)}@{_plain(row.get('client'), 48)}", f"db={_plain(row.get('database'), 32)}",
-                _plain(row.get("command"), 16), f"{_seconds(row.get('seconds'))}s",
-                f"事务 {_seconds(row.get('trx_seconds'))}s" if _seconds(row.get("trx_seconds")) else "",
-                "/".join(KIND_LABELS.get(str(kind), "") for kind in (row.get("kinds") or []) if str(kind) in KIND_LABELS)) if part)
             statement = f"{hint}{verb} {session_id};"
             statements.append(statement)
-            lines.append(f"{statement}  -- {note}")
-    for item in skipped:
-        lines.append(f"-- 跳过 {item['session_id']}：{item['reason']}，不生成 KILL")
-    return {"text": "\n".join(lines) + "\n", "statements": statements, "skipped": skipped, "mode": mode,
-            "session_ids": ids, "snapshot_us": snapshot_us, "generated_us": generated_us}
+            lines.append(statement)
+    return {"text": ("\n".join(lines) + "\n") if lines else "", "statements": statements, "skipped": skipped, "mode": mode,
+            "session_ids": ids, "snapshot_us": snapshot_us, "generated_us": generated_us, "hint": hint_name}

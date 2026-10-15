@@ -107,7 +107,9 @@ class ServiceTests(unittest.TestCase):
         with self.assertLogs("app.session_service", "INFO") as logs:
             out = self.service.kill_statements(self.payload())
         self.assertEqual(out["statements"], ["/*FORCE_NODE='rn-b'*/ KILL 2;"])
-        self.assertIn("备节点 rn-b · cn-b", out["text"])
+        self.assertEqual(out["hint"], "FORCE_NODE='rn-b'")
+        self.assertNotIn("schema_table_lock_waits", out["text"])                   # nobody waits for a lock on this node: no lock check
+        self.assertIn("schema_table_lock_waits", self.service.kill_statements(self.payload(lock_waiters=3))["text"])
         self.assertIn("nothing was executed", logs.output[0])
         self.assertIn("sessions=1", logs.output[0])
         self.assertEqual(self.live.calls, [])      # no DAS call, and the service has no database connection at all
@@ -117,7 +119,8 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaises(SessionRequestError):
                 self.service.kill_statements(bad)
         for bad in (self.payload(sessions="x"), self.payload(sessions=[1]), self.payload(snapshot_us=True), self.payload(snapshot_us="1"),
-                    self.payload(snapshot_us=0), self.payload(mode="drop"), self.payload(sessions=[])):
+                    self.payload(snapshot_us=0), self.payload(mode="drop"), self.payload(sessions=[]), self.payload(lock_waiters=-1),
+                    self.payload(lock_waiters=True), self.payload(lock_waiters="2")):
             with self.assertRaises(ValueError):
                 self.service.kill_statements(bad)
 

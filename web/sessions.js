@@ -485,7 +485,7 @@ async function generateSessionKill() {
     const written = await api("/api/sessions/kill-statements", {
       method: "POST",
       body: JSON.stringify({
-        instance, node_id: nodeId, mode: sessionsState.killMode, snapshot_us: node.observed_at_us,
+        instance, node_id: nodeId, mode: sessionsState.killMode, snapshot_us: node.observed_at_us, lock_waiters: Number(node.holders?.waiters) || 0,
         sessions: picked.map((row) => ({ session_id: row.session_id, user: row.user, client: row.client, database: row.database, command: row.command,
           seconds: row.seconds, trx_seconds: row.trx_seconds, kinds: row.kinds })),
       }),
@@ -502,13 +502,14 @@ function sessionKillHtml() {
   const blocks = sessionsState.kill.map((item, index) => {
     const primary = item.node.role === "primary";
     const warn = primary ? '<p class="session-kill-warn">这是<strong>主节点</strong>：杀错会话会直接影响线上写入，务必先跑核对语句。</p>' : "";
+    const unrouted = item.hint === "" ? '<p class="session-kill-warn">这个节点 ID 不能写进 Hint：请直连该节点执行。</p>' : "";
     const skipped = (item.skipped || []).length ? `<p class="analytics-note">跳过 ${humanCount(item.skipped.length)} 个受保护会话：${escapeHtml(item.skipped.map((row) => `${row.session_id}（${row.reason}）`).join("、"))}。</p>` : "";
-    return `<section class="detail-block"><h3>${sessionNodeChip(item.node)}</h3>${warn}
+    return `<section class="detail-block"><h3>${sessionNodeChip(item.node)}</h3>${warn}${unrouted}
       <textarea class="session-kill-text" readonly rows="${Math.min(24, Math.max(8, String(item.text).split("\n").length + 1))}" spellcheck="false" aria-label="KILL 语句">${escapeHtml(item.text)}</textarea>
       <div class="session-kill-actions"><button type="button" class="button primary compact" data-session-copy="${index}"${item.statements.length ? "" : " disabled"}>复制语句</button>
       <span class="muted">${humanCount(item.statements.length)} 条 KILL · 快照 ${escapeHtml(sessionTimeText(item.snapshot_us))}</span></div>${skipped}</section>`;
   }).join("");
-  return `<p class="analytics-note">本页只生成语句，不执行任何 kill：服务只有云上只读身份、没有数据库账号。每条语句带读写分离的 Hint（备节点 FORCE_NODE、主节点 FORCE_MASTER），走读写分离（代理）地址的连接才会落到<strong>对应节点</strong>，在主地址的连接上它只是注释。先跑第 0 步自检，read_only 对不上就停；再跑第 1 条核对语句，确认会话还在、仍是快照里的那个，再杀，杀完重跑核对。</p>
+  return `<p class="analytics-note">只生成语句，不执行。走读写分离（代理）地址的连接才会落到对应节点（主地址上 Hint 只是注释）。先跑检查：<code>ro</code> 备节点应为 1、主节点为 0，会话对得上再杀；杀完再跑检查，无结果=已杀。</p>
     ${modes}${blocks}`;
 }
 

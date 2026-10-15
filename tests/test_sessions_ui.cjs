@@ -183,10 +183,11 @@ test('KILL statements: one request per node with what the page showed, the snaps
   const written = (url, options) => {
     const body = JSON.parse(options.body);
     return {text: `-- ${body.node_id}\nKILL ${body.sessions[0].session_id};  -- <b>x</b>\n`, statements: body.sessions.map((s) => `KILL ${s.session_id};`),
-      skipped: body.node_id === 'rn-primary00000001' ? [{session_id: 9, reason: '复制线程（Binlog Dump）'}] : [], snapshot_us: body.snapshot_us, mode: body.mode, session_ids: []};
+      skipped: body.node_id === 'rn-primary00000001' ? [{session_id: 9, reason: '复制线程（Binlog Dump）'}] : [], snapshot_us: body.snapshot_us, mode: body.mode, session_ids: [], hint: body.node_id === 'rn-primary00000001' ? 'FORCE_MASTER' : ''};
   };
   const {run, c, calls, nodes, toasts} = context({api: async (url, options) => written(url, options)});
   c.data = payload();
+  c.data.nodes[1].holders = {waiters: 16, oldest_wait_s: 4077, candidates: 1};            // sessions wait for a lock on the standby only
   run('sessionsState.data = data; sessionsState.selected = new Set(["rn-primary00000001:44", "rn-primary00000001:9", "rn-secondary0000b:312"])');
   await run('generateSessionKill()');
   assert.equal(calls.length, 2);                                                           // two nodes, two requests: a KILL id means something on one node only
@@ -194,15 +195,18 @@ test('KILL statements: one request per node with what the page showed, the snaps
   assert.equal(first.instance, 'rm-x');
   assert.equal(first.mode, 'connection');
   assert.equal(first.snapshot_us, SNAP);
+  assert.equal(first.lock_waiters, 0);                                                     // the node's own waiters decide whether the lock check is written
+  assert.equal(JSON.parse(calls.find(([, o]) => JSON.parse(o.body).node_id === 'rn-secondary0000b')[1].body).lock_waiters, 16);
   assert.deepEqual(first.sessions.map((s) => s.session_id).sort((a, b) => a - b), [9, 44]);
   assert.deepEqual(Object.keys(first.sessions[0]).sort(), ['client', 'command', 'database', 'kinds', 'seconds', 'session_id', 'trx_seconds', 'user']);
   assert.ok(calls.every(([url, options]) => url === '/api/sessions/kill-statements' && options.method === 'POST'));
   assert.equal(nodes.drawerShown, true);
   const body = nodes['#detail-body'].innerHTML;
   assert.equal(nodes['#detail-title'].textContent, 'KILL 语句');
-  assert.match(body, /本页只生成语句，不执行任何 kill/);
+  assert.match(body, /只生成语句，不执行。走读写分离（代理）地址的连接/);
   assert.match(body, /这是<strong>主节点<\/strong>：杀错会话会直接影响线上写入/);
   assert.match(body, /跳过 1 个受保护会话：9（复制线程（Binlog Dump））/);
+  assert.equal(body.match(/这个节点 ID 不能写进 Hint/g).length, 1);                          // only the node whose answer had no hint
   assert.match(body, /KILL 44;  -- &lt;b&gt;x&lt;\/b&gt;/);
   assert.doesNotMatch(body, /<b>x<\/b>/);
   assert.match(body, /data-session-killmode="connection" class="is-active"/);

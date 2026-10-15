@@ -100,7 +100,7 @@ class SessionService:
         if isinstance(snapshot_us, bool) or not isinstance(snapshot_us, int) or snapshot_us <= 0:
             raise ValueError("snapshot_us 必须是快照时间（微秒）")
         result = build_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, mode=str(payload.get("mode") or "connection"),
-                                       snapshot_us=snapshot_us, generated_us=self._wall_us())
+                                       snapshot_us=snapshot_us, generated_us=self._wall_us(), lock_waiters=payload.get("lock_waiters", 0))
         LOGGER.info("session management: kill statements written instance=%s node=%s mode=%s sessions=%d skipped=%d (nothing was executed)",
                     instance, node, result["mode"], len(result["session_ids"]), len(result["skipped"]))
         return result
