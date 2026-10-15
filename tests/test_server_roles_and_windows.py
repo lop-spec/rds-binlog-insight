@@ -313,6 +313,19 @@ class StatusSnapshotTests(unittest.TestCase):
             application.status_snapshot()
             self.assertGreater(application._status_next_refresh - time.monotonic(), 0.3)  # 3 x the 0.2 s it took
 
+    def test_collector_and_tail_state_in_the_answer_is_always_live(self):
+        states = iter(range(1, 100))
+        application = self.application(lambda: {"slowLogs": ["old"], "slowTail": ["old"], "generalLog": {}, "generalLogs": [], "n": 1})
+        application.slow_logs = [SimpleNamespace(status=lambda: {"instanceId": "rm-prod", "nodeId": "rn-1", "poll": next(states)})]
+        application.node_roles = SimpleNamespace(lookup=lambda instance: {})
+        application.slow_tails = SimpleNamespace(status=lambda: [{"nodeId": "rn-1", "scans": next(states)}])
+        first, second = application.status_snapshot(), application.status_snapshot()
+        wait_idle(application)
+        self.assertEqual(first["n"], 1)  # the heavy part is the cached one
+        self.assertNotEqual(first["slowLogs"], second["slowLogs"])  # the cheap parts are read again every time
+        self.assertEqual((first["slowLogs"][0]["nodeId"], first["slowTail"][0]["nodeId"]), ("rn-1", "rn-1"))
+        self.assertNotIn("old", first["slowLogs"] + first["slowTail"])
+
     def test_the_endpoint_serves_the_snapshot_and_an_app_without_one_still_answers(self):
         self.assertEqual(get(SimpleNamespace(status_snapshot=lambda: {"version": "snap"}), "/api/status")["data"], {"version": "snap"})
         self.assertEqual(get(SimpleNamespace(public_status=lambda: {"version": "direct"}), "/api/status")["data"], {"version": "direct"})

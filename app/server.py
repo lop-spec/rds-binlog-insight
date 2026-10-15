@@ -71,8 +71,8 @@ _LOCAL_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # minute when the page cache is cold (the morning binlog peak). So the answer is computed by one background thread, callers get the
 # last one at once, and a refresh may start again only after a pause of a few times what the last one took.
 STATUS_FRESH_SECONDS = 5.0
-STATUS_PAUSE_FACTOR = 3.0
-STATUS_MAX_PAUSE_SECONDS = 120.0
+STATUS_PAUSE_FACTOR = 2.0
+STATUS_MAX_PAUSE_SECONDS = 90.0
 STATUS_SLOW_SECONDS = 5.0
 
 
@@ -399,6 +399,15 @@ class Application:
         if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
             self._start_status_refresh()  # warm the answer so the first page does not wait for it
 
+    def _live_status_sections(self) -> dict[str, Any]:
+        """The parts of the status that cost nothing to compute: collector and live-tail state, always read at request time."""
+        return {
+            "generalLog": (self.general_log.status() if getattr(self, "general_log", None) is not None else {}),
+            "generalLogs": [item.status() for item in getattr(self, "general_logs", [])],
+            "slowLogs": [self._slow_log_status(item) for item in getattr(self, "slow_logs", [])],
+            "slowTail": getattr(self, "slow_tails", None).status() if getattr(self, "slow_tails", None) is not None else [],
+        }
+
     def _init_status_cache(self) -> None:
         self._status_lock = threading.Lock()
         self._status_cached: tuple[float, dict[str, Any]] | None = None
@@ -437,18 +446,21 @@ class Application:
         with self._status_lock:
             cached = self._status_cached
             if cached is not None and now - cached[0] < STATUS_FRESH_SECONDS:
-                return {**cached[1], "statusAgeSeconds": round(now - cached[0], 1)}
+                return self._with_live_sections(cached, now)
             flight = self._status_flight
             if flight is None and (cached is None or now >= self._status_next_refresh):
                 flight = self._start_status_refresh()
             if cached is not None:
-                return {**cached[1], "statusAgeSeconds": round(now - cached[0], 1)}
+                return self._with_live_sections(cached, now)
         flight.wait()
         with self._status_lock:
             cached = self._status_cached
         if cached is None:
             raise RuntimeError("状态暂时无法计算，原因见服务日志")
-        return {**cached[1], "statusAgeSeconds": round(time.monotonic() - cached[0], 1)}
+        return self._with_live_sections(cached, time.monotonic())
+
+    def _with_live_sections(self, cached: tuple[float, dict[str, Any]], now: float) -> dict[str, Any]:
+        return {**cached[1], **self._live_status_sections(), "statusAgeSeconds": round(now - cached[0], 1)}
 
     def _start_secondary_syncs(
         self,
