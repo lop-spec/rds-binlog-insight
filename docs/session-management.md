@@ -39,9 +39,9 @@
 勾选会话 →「生成 KILL 语句」，按节点各生成一段（`POST /api/sessions/kill-statements`，请求带页面当时显示的那一行、快照时间和模式，服务端不会再读 DAS，也不连数据库）。一段文本包含：
 
 1. 头注释：生成时间、快照时间、节点角色 / 可用区和「会话号只在本节点有效」，以及这段语句用的路由 Hint（见下面「路由 Hint」）；
-2. 核对语句：`SELECT … FROM information_schema.PROCESSLIST WHERE ID IN (…)`，确认会话还在、仍是快照里的那个；
-3. 持锁核对：`SELECT * FROM sys.schema_table_lock_waits;`；
-4. 备节点才有的保险：用 `/*FORCE_MASTER*/` 查主节点上有没有同号线程，应返回 0 行；
+2. 自检路由（带同一个 Hint）：`SELECT @@server_id, @@read_only`，备节点应是 `read_only=1`、主节点应是 `0`，对不上说明这条连接是主地址或 Hint 没生效，别往下执行；
+3. 核对语句：`SELECT … FROM information_schema.PROCESSLIST WHERE ID IN (…)`，确认会话还在、仍是快照里的那个；
+4. 持锁核对：`SELECT * FROM sys.schema_table_lock_waits;`；
 5. `KILL <id>;`（结束连接并回滚它没提交的事务）或 `KILL QUERY <id>;`（只终止当前语句，对空闲会话无效），每条后面的注释写用户 @ 来源、库、命令、时长、事务时长和原因。
 
 规则：只有整数会话号变成代码，其余值（用户名、来源、库……）只写进注释，并先清掉换行 / 控制字符 / `/*` `*/`，所以一个带换行的用户名塞不进第二条语句；一次最多 200 个、重复会话号合并；**受保护的会话不生成**——复制线程（`Binlog Dump*`）、`system user` / `Daemon` / `Connect` 系统线程、`event_scheduler`、`aliyun_` 开头和 `aliyun_root` 的云内部账号、没有会话号的行——文本里以注释写明跳过的会话号和原因。主节点的段落多一句红字提醒。生成动作只在服务日志留一行（实例、节点、模式、个数，不含 SQL；写明「nothing was executed」）。
@@ -50,11 +50,14 @@
 
 集群系列的实例没有每个节点各自的地址，平时只连读写分离地址：普通语句落到代理挑的节点，而会话号只在它所在的节点有意义——核对语句查不到会话、KILL 报 `Unknown thread id`，都是这个原因。所以每条语句都带阿里云读写分离的 Hint：备节点 `/*FORCE_NODE='<节点 ID>'*/`，主节点 `/*FORCE_MASTER*/`。直连节点或主地址时它只是注释；用 mysql 命令行要加 `-c`，否则 Hint 会被命令行工具过滤；节点 ID 只有符合 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` 才会写进 Hint，否则不带 Hint、文本里写明「请连到这个节点执行」。
 
-已验证的和没验证的：
+实测过的（2026-10-14 / 15，只读账号和 DBX）：
 
-- 查询带 `FORCE_NODE` 能落到指定节点：2026-10-14 用只读账号经读写分离的只读代理地址实测，`@@server_id` 与目标节点一致，`performance_schema.threads` 里查到了目标会话（阿里云文档写「Hint 仅支持读写分离地址」，只读代理地址实测也认）。
-- KILL 是否遵循 `FORCE_NODE`：**阿里云文档没写**。文档只写了「SQL 形式的 KILL 默认只发往主实例」和「Hint 的路由优先级最高」；服务没有杀会话的权限，这里没法测。所以备节点的文本多一条保险：先用 `/*FORCE_MASTER*/` 确认主节点上没有同号线程（应返回 0 行），杀完重跑核对；KILL 没落到本节点时只会报 `Unknown thread id`，不会误杀。
-- 备选：阿里云 DAS 控制台的会话管理本身就能结束会话。
+- 查询带 `FORCE_NODE` 能落到指定节点：生产实例的只读代理地址上，试过的两个备节点（`FORCE_NODE` 写节点 ID）都落到了各自的节点：`@@server_id` 与目标一致、`read_only=1`（阿里云文档写「Hint 仅支持读写分离地址」，只读代理地址实测也认）。
+- 经代理地址，带 hint 的 `KILL <id>` 能杀掉备节点上的会话，带 hint 的 `KILL QUERY <id>` 只中断语句、连接保留：在测试实例的代理地址上用 `/*FORCE_SLAVE*/` 实测（该实例只有一个备节点）。`FORCE_NODE` 本身对 KILL 没单独实测，它和 `FORCE_SLAVE` 同属代理的 Hint 路由。
+- 同一次测试里不带 hint 的 `KILL <id>` 也成功了（阿里云文档写的是「SQL 形式的 KILL 只发往主实例」），可能是代理把它送到了刚才那条查询所在的节点；不依赖这个行为，所以文本里的 KILL 仍带 hint。
+- 主地址的连接上 Hint 只是注释：测试实例主地址连接上带 hint 的 `SELECT @@server_id` 返回的是主节点（`read_only=0`），所以文本先让你自检。
+- 测试实例的代理地址不认 `FORCE_NODE`（两个节点 ID 都报 `force hint server node is not found`，原因不明），但认 `FORCE_SLAVE` / `FORCE_MASTER`；该实例只有一个备节点，可把备节点语句的 Hint 换成 `FORCE_SLAVE`。生产实例上试过的两个备节点没有这个问题。
+- 备选：阿里云 RDS 控制台「自治服务 → 一键诊断 → 会话管理」可以直接结束会话。
 
 ## 留存
 
@@ -79,6 +82,7 @@
 
 ## 边界
 
+- 不调用 DAS 的结束会话 API（`CreateKillInstanceSessionTask`）：它必填数据库账号和密码，RAM 动作是写权限且不能限定到某个实例，`NodeId` 文档只写给 PolarDB 用，而 8769 没有登录；要做得先有鉴权、专用的最小权限库账号和审计。
 - 不做 SQL 限流、自动限流（DAS 的写操作，本服务只有只读身份）、10 秒 SQL 分析和 SQL 优化（DAS 云端能力；慢日志和分析洞察里已有对应的证据）。
 - 不加访问保护：8769 没有登录，页面会显示实时 SQL 和用户 / 来源，留存也会把异常会话的 SQL 存 7 天，与审计查询、慢日志页同等暴露。
 - 会话号只在同一个节点、同一次服务进程里有意义：节点重启后号会重来，所以核对语句必须先跑。8.0.28 上有过被 KILL 的空闲会话没释放元数据锁的情况（实例现为 8.0.36），杀完用 `sys.schema_table_lock_waits` 确认锁真的没了。

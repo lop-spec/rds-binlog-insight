@@ -508,7 +508,7 @@ function sessionKillHtml() {
       <div class="session-kill-actions"><button type="button" class="button primary compact" data-session-copy="${index}"${item.statements.length ? "" : " disabled"}>复制语句</button>
       <span class="muted">${humanCount(item.statements.length)} 条 KILL · 快照 ${escapeHtml(sessionTimeText(item.snapshot_us))}</span></div>${skipped}</section>`;
   }).join("");
-  return `<p class="analytics-note">本页只生成语句，不执行任何 kill：服务只有云上只读身份、没有数据库账号。每条语句带读写分离的 Hint（备节点 FORCE_NODE、主节点 FORCE_MASTER）：核对语句经它落到<strong>对应节点</strong>（已实测）；KILL 是否遵循 Hint 阿里云文档没写，所以备节点的文本多一条主节点保险语句。先跑核对和保险，确认会话还在、仍是快照里的那个、主节点没有同号线程，再杀，杀完重跑核对。</p>
+  return `<p class="analytics-note">本页只生成语句，不执行任何 kill：服务只有云上只读身份、没有数据库账号。每条语句带读写分离的 Hint（备节点 FORCE_NODE、主节点 FORCE_MASTER），走读写分离（代理）地址的连接才会落到<strong>对应节点</strong>，在主地址的连接上它只是注释。先跑第 0 步自检，read_only 对不上就停；再跑第 1 条核对语句，确认会话还在、仍是快照里的那个，再杀，杀完重跑核对。</p>
     ${modes}${blocks}`;
 }
 

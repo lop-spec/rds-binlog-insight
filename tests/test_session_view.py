@@ -226,7 +226,7 @@ class KillStatementTests(unittest.TestCase):
         evil = dict(session_id=5, user="x\nKILL 1; --", client="10.0.0.1 */ DROP TABLE t; /*", database="d\r\nSELECT 1;", command="Query KILL 2;",
                     seconds=99, kinds=[])
         out = build_kill_statements({"node_id": "rn-1\nKILL 3;", "role": "primary", "zone": "z\nKILL 4;"}, [evil], mode="connection", snapshot_us=1, generated_us=2)
-        allowed = ("", "/*FORCE_MASTER*/ SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (5);",
+        allowed = ("", "/*FORCE_MASTER*/ SELECT @@server_id AS server_id, @@read_only AS read_only;", "/*FORCE_MASTER*/ SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (5);",
                    "/*FORCE_MASTER*/ SELECT * FROM sys.schema_table_lock_waits;", "/*FORCE_MASTER*/ KILL 5;")
         for line in out["text"].splitlines():
             if not line.startswith("--"):
@@ -244,32 +244,34 @@ class KillStatementTests(unittest.TestCase):
         self.assertNotIn("FORCE_", out["text"])                            # no hint, and so no primary guard either: nothing to guard
         self.assertIn("请连到这个节点执行", out["text"])
 
-    def test_a_standby_statement_carries_its_node_and_the_text_guards_the_primary(self):
+    def test_a_standby_is_self_checked_then_checked_and_killed_with_its_node_hint(self):
         out = build_kill_statements(self.NODE, self.rows(), mode="connection", snapshot_us=1, generated_us=2)
         hint = "/*FORCE_NODE='rn-lagging'*/ "
         code = [line for line in out["text"].splitlines() if not line.startswith("--")]
-        self.assertEqual(code[0], hint + "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (44, 312);")
-        self.assertEqual(code[1], hint + "SELECT * FROM sys.schema_table_lock_waits;")
-        self.assertEqual(code[2], "/*FORCE_MASTER*/ SELECT ID, USER, HOST, TIME FROM information_schema.PROCESSLIST WHERE ID IN (44, 312);")
+        self.assertEqual(code[0], hint + "SELECT @@server_id AS server_id, @@read_only AS read_only;")
+        self.assertEqual(code[1], hint + "SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (44, 312);")
+        self.assertEqual(code[2], hint + "SELECT * FROM sys.schema_table_lock_waits;")
         self.assertTrue(code[3].startswith(hint + "KILL 44;") and code[4].startswith(hint + "KILL 312;"))
         self.assertEqual(len(code), 5)
         text = out["text"]
         self.assertIn("每条语句都带 Hint FORCE_NODE='rn-lagging'", text)
-        self.assertIn("-- 4. 结束会话", text)
-        self.assertIn("应返回 0 行", text)
-        self.assertIn("报 Unknown thread id 说明这条 KILL 没落到本节点", text)
-        self.assertLess(text.index("/*FORCE_MASTER*/ SELECT ID"), text.index("KILL 44;"))     # the primary is checked before any KILL
+        self.assertIn("-- 0. 先自检路由：read_only 应为 1（备节点）", text)
+        self.assertIn("FORCE_SLAVE", text)                                  # the way out when the proxy does not know the node id
+        self.assertIn("-- 3. 结束会话", text)
+        self.assertIn("执行后重跑第 1 步", text)
+        self.assertNotIn("FORCE_MASTER", text)                              # a standby's statements never go to the primary
+        self.assertLess(text.index("-- 0."), text.index("-- 1."))           # the self-check comes before the check and any KILL
 
-    def test_a_primary_uses_force_master_and_needs_no_primary_guard(self):
+    def test_a_primary_uses_force_master_and_expects_read_only_off(self):
         out = build_kill_statements({"node_id": "rn-main", "role": "primary", "zone": "cn-chengdu-a"}, self.rows(), mode="query", snapshot_us=1, generated_us=2)
         self.assertEqual(out["statements"], ["/*FORCE_MASTER*/ KILL QUERY 44;", "/*FORCE_MASTER*/ KILL QUERY 312;"])
         self.assertIn("每条语句都带 Hint FORCE_MASTER", out["text"])
-        self.assertNotIn("保险", out["text"])
-        self.assertIn("-- 3. 结束会话", out["text"])
-        self.assertEqual(len([line for line in out["text"].splitlines() if line.startswith("/*FORCE_MASTER*/ SELECT")]), 2)
+        self.assertIn("-- 0. 先自检路由：read_only 应为 0（主节点）", out["text"])
+        self.assertNotIn("FORCE_SLAVE", out["text"])
+        self.assertEqual(len([line for line in out["text"].splitlines() if line.startswith("/*FORCE_MASTER*/ SELECT")]), 3)   # self-check, check, lock waits
 
     def test_route_hint_takes_only_plain_node_ids(self):
-        self.assertEqual(route_hint({"node_id": "rn-2vc30k3p577h52e01", "role": "secondary"}), ("FORCE_NODE='rn-2vc30k3p577h52e01'", "/*FORCE_NODE='rn-2vc30k3p577h52e01'*/ "))
+        self.assertEqual(route_hint({"node_id": "rn-2abc3def4ghi5jk01", "role": "secondary"}), ("FORCE_NODE='rn-2abc3def4ghi5jk01'", "/*FORCE_NODE='rn-2abc3def4ghi5jk01'*/ "))
         self.assertEqual(route_hint({"node_id": "rn-x"}), ("FORCE_NODE='rn-x'", "/*FORCE_NODE='rn-x'*/ "))     # an unknown role still goes to its node
         self.assertEqual(route_hint({"node_id": "anything'", "role": "primary"}), ("FORCE_MASTER", "/*FORCE_MASTER*/ "))
         for bad in ("", None, "rn-1'*/", "rn 1", "rn-1\n", "-rn", "r" * 65, "节点"):
@@ -286,6 +288,7 @@ class KillStatementTests(unittest.TestCase):
     def test_an_unknown_node_role_is_said_not_guessed(self):
         out = build_kill_statements({"node_id": "rn-x"}, self.rows(), mode="connection", snapshot_us=1, generated_us=2)
         self.assertIn("节点角色未知 rn-x", out["text"])
+        self.assertIn("返回的 server_id 应是目标节点的", out["text"])
 
 
 if __name__ == "__main__":

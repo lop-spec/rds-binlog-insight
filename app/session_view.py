@@ -261,8 +261,10 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
     where = f"{role} {_plain(node.get('node_id'), 40)}{' · ' + _plain(node.get('zone'), 24) if node.get('zone') else ''}"
     lines = [f"-- SQL Insight 会话管理 · 生成于 {stamp(generated_us)} · 会话快照 {stamp(snapshot_us)}"]
     if hint:
-        lines.append(f"-- {where}：会话号只在本节点有效。每条语句都带 Hint {hint_name}：经读写分离地址执行时落到这个节点，"
-                     "直连节点或主地址时它只是注释；用 mysql 命令行要加 -c，否则 Hint 会被命令行工具过滤。")
+        on_primary_address = ("在主地址的连接上它只是注释，语句同样落到主节点" if primary
+                              else "在主地址的连接上它只是注释、语句会落到主节点，所以先跑第 0 步自检")
+        lines.append(f"-- {where}：会话号只在本节点有效。每条语句都带 Hint {hint_name}：经读写分离（代理）地址执行时落到这个节点；"
+                     f"{on_primary_address}；用 mysql 命令行要加 -c，否则 Hint 会被命令行工具过滤。")
     else:
         lines.append(f"-- {where}：会话号只在本节点有效，请连到这个节点执行；这个节点 ID 不能安全地写进 Hint，读写分离地址会落到不确定的节点。")
     ids = sorted(keep)
@@ -271,19 +273,17 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
         listing = ", ".join(str(i) for i in ids)
         check = ("SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
                  f"FROM information_schema.PROCESSLIST WHERE ID IN ({listing});")
+        if hint:
+            expected = {"primary": "read_only 应为 0（主节点）", "secondary": "read_only 应为 1（备节点）"}.get(
+                str(node.get("role") or ""), "返回的 server_id 应是目标节点的（主节点 read_only 为 0，备节点为 1）")
+            way_out = "" if primary else "；报 force hint server node is not found 说明这个代理不认该节点 ID，实例只有一个备节点时可把 Hint 换成 FORCE_SLAVE"
+            lines += [f"-- 0. 先自检路由：{expected}；不对说明这条连接是主地址或 Hint 没生效，别往下执行{way_out}",
+                      hint + "SELECT @@server_id AS server_id, @@read_only AS read_only;"]
         lines += ["-- 1. 先核对：会话还在，且仍是快照里的那个（用户、来源、命令、时长对得上）再往下执行", hint + check,
                   "-- 2. 会话在等元数据锁时，先找出真正持锁的会话（需要 performance_schema 的 metadata_locks，MySQL 8.0）",
-                  hint + "SELECT * FROM sys.schema_table_lock_waits;"]
-        step = 3
-        guarded = bool(hint) and not primary
-        if guarded:
-            lines += [f"-- {step}. 保险：确认主节点上没有同号线程（阿里云文档没写 KILL 是否遵循 FORCE_NODE，没按 Hint 走时它会落到主节点）；应返回 0 行",
-                      f"/*FORCE_MASTER*/ SELECT ID, USER, HOST, TIME FROM information_schema.PROCESSLIST WHERE ID IN ({listing});"]
-            step += 1
-        lines.append(f"-- {step}. 结束会话" + ("（KILL 结束连接并回滚它未提交的事务）" if mode == "connection"
-                                            else "（KILL QUERY 只终止当前语句，空闲会话不受影响）"))
-        if guarded:
-            lines.append("-- 执行后重跑第 1 步：会话没了才算杀掉；报 Unknown thread id 说明这条 KILL 没落到本节点（第 3 步为 0 行时不会误杀别的会话）。")
+                  hint + "SELECT * FROM sys.schema_table_lock_waits;",
+                  "-- 3. 结束会话" + ("（KILL 结束连接并回滚它未提交的事务）" if mode == "connection"
+                                      else "（KILL QUERY 只终止当前语句，空闲会话不受影响）") + "；执行后重跑第 1 步，会话没了才算杀掉"]
         for session_id in ids:
             row = keep[session_id]
             note = " ".join(part for part in (
