@@ -210,6 +210,114 @@ class LiveTailEndpointTests(unittest.TestCase):
             self.assertEqual(application.public_status()["slowTail"], [{"nodeId": "rn-1", "scans": 3}])
 
 
+def wait_idle(application, seconds=5.0):
+    """Wait until no status refresh is running."""
+    deadline = time.monotonic() + seconds
+    while application._status_flight is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert application._status_flight is None, "the status refresh did not finish"
+
+
+class StatusSnapshotTests(unittest.TestCase):
+    """/api/status is answered from the last computation: one background thread refreshes it, and a slow refresh never blocks a page."""
+
+    @staticmethod
+    def application(compute):
+        application = Application.__new__(Application)
+        application._init_status_cache()
+        application.public_status = compute
+        return application
+
+    def test_the_first_request_waits_for_the_one_computation_and_concurrent_ones_share_it(self):
+        release, started, calls, results = threading.Event(), threading.Event(), [], []
+
+        def compute():
+            calls.append(1)
+            started.set()
+            release.wait(5)
+            return {"version": "x", "n": len(calls)}
+        application = self.application(compute)
+        callers = [threading.Thread(target=lambda: results.append(application.status_snapshot())) for _ in range(5)]
+        for caller in callers:
+            caller.start()
+        self.assertTrue(started.wait(5))
+        time.sleep(0.1)  # the other callers queue behind the computation that is running
+        release.set()
+        for caller in callers:
+            caller.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([item["n"] for item in results], [1] * 5)
+
+    def test_a_fresh_answer_is_reused_and_a_stale_one_is_served_at_once_while_it_refreshes(self):
+        gate, calls = threading.Event(), []
+
+        def compute():
+            calls.append(1)
+            if len(calls) > 1:
+                gate.wait(5)
+            return {"n": len(calls)}
+        application = self.application(compute)
+        self.assertEqual(application.status_snapshot()["n"], 1)
+        wait_idle(application)
+        self.assertEqual(application.status_snapshot()["n"], 1)  # fresh: nothing recomputed
+        self.assertEqual(len(calls), 1)
+        application._status_cached = (time.monotonic() - 100, {"n": 1})  # stale now
+        application._status_next_refresh = 0.0
+        started = time.monotonic()
+        stale = application.status_snapshot()
+        self.assertLess(time.monotonic() - started, 1.0)  # the page does not wait for the refresh that has just started
+        self.assertEqual(stale["n"], 1)
+        self.assertGreaterEqual(stale["statusAgeSeconds"], 99)
+        application.status_snapshot()
+        time.sleep(0.1)
+        self.assertEqual(len(calls), 2)  # one refresh in flight, however many pages ask
+        gate.set()
+        wait_idle(application)
+        self.assertEqual(application.status_snapshot()["n"], 2)
+
+    def test_a_failing_refresh_keeps_the_previous_answer_and_a_cold_failure_is_an_error(self):
+        def broken():
+            raise RuntimeError("db down")
+        application = self.application(broken)
+        with self.assertLogs("app.server", "ERROR"):
+            with self.assertRaises(RuntimeError):
+                application.status_snapshot()
+        application._status_cached = (time.monotonic() - 100, {"n": 1})
+        application._status_next_refresh = 0.0
+        with self.assertLogs("app.server", "ERROR"):
+            answer = application.status_snapshot()
+            wait_idle(application)
+        self.assertEqual(answer["n"], 1)
+        self.assertGreaterEqual(application.status_snapshot()["statusAgeSeconds"], 99)  # still the old answer, and it says how old
+
+    def test_a_refresh_waits_out_its_pause_and_the_pause_grows_with_a_slow_one(self):
+        calls = []
+        application = self.application(lambda: calls.append(1) or {"n": len(calls)})
+        application.status_snapshot()
+        wait_idle(application)
+        application._status_cached = (time.monotonic() - 100, {"n": 1})
+        application._status_next_refresh = time.monotonic() + 60  # the pause is still on
+        application.status_snapshot()
+        time.sleep(0.2)
+        self.assertEqual(len(calls), 1)  # no new refresh
+        application._status_next_refresh = 0.0
+        application.status_snapshot()
+        wait_idle(application)
+        self.assertEqual(len(calls), 2)
+
+        def slow():
+            time.sleep(0.2)
+            return {"n": 9}
+        application = self.application(slow)
+        with patch("app.server.STATUS_FRESH_SECONDS", 0.05):
+            application.status_snapshot()
+            self.assertGreater(application._status_next_refresh - time.monotonic(), 0.3)  # 3 x the 0.2 s it took
+
+    def test_the_endpoint_serves_the_snapshot_and_an_app_without_one_still_answers(self):
+        self.assertEqual(get(SimpleNamespace(status_snapshot=lambda: {"version": "snap"}), "/api/status")["data"], {"version": "snap"})
+        self.assertEqual(get(SimpleNamespace(public_status=lambda: {"version": "direct"}), "/api/status")["data"], {"version": "direct"})
+
+
 class FakeSessions:
     def __init__(self, error=None):
         self.calls, self.error = [], error

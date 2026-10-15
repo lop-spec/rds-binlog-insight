@@ -196,3 +196,17 @@ Turn `RDS_BINLOG_RAW_ARCHIVE=0` on this version to resume the existing full pars
 keep the raw-aware query code deployed. Do not downgrade to an old image that
 cannot read the newly archived original objects. Do not delete manifests, old
 Parquet, credentials, or original OSS objects during rollback.
+
+## `/api/status` 不再等慢查询（1.33.2）
+
+页面每 3 秒轮询一次 `/api/status`，背后 `RawBinlogStore.status()` 对每个实例跑两条聚合（`raw_binlog_archives` JOIN `binlog_files`，
+各约 4 万到 40 万行）。页缓存热的时候一两秒，生产 binlog 洪峰（2026-10-15 上午每小时 89 个 512 MB 文件）把页缓存冲掉之后，线上只读复现
+每条要 53 到 69 秒，几个页面叠在一起，接口曾经要 30 到 90 秒才返回；`/healthz`、`/api/storage`、`/api/query-tasks` 不受影响。
+
+- **做法**：`Application.status_snapshot()`：状态由一个后台线程计算，请求立刻拿到上一次的结果（响应多 `statusAgeSeconds`，说明它有多旧）；
+  同一时间只允许一次刷新在跑，刷新结束后要停一段（刷新耗时的 3 倍，最短 5 秒、最长 120 秒）才会再启动，所以洪峰里也不会连续满负荷扫表；
+  刷新失败保留上一次结果并记错误日志，刷新超过 5 秒记一条警告。只有重启后的第一个请求要等那一次计算，启动时就会预热。
+- **`RawBinlogStore.status` 的缓存**从 15 秒放宽到 60 秒（`STATUS_CACHE_SECONDS`），后台刷新里重查询最多每分钟一次。
+- **没做的**：没有改库表、没有加索引；这两条聚合在冷缓存下仍然慢，只是不再有人在请求路径上等它。
+- **回归**：`tests/test_server_roles_and_windows.py` 的 `StatusSnapshotTests`（首个请求与并发共享一次计算、新结果复用、过期结果立即返回且只有一个刷新、
+  刷新失败保留旧结果、停顿期内不重启刷新且随刷新耗时变长、接口用快照/没有快照时直接算）。

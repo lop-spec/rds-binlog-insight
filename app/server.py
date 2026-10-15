@@ -67,6 +67,13 @@ from .tabularis_audit import AuditIngestError, TabularisAuditIngest
 
 LOGGER = logging.getLogger(__name__)
 _LOCAL_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# /api/status is polled every few seconds by every open page, and behind it sit table scans of the metadata database that take a
+# minute when the page cache is cold (the morning binlog peak). So the answer is computed by one background thread, callers get the
+# last one at once, and a refresh may start again only after a pause of a few times what the last one took.
+STATUS_FRESH_SECONDS = 5.0
+STATUS_PAUSE_FACTOR = 3.0
+STATUS_MAX_PAUSE_SECONDS = 120.0
+STATUS_SLOW_SECONDS = 5.0
 
 
 def _normalize_host(value: str) -> str:
@@ -388,6 +395,60 @@ class Application:
             LOGGER.warning("结构对比配置无效，该功能已禁用：%s", exc)
             self.schema_diff = SchemaDiffService([])
         self.httpd: ThreadingHTTPServer | None = None
+        self._init_status_cache()
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self._start_status_refresh()  # warm the answer so the first page does not wait for it
+
+    def _init_status_cache(self) -> None:
+        self._status_lock = threading.Lock()
+        self._status_cached: tuple[float, dict[str, Any]] | None = None
+        self._status_flight: threading.Event | None = None
+        self._status_next_refresh = 0.0
+
+    def _start_status_refresh(self) -> threading.Event:
+        """Start the one background computation of the status (the caller holds ``_status_lock``)."""
+        flight = self._status_flight = threading.Event()
+        threading.Thread(target=self._refresh_status, args=(flight,), name="status-refresh", daemon=True).start()
+        return flight
+
+    def _refresh_status(self, flight: threading.Event) -> None:
+        started = time.monotonic()
+        try:
+            payload: dict[str, Any] | None = self.public_status()
+        except Exception:  # noqa: BLE001 - a failing refresh must not take the previous answer away
+            LOGGER.exception("status refresh failed; the previous answer, if any, stays")
+            payload = None
+        took = time.monotonic() - started
+        with self._status_lock:
+            if payload is not None:
+                self._status_cached = (time.monotonic(), payload)
+            self._status_next_refresh = time.monotonic() + min(STATUS_MAX_PAUSE_SECONDS, max(STATUS_FRESH_SECONDS, took * STATUS_PAUSE_FACTOR))
+            self._status_flight = None
+        if took > STATUS_SLOW_SECONDS:
+            LOGGER.warning("status refresh was slow: %.1fs; pages keep the previous answer meanwhile", took)
+        flight.set()
+
+    def status_snapshot(self) -> dict[str, Any]:
+        """The /api/status answer: the last computed one at once, refreshed in the background (``statusAgeSeconds`` says how old).
+
+        Only the very first request after a start has to wait, for the one computation that is running.
+        """
+        now = time.monotonic()
+        with self._status_lock:
+            cached = self._status_cached
+            if cached is not None and now - cached[0] < STATUS_FRESH_SECONDS:
+                return {**cached[1], "statusAgeSeconds": round(now - cached[0], 1)}
+            flight = self._status_flight
+            if flight is None and (cached is None or now >= self._status_next_refresh):
+                flight = self._start_status_refresh()
+            if cached is not None:
+                return {**cached[1], "statusAgeSeconds": round(now - cached[0], 1)}
+        flight.wait()
+        with self._status_lock:
+            cached = self._status_cached
+        if cached is None:
+            raise RuntimeError("状态暂时无法计算，原因见服务日志")
+        return {**cached[1], "statusAgeSeconds": round(time.monotonic() - cached[0], 1)}
 
     def _start_secondary_syncs(
         self,
@@ -902,7 +963,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     coverage['reason'] = '保留窗口内尚无连续完整的索引区间'
                 self._json({'ok': True, 'data': coverage})
             elif parsed.path == "/api/status":
-                self._json({"ok": True, "data": self.app.public_status()})
+                snapshot = getattr(self.app, "status_snapshot", None)
+                self._json({"ok": True, "data": snapshot() if snapshot is not None else self.app.public_status()})
             elif parsed.path == "/api/sync/health":
                 managers = [self.app.sync, *self.app.secondary_syncs]
                 data = [{"instanceId": manager._job_scope(), **manager.status()["health"]}

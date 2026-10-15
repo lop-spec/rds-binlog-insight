@@ -19,6 +19,8 @@ from .oss_store import OssArchiveError
 LOGGER = logging.getLogger(__name__)
 MAX_FILES = 16
 MAX_BYTES = 8 * 1024**3
+# The status behind /api/status is two aggregates over the archive tables (a minute each when the page cache is cold).
+STATUS_CACHE_SECONDS = 60
 QUERY_SECONDS = 180
 RAW_ENABLED = 'RDS_BINLOG_RAW_ARCHIVE'
 
@@ -206,7 +208,7 @@ class RawBinlogStore:
     def status(self, instance: str) -> dict:
         now = time.time()
         cached = self._status_cache.get(instance)
-        if cached and now-cached[0] < 15:
+        if cached and now-cached[0] < STATUS_CACHE_SECONDS:
             return cached[1]
         with self.metadata.connection() as conn:
             archived = conn.execute('''SELECT count(*) n,min(r.started) first,max(r.completed) last,
