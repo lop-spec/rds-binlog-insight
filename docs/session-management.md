@@ -36,7 +36,7 @@
 
 ## KILL 语句
 
-勾选会话（表头的复选框一次选中 / 取消本页全部可结束的会话，受保护的不选）→「生成 KILL 语句」，不管会话在几个节点上，都合成**一段**文本（`POST /api/sessions/kill-statements` 一次请求，`nodes` 里每个节点带页面当时显示的那些行、该节点的快照时间和当时等锁的会话数 `lock_waiters`，服务端不会再读 DAS，也不连数据库）。文本只有代码、没有注释，顺序是先全部检查、再全部 KILL，主节点的在前，每条自带所属节点的 Hint，所以在同一个读写分离地址的连接上从头到尾执行即可：
+勾选会话（表头的复选框一次选中 / 取消本页全部可结束的会话，受保护的不选）→「生成 KILL 语句」，不管会话在几个节点上，都合成**一段**文本（`POST /api/sessions/kill-statements` 一次请求，`nodes` 里每个节点带页面当时显示的那些行、该节点的快照时间和当时等锁的会话数 `lock_waiters`，服务端不会再读 DAS，也不连数据库）。勾选只对屏幕上的列表有效：换页签、改关键词或最短时长、排序、翻页、刷新后，不在屏幕上的勾选会被去掉，所以文本里只有看得见的会话。文本只有代码、没有注释，顺序是先全部检查、再全部 KILL，主节点的在前，每条自带所属节点的 Hint，所以在同一个读写分离地址的连接上从头到尾执行即可：
 
 1. 每个节点一条检查，查该节点全部选中的会话：`SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (…)`。`ro` 备节点应为 1、主节点应为 0，会话对得上再杀；
 2. 只有该节点快照里有会话在等锁（`lock_waiters` > 0）时才有：`SELECT * FROM sys.schema_table_lock_waits;`；

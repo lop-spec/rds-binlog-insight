@@ -207,6 +207,35 @@ test('the header checkbox picks every session on the page that may be ended, and
   assert.match(run('sessionListHtml()'), /data-session-pick-all [^>]*title="本页没有可结束的会话" disabled>/);
 });
 
+test('a pick belongs to the list on screen: switching tab drops the picks the new tab does not show, so the count and the KILL request never include them', async () => {
+  const {run, c, calls} = context();
+  c.data = payload();
+  run('sessionsState.data = data; sessionsState.selected = new Set(); sessionsState.tab = "all"');
+  run('sessionsChange({target: {dataset: {sessionPick: "rn-primary00000001:7"}, checked: true}})');   // quiet session 7: on the all tab only
+  assert.match(run('sessionListHtml()'), /生成 KILL 语句（1）/);
+  run('sessionsState.tab = "abnormal"');
+  assert.match(run('sessionListHtml()'), /data-session-kill disabled/);
+  assert.equal(run('sessionsState.selected.size'), 0);
+  await assert.rejects(run('generateSessionKill()'), /请先勾选要结束的会话/);
+  assert.equal(calls.length, 0);
+  run('sessionsState.tab = "all"');
+  assert.match(run('sessionListHtml()'), /data-session-kill disabled/);                             // the pick did not come back
+});
+
+test('a refresh that moves a picked session out of the list drops the pick', () => {
+  const {run, c} = context();
+  c.data = payload();
+  run('sessionsState.data = data; sessionsState.selected = new Set(); sessionsState.tab = "abnormal"');
+  run('sessionsChange({target: {dataset: {sessionPick: "rn-primary00000001:44"}, checked: true}})');
+  assert.match(run('sessionListHtml()'), /生成 KILL 语句（1）/);
+  const later = payload();                                                                          // the next snapshot: 44 is no longer abnormal
+  later.nodes[0].sessions[0] = {...later.nodes[0].sessions[0], kinds: [], holder: false};
+  c.data = later;
+  run('sessionsState.data = data; renderSessionsList()');
+  assert.equal(run('sessionsState.selected.size'), 0);
+  assert.match(run('sessionListHtml()'), /data-session-kill disabled/);
+});
+
 test('KILL statements: one request for every node with what the page showed, each node\'s snapshot time and waiters, and the mode; one text, escaped, copied, regenerated per mode', async () => {
   const written = (url, options) => {
     const body = JSON.parse(options.body);
@@ -214,13 +243,14 @@ test('KILL statements: one request for every node with what the page showed, eac
       hint: n.node_id.startsWith('rn-primary') ? 'FORCE_MASTER' : '', snapshot_us: n.snapshot_us, session_ids: n.sessions.map((s) => s.session_id),
       statements: n.sessions.map((s) => `KILL ${s.session_id};`), skipped: []}));
     const statements = nodes.flatMap((n) => n.statements);
-    return {text: `-- ${body.mode}\n${statements.join('\n')}  -- <b>x</b>\n`, checks: [], statements, mode: body.mode, session_ids: [], generated_us: SNAP, nodes,
+    return {text: `-- ${body.mode}\n${statements.join('\n')}\n-- <b>x</b>\n`, checks: [], statements, mode: body.mode, session_ids: [], generated_us: SNAP, nodes,
       skipped: [{node_id: 'rn-primary00000001', session_id: 9, reason: '复制线程（Binlog Dump）'}]};
   };
   const {run, c, calls, nodes, toasts} = context({api: async (url, options) => written(url, options)});
   c.data = payload();
   c.data.nodes[1].holders = {waiters: 16, oldest_wait_s: 4077, candidates: 1};            // sessions wait for a lock on the standby only
-  run('sessionsState.data = data; sessionsState.selected = new Set(["rn-primary00000001:44", "rn-primary00000001:9", "rn-secondary0000b:312"])');
+  // on the all tab every pick is on screen; a pick the page does not show is not sent (see the picks tests above)
+  run('sessionsState.data = data; sessionsState.tab = "all"; sessionsState.selected = new Set(["rn-primary00000001:44", "rn-primary00000001:9", "rn-secondary0000b:312"])');
   await run('generateSessionKill()');
   assert.equal(calls.length, 1);                                                           // every node in one request: one text comes back
   const [url, options] = calls[0];
@@ -251,7 +281,7 @@ test('KILL statements: one request for every node with what the page showed, eac
   assert.match(html, /3 条 KILL · 2 个节点/);
   assert.match(html, /<code title="rn-primary00000001">…00000001<\/code> <span class="chip role-primary">主节点<\/span>[^]*?<span class="muted">2 条 · 快照 /);
   assert.match(html, /<code title="rn-secondary0000b">…ary0000b<\/code>[^]*?<span class="muted">1 条 · 快照 /);
-  assert.match(html, /KILL 312;  -- &lt;b&gt;x&lt;\/b&gt;/);
+  assert.match(html, /-- &lt;b&gt;x&lt;\/b&gt;/);
   assert.doesNotMatch(html, /<b>x<\/b>/);
   assert.match(html, /data-session-killmode="connection" class="is-active"/);
   // KILL QUERY regenerates the text with the other mode
@@ -262,7 +292,8 @@ test('KILL statements: one request for every node with what the page showed, eac
   let copied = '';
   c.navigator = {clipboard: {writeText: async (text) => { copied = text; }}};
   run('copySessionKill()');
-  assert.match(copied, /^-- query\nKILL 44;\nKILL 9;\nKILL 312;  -- <b>x<\/b>\n$/);
+  assert.match(copied, /^-- query\n(KILL \d+;\n)+-- <b>x<\/b>\n$/);
+  assert.deepEqual(copied.split('\n').filter((line) => line.startsWith('KILL ')).sort(), ['KILL 312;', 'KILL 44;', 'KILL 9;']);
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(toasts.some(([kind, message]) => kind === 'success' && /已复制/.test(message)));
 });

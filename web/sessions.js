@@ -219,13 +219,17 @@ function sessionListHtml() {
   const counts = Object.fromEntries(SESSION_TABS.map(([tab]) => [tab, all.filter((row) => sessionInTab(row, tab)).length]));
   const tabs = SESSION_TABS.map(([tab, label]) => `<button type="button" data-session-tab="${tab}" class="${sessionsState.tab === tab ? "is-active" : ""}">${label} ${humanCount(counts[tab])}</button>`).join("");
   const { visible, pages, rows: pageRows } = sessionPage();
-  const selectable = pageRows.filter((row) => !row.protected).map(sessionKey);
+  // A pick belongs to the list on screen. A session this page does not show (another tab or filter, another page, or a refresh
+  // that moved it) is dropped here, so the count, the header box and the KILL text all read the same set.
+  const shown = new Set(pageRows.filter((row) => !row.protected).map(sessionKey));
+  for (const key of [...sessionsState.selected]) if (!shown.has(key)) sessionsState.selected.delete(key);
+  const selectable = [...shown];
   const pickedHere = selectable.filter((key) => sessionsState.selected.has(key)).length;
   const pickAll = `<input type="checkbox" data-session-pick-all aria-label="全选本页可结束的会话" title="${selectable.length ? `全选 / 取消本页 ${humanCount(selectable.length)} 个可结束的会话` : "本页没有可结束的会话"}"${selectable.length && pickedHere === selectable.length ? " checked" : ""}${pickedHere && pickedHere < selectable.length ? " data-indeterminate" : ""}${selectable.length ? "" : " disabled"}>`;
   const filters = sessionsState.filters;
   const chips = ["user", "client", "database"].filter((field) => filters[field]).map((field) =>
     `<button type="button" class="chip session-filter-chip" data-session-clear="${field}" title="取消">${escapeHtml({ user: "用户", client: "来源", database: "库" }[field])}：${escapeHtml(filters[field])} ×</button>`).join(" ");
-  const selected = [...sessionsState.selected].filter((key) => all.some((row) => sessionKey(row) === key)).length;
+  const selected = sessionsState.selected.size;
   const truncated = (sessionsState.data?.nodes || []).some((node) => node.truncated);
   const header = `<div class="section-heading session-list-head"><div class="segmented" id="sessions-tabs" aria-label="会话范围">${tabs}</div>
     <div class="session-actions">
@@ -355,8 +359,7 @@ function renderSessionsList() {
 async function loadSessions() {
   const query = sessionsQueryString();
   sessionsState.data = await api(`/api/sessions?${query}`);
-  const known = new Set(sessionRows(sessionsState.data).map(sessionKey));
-  sessionsState.selected = new Set([...sessionsState.selected].filter((key) => known.has(key)));
+  // picks are trimmed to the rows on screen when the list is drawn (sessionListHtml)
   sessionsState.page = 0;
   renderSessionsLive();
   refreshSessionsRetention();
@@ -480,8 +483,9 @@ async function runSessions() {
 /* ---------------------------- KILL 语句与导出 ---------------------------- */
 
 function sessionSelectedRows() {
+  // only the rows on screen: a pick the page does not show is never sent (sessionListHtml drops those)
   const wanted = sessionsState.selected;
-  return sessionRows(sessionsState.data).filter((row) => wanted.has(sessionKey(row)));
+  return sessionPage().rows.filter((row) => wanted.has(sessionKey(row)));
 }
 
 async function generateSessionKill() {
