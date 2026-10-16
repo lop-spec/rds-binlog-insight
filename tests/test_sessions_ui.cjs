@@ -179,46 +179,90 @@ test('picking sessions enables the KILL button with the count; a refresh drops s
   assert.match(run('sessionListHtml()'), /data-session-kill disabled/);
 });
 
-test('KILL statements: one request per node with what the page showed, the snapshot time and the mode; the text is escaped, copied, regenerated per mode', async () => {
+test('the header checkbox picks every session on the page that may be ended, and clears them; protected rows are left out; half-picked is marked', () => {
+  const {run, c} = context();
+  c.data = payload();
+  run('sessionsState.data = data; sessionsState.tab = "all"; sessionsState.selected = new Set()');
+  let out = run('sessionListHtml()');
+  assert.match(out, /<th class="session-check"><input type="checkbox" data-session-pick-all aria-label="全选本页可结束的会话" title="全选 \/ 取消本页 4 个可结束的会话"><\/th>/);
+  run('sessionsChange({target: {dataset: {sessionPickAll: ""}, checked: true}})');
+  assert.deepEqual(JSON.parse(run('JSON.stringify([...sessionsState.selected].sort())')),
+    ['rn-primary00000001:44', 'rn-primary00000001:7', 'rn-secondary0000b:312', 'rn-secondary0000b:8']);   // 9 is protected: never picked
+  out = run('sessionListHtml()');
+  assert.match(out, /data-session-pick-all [^>]*" checked>/);
+  assert.doesNotMatch(out, /data-indeterminate/);
+  assert.match(out, /生成 KILL 语句（4）/);
+  run('sessionsChange({target: {dataset: {sessionPick: "rn-primary00000001:7"}, checked: false}})');
+  out = run('sessionListHtml()');
+  assert.doesNotMatch(out, /data-session-pick-all [^>]*" checked>/);
+  assert.match(out, /data-session-pick-all [^>]*" data-indeterminate>/);
+  run('sessionsChange({target: {dataset: {sessionPickAll: ""}, checked: false}})');
+  assert.equal(run('sessionsState.selected.size'), 0);
+  // on the abnormal tab only its rows are on the page
+  run('sessionsState.tab = "abnormal"');
+  run('sessionsChange({target: {dataset: {sessionPickAll: ""}, checked: true}})');
+  assert.deepEqual(JSON.parse(run('JSON.stringify([...sessionsState.selected].sort())')), ['rn-primary00000001:44', 'rn-secondary0000b:312']);
+  // only protected rows on the page: the box is disabled
+  run('sessionsState.tab = "all"; sessionsState.filters.q = "repl"');
+  assert.match(run('sessionListHtml()'), /data-session-pick-all [^>]*title="本页没有可结束的会话" disabled>/);
+});
+
+test('KILL statements: one request for every node with what the page showed, each node\'s snapshot time and waiters, and the mode; one text, escaped, copied, regenerated per mode', async () => {
   const written = (url, options) => {
     const body = JSON.parse(options.body);
-    return {text: `-- ${body.node_id}\nKILL ${body.sessions[0].session_id};  -- <b>x</b>\n`, statements: body.sessions.map((s) => `KILL ${s.session_id};`),
-      skipped: body.node_id === 'rn-primary00000001' ? [{session_id: 9, reason: '复制线程（Binlog Dump）'}] : [], snapshot_us: body.snapshot_us, mode: body.mode, session_ids: [], hint: body.node_id === 'rn-primary00000001' ? 'FORCE_MASTER' : ''};
+    const nodes = body.nodes.map((n) => ({node_id: n.node_id, role: n.node_id.startsWith('rn-primary') ? 'primary' : 'secondary', zone: 'cn-chengdu-b',
+      hint: n.node_id.startsWith('rn-primary') ? 'FORCE_MASTER' : '', snapshot_us: n.snapshot_us, session_ids: n.sessions.map((s) => s.session_id),
+      statements: n.sessions.map((s) => `KILL ${s.session_id};`), skipped: []}));
+    const statements = nodes.flatMap((n) => n.statements);
+    return {text: `-- ${body.mode}\n${statements.join('\n')}  -- <b>x</b>\n`, checks: [], statements, mode: body.mode, session_ids: [], generated_us: SNAP, nodes,
+      skipped: [{node_id: 'rn-primary00000001', session_id: 9, reason: '复制线程（Binlog Dump）'}]};
   };
   const {run, c, calls, nodes, toasts} = context({api: async (url, options) => written(url, options)});
   c.data = payload();
   c.data.nodes[1].holders = {waiters: 16, oldest_wait_s: 4077, candidates: 1};            // sessions wait for a lock on the standby only
   run('sessionsState.data = data; sessionsState.selected = new Set(["rn-primary00000001:44", "rn-primary00000001:9", "rn-secondary0000b:312"])');
   await run('generateSessionKill()');
-  assert.equal(calls.length, 2);                                                           // two nodes, two requests: a KILL id means something on one node only
-  const first = JSON.parse(calls.find(([, o]) => JSON.parse(o.body).node_id === 'rn-primary00000001')[1].body);
-  assert.equal(first.instance, 'rm-x');
-  assert.equal(first.mode, 'connection');
-  assert.equal(first.snapshot_us, SNAP);
-  assert.equal(first.lock_waiters, 0);                                                     // the node's own waiters decide whether the lock check is written
-  assert.equal(JSON.parse(calls.find(([, o]) => JSON.parse(o.body).node_id === 'rn-secondary0000b')[1].body).lock_waiters, 16);
-  assert.deepEqual(first.sessions.map((s) => s.session_id).sort((a, b) => a - b), [9, 44]);
-  assert.deepEqual(Object.keys(first.sessions[0]).sort(), ['client', 'command', 'database', 'kinds', 'seconds', 'session_id', 'trx_seconds', 'user']);
-  assert.ok(calls.every(([url, options]) => url === '/api/sessions/kill-statements' && options.method === 'POST'));
+  assert.equal(calls.length, 1);                                                           // every node in one request: one text comes back
+  const [url, options] = calls[0];
+  assert.equal(url, '/api/sessions/kill-statements');
+  assert.equal(options.method, 'POST');
+  const body = JSON.parse(options.body);
+  assert.deepEqual(Object.keys(body).sort(), ['instance', 'mode', 'nodes']);
+  assert.equal(body.instance, 'rm-x');
+  assert.equal(body.mode, 'connection');
+  const primary = body.nodes.find((n) => n.node_id === 'rn-primary00000001'), standby = body.nodes.find((n) => n.node_id === 'rn-secondary0000b');
+  assert.equal(body.nodes.length, 2);
+  assert.equal(primary.snapshot_us, SNAP);
+  assert.equal(primary.lock_waiters, 0);                                                   // each node's own waiters decide whether its lock check is written
+  assert.equal(standby.lock_waiters, 16);
+  assert.deepEqual(primary.sessions.map((s) => s.session_id).sort((a, b) => a - b), [9, 44]);
+  assert.deepEqual(standby.sessions.map((s) => s.session_id), [312]);
+  assert.deepEqual(Object.keys(primary.sessions[0]).sort(), ['client', 'command', 'database', 'kinds', 'seconds', 'session_id', 'trx_seconds', 'user']);
   assert.equal(nodes.drawerShown, true);
-  const body = nodes['#detail-body'].innerHTML;
+  const html = nodes['#detail-body'].innerHTML;
   assert.equal(nodes['#detail-title'].textContent, 'KILL 语句');
-  assert.match(body, /只生成语句，不执行。走读写分离（代理）地址的连接/);
-  assert.match(body, /这是<strong>主节点<\/strong>：杀错会话会直接影响线上写入/);
-  assert.match(body, /跳过 1 个受保护会话：9（复制线程（Binlog Dump））/);
-  assert.equal(body.match(/这个节点 ID 不能写进 Hint/g).length, 1);                          // only the node whose answer had no hint
-  assert.match(body, /KILL 44;  -- &lt;b&gt;x&lt;\/b&gt;/);
-  assert.doesNotMatch(body, /<b>x<\/b>/);
-  assert.match(body, /data-session-killmode="connection" class="is-active"/);
-  // KILL QUERY regenerates every block with the other mode
+  assert.match(html, /只生成语句，不执行。所有节点的语句合在一起/);
+  assert.match(html, /含<strong>主节点<\/strong>的会话：杀错会话会直接影响线上写入/);
+  assert.match(html, /跳过 1 个受保护会话：9（复制线程（Binlog Dump））/);
+  assert.match(html, /节点 rn-secondary0000b 的 ID 不能写进 Hint/);                         // only the node whose answer had no hint
+  assert.doesNotMatch(html, /节点 rn-primary00000001 的 ID/);
+  assert.equal(html.match(/<textarea class="session-kill-text"/g).length, 1);            // one text and one copy button, whatever the nodes
+  assert.equal(html.match(/data-session-copy/g).length, 1);
+  assert.match(html, /3 条 KILL · 2 个节点/);
+  assert.match(html, /<code title="rn-primary00000001">…00000001<\/code> <span class="chip role-primary">主节点<\/span>[^]*?<span class="muted">2 条 · 快照 /);
+  assert.match(html, /<code title="rn-secondary0000b">…ary0000b<\/code>[^]*?<span class="muted">1 条 · 快照 /);
+  assert.match(html, /KILL 312;  -- &lt;b&gt;x&lt;\/b&gt;/);
+  assert.doesNotMatch(html, /<b>x<\/b>/);
+  assert.match(html, /data-session-killmode="connection" class="is-active"/);
+  // KILL QUERY regenerates the text with the other mode
   await run('regenerateSessionKill("query")');
   assert.equal(JSON.parse(calls.at(-1)[1].body).mode, 'query');
   assert.match(nodes['#detail-body'].innerHTML, /data-session-killmode="query" class="is-active"/);
   // copy: the clipboard gets exactly the generated text
   let copied = '';
   c.navigator = {clipboard: {writeText: async (text) => { copied = text; }}};
-  run('copySessionKill(0)');
-  assert.match(copied, /^-- rn-/);
+  run('copySessionKill()');
+  assert.match(copied, /^-- query\nKILL 44;\nKILL 9;\nKILL 312;  -- <b>x<\/b>\n$/);
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(toasts.some(([kind, message]) => kind === 'success' && /已复制/.test(message)));
 });

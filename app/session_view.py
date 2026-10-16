@@ -252,18 +252,34 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
     verb = "KILL" if mode == "connection" else "KILL QUERY"
     hint_name, hint = route_hint(node)
     ids = sorted(keep)
+    checks: list[str] = []
     statements: list[str] = []
-    lines: list[str] = []
     if ids:
         listing = ", ".join(str(i) for i in ids)
         read_only = "@@read_only AS ro, " if hint else ""
-        lines.append(hint + f"SELECT {read_only}ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
-                     f"FROM information_schema.PROCESSLIST WHERE ID IN ({listing});")
+        checks.append(hint + f"SELECT {read_only}ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
+                      f"FROM information_schema.PROCESSLIST WHERE ID IN ({listing});")
         if lock_waiters:
-            lines.append(hint + "SELECT * FROM sys.schema_table_lock_waits;")
-        for session_id in ids:
-            statement = f"{hint}{verb} {session_id};"
-            statements.append(statement)
-            lines.append(statement)
-    return {"text": ("\n".join(lines) + "\n") if lines else "", "statements": statements, "skipped": skipped, "mode": mode,
-            "session_ids": ids, "snapshot_us": snapshot_us, "generated_us": generated_us, "hint": hint_name}
+            checks.append(hint + "SELECT * FROM sys.schema_table_lock_waits;")
+        statements.extend(f"{hint}{verb} {session_id};" for session_id in ids)
+    lines = checks + statements
+    return {"text": ("\n".join(lines) + "\n") if lines else "", "checks": checks, "statements": statements, "skipped": skipped,
+            "mode": mode, "session_ids": ids, "snapshot_us": snapshot_us, "generated_us": generated_us, "hint": hint_name,
+            "node_id": str(node.get("node_id") or ""), "role": str(node.get("role") or ""), "zone": str(node.get("zone") or "")}
+
+
+def combine_kill_statements(parts: list[dict[str, Any]], *, mode: str, generated_us: int) -> dict[str, Any]:
+    """One text for sessions picked on several nodes: every node's checks first, then every node's KILLs, so a person runs
+    the checks, reads them, then runs the KILLs, whatever node each session is on. Every line keeps its node's hint, so
+    the whole text goes to one connection on the read/write splitting address. ``parts`` are ``build_kill_statements``
+    answers, one per node, in the order the text should follow (the primary first).
+    """
+    checks = [line for part in parts for line in part["checks"]]
+    statements = [line for part in parts for line in part["statements"]]
+    lines = checks + statements
+    nodes = [{key: part[key] for key in ("node_id", "role", "zone", "hint", "snapshot_us", "session_ids", "statements", "skipped")}
+             for part in parts]
+    return {"text": ("\n".join(lines) + "\n") if lines else "", "checks": checks, "statements": statements,
+            "skipped": [{"node_id": part["node_id"], **row} for part in parts for row in part["skipped"]],
+            "session_ids": [session_id for part in parts for session_id in part["session_ids"]],
+            "mode": mode, "generated_us": generated_us, "nodes": nodes}

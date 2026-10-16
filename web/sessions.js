@@ -38,7 +38,7 @@ const sessionsState = {
   selected: new Set(),
   expanded: new Set(),
   killMode: "connection",
-  kill: [],
+  kill: null,
 };
 
 /* ---------------------------- 小工具 ---------------------------- */
@@ -105,6 +105,13 @@ function sessionSorted(rows, sort) {
 function sessionVisible() {
   const rows = sessionRows(sessionsState.data).filter((row) => sessionInTab(row, sessionsState.tab) && sessionMatches(row, sessionsState.filters));
   return sessionSorted(rows, sessionsState.sort);
+}
+
+function sessionPage() {
+  const visible = sessionVisible();
+  const pages = Math.max(1, Math.ceil(visible.length / SESSION_PAGE_SIZE));
+  sessionsState.page = Math.min(sessionsState.page, pages - 1);
+  return { visible, pages, rows: visible.slice(sessionsState.page * SESSION_PAGE_SIZE, (sessionsState.page + 1) * SESSION_PAGE_SIZE) };
 }
 
 /* ---------------------------- 概览与统计 ---------------------------- */
@@ -211,10 +218,10 @@ function sessionListHtml() {
   const all = sessionRows(sessionsState.data);
   const counts = Object.fromEntries(SESSION_TABS.map(([tab]) => [tab, all.filter((row) => sessionInTab(row, tab)).length]));
   const tabs = SESSION_TABS.map(([tab, label]) => `<button type="button" data-session-tab="${tab}" class="${sessionsState.tab === tab ? "is-active" : ""}">${label} ${humanCount(counts[tab])}</button>`).join("");
-  const visible = sessionVisible();
-  const pages = Math.max(1, Math.ceil(visible.length / SESSION_PAGE_SIZE));
-  sessionsState.page = Math.min(sessionsState.page, pages - 1);
-  const pageRows = visible.slice(sessionsState.page * SESSION_PAGE_SIZE, (sessionsState.page + 1) * SESSION_PAGE_SIZE);
+  const { visible, pages, rows: pageRows } = sessionPage();
+  const selectable = pageRows.filter((row) => !row.protected).map(sessionKey);
+  const pickedHere = selectable.filter((key) => sessionsState.selected.has(key)).length;
+  const pickAll = `<input type="checkbox" data-session-pick-all aria-label="全选本页可结束的会话" title="${selectable.length ? `全选 / 取消本页 ${humanCount(selectable.length)} 个可结束的会话` : "本页没有可结束的会话"}"${selectable.length && pickedHere === selectable.length ? " checked" : ""}${pickedHere && pickedHere < selectable.length ? " data-indeterminate" : ""}${selectable.length ? "" : " disabled"}>`;
   const filters = sessionsState.filters;
   const chips = ["user", "client", "database"].filter((field) => filters[field]).map((field) =>
     `<button type="button" class="chip session-filter-chip" data-session-clear="${field}" title="取消">${escapeHtml({ user: "用户", client: "来源", database: "库" }[field])}：${escapeHtml(filters[field])} ×</button>`).join(" ");
@@ -229,7 +236,7 @@ function sessionListHtml() {
     <div class="session-filters"><label class="field"><span>关键词</span><input id="sessions-q" type="search" value="${escapeHtml(filters.q)}" placeholder="用户 / 来源 / 库 / SQL / 状态 / 会话号" autocomplete="off"></label>
       <label class="field"><span>执行时间 ≥（秒）</span><input id="sessions-min" type="number" min="0" step="1" value="${filters.minSeconds || ""}" placeholder="0"></label>
       <div class="session-filter-chips">${chips}</div></div>`;
-  const body = pageRows.length ? `<div class="table-wrap"><table class="data-table analytics-table session-table"><thead><tr><th class="session-check"></th><th>节点</th><th>会话 ID</th><th>用户</th><th>来源</th><th>库</th><th>命令 / 状态</th><th>执行时间</th><th>事务时长</th><th>异常原因</th><th>SQL</th></tr></thead>
+  const body = pageRows.length ? `<div class="table-wrap"><table class="data-table analytics-table session-table"><thead><tr><th class="session-check">${pickAll}</th><th>节点</th><th>会话 ID</th><th>用户</th><th>来源</th><th>库</th><th>命令 / 状态</th><th>执行时间</th><th>事务时长</th><th>异常原因</th><th>SQL</th></tr></thead>
       <tbody>${pageRows.map(sessionRowHtml).join("")}</tbody></table></div>` : `<p class="analytics-empty">${sessionsState.tab === "abnormal" ? "当前快照里没有异常会话" : "没有符合条件的会话"}。</p>`;
   const pager = pages > 1 ? `<div class="session-pager"><button type="button" class="button secondary compact" data-session-page="-1"${sessionsState.page === 0 ? " disabled" : ""}>上一页</button>
       <span>第 ${sessionsState.page + 1} / ${pages} 页 · 共 ${humanCount(visible.length)} 条</span><button type="button" class="button secondary compact" data-session-page="1"${sessionsState.page >= pages - 1 ? " disabled" : ""}>下一页</button></div>` : "";
@@ -334,11 +341,15 @@ function renderSessionsLive() {
   $("#sessions-summary").innerHTML = sessionSummaryHtml(data);
   $("#sessions-holders").innerHTML = sessionHolderHtml(data);
   $("#sessions-stats").innerHTML = sessionStatsHtml(data);
-  $("#sessions-list").innerHTML = sessionListHtml();
+  renderSessionsList();
 }
 
 function renderSessionsList() {
-  if (sessionsState.mode === "live") $("#sessions-list").innerHTML = sessionListHtml();
+  if (sessionsState.mode !== "live") return;
+  const list = $("#sessions-list");
+  list.innerHTML = sessionListHtml();
+  const pickAll = list.querySelector?.("[data-session-pick-all]");      // the half-picked state is a property, not an attribute
+  if (pickAll) pickAll.indeterminate = pickAll.hasAttribute("data-indeterminate");
 }
 
 async function loadSessions() {
@@ -479,38 +490,34 @@ async function generateSessionKill() {
   const instance = sessionsState.data.instance_id;
   const byNode = new Map();
   for (const row of rows) byNode.set(row.node_id, [...(byNode.get(row.node_id) || []), row]);
-  const results = [];
-  for (const [nodeId, picked] of byNode) {
+  // one request for every node: the answer is one text, every line with its node's hint
+  const nodes = [...byNode].map(([nodeId, picked]) => {
     const node = sessionsState.data.nodes.find((item) => item.node_id === nodeId);
-    const written = await api("/api/sessions/kill-statements", {
-      method: "POST",
-      body: JSON.stringify({
-        instance, node_id: nodeId, mode: sessionsState.killMode, snapshot_us: node.observed_at_us, lock_waiters: Number(node.holders?.waiters) || 0,
-        sessions: picked.map((row) => ({ session_id: row.session_id, user: row.user, client: row.client, database: row.database, command: row.command,
-          seconds: row.seconds, trx_seconds: row.trx_seconds, kinds: row.kinds })),
-      }),
-    });
-    results.push({ node, ...written });
-  }
-  sessionsState.kill = results;
+    return {
+      node_id: nodeId, snapshot_us: node.observed_at_us, lock_waiters: Number(node.holders?.waiters) || 0,
+      sessions: picked.map((row) => ({ session_id: row.session_id, user: row.user, client: row.client, database: row.database, command: row.command,
+        seconds: row.seconds, trx_seconds: row.trx_seconds, kinds: row.kinds })),
+    };
+  });
+  sessionsState.kill = await api("/api/sessions/kill-statements", { method: "POST", body: JSON.stringify({ instance, mode: sessionsState.killMode, nodes }) });
   showSessionKill();
 }
 
 function sessionKillHtml() {
   const mode = sessionsState.killMode;
+  const item = sessionsState.kill;
   const modes = `<div class="segmented" id="sessions-kill-mode"><button type="button" data-session-killmode="connection" class="${mode === "connection" ? "is-active" : ""}" title="KILL：结束连接并回滚它没提交的事务">KILL（结束会话）</button><button type="button" data-session-killmode="query" class="${mode === "query" ? "is-active" : ""}" title="KILL QUERY：只终止当前语句，连接和事务还在，对空闲事务无效">KILL QUERY（只终止语句）</button></div>`;
-  const blocks = sessionsState.kill.map((item, index) => {
-    const primary = item.node.role === "primary";
-    const warn = primary ? '<p class="session-kill-warn">这是<strong>主节点</strong>：杀错会话会直接影响线上写入，务必先跑核对语句。</p>' : "";
-    const unrouted = item.hint === "" ? '<p class="session-kill-warn">这个节点 ID 不能写进 Hint：请直连该节点执行。</p>' : "";
-    const skipped = (item.skipped || []).length ? `<p class="analytics-note">跳过 ${humanCount(item.skipped.length)} 个受保护会话：${escapeHtml(item.skipped.map((row) => `${row.session_id}（${row.reason}）`).join("、"))}。</p>` : "";
-    return `<section class="detail-block"><h3>${sessionNodeChip(item.node)}</h3>${warn}${unrouted}
-      <textarea class="session-kill-text" readonly rows="${Math.min(24, Math.max(8, String(item.text).split("\n").length + 1))}" spellcheck="false" aria-label="KILL 语句">${escapeHtml(item.text)}</textarea>
-      <div class="session-kill-actions"><button type="button" class="button primary compact" data-session-copy="${index}"${item.statements.length ? "" : " disabled"}>复制语句</button>
-      <span class="muted">${humanCount(item.statements.length)} 条 KILL · 快照 ${escapeHtml(sessionTimeText(item.snapshot_us))}</span></div>${skipped}</section>`;
-  }).join("");
-  return `<p class="analytics-note">只生成语句，不执行。走读写分离（代理）地址的连接才会落到对应节点（主地址上 Hint 只是注释）。先跑检查：<code>ro</code> 备节点应为 1、主节点为 0，会话对得上再杀；杀完再跑检查，无结果=已杀。</p>
-    ${modes}${blocks}`;
+  const nodes = item.nodes || [];
+  const warn = nodes.some((node) => node.role === "primary") ? '<p class="session-kill-warn">含<strong>主节点</strong>的会话：杀错会话会直接影响线上写入，务必先跑检查语句。</p>' : "";
+  const unrouted = nodes.filter((node) => node.hint === "");
+  const unroutedNote = unrouted.length ? `<p class="session-kill-warn">节点 ${escapeHtml(unrouted.map((node) => node.node_id).join("、"))} 的 ID 不能写进 Hint：它的语句请直连该节点执行。</p>` : "";
+  const skipped = (item.skipped || []).length ? `<p class="analytics-note">跳过 ${humanCount(item.skipped.length)} 个受保护会话：${escapeHtml(item.skipped.map((row) => `${row.session_id}（${row.reason}）`).join("、"))}。</p>` : "";
+  const chips = nodes.map((node) => `<span class="session-kill-node">${sessionNodeChip(node)}<span class="muted">${humanCount(node.statements.length)} 条 · 快照 ${escapeHtml(sessionTimeText(node.snapshot_us))}</span></span>`).join("");
+  return `<p class="analytics-note">只生成语句，不执行。所有节点的语句合在一起，每条自带该节点的路由 Hint，在同一个读写分离（代理）地址的连接上按顺序执行就行（主地址上 Hint 只是注释）。先跑开头的检查：<code>ro</code> 备节点应为 1、主节点为 0，会话对得上再跑后面的 KILL；杀完再跑检查，无结果=已杀。</p>
+    ${modes}<section class="detail-block">${warn}${unroutedNote}<div class="session-kill-nodes">${chips}</div>
+      <textarea class="session-kill-text" readonly rows="${Math.min(32, Math.max(8, String(item.text).split("\n").length + 1))}" spellcheck="false" aria-label="KILL 语句">${escapeHtml(item.text)}</textarea>
+      <div class="session-kill-actions"><button type="button" class="button primary compact" data-session-copy${item.statements.length ? "" : " disabled"}>复制语句</button>
+      <span class="muted">${humanCount(item.statements.length)} 条 KILL · ${humanCount(nodes.length)} 个节点</span></div>${skipped}</section>`;
 }
 
 function showSessionKill() {
@@ -524,15 +531,15 @@ async function regenerateSessionKill(mode) {
   await generateSessionKill();
 }
 
-function copySessionKill(index) {
-  const item = sessionsState.kill[index];
+function copySessionKill() {
+  const item = sessionsState.kill;
   if (!item) return;
   const done = () => toast("已复制 KILL 语句", "success");
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(item.text).then(done, () => toast("复制失败，请手动选中文本复制", "error", 6000));
     return;
   }
-  const area = $$("textarea.session-kill-text")[index];
+  const area = $("textarea.session-kill-text");
   if (area) { area.select(); document.execCommand?.("copy"); done(); }
 }
 
@@ -594,8 +601,7 @@ function sessionsClick(event) {
   if (find("[data-session-kill]")) { generateSessionKill().catch((error) => toast(error.message, "error", 6000)); return; }
   const killMode = find("[data-session-killmode]");
   if (killMode) { regenerateSessionKill(killMode.dataset.sessionKillmode).catch((error) => toast(error.message, "error", 6000)); return; }
-  const copy = find("[data-session-copy]");
-  if (copy) { copySessionKill(Number(copy.dataset.sessionCopy)); return; }
+  if (find("[data-session-copy]")) { copySessionKill(); return; }
   const around = find("[data-session-around]");
   if (around) {
     const at = Number(around.dataset.sessionAround);
@@ -606,6 +612,14 @@ function sessionsClick(event) {
 
 function sessionsChange(event) {
   const target = event.target;
+  if (target.dataset?.sessionPickAll !== undefined) {
+    for (const row of sessionPage().rows) {                         // every session on this page that may be ended
+      if (row.protected) continue;
+      if (target.checked) sessionsState.selected.add(sessionKey(row)); else sessionsState.selected.delete(sessionKey(row));
+    }
+    renderSessionsList();
+    return;
+  }
   if (target.dataset?.sessionPick !== undefined) {
     const key = target.dataset.sessionPick;
     if (target.checked) sessionsState.selected.add(key); else sessionsState.selected.delete(key);

@@ -2,7 +2,7 @@
 import unittest
 from datetime import UTC, datetime
 
-from app.session_view import (DEFAULT_THRESHOLDS, HOLDER_LIMIT, LIST_ACTIVE_LIMIT, MAX_KILL_SESSIONS, build_kill_statements,
+from app.session_view import (DEFAULT_THRESHOLDS, HOLDER_LIMIT, LIST_ACTIVE_LIMIT, MAX_KILL_SESSIONS, build_kill_statements, combine_kill_statements,
                               build_session_view, is_lock_wait, parse_thresholds, protected_reason, route_hint)
 
 MDL = "Waiting for table metadata lock"
@@ -237,6 +237,26 @@ class KillStatementTests(unittest.TestCase):
         self.assertEqual(out["text"].splitlines(), ["/*FORCE_MASTER*/ SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
                                                     "FROM information_schema.PROCESSLIST WHERE ID IN (5);", "/*FORCE_MASTER*/ KILL 5;"])
         self.assertEqual(out["statements"], ["/*FORCE_MASTER*/ KILL 5;"])
+
+    def test_one_text_for_several_nodes_puts_every_check_before_every_kill(self):
+        primary = build_kill_statements({"node_id": "rn-main", "role": "primary", "zone": "cn-chengdu-a"}, self.rows()[:1], mode="connection", snapshot_us=1, generated_us=2)
+        standby = build_kill_statements(self.NODE, self.rows() + [dict(session_id=9, user="repl", command="Binlog Dump GTID", seconds=1)],
+                                        mode="connection", snapshot_us=3, generated_us=2, lock_waiters=2)
+        self.assertEqual(primary["checks"], ["/*FORCE_MASTER*/ " + self.CHECK.replace("(44, 312)", "(312)")])
+        self.assertEqual((primary["node_id"], primary["role"], primary["zone"]), ("rn-main", "primary", "cn-chengdu-a"))
+        out = combine_kill_statements([primary, standby], mode="connection", generated_us=2)
+        self.assertEqual(out["text"].splitlines(), [
+            "/*FORCE_MASTER*/ " + self.CHECK.replace("(44, 312)", "(312)"),
+            self.HINT + self.CHECK, self.HINT + "SELECT * FROM sys.schema_table_lock_waits;",
+            "/*FORCE_MASTER*/ KILL 312;", self.HINT + "KILL 44;", self.HINT + "KILL 312;"])
+        self.assertEqual(out["checks"], out["text"].splitlines()[:3])
+        self.assertEqual(out["statements"], out["text"].splitlines()[3:])
+        self.assertEqual(out["session_ids"], [312, 44, 312])                      # the same id on two nodes is two sessions
+        self.assertEqual(out["skipped"], [{"node_id": "rn-lagging", "session_id": 9, "reason": "复制线程（Binlog Dump）"}])
+        self.assertEqual([(n["node_id"], n["role"], n["hint"], n["snapshot_us"], n["session_ids"], len(n["statements"]), len(n["skipped"])) for n in out["nodes"]],
+                         [("rn-main", "primary", "FORCE_MASTER", 1, [312], 1, 0), ("rn-lagging", "secondary", "FORCE_NODE='rn-lagging'", 3, [44, 312], 2, 1)])
+        self.assertEqual((out["mode"], out["generated_us"]), ("connection", 2))
+        self.assertEqual(combine_kill_statements([], mode="connection", generated_us=2)["text"], "")
 
     def test_a_node_id_that_cannot_sit_in_a_hint_leaves_the_hint_out(self):
         out = build_kill_statements({"node_id": "rn-1'*/ KILL 3; /*", "role": "secondary", "zone": "z"}, self.rows()[:1], mode="connection", snapshot_us=1, generated_us=2)

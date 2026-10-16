@@ -8,7 +8,7 @@
 
 - **实例会话**：异常会话、运行中会话（命令是 Query / Execute）、会话总数、运行中最长；下面每个节点一行，读取失败的节点写明原因（没权限 / DAS 限流 / 超时），不影响其他节点。
 - **会话统计**：按用户、按访问来源、按数据库，各给会话总数、活跃数（运行中或在未结束事务里）、异常数；点一行只看它，再点取消。
-- **会话列表**：「异常会话 / 活跃会话 / 全部会话」三个范围，关键词和最短执行时间筛选，按执行时间 / 事务时长 / 会话号排序，100 条一页。每个节点的列表保留全部异常会话和疑似持锁会话，其余各按时长最多 1000 / 1500 条，更多的在统计里仍计入（响应的 `truncated` 为真时页面说明）。
+- **会话列表**：「异常会话 / 活跃会话 / 全部会话」三个范围，关键词和最短执行时间筛选，按执行时间 / 事务时长 / 会话号排序，100 条一页；表头的复选框一次选中 / 取消本页全部可结束的会话（受保护的不选，本页只选了一部分时显示半选）。每个节点的列表保留全部异常会话和疑似持锁会话，其余各按时长最多 1000 / 1500 条，更多的在统计里仍计入（响应的 `truncated` 为真时页面说明）。
 - **导出活跃会话**：当前快照里活跃会话的 CSV（单元格以 `= + - @` 开头时加引号前缀，表格软件不会把 SQL 当公式）。
 - **历史（留存）**：选时间窗，列出该窗口里留存到的异常会话——首次 → 最后看到、最长执行、最长事务、原因、命令 / 状态、SQL；「疑似持锁」的排最前；「同时段」按钮以某一行为中心看前后 2 分钟。窗口顶部给每个节点的快照数和应有数，少于 70% 标「留存有缺口」，缺口里的空白不等于没有异常。
 
@@ -36,15 +36,15 @@
 
 ## KILL 语句
 
-勾选会话 →「生成 KILL 语句」，按节点各生成一段（`POST /api/sessions/kill-statements`，请求带页面当时显示的那一行、快照时间、模式和该节点当时等锁的会话数 `lock_waiters`，服务端不会再读 DAS，也不连数据库）。一段文本只有代码、没有注释：
+勾选会话（表头的复选框一次选中 / 取消本页全部可结束的会话，受保护的不选）→「生成 KILL 语句」，不管会话在几个节点上，都合成**一段**文本（`POST /api/sessions/kill-statements` 一次请求，`nodes` 里每个节点带页面当时显示的那些行、该节点的快照时间和当时等锁的会话数 `lock_waiters`，服务端不会再读 DAS，也不连数据库）。文本只有代码、没有注释，顺序是先全部检查、再全部 KILL，主节点的在前，每条自带所属节点的 Hint，所以在同一个读写分离地址的连接上从头到尾执行即可：
 
-1. 检查，一条查全部选中的会话：`SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (…)`。`ro` 备节点应为 1、主节点应为 0，会话对得上再杀；
+1. 每个节点一条检查，查该节点全部选中的会话：`SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (…)`。`ro` 备节点应为 1、主节点应为 0，会话对得上再杀；
 2. 只有该节点快照里有会话在等锁（`lock_waiters` > 0）时才有：`SELECT * FROM sys.schema_table_lock_waits;`；
-3. 每个会话一行 `KILL <id>;`（或 `KILL QUERY <id>;`，只终止当前语句，对空闲会话无效），连在一起，可以一次执行。
+3. 每个会话一行 `KILL <id>;`（或 `KILL QUERY <id>;`，只终止当前语句，对空闲会话无效），全部节点的连在一起。
 
 杀完再跑检查：无结果=已杀掉。检查没结果、或 `ro` 不对，说明这条连接不是读写分离（代理）地址、或 Hint 没生效，别杀。
 
-规则：文本里只有整数会话号和 Hint，用户名、来源、库等不进文本（页面表格里看），所以塞不进第二条语句；一次最多 200 个、重复会话号合并；**受保护的会话不生成**——复制线程（`Binlog Dump*`）、`system user` / `Daemon` / `Connect` 系统线程、`event_scheduler`、`aliyun_` 开头和 `aliyun_root` 的云内部账号、没有会话号的行——页面在文本下面写明跳过了哪些、为什么（接口返回的 `skipped`）。主节点的段落多一句红字提醒。生成动作只在服务日志留一行（实例、节点、模式、个数，不含 SQL；写明「nothing was executed」）。
+规则：文本里只有整数会话号和 Hint，用户名、来源、库等不进文本（页面表格里看），所以塞不进第二条语句；一次最多 200 个、重复会话号合并；**受保护的会话不生成**——复制线程（`Binlog Dump*`）、`system user` / `Daemon` / `Connect` 系统线程、`event_scheduler`、`aliyun_` 开头和 `aliyun_root` 的云内部账号、没有会话号的行——页面在文本下面写明跳过了哪些、为什么（接口返回的 `skipped`）。选中的会话含主节点的时多一句红字提醒。生成动作只在服务日志留一行（实例、节点列表、模式、个数，不含 SQL；写明「nothing was executed」）。
 
 ### 路由 Hint
 
@@ -76,7 +76,7 @@
 | `GET /api/sessions?instance=&nodeId=&blockingSeconds=&trxSeconds=&idleTrxSeconds=` | 实例（或一个节点）的会话视图；`nodeId` 留空读该实例全部已登记节点，最多 3 个并行。每个节点 `status: ok` 带 `overview` / `holders` / `stats` / `sessions` / `truncated` / `observed_at_us` / `cached`，失败的带 `code` / `message`；`partial` 表示有节点失败 |
 | `GET /api/sessions/history?instance=&nodeId=&startEpochUs=&endEpochUs=&limit=` | 留存的异常会话（默认最近 1 小时，窗口不超过 31 天，最多 500 条）、每个节点的快照覆盖、节点标签和留存状态 |
 | `GET /api/sessions/status` | 留存线程状态 |
-| `POST /api/sessions/kill-statements` | 生成 KILL 语句，`{instance, node_id, mode: connection|query, snapshot_us, lock_waiters, sessions: [...]}`，返回 `text` / `statements` / `skipped` / `hint`（节点 ID 不能写进 Hint 时为空，页面提示直连） |
+| `POST /api/sessions/kill-statements` | 生成 KILL 语句，`{instance, mode: connection|query, nodes: [{node_id, snapshot_us, lock_waiters, sessions: [...]}, …]}`（顶层直接给 `node_id` / `snapshot_us` / `lock_waiters` / `sessions` 是单节点写法），所有节点合成一段：返回 `text`（先全部检查、再全部 KILL，主节点在前）/ `checks` / `statements` / `session_ids` / `skipped`（每条带 `node_id`）/ `nodes`（每个节点的 `role` / `hint`（节点 ID 不能写进 Hint 时为空，页面提示直连）/ `snapshot_us` / `session_ids` / `statements` / `skipped`） |
 
 所有接口只接受已登记采集慢日志的（实例，节点），否则 400（`SESSIONS_UNKNOWN_INSTANCE` / `SESSIONS_UNKNOWN_NODE`）；错误码 `DAS_PERMISSION_DENIED`（403 语义，节点级）、`DAS_THROTTLED`、`DAS_TIMEOUT` / `DAS_UNREACHABLE` / `DAS_FAILED` 写在节点的 `code` 里。
 

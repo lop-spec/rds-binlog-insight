@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .live_sessions import LiveSessions, LiveSessionsError
 from .session_collector import SessionCollector
 from .session_store import SessionStore
-from .session_view import build_kill_statements, build_session_view
+from .session_view import build_kill_statements, build_session_view, combine_kill_statements
 
 LOGGER = logging.getLogger(__name__)
 
@@ -90,17 +90,32 @@ class SessionService:
 
     # -- ending sessions is a text -------------------------------------------
     def kill_statements(self, payload: dict[str, Any]) -> dict[str, Any]:
-        instance, node = str(payload.get("instance") or "").strip(), str(payload.get("node_id") or "").strip()
-        if not node or node not in self._known(instance):
-            raise SessionRequestError("SESSIONS_UNKNOWN_NODE", "只能为已登记采集慢日志的实例节点生成")
-        sessions = payload.get("sessions")
-        if not isinstance(sessions, list) or not all(isinstance(row, dict) for row in sessions):
-            raise ValueError("sessions 必须是会话对象数组")
-        snapshot_us = payload.get("snapshot_us")
-        if isinstance(snapshot_us, bool) or not isinstance(snapshot_us, int) or snapshot_us <= 0:
-            raise ValueError("snapshot_us 必须是快照时间（微秒）")
-        result = build_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, mode=str(payload.get("mode") or "connection"),
-                                       snapshot_us=snapshot_us, generated_us=self._wall_us(), lock_waiters=payload.get("lock_waiters", 0))
-        LOGGER.info("session management: kill statements written instance=%s node=%s mode=%s sessions=%d skipped=%d (nothing was executed)",
-                    instance, node, result["mode"], len(result["session_ids"]), len(result["skipped"]))
+        """One text for every node in ``payload["nodes"]`` (``{node_id, snapshot_us, lock_waiters, sessions}`` each); a payload
+        with ``node_id`` and ``sessions`` at the top is the one-node form of the same request."""
+        instance, mode = str(payload.get("instance") or "").strip(), str(payload.get("mode") or "connection")
+        nodes = payload.get("nodes")
+        if nodes is None:
+            nodes = [{key: payload[key] for key in ("node_id", "snapshot_us", "lock_waiters", "sessions") if key in payload}]
+        if not isinstance(nodes, list) or not nodes or not all(isinstance(item, dict) for item in nodes):
+            raise ValueError("nodes 必须是非空的节点数组")
+        known, generated_us = self._known(instance), self._wall_us()
+        parts: list[dict[str, Any]] = []
+        for item in nodes:
+            node = str(item.get("node_id") or "").strip()
+            if not node or node not in known:
+                raise SessionRequestError("SESSIONS_UNKNOWN_NODE", "只能为已登记采集慢日志的实例节点生成")
+            if any(part["node_id"] == node for part in parts):
+                raise ValueError("同一个节点只能出现一次")
+            sessions = item.get("sessions")
+            if not isinstance(sessions, list) or not all(isinstance(row, dict) for row in sessions):
+                raise ValueError("sessions 必须是会话对象数组")
+            snapshot_us = item.get("snapshot_us")
+            if isinstance(snapshot_us, bool) or not isinstance(snapshot_us, int) or snapshot_us <= 0:
+                raise ValueError("snapshot_us 必须是快照时间（微秒）")
+            parts.append(build_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, mode=mode, snapshot_us=snapshot_us,
+                                               generated_us=generated_us, lock_waiters=item.get("lock_waiters", 0)))
+        parts.sort(key=lambda part: (ROLE_ORDER.get(part["role"], 2), part["node_id"]))
+        result = combine_kill_statements(parts, mode=mode, generated_us=generated_us)
+        LOGGER.info("session management: kill statements written instance=%s nodes=%s mode=%s sessions=%d skipped=%d (nothing was executed)",
+                    instance, ",".join(part["node_id"] for part in parts), mode, len(result["statements"]), len(result["skipped"]))
         return result
