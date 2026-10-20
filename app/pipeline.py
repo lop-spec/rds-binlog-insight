@@ -21,6 +21,7 @@ from .config import Settings, utc_now_text
 from .credentials import CloudCredential, load_credential
 from .downloader import DownloadError, download_file
 from .maintenance_status import SUPERVISOR_STATUS_NAME, read_json_status
+from .scratch_sweep import sweep_stale_scratch
 from .metadata import MetadataStore
 from .sync_lifecycle import PauseControl, sync_health
 from .oss_store import OSS_PACK_TARGET_BYTES, OssArchive, OssArchiveError
@@ -2230,6 +2231,11 @@ class SyncManager:
                 # 执行一次；secondary 一起跑会对同一批分区重复清理。
                 if self.role == "primary":
                     self._run_retention_cleanup_if_due(settings)
+                    # Killed workers leave bodies in the shared scratch; the sweep runs at most hourly.
+                    try:
+                        sweep_stale_scratch(self.storage.paths["scratch"])
+                    except Exception:  # noqa: BLE001 - housekeeping must not stop auto sync
+                        LOGGER.warning("Scratch sweep failed", exc_info=True)
                 # Only an explicitly timed maintenance pause expires. Never
                 # flip autoSync or resume an indefinite operator pause.
                 with self._state_lock:
