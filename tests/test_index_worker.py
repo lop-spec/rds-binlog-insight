@@ -180,7 +180,7 @@ class IndexWorkerCandidateTests(unittest.TestCase):
         with (
             patch(
                 "app.index_worker.ensure_data_dirs",
-                return_value={"index": Path("index")},
+                return_value={"index": Path("index"), "scratch": Path("scratch-absent")},
             ),
             patch("app.index_worker.write_json_status") as status_write,
             patch('app.raw_binlog.enabled', return_value=True),

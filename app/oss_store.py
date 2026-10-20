@@ -22,6 +22,9 @@ from .oss_crc import report_crc_backend
 LOGGER = logging.getLogger(__name__)
 
 OSS_PACK_TARGET_BYTES = 128 * 1024 * 1024
+# PutObject accepts at most 5 GiB; anything past 1 GiB goes up in 64 MiB parts (23 GB -> ~350 of 10,000).
+OSS_MULTIPART_THRESHOLD_BYTES = 1024**3
+OSS_MULTIPART_PART_BYTES = 64 * 1024**2
 
 # 整桶生命周期规则的 read-modify-write 必须进程内串行，详见 ensure_lifecycle。
 _LIFECYCLE_LOCK = threading.Lock()
@@ -548,6 +551,73 @@ class OssArchive:
             return True
         return isinstance(candidate, (TimeoutError, ConnectionError, OSError))
 
+    def _multipart_upload_from_file(
+        self,
+        key: str,
+        path: Path,
+        headers: dict[str, str],
+    ) -> None:
+        """Upload a large file in parts; one PutObject is capped at 5 GiB.
+
+        A 23 GB raw binlog (10-15) failed 764 single-PUT attempts with a TLS EOF and re-sent the whole
+        file each time. Parts are retried on their own; the metadata and forbid-overwrite headers go on
+        the initiate request, forbid-overwrite again on complete. With enable_crc the SDK checks each
+        part and the combined object CRC64. Any failure aborts the upload so no parts are left billed.
+        """
+
+        size = path.stat().st_size
+        upload_id = self.bucket.init_multipart_upload(key, headers=headers).upload_id
+        try:
+            parts: list[oss2.models.PartInfo] = []
+            with path.open("rb") as handle:
+                number = 0
+                for offset in range(0, size, OSS_MULTIPART_PART_BYTES):
+                    number += 1
+                    length = min(OSS_MULTIPART_PART_BYTES, size - offset)
+                    for attempt in range(self.upload_attempts):
+                        handle.seek(offset)
+                        try:
+                            result = self.bucket.upload_part(
+                                key,
+                                upload_id,
+                                number,
+                                oss2.SizedFileAdapter(handle, length),
+                            )
+                            break
+                        except Exception as exc:  # noqa: BLE001 - SDK error hierarchy varies
+                            if (
+                                attempt + 1 >= self.upload_attempts
+                                or not self._retryable_request_error(exc)
+                            ):
+                                raise
+                            LOGGER.warning(
+                                "Transient OSS part upload failure; retrying key=%s part=%s attempt=%s/%s error=%s",
+                                key,
+                                number,
+                                attempt + 1,
+                                self.upload_attempts,
+                                type(exc).__name__,
+                            )
+                            if self.upload_retry_delay_seconds:
+                                time.sleep(self.upload_retry_delay_seconds * (2**attempt))
+                    parts.append(
+                        oss2.models.PartInfo(
+                            number, result.etag, size=length, part_crc=result.crc
+                        )
+                    )
+            self.bucket.complete_multipart_upload(
+                key,
+                upload_id,
+                parts,
+                headers={"x-oss-forbid-overwrite": "true"},
+            )
+        except BaseException:
+            try:
+                self.bucket.abort_multipart_upload(key, upload_id)
+            except Exception:  # noqa: BLE001 - the original failure is the one to report
+                LOGGER.warning("OSS multipart abort failed key=%s upload_id=%s", key, upload_id, exc_info=True)
+            raise
+
     def _put_object_from_file_verified(
         self,
         key: str,
@@ -570,11 +640,14 @@ class OssArchive:
         for attempt in range(self.upload_attempts):
             request_error: BaseException | None = None
             try:
-                self.bucket.put_object_from_file(
-                    key,
-                    str(path),
-                    headers=headers,
-                )
+                if path.stat().st_size > OSS_MULTIPART_THRESHOLD_BYTES:
+                    self._multipart_upload_from_file(key, path, headers)
+                else:
+                    self.bucket.put_object_from_file(
+                        key,
+                        str(path),
+                        headers=headers,
+                    )
             except Exception as exc:  # noqa: BLE001 - SDK error hierarchy varies
                 request_error = exc
                 last_error = exc

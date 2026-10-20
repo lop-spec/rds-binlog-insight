@@ -19,6 +19,7 @@ os.environ.setdefault("ARROW_NUM_THREADS", "1")
 from .config import data_root, ensure_data_dirs
 from .credentials import load_credential
 from .maintenance_status import WORKER_PROGRESS_NAME, write_json_status
+from .scratch_sweep import sweep_stale_scratch
 from .metadata import MetadataStore, SLOW_LOG_FILE_PREFIX
 from .oss_store import OssArchive
 from .storage import EventStorage
@@ -561,6 +562,8 @@ def run_one(data_dir: Path, generation: str) -> int:
         )
 
     publish("starting", token=f"{generation}:starting")
+    # The supervisor respawns this batch process constantly; the sweep throttles itself to once an hour.
+    sweep_stale_scratch(paths["scratch"])
     metadata = MetadataStore(
         data_dir / "metadata.sqlite3",
         run_migrations=False,

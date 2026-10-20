@@ -16,7 +16,7 @@ const RISE_METRICS = [
 ];
 
 const RISE_STATUS = {
-  incomplete_index: "所选时段及前后 6 小时内没有索引完整的同长度时段（索引仍在追平，或该实例暂无采集）",
+  incomplete_index: "所选时段及前后 6 小时内没有索引完整的同长度时段",
   incomplete_baseline_index: "所选时段的昨日对照日索引不完整，前后 6 小时内也没有可用的时段",
   unsupported_metric: "不支持该指标",
   no_collected_executions: "该窗口没有采集到慢 SQL 执行记录",
@@ -38,6 +38,23 @@ const RISE_MAX_WINDOW_MS = 24 * 3_600_000 - 300_000;
 
 function riseMessage(status) {
   return RISE_STATUS[status] || (typeof RESOURCE_STATUS === "object" && RESOURCE_STATUS[status]) || `不可用：${status}`;
+}
+
+// 索引不完整时，服务端附上 ClickHouse 慢日志入库的现状：暂停原因（如磁盘低于安全线）、已入库到哪、还剩多少分区。
+function riseIngestNote(ingest) {
+  if (!ingest || !ingest.state) return "";
+  const notes = [];
+  const error = String(ingest.error || "");
+  if (/free disk/i.test(error)) notes.push(`慢日志入库已暂停：磁盘剩余空间低于安全线（${error}）`);
+  else if (["paused", "error"].includes(ingest.state) && error) notes.push(`慢日志入库暂停：${error}`);
+  if (ingest.readyThroughUs) notes.push(`已入库到 ${formatTime(Number(ingest.readyThroughUs))}`);
+  if (Number(ingest.pendingParts) > 0) notes.push(`还有 ${riseNumber(ingest.pendingParts, 0)} 个分区待入库`);
+  return notes.join("；");
+}
+
+function riseUnavailableText(data) {
+  const note = riseIngestNote(data.ingest);
+  return note ? `${riseMessage(data.status)}。${note}` : riseMessage(data.status);
 }
 
 function initRdsControls() {
@@ -462,7 +479,7 @@ function renderRise(data) {
   });
   const prefix = `${(state.riseWindowNotes || []).map((text) => riseNotice("时间框已调整", escapeHtml(text))).join("")}${riseAdjustNotice(data)}`;
   if (!nodes.length) {
-    panel.innerHTML = `${prefix}<p class="analytics-unavailable"><strong>无法排查。</strong>${escapeHtml(riseMessage(data.status))}</p>`;
+    panel.innerHTML = `${prefix}<p class="analytics-unavailable"><strong>无法排查。</strong>${escapeHtml(riseUnavailableText(data))}</p>`;
     return;
   }
   const many = nodes.length > 3;
@@ -602,7 +619,7 @@ async function runRise() {
   switchAnalyticsTab(target);
   if (target === "sql") await loadAnalyticsDetails();
   if (data) {
-    if (!data.nodes?.length) toast(`无法排查：${riseMessage(data.status)}`, "error", 6000);
+    if (!data.nodes?.length) toast(`无法排查：${riseUnavailableText(data)}`, "error", 8000);
     else if (data.adjusted?.reason === "source_delay") toast(`所选时段末尾阿里云还没放齐，已截到 ${formatTime(data.end_us)}`, "info", 6000);
     else if (data.adjusted?.kind === "truncated") toast(`所选时段末尾还没入库，已截到 ${formatTime(data.end_us)}`, "info", 6000);
     else if (data.adjusted) toast("所选时段没有完整索引，已改查最近的有索引时段", "info", 6000);

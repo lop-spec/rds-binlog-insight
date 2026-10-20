@@ -3298,6 +3298,35 @@ class MetadataStore:
                 for row in rows:
                     yield dict(row)
 
+    def iter_recent_slowlog_parts(
+        self, *, since_epoch_us: int, batch: int = 4096
+    ) -> Iterator[dict[str, Any]]:
+        """Query-visible slow-log parts whose events start at or after since_epoch_us.
+
+        The ClickHouse lane's discovery pass: a range seek on idx_part_time (~1.3k parts per 6 h on
+        production, tens of milliseconds) instead of iter_slowlog_parts' full ordered pass over every
+        retained part (minutes once the disk is busy). CROSS JOIN pins parquet_parts as the outer loop;
+        an ORDER BY here would turn the plan back into a scan of the path index.
+        """
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT p.*, b.instance_id, b.log_file_name,
+                       b.log_begin_utc, b.log_end_utc
+                FROM parquet_parts p
+                CROSS JOIN binlog_files b
+                WHERE p.min_event_epoch_us >= ?
+                  AND b.id = p.binlog_id
+                  AND b.query_visible = 1
+                  AND b.host_instance_id = ?
+                  AND b.log_file_name LIKE ?
+                """,
+                (int(since_epoch_us), SLOW_LOG_HOST_INSTANCE_ID, SLOW_LOG_FILE_PREFIX + "%"),
+            )
+            while rows := cursor.fetchmany(max(int(batch), 1)):
+                for row in rows:
+                    yield dict(row)
+
     def slowlog_parts_page(
         self,
         *,

@@ -15,7 +15,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: local/rds-binlog-insight:1.33.7-rawoss
+    image: local/rds-binlog-insight:1.33.8-rawoss
     container_name: rds-binlog-insight
     restart: unless-stopped
     logging: *runtime-logging
@@ -129,7 +129,7 @@ services:
     stop_grace_period: 90s
 
   indexer:
-    image: local/rds-binlog-insight:1.33.7-rawoss
+    image: local/rds-binlog-insight:1.33.8-rawoss
     container_name: rds-binlog-insight-indexer
     restart: unless-stopped
     logging: *runtime-logging
@@ -212,7 +212,7 @@ services:
         condition: service_healthy
 
   slowlog-indexer:
-    image: local/rds-binlog-insight:1.33.7-rawoss
+    image: local/rds-binlog-insight:1.33.8-rawoss
     container_name: rds-binlog-insight-slowlog-indexer
     restart: unless-stopped
     logging: *runtime-logging
@@ -290,7 +290,7 @@ services:
         condition: service_healthy
 
   clickhouse:
-    image: ghcr.io/lop-spec/rds-binlog-insight:clickhouse-1.33.7-rawoss
+    image: ghcr.io/lop-spec/rds-binlog-insight:clickhouse-1.33.8-rawoss
     container_name: rds-binlog-insight-clickhouse
     restart: unless-stopped
     logging: *runtime-logging
@@ -342,7 +342,7 @@ services:
     stop_grace_period: 60s
 
   clickhouse-ingester:
-    image: local/rds-binlog-insight:1.33.7-rawoss
+    image: local/rds-binlog-insight:1.33.8-rawoss
     container_name: rds-binlog-insight-clickhouse-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -417,7 +417,7 @@ services:
 
   clickhouse-oss-ingester:
     profiles: ["clickhouse-oss"]
-    image: local/rds-binlog-insight:1.33.7-rawoss
+    image: local/rds-binlog-insight:1.33.8-rawoss
     container_name: rds-binlog-insight-clickhouse-oss-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -500,7 +500,7 @@ services:
 
   clickhouse-raw-oss-worker:
     profiles: ["clickhouse-raw-oss"]
-    image: local/rds-binlog-insight:1.33.7-rawoss
+    image: local/rds-binlog-insight:1.33.8-rawoss
     container_name: rds-binlog-insight-clickhouse-raw-oss-worker
     restart: unless-stopped
     logging: *runtime-logging
@@ -574,7 +574,7 @@ services:
 
   binlog-rows-worker:
     profiles: ["binlog-rows"]
-    image: local/rds-binlog-insight:1.33.7-rawoss
+    image: local/rds-binlog-insight:1.33.8-rawoss
     container_name: rds-binlog-insight-rows-worker
     restart: unless-stopped
     logging: *runtime-logging
@@ -637,7 +637,7 @@ services:
         condition: service_healthy
 
   clickhouse-slowlog-ingester:
-    image: local/rds-binlog-insight:1.33.7-rawoss
+    image: local/rds-binlog-insight:1.33.8-rawoss
     container_name: rds-binlog-insight-clickhouse-slowlog-ingester
     restart: unless-stopped
     logging: *runtime-logging
@@ -667,10 +667,14 @@ services:
       # parts into one Parquet insert; the API canary, host PSI admission and
       # explicit inter-batch pacing bound every batch without io.max.
       RDS_BINLOG_CLICKHOUSE_SLOWLOG_BATCH_PARTS: "64"
-      # The MySQL collector already polls every 120 seconds.  A 30-second
-      # bounded reconciliation keeps ClickHouse within one short poll behind
-      # the exact SQLite index while preserving the full sweep as crash repair.
+      # The MySQL collector already polls every 120 seconds.  Every 30 seconds an
+      # indexed pass queues parts whose events started in the last 6 hours; the
+      # full sweep over every retained part (retention, deletions, backfilled
+      # older windows, crash repair) runs hourly.  The sweep used to run every
+      # 30 seconds and took 5-9 minutes on a busy disk, one batch per sweep.
       RDS_BINLOG_CLICKHOUSE_SLOWLOG_RECONCILE_SECONDS: "30"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_FULL_RECONCILE_SECONDS: "3600"
+      RDS_BINLOG_CLICKHOUSE_SLOWLOG_DISCOVERY_LOOKBACK_SECONDS: "21600"
       RDS_BINLOG_CLICKHOUSE_SLOWLOG_IDLE_SECONDS: "5"
       # Protect the exact SQLite fallback while historical ClickHouse work is
       # sharing the same disk.  The ingester reads the source worker's atomic

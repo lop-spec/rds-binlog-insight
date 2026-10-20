@@ -1081,6 +1081,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                     writes_lookup=self._write_hotspots,
                     tail=getattr(self.app, "slow_tails", None),
                 )
+                if str(result.get("status") or "").startswith("incomplete_"):
+                    # The index gap is ClickHouse's; say why its lane is behind (10-20: disk safety floor).
+                    from .maintenance_status import clickhouse_slowlog_ingest_note
+                    result["ingest"] = clickhouse_slowlog_ingest_note(self.app.storage.paths["logs"])
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/live-sessions":
                 # Running statements of one node, read from DAS when asked; only nodes whose slow log is collected here.

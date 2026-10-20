@@ -649,3 +649,20 @@ test('the 对齐节点 IOPS entry is gone: one investigation, one ranking', () =
   assert.doesNotMatch(app + workspace, /性能关联（昨日基线）|'performance'/);
   assert.match(html, /<details class="action-menu"><summary>更多操作<\/summary><div class="menu-content"><button id="analytics-reset"[^>]*>重置条件<\/button><\/div><\/details>/);
 });
+
+test('an unservable window says why the ClickHouse slow-log lane is behind (10-20 disk floor)', async () => {
+  const ingest = {state: 'paused', phase: 'safety-fuse', error: 'ClickHouse slow-log ingestion paused: free disk 114.0 GiB is below 120 GiB',
+    pendingParts: 3901, readyThroughUs: 1792404264000000, updatedAt: '2026-10-20T03:13:37Z'};
+  const {c, nodes, toasts} = rdsContext(async () => ({status: 'incomplete_index', nodes: [], ingest}));
+  await vm.runInContext('runAnalytics()', c);
+  const text = nodes['#analytics-panel-rise'].innerHTML;
+  assert.match(text, /无法排查。/);
+  assert.match(text, /磁盘剩余空间低于安全线/);
+  assert.match(text, /还有 3,901 个分区待入库/);
+  assert.doesNotMatch(text, /索引仍在追平，或该实例暂无采集/);
+  assert.ok(toasts.some(([kind, message]) => kind === 'error' && /已入库到/.test(message)));
+  // without an ingest note the plain reason stays
+  const plain = rdsContext(async () => ({status: 'incomplete_index', nodes: []}));
+  await vm.runInContext('runAnalytics()', plain.c);
+  assert.match(plain.nodes['#analytics-panel-rise'].innerHTML, /前后 6 小时内没有索引完整的同长度时段<\/p>/);
+});

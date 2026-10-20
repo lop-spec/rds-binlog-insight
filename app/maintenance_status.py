@@ -22,6 +22,20 @@ def read_json_status(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def clickhouse_slowlog_ingest_note(logs_dir: Path) -> dict[str, Any]:
+    """What the ClickHouse slow-log lane is doing, for a window the index cannot serve yet."""
+    status = read_json_status(Path(logs_dir) / CLICKHOUSE_SLOWLOG_WORKER_STATUS_NAME)
+    stats = status.get("stats") if isinstance(status.get("stats"), dict) else {}
+    return {
+        "state": str(status.get("state") or ""),
+        "phase": str(status.get("phase") or ""),
+        "error": str(status.get("lastError") or "")[:300],
+        "pendingParts": int(stats.get("pending_parts") or 0),
+        "readyThroughUs": int(stats.get("ready_watermark_us") or 0),
+        "updatedAt": str(status.get("updatedAt") or ""),
+    }
+
+
 def write_json_status(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {**value, "updatedAt": utc_now_text()}

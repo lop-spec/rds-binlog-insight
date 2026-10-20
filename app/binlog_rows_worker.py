@@ -32,6 +32,7 @@ from .binlog_rows import (
     purge_file_rows,
 )
 from .config import data_root, ensure_data_dirs
+from .scratch_sweep import sweep_stale_scratch
 
 LOGGER = logging.getLogger("binlog_rows_worker")
 STATUS_NAME = "binlog-rows-worker-status.json"
@@ -544,6 +545,8 @@ class Worker:
                     break  # re-rank so the newest unclaimed file is always next
 
     def run(self) -> None:
+        # Lanes of a killed predecessor keep their 512 MB source.binlog (three since 09-25 on 10-20).
+        sweep_stale_scratch(self.storage.paths["scratch"], min_interval_seconds=0)
         purged = self.recover_inflight()
         if purged:
             LOGGER.warning("BINLOG_ROWS_INFLIGHT_RECOVERED files=%s", purged)

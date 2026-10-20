@@ -97,6 +97,10 @@ class ClickHouseSlowLogConfig:
     source_max_pending_age_seconds: int
     source_recovery_ratio: float
     source_status_stale_seconds: int
+    # reconcile_seconds paces the cheap discovery pass over recent parts; the full sweep (retention, deletions,
+    # parts written for older event times) runs every full_reconcile_seconds.
+    full_reconcile_seconds: int = 3600
+    discovery_lookback_seconds: int = 6 * 3600
 
     @classmethod
     def from_env(cls) -> "ClickHouseSlowLogConfig":
@@ -170,6 +174,18 @@ class ClickHouseSlowLogConfig:
                 30,
                 5,
                 3600,
+            ),
+            full_reconcile_seconds=_int_env(
+                "RDS_BINLOG_CLICKHOUSE_SLOWLOG_FULL_RECONCILE_SECONDS",
+                3600,
+                300,
+                86_400,
+            ),
+            discovery_lookback_seconds=_int_env(
+                "RDS_BINLOG_CLICKHOUSE_SLOWLOG_DISCOVERY_LOOKBACK_SECONDS",
+                6 * 3600,
+                600,
+                7 * 86_400,
             ),
         )
 
@@ -475,6 +491,33 @@ def reconcile_slowlog_manifest(
         start_epoch_us=start_us,
         end_epoch_us=end_us,
         filter_parts_to_window=True,
+    )
+
+
+def discover_recent_slowlog_parts(
+    metadata: Any,
+    manifest: ClickHouseManifest,
+    *,
+    lookback_seconds: int,
+    now_us: int | None = None,
+    page_size: int = 2048,
+) -> dict[str, int]:
+    """Queue new and rewritten recent parts without the full sweep.
+
+    The full reconcile is the only pass that retires or deletes manifest rows, so this one never sweeps
+    and leaves the recorded reconcile window alone; it only upserts what the collector wrote lately.
+    """
+    end_us = int(now_us or time.time_ns() // 1000)
+    start_us = end_us - max(int(lookback_seconds), 1) * 1_000_000
+    return manifest.reconcile_streaming(
+        metadata.iter_recent_slowlog_parts(
+            since_epoch_us=start_us, batch=max(int(page_size), 1)
+        ),
+        start_epoch_us=start_us,
+        end_epoch_us=end_us,
+        filter_parts_to_window=True,
+        sweep_unseen=False,
+        preserve_reconcile_state=True,
     )
 
 
@@ -1332,6 +1375,14 @@ class ClickHouseSlowLogWorker:
             block_paused_state=False,
         )
         last_reconcile = 0.0
+        last_discovery = 0.0
+        full_reconcile_seconds = max(
+            int(getattr(self.config, "full_reconcile_seconds", 3600)),
+            int(self.config.reconcile_seconds),
+        )
+        discovery_lookback_seconds = int(
+            getattr(self.config, "discovery_lookback_seconds", 6 * 3600)
+        )
         last_error = ""
         io_pressure_override_active = False
         # Status-file statistics aggregate the whole clickhouse_parts table and the loop publishes two
@@ -1407,10 +1458,12 @@ class ClickHouseSlowLogWorker:
                         )
                     now = time.monotonic()
                     reconcile_result: dict[str, Any] = {}
+                    # The full sweep reads every retained part (~300k, 5-9 min when a backlog saturates
+                    # the disk) and used to run every reconcile_seconds, so each batch waited for one.
+                    # New parts are found by the indexed recent pass; the sweep keeps its hourly duties.
                     if (
                         last_reconcile == 0.0
-                        or now - last_reconcile
-                        >= self.config.reconcile_seconds
+                        or now - last_reconcile >= full_reconcile_seconds
                     ):
                         publish("running", phase="reconcile")
                         reconcile_result = reconcile_slowlog_manifest(
@@ -1418,7 +1471,15 @@ class ClickHouseSlowLogWorker:
                             manifest,
                             retention_days=self.config.retention_days,
                         )
-                        last_reconcile = time.monotonic()
+                        last_reconcile = last_discovery = time.monotonic()
+                    elif now - last_discovery >= self.config.reconcile_seconds:
+                        publish("running", phase="discover")
+                        reconcile_result = discover_recent_slowlog_parts(
+                            metadata,
+                            manifest,
+                            lookback_seconds=discovery_lookback_seconds,
+                        )
+                        last_discovery = time.monotonic()
                     publish("running", phase="ingest")
                     batch = ingest_slowlog_batch(
                         metadata,
