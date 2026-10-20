@@ -75,6 +75,14 @@ SLOWLOG_RECONCILE_REFRESH_SECONDS = _env_int(
     3600,
 )
 SLOWLOG_INDEX_ENABLED = _env_bool("RDS_BINLOG_SLOWLOG_INDEX_ENABLED", True)
+SLOWLOG_RECONCILE_PAGE_SECONDS = _env_int(
+    "RDS_BINLOG_SLOWLOG_RECONCILE_PAGE_SECONDS",
+    30,
+    0,
+    3600,
+)
+# Monotonic time of the last sweep page in this process (index the list so tests can reset it).
+_RECONCILE_PAGE_AT = [float("-inf")]
 INDEX_PHASES_ALL = ("catalog", "analytics", "select", "rollup", "exact", "structure", "index")
 
 
@@ -413,7 +421,16 @@ def _advance_slowlog_index(
         state = storage.slowlog_index.reconcile_state()
     reconcile_scanned = 0
     reconcile_advanced = False
-    if not state["complete"]:
+    # Live parts first: while built parts wait, an open sweep takes one page at most every
+    # SLOWLOG_RECONCILE_PAGE_SECONDS instead of one page before every part (10-20: the hourly sweep
+    # of ~300k parts let the queue grow to 100+ and held the ClickHouse lane behind it).
+    waiting = bool(storage.slowlog_index.ready_paths(1))
+    page_due = (
+        not waiting
+        or time.monotonic() - _RECONCILE_PAGE_AT[0] >= SLOWLOG_RECONCILE_PAGE_SECONDS
+    )
+    if not state["complete"] and page_due:
+        _RECONCILE_PAGE_AT[0] = time.monotonic()
         page = metadata.slowlog_parts_page(
             after_path=str(state.get("after_path") or ""),
             limit=SLOWLOG_RECONCILE_BATCH_SIZE,

@@ -163,5 +163,72 @@ class SlowLogDiscoveryTests(unittest.TestCase):
             self.assertEqual(calls, ["full", "recent:21600", "recent:21600", "recent:21600", "full"])
 
 
+
+class SourceSweepYieldsToLivePartsTests(unittest.TestCase):
+    def _storage(self, waiting: list[str]):
+        from unittest.mock import Mock
+
+        index = Mock()
+        index.reconcile_state.return_value = {"complete": False, "after_path": "", "updated_at_us": 0}
+        index.ready_paths.side_effect = lambda limit: waiting[:limit]
+        index.missing_parts.return_value = []
+        storage = Mock()
+        storage.slowlog_index = index
+        storage.ensure_slowlog_part.return_value = {"built": 1, "indexed_rows": 3}
+        return storage
+
+    def test_open_sweep_takes_one_page_per_interval_while_parts_wait(self):
+        from unittest.mock import Mock
+
+        import app.index_worker as worker
+
+        metadata = Mock()
+        metadata.slowlog_parts_page.return_value = [{"path": "/data/events/a.parquet"}] * 4
+        metadata.part_by_path.side_effect = lambda path: {
+            "path": path, "sha256": "s", "log_file_name": "slow-log/rm-example-a/x"}
+        storage = self._storage(["/data/events/live.parquet"])
+        clock = {"now": 1000.0}
+        with patch.object(worker, "_RECONCILE_PAGE_AT", [float("-inf")]), \
+                patch.object(worker, "SLOWLOG_RECONCILE_PAGE_SECONDS", 30), \
+                patch("app.index_worker.time.monotonic", side_effect=lambda: clock["now"]):
+            first = worker._advance_slowlog_index(metadata, storage, object(), publish=lambda *a, **k: None, generation="g")
+            clock["now"] += 5
+            second = worker._advance_slowlog_index(metadata, storage, object(), publish=lambda *a, **k: None, generation="g")
+            clock["now"] += 30
+            third = worker._advance_slowlog_index(metadata, storage, object(), publish=lambda *a, **k: None, generation="g")
+        self.assertEqual([r["reconcileAdvanced"] for r in (first, second, third)], [True, False, True])
+        self.assertEqual([r["parts"] for r in (first, second, third)], [1, 1, 1])
+        self.assertEqual(metadata.slowlog_parts_page.call_count, 2)
+
+    def test_idle_queue_pages_every_loop(self):
+        from unittest.mock import Mock
+
+        import app.index_worker as worker
+
+        metadata = Mock()
+        metadata.slowlog_parts_page.return_value = []
+        storage = self._storage([])
+        with patch.object(worker, "_RECONCILE_PAGE_AT", [float("-inf")]):
+            for _ in range(3):
+                result = worker._advance_slowlog_index(metadata, storage, None, publish=lambda *a, **k: None, generation="g")
+                self.assertTrue(result["reconcileAdvanced"])
+        self.assertEqual(metadata.slowlog_parts_page.call_count, 3)
+
+    def test_sweep_page_walks_the_path_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = MetadataStore(Path(directory) / "metadata.sqlite3")
+            now = time.time_ns() // 1000
+            paths = sorted(_register(store, f"slow-log/rm-example-a/{i}", now) for i in range(3))
+            _register(store, "mysql-bin.000009", now, host="100000001")
+            page = store.slowlog_parts_page(after_path=paths[0], limit=5)
+            self.assertEqual([part["path"] for part in page], paths[1:])
+            with store.connection() as connection:
+                plan = " ".join(str(row[-1]) for row in connection.execute(
+                    "EXPLAIN QUERY PLAN SELECT p.path FROM parquet_parts p CROSS JOIN binlog_files b "
+                    "WHERE p.path > ? AND b.id = p.binlog_id AND b.query_visible = 1 AND b.host_instance_id = ? "
+                    "AND b.log_file_name LIKE ? ORDER BY p.path LIMIT ?", ("", "slow-log", "slow-log/%", 5)))
+            self.assertNotIn("TEMP B-TREE", plan)
+
+
 if __name__ == "__main__":
     unittest.main()

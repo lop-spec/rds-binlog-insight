@@ -3333,7 +3333,13 @@ class MetadataStore:
         after_path: str = "",
         limit: int = 2048,
     ) -> list[dict[str, Any]]:
-        """Return one bounded, stable page for slow-log reconciliation."""
+        """Return one bounded, stable page for slow-log reconciliation.
+
+        CROSS JOIN walks the path index from after_path and stops at the limit. The planner otherwise
+        starts from the slow-log files and sorts every one of their parts for each page (0.84 s warm for
+        128 rows on production, far more on a busy disk, against 0.03 s), and the source indexer pays
+        one page before each part it builds while a sweep is open.
+        """
 
         with self.connection() as conn:
             rows = conn.execute(
@@ -3341,18 +3347,19 @@ class MetadataStore:
                 SELECT p.*, b.instance_id, b.log_file_name,
                        b.log_begin_utc, b.log_end_utc
                 FROM parquet_parts p
-                JOIN binlog_files b ON b.id = p.binlog_id
-                WHERE b.query_visible = 1
+                CROSS JOIN binlog_files b
+                WHERE p.path > ?
+                  AND b.id = p.binlog_id
+                  AND b.query_visible = 1
                   AND b.host_instance_id = ?
                   AND b.log_file_name LIKE ?
-                  AND p.path > ?
                 ORDER BY p.path
                 LIMIT ?
                 """,
                 (
+                    str(after_path or ""),
                     SLOW_LOG_HOST_INSTANCE_ID,
                     SLOW_LOG_FILE_PREFIX + "%",
-                    str(after_path or ""),
                     max(int(limit), 0),
                 ),
             ).fetchall()
