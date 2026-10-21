@@ -20,12 +20,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .clickhouse_client import ClickHouseClient, ClickHouseConfig
-from .mongo_insight import COSTS, MINUTE, WINDOW, VERSION, NORMALIZATION_VERSION, canonical, digest, normalize_record, rollup_events
+from collections import Counter
+
+from .mongo_insight import COSTS, MINUTE, WINDOW, VERSION, NORMALIZATION_VERSION, canonical, digest, normalize_record, rollup_events, top_counts
 from .storage import _BodyFileLock
 
 LOGGER = logging.getLogger(__name__)
 NUMBERS = ('bucket','count','failed','collscan','spill','overlap_us','max_us','first_us','last_us') + COSTS + tuple(k+'_known' for k in COSTS)
-STRINGS = ('role','group_id','profile','sample')
+STRINGS = ('role','group_id','profile','sample','clients','accounts')
 SCHEMA = pa.schema([(k,pa.int64()) for k in NUMBERS]+[(k,pa.string()) for k in STRINGS])
 MAX_ROWS = 250_000
 
@@ -86,6 +88,9 @@ class MongoStore:
                           ', created_at DateTime DEFAULT now()) ENGINE=ReplacingMergeTree '
                           'PARTITION BY toDate(created_at) ORDER BY (instance,revision,bucket,role,group_id) '
                           'TTL created_at + INTERVAL 7 DAY')
+        # 1.33.12: client addresses and accounts per rollup row (rows written before stay empty).
+        for column in ('clients','accounts'):
+            self.client.query('ALTER TABLE '+self.table('rollups')+' ADD COLUMN IF NOT EXISTS '+column+" String DEFAULT ''")
         self.client.query('CREATE TABLE IF NOT EXISTS '+self.table('telemetry')+
                           ' (instance String, kind String, id String, timestamp Int64, role String, node String, '
                           'payload String, created_at DateTime DEFAULT now()) ENGINE=ReplacingMergeTree '
@@ -226,6 +231,9 @@ class MongoStore:
         selection=[f'CAST(floor(src.bucket / {width}) * {width} AS BIGINT) AS bucket','src.role AS role','src.group_id AS group_id','min(src.profile) AS profile',
                    sample_expression+' AS sample','max(src.max_us) AS max_us','min(src.first_us) AS first_us','max(src.last_us) AS last_us']
         selection += [f'sum(src.{k}) AS {k}' for k in sums]
+        # Count objects joined by newlines, added up in Python (``parse_counts``); empty for rows written before 1.33.12.
+        joined="arrayStringConcat(groupArray(src.{0}), char(10))" if self.backend=='clickhouse' else "coalesce(string_agg(src.{0}, chr(10)), '')"
+        selection += [joined.format(k)+' AS '+k for k in ('clients','accounts')]
         if self.backend=='clickhouse':
             revisions=[m['revision'] for _,m in manifests]
             if any(len(v)!=64 or any(c not in '0123456789abcdef' for c in v) for v in revisions):
@@ -250,9 +258,12 @@ class MongoStore:
         else:
             files=[str(p.parent/m['rollup']) for p,m in manifests if m['rollup_rows']]
             if not files:return [],coverage
+            # Rollups written before 1.33.12 have no source columns; union_by_name fills them only when some file has them.
+            if not any('clients' in pq.read_schema(f).names for f in files):
+                selection=[c if not c.endswith((' AS clients',' AS accounts')) else "'' AS "+c.rsplit(' AS ',1)[1] for c in selection]
             with duckdb.connect() as db:
                 db.execute("SET threads=1; SET memory_limit='256MB'")
-                sql='SELECT '+','.join(selection)+' FROM read_parquet(?) AS src WHERE src.bucket >= ? AND src.bucket < ?'
+                sql='SELECT '+','.join(selection)+' FROM read_parquet(?, union_by_name=true) AS src WHERE src.bucket >= ? AND src.bucket < ?'
                 params=[files,lo,hi]
                 if role:sql+=' AND role=?';params.append(role)
                 sql+=' GROUP BY ALL LIMIT '+str(MAX_ROWS+1)
@@ -273,6 +284,40 @@ class MongoStore:
             if kind and kind!=profile['kind']:continue
             selected.append(row)
         return selected,coverage
+
+    # The raw provider batches are read back on request only, for windows collected before the rollups had sources.
+    RAW_SOURCE_MAX_WINDOWS = 36  # three hours of five-minute windows
+
+    def raw_sources(self, instance, start, end, group_id, role, prefixes):
+        """Client addresses and accounts of one template, recounted from the retained raw batches of [start, end)."""
+        if end - start > self.RAW_SOURCE_MAX_WINDOWS * WINDOW:
+            raise ValueError('raw_source_window_exceeds_three_hours')
+        manifests, coverage = self.manifests(instance, start, end)
+        clients, accounts = Counter(), Counter()
+        matched = scanned = unreadable = 0
+        for path, manifest in manifests:
+            raw = path.parent / str(manifest.get('raw') or '')
+            if not manifest.get('raw') or not raw.exists():
+                unreadable += 1
+                continue
+            for text in pq.read_table(raw, columns=['record']).column('record').to_pylist():
+                scanned += 1
+                try:
+                    event = normalize_record(json.loads(text), instance, prefixes)
+                except Exception:  # noqa: BLE001 - publish already logged it; it never entered the rollups either
+                    continue
+                if event['group_id'] != group_id or (role and event['role'] != role) or not start <= event['start_us'] < end:
+                    continue
+                matched += 1
+                if event.get('client'):
+                    clients[event['client']] += 1
+                if event.get('account'):
+                    accounts[event['account']] += 1
+        if unreadable:
+            LOGGER.warning('mongo_raw_sources missing raw batches: instance=%s windows=%s', instance, unreadable)
+        return dict(clients=top_counts(clients, 20), client_count=len(clients), accounts=top_counts(accounts, 10),
+                    account_count=len(accounts), matched=matched, clients_known=sum(clients.values()), scanned=scanned,
+                    windows=len(manifests), missing_raw_windows=unreadable, complete=coverage['complete'] and not unreadable)
 
     def telemetry(self, instance, kind, points):
         if not points:return

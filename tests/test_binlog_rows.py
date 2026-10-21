@@ -425,6 +425,62 @@ class Release1293Tests(unittest.TestCase):
             worker.ch.execute.assert_not_called()
 
 
+class BackgroundRecoveryTests(unittest.TestCase):
+    """1.33.12: markers left by a predecessor are purged while the lanes run; their files stay claimed until then."""
+
+    def worker(self, tmp):
+        from pathlib import Path
+        from app import binlog_rows_worker as worker_module
+        worker = worker_module.Worker.__new__(worker_module.Worker)
+        worker.storage = mock.Mock(paths={"index": Path(tmp)})
+        worker.ingested = mock.Mock(return_value=set())
+        worker.claims = worker_module.Claims()
+        worker.ch = mock.Mock()
+        return worker
+
+    @staticmethod
+    def marker(folder, name):
+        path = folder / f"{name}.json"
+        path.write_text(json.dumps({"instance_id": "i", "file_id": name, "part_keys": [f"raw:{name}"], "lo": 1, "hi": 2,
+                                    "partitions": [["2026-10-19", 0]]}))
+        return path
+
+    def test_recovery_runs_beside_the_lanes_and_holds_its_files(self):
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self.worker(tmp)
+            release = threading.Event()
+            worker.ch.execute.side_effect = lambda *a, **k: release.wait(5)
+            folder = worker.inflight_dir()
+            for name in ("old1", "old2"):
+                self.marker(folder, name)
+            thread = worker.recover_in_background()
+            self.assertIsNotNone(thread)
+            self.assertFalse(worker.claims.take("old2"))  # a lane cannot take a file still being purged
+            self.assertTrue(worker.claims.take("fresh"))  # other files go on
+            release.set()
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(list(folder.glob("*.json")), [])
+            self.assertTrue(worker.claims.take("old2"))   # released once its rows are gone
+
+    def test_a_failed_purge_keeps_its_marker_and_releases_the_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self.worker(tmp)
+            worker.ch.execute.side_effect = RawBinlogError("memory", "X")
+            path = self.marker(worker.inflight_dir(), "bad")
+            worker.recover_in_background().join(5)
+            self.assertTrue(path.exists())
+            self.assertTrue(worker.claims.take("bad"))
+
+    def test_nothing_left_means_no_thread(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(self.worker(tmp).recover_in_background())
+
+
 class Release1294Tests(unittest.TestCase):
     def test_day_slices_cover_range_newest_first(self):
         day = br.DAY_US

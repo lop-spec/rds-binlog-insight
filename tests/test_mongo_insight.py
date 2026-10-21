@@ -453,3 +453,79 @@ class LockWaitGates(unittest.TestCase):
 
 
 if __name__=='__main__': unittest.main()
+
+
+class MongoClientSourceTests(unittest.TestCase):
+    """1.33.12: the provider's HostAddress / AccountName reach the page; they never change a template identity."""
+
+    def rec(self, host, account='app@admin', ms=120):
+        value = record(ms=ms)
+        value.update(HostAddress=host, AccountName=account)
+        return value
+
+    def test_client_and_account_are_kept_without_changing_the_fingerprint(self):
+        plain = normalize_record(record(), 'dds-example', ['messages'])
+        event = normalize_record(self.rec('10.0.0.7:51234'), 'dds-example', ['messages'])
+        self.assertEqual(event['group_id'], plain['group_id'])
+        self.assertEqual((event['client'], event['account']), ('10.0.0.7', 'app@admin'))
+        self.assertEqual(json.loads(event['sample'])['client'], '10.0.0.7')
+        self.assertEqual(normalize_record(record(), 'dds-example', ['messages'])['client'], '')
+
+    def test_sources_add_up_through_publish_read_and_analyze(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = MongoStore(Path(td), backend='parquet')
+            records = [self.rec('10.0.0.7'), self.rec('10.0.0.7'), self.rec('10.0.0.8', 'other@admin')]
+            start = normalize_record(records[0], 'dds-example', ['messages'])['start_us'] // 300_000_000 * 300_000_000
+            store.publish('dds-example', start, start + 300_000_000, records, ['messages'])
+            rows, coverage = store.read('dds-example', start, start + 300_000_000)
+            result = analyze(rows, [], [], start, start + 300_000_000, coverage=True, baseline_coverage=False)
+            row = result['statements'][0]
+            self.assertEqual(row['clients'], [{'name': '10.0.0.7', 'count': 2}, {'name': '10.0.0.8', 'count': 1}])
+            self.assertEqual((row['client_count'], row['clients_known']), (2, 3))
+            self.assertEqual(row['accounts'][0], {'name': 'app@admin', 'count': 2})
+
+    def test_rollups_written_before_the_column_still_read(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from app import mongo_store
+        with tempfile.TemporaryDirectory() as td:
+            store = MongoStore(Path(td), backend='parquet')
+            start = normalize_record(record(), 'dds-example', ['messages'])['start_us'] // 300_000_000 * 300_000_000
+            old = pa.schema([field for field in mongo_store.SCHEMA if field.name not in ('clients', 'accounts')])
+            real = mongo_store.atomic_parquet
+
+            def legacy(table, path):
+                if str(path).endswith('.rollup.parquet'):
+                    table = table.select([name for name in old.names])
+                real(table, path)
+            from unittest.mock import patch
+            with patch('app.mongo_store.atomic_parquet', side_effect=legacy):
+                store.publish('dds-example', start, start + 300_000_000, [record()], ['messages'])
+            rows, _ = store.read('dds-example', start, start + 300_000_000)
+            result = analyze(rows, [], [], start, start + 300_000_000, coverage=True, baseline_coverage=False)
+            self.assertEqual((result['statements'][0]['clients'], result['statements'][0]['clients_known']), ([], 0))
+
+    def test_merged_count_text_adds_up_and_ignores_junk(self):
+        from app.mongo_insight import parse_counts, client_host
+        self.assertEqual(parse_counts('{"a":2}\n{"a":1,"b":1}\n\nnot json'), {'a': 3, 'b': 1})
+        self.assertEqual(parse_counts(None), {})
+        self.assertEqual(client_host('fe80::1'), 'fe80::1')
+
+
+class MongoRawSourceTests(unittest.TestCase):
+    def test_sources_of_old_windows_are_recounted_from_the_raw_batch(self):
+        def rec(host, nsfilter=42):
+            value = record(command={'find': 'messages_1', 'filter': {'x': nsfilter}})
+            value.update(HostAddress=host, AccountName='app@admin')
+            return value
+        with tempfile.TemporaryDirectory() as td:
+            store = MongoStore(Path(td), backend='parquet')
+            records = [rec('10.0.0.7'), rec('10.0.0.7'), rec('10.0.0.9'), rec('10.0.0.8', 'other-shape')]
+            first = normalize_record(records[0], 'dds-example', ['messages'])
+            start = first['start_us'] // 300_000_000 * 300_000_000
+            store.publish('dds-example', start, start + 300_000_000, records, ['messages'])
+            found = store.raw_sources('dds-example', start, start + 300_000_000, first['group_id'], 'Primary', ['messages'])
+            self.assertEqual(found['clients'], [{'name': '10.0.0.7', 'count': 2}, {'name': '10.0.0.9', 'count': 1}])
+            self.assertEqual((found['matched'], found['scanned'], found['complete']), (3, 4, True))
+            with self.assertRaisesRegex(ValueError, 'three_hours'):
+                store.raw_sources('dds-example', start, start + 37 * 300_000_000, first['group_id'], '', ['messages'])

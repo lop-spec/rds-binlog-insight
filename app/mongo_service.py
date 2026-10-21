@@ -121,6 +121,23 @@ class MongoService:
         result['client_count_scope']='connected_services_only' if clients else 'not_connected'
         return result
 
+    def sources(self, params):
+        """Client addresses of one template in a window, recounted from the raw batches (windows collected before 1.33.12)."""
+        def get(key, default=''):
+            value = params.get(key, default)
+            return value[0] if isinstance(value, list) else value
+        instance = get('instance')
+        if instance not in self.stores:
+            raise ValueError('configured_mongo_instance_required')
+        start, end = int(get('startEpochUs')), int(get('endEpochUs'))
+        role, group_id = get('role'), get('group')
+        if role not in ('', 'Primary', 'Secondary', 'Unknown'):
+            raise ValueError('invalid_role')
+        if len(group_id) != 64 or any(c not in '0123456789abcdef' for c in group_id):
+            raise ValueError('invalid_group')
+        entry = next(e for e in self.entries if e['instanceId'] == instance)
+        return self.stores[instance].raw_sources(instance, start, end, group_id, role, entry.get('families', []))
+
     def authorized(self,authorization):
         token_file=self.root/'.credentials'/'mongo-ingest-token'
         if not token_file.exists():

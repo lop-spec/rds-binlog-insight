@@ -378,15 +378,43 @@ class Worker:
         marker.unlink(missing_ok=True)
         return True
 
-    def recover_inflight(self) -> int:
-        """Purge rows of moves that never reached the manifest (crash, kill, container stop)."""
+    def recover_inflight(self, markers: list[Path] | None = None) -> int:
+        """Purge rows of moves that never reached the manifest (crash, kill, container stop).
+
+        Each purge is a lightweight DELETE over the file's days (10-21: about 13 minutes each, six markers held every lane
+        for 85 minutes), so ``run`` hands the markers found at start to a background thread: their files are claimed
+        first, lanes skip them, and each claim is released once its rows are gone. A purge that fails keeps its marker
+        and is retried on the next start (or by ``commit`` when a lane takes the file).
+        """
         purged = 0
-        for marker in sorted(self.inflight_dir().glob("*.json")):
+        for marker in sorted(self.inflight_dir().glob("*.json")) if markers is None else markers:
+            file_id = marker.stem
             try:
                 purged += self.purge_marker(marker, reason="inflight-recovery")
             except ValueError:
                 LOGGER.error("BINLOG_ROWS_INFLIGHT_UNREADABLE marker=%s", marker.name)
+            except Exception as exc:  # noqa: BLE001 - the marker stays; never take the lanes down with it
+                LOGGER.error("BINLOG_ROWS_INFLIGHT_PURGE_FAILED marker=%s error=%s", marker.name, str(exc)[:300])
+            finally:
+                if markers is not None:
+                    self.claims.release(file_id)
         return purged
+
+    def recover_in_background(self) -> threading.Thread | None:
+        """Claim the files of the markers left by a predecessor, then purge them while the lanes run."""
+        markers = sorted(self.inflight_dir().glob("*.json"))
+        if not markers:
+            return None
+        for marker in markers:
+            self.claims.take(marker.stem)  # lanes are not running yet: every claim succeeds
+        LOGGER.warning("BINLOG_ROWS_INFLIGHT_RECOVERY_BACKGROUND markers=%s", len(markers))
+
+        def work() -> None:
+            purged = self.recover_inflight(markers)
+            LOGGER.warning("BINLOG_ROWS_INFLIGHT_RECOVERED files=%s", purged)
+        thread = threading.Thread(target=work, name="inflight-recovery", daemon=True)
+        thread.start()
+        return thread
 
     def collector_lag_seconds(self) -> int:
         with self.metadata.connection() as conn:
@@ -676,9 +704,7 @@ class Worker:
     def run(self) -> None:
         # Lanes of a killed predecessor keep their 512 MB source.binlog (three since 09-25 on 10-20).
         sweep_stale_scratch(self.storage.paths["scratch"], min_interval_seconds=0)
-        purged = self.recover_inflight()
-        if purged:
-            LOGGER.warning("BINLOG_ROWS_INFLIGHT_RECOVERED files=%s", purged)
+        self.recover_in_background()
         threads = [threading.Thread(target=self.run_lane, args=(lane,), name=f"lane-{lane}", daemon=True)
                    for lane in range(self.lanes)]
         for thread in threads:

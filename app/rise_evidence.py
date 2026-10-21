@@ -28,12 +28,24 @@ DAY_US = 86400 * 1_000_000
 # normalized SQL, so only names are touched.
 _SHARD = re.compile(r"(?<![0-9A-Za-z_])([A-Za-z][0-9A-Za-z_]*?)_\d+(?![0-9A-Za-z_])")
 _SPACE = re.compile(r"\s+")
+# INSERT / REPLACE up to and including VALUES: table and column list.
+_INSERT_HEAD = re.compile(r"^((?:INSERT|REPLACE)\s+(?:IGNORE\s+)?INTO\s+\S+\s*\([^)]*\)\s*VALUES?)\b", re.IGNORECASE)
 
 
 def sql_template(normalized_sql: str) -> str:
-    """The normalized SQL with numeric shard suffixes replaced and whitespace collapsed; '' when there is no text."""
+    """The normalized SQL with numeric shard suffixes replaced and whitespace collapsed; '' when there is no text.
+
+    An INSERT / REPLACE is cut after its column list and VALUES: a multi-row batch keeps literals in the slow log's text
+    and is cut off by its length limit (10-21: one upsert came as a 1,243-character single row and as a 417-character
+    truncated batch), so what follows VALUES is not a stable identity.
+    """
     text = _SPACE.sub(" ", str(normalized_sql or "")).strip()
-    return _SHARD.sub(r"\1_#", text) if text else ""
+    if not text:
+        return ""
+    head = _INSERT_HEAD.match(text)
+    if head:
+        text = head.group(1)
+    return _SHARD.sub(r"\1_#", text)
 
 
 def assign_template_families(events: list[dict[str, Any]], profiles: Callable[[set[str]], dict[str, dict[str, Any]]],

@@ -195,3 +195,13 @@ test('no causal claim or fabricated full collection counts',()=>{
  assert.match(source,/不是慢日志计数/);assert.match(source,/未采集原生命令计数/);
  assert.match(source,/escapeHtml\(x.namespace\)/);assert.match(source,/字段覆盖/);
 });
+test('source IPs show with counts, and windows collected before them offer a raw read-back',()=>{
+ const c=context();vm.runInContext(source,c);
+ c.x={group_id:'g',role:'Primary',count:5,clients_known:5,client_count:3,clients:[{name:'172.16.1.95',count:3},{name:'172.16.0.97',count:2}],accounts:[{name:'root@admin',count:5}]};
+ const html=vm.runInContext('mongoSources(x)',c);
+ assert.match(html,/172\.16\.1\.95 <small>×3<\/small>/);assert.match(html,/另 1 个/);assert.match(html,/账号 root@admin/);
+ c.y={group_id:'g',role:'Primary',count:5,clients_known:0,clients:[]};
+ assert.match(vm.runInContext('mongoSources(y)',c),/data-mongo-sources="g"[\s\S]*查来源/);
+ c.z={...c.x,clients_known:2};
+ assert.match(vm.runInContext('mongoSources(z)',c),/2\/5 条有来源/);
+});

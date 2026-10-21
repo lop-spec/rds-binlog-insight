@@ -100,6 +100,34 @@ def normalize_shape(value: Any, *, prefixes: list[str], key: str = '', parent: s
                    'number' if isinstance(value, (int, float)) else 'string')
 
 
+def client_host(value: Any) -> str:
+    """The client address of a slow record without its port (DDS gives ``HostAddress`` as an IP, sometimes ip:port)."""
+    text = str(value or '').strip()
+    return text.rsplit(':', 1)[0] if text.count(':') == 1 else text
+
+
+def parse_counts(text: Any) -> Counter:
+    """Counts stored as canonical JSON objects; several objects joined by newlines (a merged read) add up; old rows have none."""
+    total: Counter = Counter()
+    for line in str(text or '').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            for key, count in value.items():
+                if isinstance(count, (int, float)) and not isinstance(count, bool):
+                    total[str(key)] += int(count)
+    return total
+
+
+def top_counts(counts: Counter, limit: int) -> list[dict]:
+    return [{'name': name, 'count': count} for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
 def normalize_record(record: dict, instance: str, prefixes: list[str]) -> dict:
     q = json.loads(record['SQLText'])
     if not isinstance(q, dict):
@@ -152,6 +180,13 @@ def normalize_record(record: dict, instance: str, prefixes: list[str]) -> dict:
                   plan=q.get('planSummary'), used_disk=q.get('usedDisk'), error_code=q.get('errCode'),
                   error_name=q.get('errName'), role=role, costs=values,
                   query_shape_hash=q.get('queryShapeHash'), plan_cache_key=q.get('planCacheKey'))
+    # Who sent it: the provider's client address and account. Not part of the template identity.
+    client = client_host(record.get('HostAddress') or q.get('remote'))
+    account = str(record.get('AccountName') or q.get('user') or '').strip()
+    if client:
+        sample['client'] = client
+    if account:
+        sample['account'] = account
     if database_scope:
         sample['scope'] = 'database'
     return dict(instance=instance, namespace=ns, role=role, command=op, kind=kind,
@@ -159,7 +194,7 @@ def normalize_record(record: dict, instance: str, prefixes: list[str]) -> dict:
                 finish_us=start+ms*1000, sample=canonical(sample),
                 failed=int(q.get('ok') == 0 or bool(q.get('errCode'))),
                 collscan=int(q.get('planSummary') == 'COLLSCAN'), spill=int(q.get('usedDisk') is True),
-                **values)
+                client=client, account=account, **values)
 
 
 def rollup_events(events: list[dict]) -> list[dict]:
@@ -176,12 +211,17 @@ def rollup_events(events: list[dict]) -> list[dict]:
                 rows[key] = dict(bucket=bucket, role=event['role'], group_id=event['group_id'], profile=event['profile'],
                                  count=0, failed=0, collscan=0, spill=0, overlap_us=0, max_us=0,
                                  first_us=event['start_us'], last_us=event['start_us'], sample=event['sample'],
+                                 clients=Counter(), accounts=Counter(),
                                  **{k: 0 for k in COSTS}, **{k+'_known': 0 for k in COSTS})
             row = rows[key]
             row['overlap_us'] += max(0, min(end, bucket+MINUTE)-max(event['start_us'], bucket))
             if bucket != first:
                 continue
             row['count'] += 1
+            if event.get('client'):
+                row['clients'][event['client']] += 1
+            if event.get('account'):
+                row['accounts'][event['account']] += 1
             for k in ('failed', 'collscan', 'spill'):
                 row[k] += event[k]
             for k in COSTS:
@@ -193,6 +233,9 @@ def rollup_events(events: list[dict]) -> list[dict]:
             if event['duration_us'] >= row['max_us']:
                 row['max_us'] = event['duration_us']
                 row['sample'] = event['sample']
+    for row in rows.values():
+        row['clients'] = canonical(dict(row['clients'])) if row['clients'] else ''
+        row['accounts'] = canonical(dict(row['accounts'])) if row['accounts'] else ''
     return list(rows.values())
 
 
@@ -372,9 +415,11 @@ def summarize(rows: list[dict]) -> dict:
         if key not in result:
             result[key] = dict(profile=json.loads(row['profile']), count=0, failed=0, collscan=0, spill=0,
                                max_us=0, first_us=row['first_us'], last_us=row['last_us'], sample=row['sample'],
-                               trend=defaultdict(int), runtime=defaultdict(int),
+                               trend=defaultdict(int), runtime=defaultdict(int), clients=Counter(), accounts=Counter(),
                                **{k: 0 for k in COSTS}, **{k+'_known': 0 for k in COSTS})
         a = result[key]
+        a['clients'].update(parse_counts(row.get('clients')))
+        a['accounts'].update(parse_counts(row.get('accounts')))
         for k in ('count','failed','collscan','spill') + COSTS + tuple(k+'_known' for k in COSTS):
             a[k] += int(row[k])
         a['first_us'] = min(a['first_us'], row['first_us'])
@@ -414,7 +459,10 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
         row = dict(group_id=group_id, role=role, **a['profile'], count=a['count'],
                    failed=a['failed'], collscan=a['collscan'], spill=a['spill'], max_us=a['max_us'],
                    first_us=a['first_us'], last_us=a['last_us'], sample=json.loads(a['sample']),
-                   trend=[{'bucket':t,'count':v,'runtime_us':a['runtime'].get(t,0)} for t,v in sorted(a['trend'].items())])
+                   trend=[{'bucket':t,'count':v,'runtime_us':a['runtime'].get(t,0)} for t,v in sorted(a['trend'].items())],
+                   # Source addresses and accounts of the collected records; windows collected before 1.33.12 carry none.
+                   clients=top_counts(a['clients'], 5), client_count=len(a['clients']), clients_known=sum(a['clients'].values()),
+                   accounts=top_counts(a['accounts'], 3), account_count=len(a['accounts']))
         valid = coverage and baseline_coverage and comparable_minutes
         row['baseline_count'] = (b['count'] if b else 0) if baseline_coverage else None
         row['count_delta'] = a['count'] - row['baseline_count'] if valid else None

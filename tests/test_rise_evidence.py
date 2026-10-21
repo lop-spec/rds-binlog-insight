@@ -17,6 +17,13 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(sql_template("select  *\n from task_queue_9"), "select * from task_queue_#")
         self.assertEqual(sql_template(""), "")
 
+    def test_a_truncated_multi_row_batch_has_the_template_of_its_single_row_insert(self):
+        single = "INSERT INTO `orders` (`a`,`b`) VALUES (?) ON DUPLICATE KEY UPDATE `a`=IF(a IN (?), VALUES(a), a)"
+        batch = "INSERT INTO `orders` (`a`,`b`) VALUES (?),(?,'[{\\\"payment\\\":?,\\\"num\\\":?,"
+        self.assertEqual(sql_template(single), sql_template(batch))
+        self.assertNotEqual(sql_template(single), sql_template("INSERT INTO `orders` (`a`) VALUES (?)"))
+        self.assertNotEqual(sql_template(single), sql_template("INSERT INTO `other` (`a`,`b`) VALUES (?)"))
+
     def test_sql_ids_of_one_statement_on_shard_tables_become_one_family(self):
         events = [
             dict(fingerprint="f38", sql_id="A", database_name="order_record", node_id="n"),
