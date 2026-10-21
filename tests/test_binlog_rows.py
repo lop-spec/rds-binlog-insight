@@ -172,10 +172,18 @@ class SchemaTests(unittest.TestCase):
                 self.assertIn(name, view)
         self.assertIn("% 8) AS tbl_bucket", view)
         self.assertIn(f"leftUTF8(row_query, {br.STATEMENT_MAX_BYTES}))) AS row_query_hash", view)
-        lanes = [s for s in br.build_schema() if "binlog_rows_buf_worker_v2_" in s]
+        lanes = [s for s in br.build_schema() if "binlog_rows_buf_worker_v3_" in s]
         self.assertEqual(len(lanes), br.WORKER_LANES_MAX)
         for statement in lanes:
-            self.assertIn(f"ORDER BY ({br.BUCKET_EXPR})", statement)
+            self.assertIn(f"PARTITION BY toUInt8({br.BUCKET_EXPR})", statement)
+
+    def test_each_move_reads_only_its_bucket_and_skips_absent_buckets(self):
+        client = mock.Mock()
+        br.RowsIngestor(client, buffer_table="b").move(["raw:f"], "t", partitions=[("2026-10-21", 2), ("2026-10-21", 5), ("2026-10-22", 5)])
+        sqls = [c.args[0] for c in client.execute.call_args_list]
+        self.assertEqual(len(sqls), 2)
+        self.assertIn("_partition_id = '2'", sqls[0])
+        self.assertIn("_partition_id = '5'", sqls[1])
 
 
 class BackendTests(unittest.TestCase):
@@ -306,7 +314,7 @@ class Release1291Tests(unittest.TestCase):
         client = mock.Mock()
         br.RowsIngestor(client).move(["raw:f"], "t")
         sql = client.execute.call_args_list[0].args[0]
-        self.assertIn("WHERE (table_name != '' OR operation = 'DDL')", sql)
+        self.assertIn("AND (table_name != '' OR operation = 'DDL') AND", sql)
 
     def test_move_writes_one_bucket_per_insert(self):
         client = mock.Mock()

@@ -32,9 +32,11 @@ STATEMENTS_TABLE = f"{DATABASE}.binlog_statements_v1"
 STAGE_TABLE = f"{DATABASE}.binlog_rows_stage_v1"
 FILES_TABLE = f"{DATABASE}.binlog_rows_files_v1"
 BUFFER_TABLE = f"{DATABASE}.binlog_rows_buf_v1"
-# v2 worker buffers are sorted by table bucket: each per-bucket move reads only its own granules
-# (8 full scans per binlog before, ~56 s of the ~130 s per file).
-WORKER_BUFFER_TABLE = f"{DATABASE}.binlog_rows_buf_worker_v2"
+# v3 worker buffers are partitioned by table bucket, so each per-bucket move reads only its own parts. v2 sorted by the
+# bucket instead, which never pruned: a buffer is a pile of 16384-row parts of two granules each, every granule holds
+# rows of all eight buckets, and each of the eight moves read the whole buffer (10-21: 330k rows read to write 50k,
+# 13 CPU-s per file).
+WORKER_BUFFER_TABLE = f"{DATABASE}.binlog_rows_buf_worker_v3"
 WORKER_LANES_MAX = 8
 STORAGE_POLICY = "binlog_rows"
 BUCKETS = 8
@@ -185,6 +187,13 @@ def parser_select_sql() -> str:
     ))
 
 
+def worker_buffer_schema() -> list[str]:
+    """The per-lane worker buffers; the worker also creates them itself at start (they are scratch tables)."""
+    return [f"CREATE TABLE IF NOT EXISTS {WORKER_BUFFER_TABLE}_{lane} AS {STAGE_TABLE} ENGINE = MergeTree "
+            f"PARTITION BY toUInt8({BUCKET_EXPR}) ORDER BY tuple() SETTINGS min_bytes_for_wide_part = 1073741824"
+            for lane in range(WORKER_LANES_MAX)]
+
+
 def build_schema() -> list[str]:
     """Idempotent DDL. The ``binlog_rows`` storage policy lives in the server config."""
     stage_cols = ",\n ".join(f"{name} {ctype}" for name, ctype in STAGE_COLUMNS)
@@ -226,8 +235,7 @@ SETTINGS storage_policy = '{STORAGE_POLICY}', index_granularity = 8192,
         f"CREATE TABLE IF NOT EXISTS {STAGE_TABLE} (\n {stage_cols}\n) ENGINE = Null",
         f"CREATE TABLE IF NOT EXISTS {BUFFER_TABLE} AS {STAGE_TABLE} ENGINE = MergeTree ORDER BY tuple() "
         "SETTINGS min_bytes_for_wide_part = 1073741824",
-        *(f"CREATE TABLE IF NOT EXISTS {WORKER_BUFFER_TABLE}_{lane} AS {STAGE_TABLE} ENGINE = MergeTree "
-          f"ORDER BY ({BUCKET_EXPR}) SETTINGS min_bytes_for_wide_part = 1073741824" for lane in range(WORKER_LANES_MAX)),
+        *worker_buffer_schema(),
         f"""CREATE TABLE IF NOT EXISTS {FILES_TABLE} (
  instance_id LowCardinality(String), file_id String, host_instance_id LowCardinality(String), source_file_name String,
  lo_us Int64, hi_us Int64, rows UInt64, source LowCardinality(String), rq_complete UInt8,
@@ -902,14 +910,17 @@ class RowsIngestor:
         after the failed INSERT has stopped on the server: a client timeout or dropped connection leaves it
         running, and a purge that starts first misses its later parts (mysql-bin.095753 kept 77,876 duplicate
         rows that way).
+        The worker buffers are partitioned by bucket: ``_partition_id`` keeps each move to its own parts, and buckets the
+        buffer does not hold (``partitions``) are skipped.
         """
         bucket, query_id = -1, ""
+        present = range(BUCKETS) if partitions is None else sorted({b for _day, b in partitions})
         try:
-            for bucket in range(BUCKETS):
+            for bucket in present:
                 query_id = f"{tag}-move-{uuid.uuid4().hex[:16]}-b{bucket}"
                 self.ch.execute(
                     f"INSERT INTO {STAGE_TABLE} SELECT * FROM {self.buffer} "
-                    f"WHERE {ROW_STORE_FILTER} AND {BUCKET_EXPR} = {bucket}",
+                    f"WHERE _partition_id = '{int(bucket)}' AND {ROW_STORE_FILTER} AND {BUCKET_EXPR} = {bucket}",
                     settings={"max_threads": 1, "max_insert_threads": 1, "max_block_size": 16384,
                               "min_insert_block_size_rows": 16384, "min_insert_block_size_bytes": 16777216,
                               "max_insert_block_size": 16384, "max_memory_usage": 1_200_000_000,

@@ -29,7 +29,7 @@ from typing import Any
 from .binlog_lite import RawBinlogError
 from .binlog_rows import (
     NON_BINLOG_HOSTS, STAGE_COLUMN_NAMES, WORKER_BUFFER_TABLE, WORKER_LANES_MAX, ChHttp, RowsIngestor, _epoch_us,
-    purge_file_rows,
+    purge_file_rows, worker_buffer_schema,
 )
 from .config import data_root, ensure_data_dirs
 from .scratch_sweep import sweep_stale_scratch
@@ -704,6 +704,8 @@ class Worker:
     def run(self) -> None:
         # Lanes of a killed predecessor keep their 512 MB source.binlog (three since 09-25 on 10-20).
         sweep_stale_scratch(self.storage.paths["scratch"], min_interval_seconds=0)
+        for statement in worker_buffer_schema():  # scratch tables: created here, no migration step
+            self.ch.execute(statement, settings={"max_execution_time": 60}, timeout=80)
         self.recover_in_background()
         threads = [threading.Thread(target=self.run_lane, args=(lane,), name=f"lane-{lane}", daemon=True)
                    for lane in range(self.lanes)]
