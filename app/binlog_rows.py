@@ -843,6 +843,14 @@ class BinlogRows:
 
 # --------------------------------------------------------------------------- ingestion
 
+# How big each part written by a move is. A batch is moved per bucket, but parts were still cut at 16384 rows / 16 MiB:
+# 10-22 with batches of four, 26 new binlog_rows_v1 parts per file and merges unchanged at ~27 CPU-s per file. The move
+# squashes to 64 MiB; the query limit goes to 2 GB for the squashing buffer (the worker pauses its lanes when ClickHouse
+# as a whole nears RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB).
+MOVE_SQUASH = {"min_insert_block_size_rows": 4_000_000, "min_insert_block_size_bytes": 67_108_864,
+               "max_memory_usage": 2_000_000_000}
+
+
 class RowsIngestor:
     """Ingest one collected binlog file into binlog_rows_v1 through a local buffer.
 
@@ -945,8 +953,7 @@ class RowsIngestor:
                     f"INSERT INTO {STAGE_TABLE} SELECT * FROM {self.buffer} "
                     f"WHERE _partition_id = '{int(bucket)}' AND {ROW_STORE_FILTER} AND {BUCKET_EXPR} = {bucket}",
                     settings={"max_threads": 1, "max_insert_threads": 1, "max_block_size": 16384,
-                              "min_insert_block_size_rows": 16384, "min_insert_block_size_bytes": 16777216,
-                              "max_insert_block_size": 16384, "max_memory_usage": 1_200_000_000,
+                              **MOVE_SQUASH, "max_insert_block_size": 16384,
                               "max_execution_time": 0, "log_comment": tag + "-move"}, timeout=3600,
                     query_id=query_id)
         except RawBinlogError as exc:
