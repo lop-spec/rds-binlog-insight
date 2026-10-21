@@ -36,7 +36,8 @@ BUFFER_TABLE = f"{DATABASE}.binlog_rows_buf_v1"
 # bucket instead, which never pruned: a buffer is a pile of 16384-row parts of two granules each, every granule holds
 # rows of all eight buckets, and each of the eight moves read the whole buffer (10-21: 330k rows read to write 50k,
 # 13 CPU-s per file).
-WORKER_BUFFER_TABLE = f"{DATABASE}.binlog_rows_buf_worker_v3"
+# v4 also sorts by source file: a buffer holds a batch of files and the per-file count check and aggregates read one file.
+WORKER_BUFFER_TABLE = f"{DATABASE}.binlog_rows_buf_worker_v4"
 WORKER_LANES_MAX = 8
 STORAGE_POLICY = "binlog_rows"
 BUCKETS = 8
@@ -190,7 +191,9 @@ def parser_select_sql() -> str:
 def worker_buffer_schema() -> list[str]:
     """The per-lane worker buffers; the worker also creates them itself at start (they are scratch tables)."""
     return [f"CREATE TABLE IF NOT EXISTS {WORKER_BUFFER_TABLE}_{lane} AS {STAGE_TABLE} ENGINE = MergeTree "
-            f"PARTITION BY toUInt8({BUCKET_EXPR}) ORDER BY tuple() SETTINGS min_bytes_for_wide_part = 1073741824"
+            f"PARTITION BY toUInt8({BUCKET_EXPR}) ORDER BY _source_part_key SETTINGS min_bytes_for_wide_part = 1073741824, "
+            # never merged: a buffer lives for one batch and is truncated (10-22: 619 merges in 15 min on v3)
+            "max_bytes_to_merge_at_max_space_in_pool = 1, max_bytes_to_merge_at_min_space_in_pool = 1"
             for lane in range(WORKER_LANES_MAX)]
 
 
@@ -883,6 +886,23 @@ class RowsIngestor:
                         settings={**self.LOAD_SETTINGS, "log_comment": "binlog-rows-raw-load"},
                         body=stream, timeout=3600)
 
+    def load_rowbinary_stream(self, stream: Any, entry: dict[str, Any]) -> None:
+        """Parser RowBinary (``--rowbinary``) straight into the buffer: same input structure and SELECT as the JSON path."""
+        sql = (f"INSERT INTO {self.buffer} ({', '.join(STAGE_COLUMN_NAMES)}) SELECT {parser_select_sql()} "
+               f"FROM input('{PARSER_INPUT_STRUCTURE}') FORMAT RowBinary")
+        self.ch.execute(sql, params={"file_id": entry["file_id"], "instance_id": entry["instance_id"],
+                                     "host_instance_id": entry["host_instance_id"],
+                                     "source_file_name": entry["source_file_name"]},
+                        settings={**self.LOAD_SETTINGS, "log_comment": "binlog-rows-raw-load"},
+                        body=stream, timeout=3600)
+
+    def file_rows(self, file_id: str) -> int:
+        """Buffered rows of one file (the buffer is sorted by source, so this reads that file only)."""
+        if not re.fullmatch(r"[0-9a-f]{16,128}", file_id):
+            raise ValueError("unexpected file id")
+        return int(self.ch.execute(f"SELECT count() FROM {self.buffer} WHERE _source_part_key = 'raw:{file_id}' FORMAT TSV",
+                                   settings={"max_execution_time": 120}, timeout=140).strip() or 0)
+
     def buffered_rows(self) -> int:
         return int(self.ch.execute(f"SELECT count() FROM {self.buffer} FORMAT TSV",
                                    settings={"max_execution_time": 120}, timeout=140).strip() or 0)
@@ -943,9 +963,18 @@ class RowsIngestor:
         except RawBinlogError as exc:
             LOGGER.warning("BINLOG_ROWS_KILL_FAILED query_id=%s error=%s", query_id, str(exc)[:200])
 
-    def aggregate(self, file_id: str, tag: str) -> None:
-        """Buffer -> analytics aggregates, once per file (a retry with the same token is skipped)."""
-        for kind, sql in aggregate_statements(self.buffer, ROW_STORE_FILTER).items():
+    def aggregate(self, file_id: str, tag: str, *, only_file: bool = False) -> None:
+        """Buffer -> analytics aggregates, once per file (a retry with the same token is skipped).
+
+        ``only_file`` restricts the read to this file's rows when the buffer holds a batch; the aggregates stay per
+        file, so a retried batch of a different composition never counts a file twice.
+        """
+        where = ROW_STORE_FILTER
+        if only_file:
+            if not re.fullmatch(r"[0-9a-f]{16,128}", file_id):
+                raise ValueError("unexpected file id")
+            where = f"{ROW_STORE_FILTER} AND _source_part_key = 'raw:{file_id}'"
+        for kind, sql in aggregate_statements(self.buffer, where).items():
             self.ch.execute(sql, settings={**AGG_INSERT_SETTINGS, "insert_deduplication_token": f"{kind}:{file_id}",
                                            "log_comment": tag + "-agg"}, timeout=1900)
 

@@ -156,6 +156,11 @@ type extractor struct {
 	// equals the full output.
 	slim   bool
 	timing TxnTiming
+	// rowBinary writes each record as one ClickHouse RowBinary row of the row store's
+	// input structure (see writeRowBinary) instead of a JSON line: ClickHouse parses
+	// it for a fraction of the CPU (10-21: JSONEachRow cost ~11 CPU-s per 500 MB binlog).
+	rowBinary *bufio.Writer
+	scratch   []byte
 }
 
 const slimRowQueryRunes = 65536
@@ -175,6 +180,79 @@ func newExtractor(writer io.Writer, sourceFileID, flavor string) *extractor {
 	encoder := json.NewEncoder(writer)
 	encoder.SetEscapeHTML(false)
 	return &extractor{encoder: encoder, sourceFileID: sourceFileID, flavor: flavor}
+}
+
+// rowBinaryNullFields is the number of trailing input columns the parser never fills
+// (connection_id ... transaction_context_id of the row store's input structure).
+const rowBinaryNullFields = 11
+
+// jsonSafe matches what encoding/json writes for a string: every byte of invalid
+// UTF-8 becomes U+FFFD, so the RowBinary output stores exactly what the JSON did.
+func jsonSafe(value string) string {
+	if utf8.ValidString(value) {
+		return value
+	}
+	var out strings.Builder
+	out.Grow(len(value) + 8)
+	for index := 0; index < len(value); {
+		r, width := utf8.DecodeRuneInString(value[index:])
+		if r == utf8.RuneError && width == 1 {
+			out.WriteString("\uFFFD")
+		} else {
+			out.WriteString(value[index : index+width])
+		}
+		index += width
+	}
+	return out.String()
+}
+
+// writeRowBinary emits one row of the row store's input structure, every column
+// Nullable: event_id, event_epoch_us, raw_event_type, operation, database_name,
+// table_name, server_id, thread_id, transaction_id, gtid, start_position,
+// end_position, row_index (Int32), execution_time_ms, error_code (Int32), sql_kind,
+// sql_text, before_json, after_json, row_query, then rowBinaryNullFields NULLs.
+func (x *extractor) writeRowBinary(record *outputEvent) error {
+	b := x.scratch[:0]
+	str := func(value string) {
+		value = jsonSafe(value)
+		b = append(b, 0)
+		b = binary.AppendUvarint(b, uint64(len(value)))
+		b = append(b, value...)
+	}
+	i64 := func(value int64) {
+		b = append(b, 0)
+		b = binary.LittleEndian.AppendUint64(b, uint64(value))
+	}
+	i32 := func(value int32) {
+		b = append(b, 0)
+		b = binary.LittleEndian.AppendUint32(b, uint32(value))
+	}
+	str(record.EventID)
+	i64(record.EventEpochUS)
+	str(record.RawEventType)
+	str(record.Operation)
+	str(record.DatabaseName)
+	str(record.TableName)
+	i64(int64(record.ServerID))
+	i64(int64(record.ThreadID))
+	str(record.TransactionID)
+	str(record.GTID)
+	i64(int64(record.StartPosition))
+	i64(int64(record.EndPosition))
+	i32(int32(record.RowIndex))
+	i64(record.ExecutionTimeMS)
+	i32(int32(record.ErrorCode))
+	str(record.SQLKind)
+	str(record.SQLText)
+	str(record.BeforeJSON)
+	str(record.AfterJSON)
+	str(record.RowQuery)
+	for i := 0; i < rowBinaryNullFields; i++ {
+		b = append(b, 1)
+	}
+	x.scratch = b
+	_, err := x.rowBinary.Write(b)
+	return err
 }
 
 func (x *extractor) resetStreamState() {
@@ -269,7 +347,11 @@ func (x *extractor) emit(record outputEvent) error {
 	}, "\x1f")
 	sum := sha256.Sum256([]byte(stable))
 	record.EventID = hex.EncodeToString(sum[:])
-	if err := x.encoder.Encode(record); err != nil {
+	if x.rowBinary != nil {
+		if err := x.writeRowBinary(&record); err != nil {
+			return fmt.Errorf("write RowBinary event: %w", err)
+		}
+	} else if err := x.encoder.Encode(record); err != nil {
 		return fmt.Errorf("write JSONL event: %w", err)
 	}
 	if x.afterEncode != nil {
@@ -1277,6 +1359,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	outputDir := flags.String("output-dir", "", "publish atomic NDJSON chunks and emit manifests")
 	chunkMaxLines := flags.Int("chunk-max-lines", 200_000, "maximum records per NDJSON chunk")
 	chunkMaxBytes := flags.Int64("chunk-max-bytes", 384*1024*1024, "maximum bytes per NDJSON chunk")
+	rowBinary := flags.Bool("rowbinary", false, "with --slim and without --output-dir: ClickHouse RowBinary rows of the row store's input structure instead of JSON lines")
 	slim := flags.Bool("slim", false, "row-store output: omit pseudo SQL, column metadata, base64 SQL, table identity, transaction timing and transaction boundaries; cut row_query to 65536 code points")
 	checksumStdin := flags.Bool(
 		"checksum-stdin",
@@ -1332,6 +1415,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	}
 	extractor := newExtractor(writer, *sourceFileID, normalizedFlavor)
 	extractor.slim = *slim
+	if *rowBinary {
+		if !*slim || output != nil {
+			fmt.Fprintln(stderr, "--rowbinary needs --slim and cannot be combined with --output-dir")
+			return 2
+		}
+		extractor.rowBinary = bufio.NewWriterSize(writer, 1<<20)
+	}
 	if output != nil {
 		extractor.afterEncode = output.recordComplete
 	}
@@ -1348,6 +1438,12 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		}
 		fmt.Fprintln(stderr, err)
 		return 1
+	}
+	if extractor.rowBinary != nil {
+		if err := extractor.rowBinary.Flush(); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
 	}
 	if output != nil {
 		if err := output.Close(); err != nil {

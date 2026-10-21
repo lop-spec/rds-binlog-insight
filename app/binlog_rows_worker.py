@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import re
 import hashlib
 import json
 import logging
@@ -107,6 +108,13 @@ def download_ranges(bucket: Any, key: str, size: int, path: Path, stop: threadin
 # 693 files behind during a write surge. 0 restores the scratch-file path.
 STREAM_INGEST = os.environ.get("RDS_BINLOG_ROWS_STREAM", "1").strip() != "0"
 STREAM_CHUNK = 8 * 1024 ** 2
+# The parser writes ClickHouse RowBinary instead of JSON lines on the streaming path (about a quarter of the load CPU).
+ROWBINARY = os.environ.get("RDS_BINLOG_ROWS_ROWBINARY", "1").strip() != "0"
+# Raw files loaded into one buffer and moved together. One move per bucket writes one part per (day, bucket) for the whole
+# batch instead of per file: 10-21, about 31 new row-store parts per file kept merges at 37 CPU-s per file. A lane never
+# waits to fill a batch; it takes what is already pending.
+BATCH_FILES = max(1, min(int(os.environ.get("RDS_BINLOG_ROWS_BATCH_FILES", "4") or 4), 8))
+PARSED_RE = re.compile(rb"parsed (\d+) audit records")
 
 
 def stream_ranges(bucket: Any, key: str, size: int, stop: threading.Event, *, streams: int | None = None,
@@ -228,6 +236,14 @@ class LineCountingStream:
             self.lines += 1  # final record without trailing newline
             self._last = NEWLINE
         return data
+
+
+class BatchLoadError(Exception):
+    """A file of a batch could not be loaded; the other files were not committed and are simply retried."""
+
+    def __init__(self, entry: dict[str, Any], error: BaseException):
+        super().__init__(str(error))
+        self.entry, self.error = entry, error
 
 
 class Claims:
@@ -559,24 +575,37 @@ class Worker:
 
     def ingest_raw_stream(self, ingestor: RowsIngestor, entry: dict[str, Any], lane: int, archive: Any,
                           descriptor: dict[str, Any]) -> int:
-        """OSS -> parser stdin -> ClickHouse buffer, with the SHA256 taken on the way in.
+        """One file: OSS -> parser stdin -> ClickHouse buffer -> commit (``load_raw_stream`` does the checks)."""
+        ingestor.truncate()
+        try:
+            total = self.load_raw_stream(ingestor, entry, archive, descriptor)
+        except BaseException:
+            ingestor.truncate()
+            raise
+        self.commit(ingestor, entry, ["raw:" + entry["file_id"]], total, "raw", True, lane)
+        ingestor.truncate()
+        return total
 
-        Nothing is committed before the whole object has been read, its length and SHA256 match the archive record and the
-        buffered row count matches the parser's: a bad stream ends in a truncated buffer, exactly like a bad local copy.
+    def load_raw_stream(self, ingestor: RowsIngestor, entry: dict[str, Any], archive: Any, descriptor: dict[str, Any]) -> int:
+        """OSS -> parser stdin -> ClickHouse buffer, with the SHA256 taken on the way in; the buffer may already hold a batch.
+
+        Nothing is committed here. The whole object must have been read, its length and SHA256 must match the archive record,
+        the parser must have exited cleanly and this file's buffered rows must equal the records the parser wrote; otherwise
+        it raises and the caller truncates the buffer.
         """
         raw = descriptor["raw"]
         size = int(raw["size_bytes"])
-        ingestor.truncate()
+        binary = ROWBINARY
         with tempfile.TemporaryFile() as stderr:
             process = subprocess.Popen(
-                [*parser_command(), "--input", "-", "--source-file-id", entry["file_id"],
+                [*parser_command(), *(["--rowbinary"] if binary else []), "--input", "-", "--source-file-id", entry["file_id"],
                  "--flavor", descriptor.get("flavor") or "mysql"],
                 stdout=subprocess.PIPE, stderr=stderr, stdin=subprocess.PIPE)
             feed = ParserFeed(stream_ranges(archive.bucket, raw["oss_key"], size, self.stop), process.stdin)
             feed.start()
             stream = LineCountingStream(process.stdout, self.stop)
             try:
-                ingestor.load_ndjson_stream(stream, entry)
+                (ingestor.load_rowbinary_stream if binary else ingestor.load_ndjson_stream)(stream, entry)
             except BaseException:
                 process.kill()
                 raise
@@ -585,26 +614,79 @@ class Worker:
                 feed.join(timeout=60)
                 process.stdout.close()
             if feed.error is not None:
-                ingestor.truncate()
                 raise feed.error if isinstance(feed.error, RawBinlogError) else RawBinlogError(
                     f"原档读取失败：{feed.error}", "RAW_INDEX_DOWNLOAD_FAILED")
             digest = feed.digest
             if feed.size != size or digest.hexdigest() != raw["sha256"]:
-                ingestor.truncate()
                 raise RawBinlogError("原档长度/SHA256校验失败", "RAW_INDEX_VERIFY_FAILED")
+            stderr.seek(0)
+            log = stderr.read()
             if returncode != 0:
-                stderr.seek(0)
-                tail = stderr.read()[-400:].decode("utf-8", errors="replace")
-                ingestor.truncate()
+                tail = log[-400:].decode("utf-8", errors="replace")
                 raise RawBinlogError(f"解析器退出码 {returncode}：{tail}", "PARSER_FAILED")
-            total = stream.lines
-        buffered = ingestor.buffered_rows()
+            if binary:
+                # RowBinary has no line breaks to count: the parser's own count closes the run.
+                found = PARSED_RE.findall(log)
+                if not found:
+                    raise RawBinlogError("解析器没有报告记录数", "PARSER_FAILED")
+                total = int(found[-1])
+            else:
+                total = stream.lines
+        buffered = ingestor.file_rows(entry["file_id"])
         if buffered != total:
-            ingestor.truncate()
             raise RawBinlogError(f"缓冲行数 {buffered} 与解析行数 {total} 不一致", "BINLOG_ROWS_VERIFY_FAILED")
-        self.commit(ingestor, entry, ["raw:" + entry["file_id"]], total, "raw", True, lane)
-        ingestor.truncate()
         return total
+
+    def ingest_batch(self, ingestor: RowsIngestor, entries: list[dict[str, Any]], lane: int) -> dict[str, int]:
+        """Several raw files through one buffer and one commit; raises ``BatchLoadError`` naming the file that failed."""
+        archive = self.archive()
+        ingestor.truncate()
+        rows: dict[str, int] = {}
+        for entry in entries:
+            try:
+                self.storage.raw_binlogs.verify(archive, entry["descriptor"])
+                rows[entry["file_id"]] = self.load_raw_stream(ingestor, entry, archive, entry["descriptor"])
+            except BaseException as exc:
+                ingestor.truncate()
+                raise BatchLoadError(entry, exc) from exc
+        try:
+            self.commit_batch(ingestor, entries, rows, lane)
+        finally:
+            ingestor.truncate()
+        return rows
+
+    def commit_batch(self, ingestor: RowsIngestor, entries: list[dict[str, Any]], rows: dict[str, int], lane: int) -> None:
+        """Move a batch once, then aggregates and manifest per file, behind one durable marker per file.
+
+        Each marker names only its own file's rows (that is what recovery purges); the partitions are the batch's, a
+        superset of the file's. A failed move purges every file of the batch before it raises.
+        """
+        markers = []
+        for entry in entries:
+            marker = self.inflight_dir() / f"{entry['file_id']}.json"
+            if marker.exists():
+                self.purge_marker(marker, reason="retry")
+            markers.append(marker)
+        partitions = ingestor.partitions()
+        for entry, marker in zip(entries, markers):
+            tmp = marker.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
+                                       "part_keys": ["raw:" + entry["file_id"]], "file": entry["source_file_name"],
+                                       "lo": entry.get("lo"), "hi": entry.get("hi"), "partitions": partitions}))
+            os.replace(tmp, marker)
+        keys = ["raw:" + entry["file_id"] for entry in entries]
+        try:
+            ingestor.move(keys, f"binlog-rows-l{lane}", lo_us=min(e["lo"] for e in entries), hi_us=max(e["hi"] for e in entries),
+                          partitions=partitions)
+        except RawBinlogError as exc:
+            if getattr(exc, "rows_purged", False):
+                for marker in markers:
+                    marker.unlink(missing_ok=True)
+            raise
+        for entry, marker in zip(entries, markers):
+            ingestor.aggregate(entry["file_id"], f"binlog-rows-l{lane}", only_file=len(entries) > 1)
+            ingestor.record(entry, rows[entry["file_id"]], "raw", True)
+            marker.unlink(missing_ok=True)
 
     def ingest_parquet(self, ingestor: RowsIngestor, entry: dict[str, Any], lane: int) -> int:
         from .clickhouse_client import SOURCE_COLUMN_TYPES
@@ -666,13 +748,18 @@ class Worker:
                 self.publish(lane, state="idle", reason="caught-up" if self.lane_specs[lane][0] == "live" else "window-complete")
                 self.stop.wait(30)
                 continue
-            for entry in todo:
+            for position, entry in enumerate(todo):
                 if self.stop.is_set() or not self.wait_for_capacity(lane):
                     break
                 if not self.claims.take(entry["file_id"]):
                     continue
                 if entry["file_id"] in self.ingested(entry["instance_id"]):
                     self.claims.finish(entry["file_id"])  # committed by another lane after this list was built
+                    continue
+                if entry["kind"] == "raw" and STREAM_INGEST and BATCH_FILES > 1:
+                    self.run_batch(ingestor, lane, entry, todo[position + 1:], failures)
+                    if self.lane_specs[lane][0] == "live":
+                        break
                     continue
                 started = time.monotonic()
                 committed = False
@@ -700,6 +787,48 @@ class Worker:
                     (self.claims.finish if committed else self.claims.release)(entry["file_id"])
                 if self.lane_specs[lane][0] == "live":
                     break  # re-rank so the newest unclaimed file is always next
+
+    def run_batch(self, ingestor: RowsIngestor, lane: int, first: dict[str, Any], rest: list[dict[str, Any]],
+                  failures: dict[str, int]) -> None:
+        """``first`` (claimed) plus up to BATCH_FILES - 1 more pending raw files of the same list, loaded and committed together."""
+        batch = [first]
+        for entry in rest:
+            if len(batch) >= BATCH_FILES:
+                break
+            if entry["kind"] != "raw" or failures.get(entry["file_id"], 0) >= 3:
+                continue
+            if entry["instance_id"] != first["instance_id"] or not self.claims.take(entry["file_id"]):
+                continue
+            if entry["file_id"] in self.ingested(entry["instance_id"]):
+                self.claims.finish(entry["file_id"])
+                continue
+            batch.append(entry)
+        started = time.monotonic()
+        committed = False
+        names = ",".join(entry["source_file_name"] for entry in batch)
+        try:
+            self.publish(lane, state="running", file=names, kind="raw")
+            rows = self.ingest_batch(ingestor, batch, lane)
+            committed = True
+            seconds = round(time.monotonic() - started, 1)
+            for entry in batch:
+                self.mark_ingested(entry["instance_id"], entry["file_id"])
+                LOGGER.info("BINLOG_ROWS_INGESTED lane=%s file=%s kind=raw rows=%s seconds=%s batch=%s",
+                            lane, entry["source_file_name"], rows[entry["file_id"]], seconds, len(batch))
+            self.publish(lane, state="running", lastFile=batch[-1]["source_file_name"], lastRows=sum(rows.values()),
+                         lastSeconds=seconds, lastEventEnd=max(entry["hi"] for entry in batch))
+        except Exception as exc:
+            failed = exc.entry if isinstance(exc, BatchLoadError) else None
+            for entry in batch if failed is None else [failed]:
+                failures[entry["file_id"]] = failures.get(entry["file_id"], 0) + 1
+            error = exc.error if isinstance(exc, BatchLoadError) else exc
+            LOGGER.error("BINLOG_ROWS_INGEST_FAILED lane=%s file=%s kind=raw batch=%s error=%s", lane,
+                         failed["source_file_name"] if failed else names, len(batch), str(error)[:300])
+            self.publish(lane, state="error", lastError=str(error)[:300], errorFile=failed["source_file_name"] if failed else names)
+            self.stop.wait(10)
+        finally:
+            for entry in batch:
+                (self.claims.finish if committed else self.claims.release)(entry["file_id"])
 
     def run(self) -> None:
         # Lanes of a killed predecessor keep their 512 MB source.binlog (three since 09-25 on 10-20).

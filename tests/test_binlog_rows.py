@@ -172,10 +172,10 @@ class SchemaTests(unittest.TestCase):
                 self.assertIn(name, view)
         self.assertIn("% 8) AS tbl_bucket", view)
         self.assertIn(f"leftUTF8(row_query, {br.STATEMENT_MAX_BYTES}))) AS row_query_hash", view)
-        lanes = [s for s in br.build_schema() if "binlog_rows_buf_worker_v3_" in s]
+        lanes = [s for s in br.build_schema() if "binlog_rows_buf_worker_v4_" in s]
         self.assertEqual(len(lanes), br.WORKER_LANES_MAX)
         for statement in lanes:
-            self.assertIn(f"PARTITION BY toUInt8({br.BUCKET_EXPR})", statement)
+            self.assertIn(f"PARTITION BY toUInt8({br.BUCKET_EXPR}) ORDER BY _source_part_key", statement)
 
     def test_each_move_reads_only_its_bucket_and_skips_absent_buckets(self):
         client = mock.Mock()
@@ -1183,7 +1183,8 @@ class StreamIngestTests(unittest.TestCase):
                 pass
             ingestor.loaded = stream.lines
         ingestor.load_ndjson_stream.side_effect = load
-        ingestor.buffered_rows.side_effect = lambda: ingestor.loaded if rows_in_buffer is None else rows_in_buffer
+        ingestor.load_rowbinary_stream.side_effect = load
+        ingestor.file_rows.side_effect = lambda _file: ingestor.loaded if rows_in_buffer is None else rows_in_buffer
         archive = mock.Mock()
         archive.bucket = self.bucket(payload)
         descriptor = {"raw": {"oss_key": "k", "size_bytes": len(self.PAYLOAD), "sha256": sha or hashlib.sha256(self.PAYLOAD).hexdigest()}}
@@ -1192,8 +1193,9 @@ class StreamIngestTests(unittest.TestCase):
             total = w.ingest_raw_stream(ingestor, entry, 0, archive, descriptor)
         return total, w, ingestor
 
-    # reads all of stdin, then prints one record per 1000 bytes
-    PARSER = "import sys\ndata = sys.stdin.buffer.read()\nfor i in range(len(data) // 1000):\n    print('{\"n\":%d}' % i)\n"
+    # reads all of stdin, then prints one record per 1000 bytes and reports the count on stderr like binlog-parser
+    PARSER = ("import sys\ndata = sys.stdin.buffer.read()\nn = len(data) // 1000\nfor i in range(n):\n    print('{\"n\":%d}' % i)\n"
+              "sys.stderr.write('parsed %d audit records\\n' % n)\n")
 
     def test_a_good_stream_is_committed_with_the_parsers_row_count(self):
         total, w, ingestor = self.run_stream(self.PAYLOAD, None, self.PARSER)
@@ -1217,3 +1219,98 @@ class StreamIngestTests(unittest.TestCase):
     def test_a_buffer_that_lost_rows_is_never_committed(self):
         with self.assertRaisesRegex(RawBinlogError, "缓冲行数"):
             self.run_stream(self.PAYLOAD, None, self.PARSER, rows_in_buffer=1)
+
+
+class BatchCommitTests(unittest.TestCase):
+    """1.34.0: pending raw files go through one buffer and one move; aggregates and manifest stay per file."""
+
+    def worker(self, tmp):
+        import threading
+        from pathlib import Path
+        from app import binlog_rows_worker as worker_module
+        w = worker_module.Worker.__new__(worker_module.Worker)
+        w.storage = mock.Mock(paths={"index": Path(tmp)})
+        w.stop = threading.Event()
+        w.claims = worker_module.Claims()
+        w.ingested = mock.Mock(return_value=set())
+        w._archive = mock.Mock()
+        w.archive = mock.Mock(return_value=w._archive)
+        w.ch = mock.Mock()
+        return w
+
+    @staticmethod
+    def entries(n):
+        return [{"file_id": f"{i:032x}", "instance_id": "i", "host_instance_id": "h", "source_file_name": f"mysql-bin.{i}",
+                 "lo": 1000 + i, "hi": 2000 + i, "kind": "raw", "descriptor": {"raw": {}}} for i in range(1, n + 1)]
+
+    def test_one_move_for_the_batch_and_per_file_aggregates_and_manifest(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.worker(tmp)
+            ingestor = mock.Mock()
+            ingestor.partitions.return_value = [("2026-10-21", 3)]
+            batch = self.entries(3)
+            w.load_raw_stream = mock.Mock(side_effect=[10, 20, 30])
+            rows = w.ingest_batch(ingestor, batch, 0)
+            self.assertEqual(list(rows.values()), [10, 20, 30])
+            ingestor.move.assert_called_once()
+            self.assertEqual(ingestor.move.call_args.args[0], ["raw:" + e["file_id"] for e in batch])
+            self.assertEqual((ingestor.move.call_args.kwargs["lo_us"], ingestor.move.call_args.kwargs["hi_us"]), (1001, 2003))
+            self.assertEqual([c.kwargs["only_file"] for c in ingestor.aggregate.call_args_list], [True] * 3)
+            self.assertEqual([c.args[1] for c in ingestor.record.call_args_list], [10, 20, 30])
+            self.assertEqual(list(w.inflight_dir().glob("*.json")), [])
+
+    def test_a_file_that_fails_to_load_names_itself_and_nothing_is_committed(self):
+        import tempfile
+        from app.binlog_rows_worker import BatchLoadError
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.worker(tmp)
+            ingestor = mock.Mock()
+            batch = self.entries(3)
+            w.load_raw_stream = mock.Mock(side_effect=[10, RawBinlogError("sha", "RAW_INDEX_VERIFY_FAILED"), 30])
+            with self.assertRaises(BatchLoadError) as caught:
+                w.ingest_batch(ingestor, batch, 0)
+            self.assertIs(caught.exception.entry, batch[1])
+            ingestor.move.assert_not_called()
+            ingestor.record.assert_not_called()
+            self.assertGreaterEqual(ingestor.truncate.call_count, 2)
+
+    def test_a_failed_move_purges_the_batch_and_drops_its_markers(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.worker(tmp)
+            ingestor = mock.Mock()
+            ingestor.partitions.return_value = [("2026-10-21", 3)]
+            failure = RawBinlogError("memory", "X")
+            failure.rows_purged = True
+            ingestor.move.side_effect = failure
+            w.load_raw_stream = mock.Mock(side_effect=[10, 20])
+            with self.assertRaises(RawBinlogError):
+                w.ingest_batch(ingestor, self.entries(2), 0)
+            self.assertEqual(list(w.inflight_dir().glob("*.json")), [])
+            ingestor.record.assert_not_called()
+
+    def test_run_batch_takes_pending_raw_files_and_blames_only_the_failing_one(self):
+        import tempfile
+        from app import binlog_rows_worker as worker_module
+        from app.binlog_rows_worker import BatchLoadError
+        with tempfile.TemporaryDirectory() as tmp:
+            w = self.worker(tmp)
+            w.publish = mock.Mock()
+            w.mark_ingested = mock.Mock()
+            todo = self.entries(6)
+            todo[2]["kind"] = "parquet"
+            self.assertTrue(w.claims.take(todo[0]["file_id"]))
+            seen = []
+
+            def batch_run(ingestor, batch, lane):
+                seen.append([e["file_id"] for e in batch])
+                raise BatchLoadError(batch[1], RuntimeError("bad"))
+            w.ingest_batch = batch_run
+            failures = {}
+            with mock.patch.object(worker_module, "BATCH_FILES", 4):
+                w.stop.set()  # skip the 10 s back-off wait
+                w.run_batch(mock.Mock(), 0, todo[0], todo[1:], failures)
+            self.assertEqual(seen, [[todo[i]["file_id"] for i in (0, 1, 3, 4)]])  # parquet skipped, at most four
+            self.assertEqual(failures, {todo[1]["file_id"]: 1})
+            self.assertTrue(all(w.claims.take(todo[i]["file_id"]) for i in (0, 1, 3, 4)))  # all released
