@@ -858,6 +858,9 @@ class RowsIngestor:
     LOAD_SETTINGS = {"max_threads": 1, "max_insert_threads": 1, "max_memory_usage": 1_200_000_000,
                      "min_insert_block_size_rows": 16384, "min_insert_block_size_bytes": 16777216,
                      "max_insert_block_size": 16384, "max_execution_time": 0,
+                     # Rows run to hundreds of KB (wide row images): 16384 of them overran the 1.2 GB query limit on
+                     # RowBinary (10-22, mysql-bin.130020: a 1 GB column buffer); cut input blocks by bytes as well.
+                     "input_format_max_block_size_bytes": 33554432, "max_insert_block_size_bytes": 33554432,
                      "max_insert_delayed_streams_for_parallel_write": 1, "input_format_null_as_default": 1,
                      "input_format_skip_unknown_fields": 1,
                      # ClickHouse lets aliases shadow columns; DuckDB (the Parquet path) does not.
