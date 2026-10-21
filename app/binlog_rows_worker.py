@@ -102,6 +102,84 @@ def download_ranges(bucket: Any, key: str, size: int, path: Path, stop: threadin
             future.result()
 
 
+# Stream the archived binlog from OSS straight into the parser (no 512 MB scratch copy, no second read for the SHA256).
+# 10-21: two lanes wrote, re-read and parsed a local copy of every file while the host sat at 55% iowait; the row store fell
+# 693 files behind during a write surge. 0 restores the scratch-file path.
+STREAM_INGEST = os.environ.get("RDS_BINLOG_ROWS_STREAM", "1").strip() != "0"
+STREAM_CHUNK = 8 * 1024 ** 2
+
+
+def stream_ranges(bucket: Any, key: str, size: int, stop: threading.Event, *, streams: int | None = None,
+                  chunk: int = STREAM_CHUNK):
+    """The object's bytes in order, fetched as parallel ranged GETs with at most ``2 x streams`` chunks in memory.
+
+    Each chunk must come back exactly as long as asked; anything else raises before a byte past it is handed on.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    bucket = ranged_bucket(bucket)
+    streams = max(1, streams or DOWNLOAD_STREAMS)
+    bounds = [(start, min(start + chunk, size)) for start in range(0, size, chunk)]
+
+    def fetch(span: tuple[int, int]) -> bytes:
+        start, end = span
+        if stop.is_set():
+            raise RawBinlogError("写入进程停止", "BINLOG_ROWS_STOPPED")
+        response = bucket.get_object(key, byte_range=(start, end - 1))
+        parts, got = [], 0
+        try:
+            while piece := response.read(1024 ** 2):
+                got += len(piece)
+                if got > end - start:
+                    raise RawBinlogError("分段下载超过请求长度", "RAW_INDEX_VERIFY_FAILED")
+                parts.append(piece)
+        finally:
+            response.close()
+        if got != end - start:
+            raise RawBinlogError("分段下载长度不符", "RAW_INDEX_VERIFY_FAILED")
+        return b"".join(parts)
+
+    with ThreadPoolExecutor(max_workers=streams, thread_name_prefix="oss-stream") as pool:
+        pending = {}
+        ahead = 2 * streams
+        for index in range(min(ahead, len(bounds))):
+            pending[index] = pool.submit(fetch, bounds[index])
+        try:
+            for index in range(len(bounds)):
+                data = pending.pop(index).result()
+                following = index + ahead
+                if following < len(bounds):
+                    pending[following] = pool.submit(fetch, bounds[following])
+                yield data
+        finally:
+            for future in pending.values():
+                future.cancel()
+
+
+class ParserFeed(threading.Thread):
+    """Writes the streamed binlog into the parser's stdin and hashes it on the way; errors are kept for the caller."""
+
+    def __init__(self, chunks: Any, sink: Any):
+        super().__init__(name="parser-feed", daemon=True)
+        self.chunks, self.sink = chunks, sink
+        self.digest, self.size, self.error = hashlib.sha256(), 0, None
+
+    def run(self) -> None:
+        try:
+            for data in self.chunks:
+                self.digest.update(data)
+                self.size += len(data)
+                self.sink.write(data)
+        except BrokenPipeError:
+            self.error = RawBinlogError("解析器提前退出", "PARSER_FAILED")
+        except BaseException as exc:  # noqa: BLE001 - re-raised by the lane after the parser has stopped
+            self.error = exc
+        finally:
+            try:
+                self.sink.close()
+            except OSError:
+                pass
+
+
 def parser_command() -> list[str]:
     """Row-store mode of the collector's parser: same event ids and row images, ~40% less CPU."""
     from .parser_bridge import parser_executable
@@ -405,6 +483,8 @@ class Worker:
         descriptor = entry["descriptor"]
         raw = descriptor["raw"]
         self.storage.raw_binlogs.verify(archive, descriptor)
+        if STREAM_INGEST:
+            return self.ingest_raw_stream(ingestor, entry, lane, archive, descriptor)
         scratch_root = self.storage.paths["scratch"] / "binlog-rows"
         scratch_root.mkdir(parents=True, exist_ok=True)
         if shutil.disk_usage(scratch_root).free < int(raw["size_bytes"]) + 20 * 1024 ** 3:
@@ -439,6 +519,55 @@ class Worker:
                     returncode = process.wait(timeout=600)
             if returncode != 0:
                 tail = stderr_path.read_bytes()[-400:].decode("utf-8", errors="replace")
+                raise RawBinlogError(f"解析器退出码 {returncode}：{tail}", "PARSER_FAILED")
+            total = stream.lines
+        buffered = ingestor.buffered_rows()
+        if buffered != total:
+            ingestor.truncate()
+            raise RawBinlogError(f"缓冲行数 {buffered} 与解析行数 {total} 不一致", "BINLOG_ROWS_VERIFY_FAILED")
+        self.commit(ingestor, entry, ["raw:" + entry["file_id"]], total, "raw", True, lane)
+        ingestor.truncate()
+        return total
+
+    def ingest_raw_stream(self, ingestor: RowsIngestor, entry: dict[str, Any], lane: int, archive: Any,
+                          descriptor: dict[str, Any]) -> int:
+        """OSS -> parser stdin -> ClickHouse buffer, with the SHA256 taken on the way in.
+
+        Nothing is committed before the whole object has been read, its length and SHA256 match the archive record and the
+        buffered row count matches the parser's: a bad stream ends in a truncated buffer, exactly like a bad local copy.
+        """
+        raw = descriptor["raw"]
+        size = int(raw["size_bytes"])
+        ingestor.truncate()
+        with tempfile.TemporaryFile() as stderr:
+            process = subprocess.Popen(
+                [*parser_command(), "--input", "-", "--source-file-id", entry["file_id"],
+                 "--flavor", descriptor.get("flavor") or "mysql"],
+                stdout=subprocess.PIPE, stderr=stderr, stdin=subprocess.PIPE)
+            feed = ParserFeed(stream_ranges(archive.bucket, raw["oss_key"], size, self.stop), process.stdin)
+            feed.start()
+            stream = LineCountingStream(process.stdout, self.stop)
+            try:
+                ingestor.load_ndjson_stream(stream, entry)
+            except BaseException:
+                process.kill()
+                raise
+            finally:
+                returncode = process.wait(timeout=600)
+                feed.join(timeout=60)
+                process.stdout.close()
+            if feed.error is not None:
+                ingestor.truncate()
+                raise feed.error if isinstance(feed.error, RawBinlogError) else RawBinlogError(
+                    f"原档读取失败：{feed.error}", "RAW_INDEX_DOWNLOAD_FAILED")
+            digest = feed.digest
+            if feed.size != size or digest.hexdigest() != raw["sha256"]:
+                ingestor.truncate()
+                raise RawBinlogError("原档长度/SHA256校验失败", "RAW_INDEX_VERIFY_FAILED")
+            if returncode != 0:
+                stderr.seek(0)
+                tail = stderr.read()[-400:].decode("utf-8", errors="replace")
+                ingestor.truncate()
                 raise RawBinlogError(f"解析器退出码 {returncode}：{tail}", "PARSER_FAILED")
             total = stream.lines
         buffered = ingestor.buffered_rows()

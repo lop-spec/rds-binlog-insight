@@ -666,3 +666,34 @@ test('an unservable window says why the ClickHouse slow-log lane is behind (10-2
   await vm.runInContext('runAnalytics()', plain.c);
   assert.match(plain.nodes['#analytics-panel-rise'].innerHTML, /前后 6 小时内没有索引完整的同长度时段<\/p>/);
 });
+
+// ---- 10-21: the slow log saw a sliver of the rise; the page says so, names the statement type and marks merged shard IDs ----
+test('a rise the slow log cannot explain is said above the table, with the counter that grew and the merged shard row', () => {
+  const {c} = rdsContext(async () => ({}));
+  c.node = {node_id: 'rn-p', status: 'ok', peak: 30, metric_scale: 1, metric_values: [10, 20, 30], resource_comparison: {baseline_mean: 11, current_mean: 20, delta: 9},
+    total_fingerprints: 2, statements: [stmt('order', 0.4, 69_000_000, 0, {merged_sql_ids: 2, growth_share: 0.36}), stmt('todo', -0.2, 1_555_000_000, 1_372_000_000, {growth_share: 0.31})],
+    evidence: {status: 'ok', explained_ratio: 0.03, low_explained: true, slowlog_added_concurrency: 0.25,
+      threads: {current: 20, baseline: 11, delta: 9, ratio: 0.8},
+      lead: {key: 'com_insert', operation: 'INSERT', current: 13700, baseline: 4200, delta: 9500, ratio: 2.26},
+      related_rows: [1],
+      items: [{key: 'com_select', label: 'SELECT 次数 / 秒', operation: 'SELECT', current: 470, baseline: 450, delta: 20, ratio: 0.04},
+              {key: 'com_insert', label: 'INSERT 次数 / 秒', operation: 'INSERT', current: 13700, baseline: 4200, delta: 9500, ratio: 2.26}]}};
+  c.data = {metric_id: 'threads', sample_end_us: [1, 2, 3]};
+  const html = vm.runInContext('riseNodeBody(data, node)', c);
+  assert.match(html, /慢日志只能解释这次上涨的约 3%/);
+  assert.match(html, /INSERT：4,200 → 13,700 次\/秒（\+226%）/);
+  assert.match(html, /下表第 1 行/);
+  assert.match(html, /合并 2 个 SQL ID/);
+  assert.match(html, /<details class="rise-counters" open>/);
+  assert.ok(html.indexOf('rise-explained') < html.indexOf('rise-table'), 'the verdict comes before the ranking');
+  c.node.evidence = {status: 'unavailable'};
+  assert.match(vm.runInContext('riseNodeBody(data, node)', c), /语句计数（云监控）读不到/);
+});
+
+test('a window the binlog row store only partly holds is announced on the rise page', () => {
+  const {c} = rdsContext(async () => ({}));
+  assert.match(vm.runInContext('riseBinlogCoverage({binlog_coverage: {status: "ok", covered_ratio: 0.42, pending_files: 693}})', c),
+    /只覆盖了这个窗口的 42%[\s\S]*693 个 binlog 文件/);
+  assert.equal(vm.runInContext('riseBinlogCoverage({binlog_coverage: {status: "ok", covered_ratio: 1}})', c), '');
+  assert.equal(vm.runInContext('riseBinlogCoverage({})', c), '');
+});

@@ -1047,3 +1047,109 @@ class Release12918Tests(unittest.TestCase):
         self.assertEqual((seen["params"]["i"], seen["params"]["a"], seen["params"]["b"]),
                          ("rm-x", 1791947700000000, 1791948000000000))
         self.assertEqual(seen["params"]["d0"], seen["params"]["d1"])   # one UTC day for a few minutes
+
+
+class StreamIngestTests(unittest.TestCase):
+    """1.33.11: the archived binlog goes from OSS straight into the parser; the SHA256 is taken on the way."""
+
+    PAYLOAD = bytes(range(256)) * 997  # not a multiple of the chunk size
+
+    class Body:
+        def __init__(self, data):
+            self.data = data
+
+        def read(self, size=-1):
+            chunk, self.data = self.data[:size], self.data[size:]
+            return chunk
+
+        def close(self):
+            pass
+
+    def bucket(self, payload, short_at=None):
+        test = self
+
+        class Bucket:
+            enable_crc = False
+            asked = []
+
+            def get_object(self, key, byte_range):
+                start, end = byte_range
+                Bucket.asked.append(start)
+                data = payload[start:end + 1]
+                return test.Body(data[:-1] if start == short_at else data)
+        return Bucket()
+
+    def test_chunks_come_back_in_order_and_whole(self):
+        import threading
+        from app import binlog_rows_worker as worker
+        got = b"".join(worker.stream_ranges(self.bucket(self.PAYLOAD), "k", len(self.PAYLOAD), threading.Event(),
+                                            streams=3, chunk=1000))
+        self.assertEqual(got, self.PAYLOAD)
+
+    def test_a_short_range_fails_the_stream(self):
+        import threading
+        from app import binlog_rows_worker as worker
+        with self.assertRaises(RawBinlogError):
+            b"".join(worker.stream_ranges(self.bucket(self.PAYLOAD, short_at=5000), "k", len(self.PAYLOAD), threading.Event(),
+                                          streams=2, chunk=1000))
+
+    def test_prefetch_is_bounded(self):
+        import threading
+        from app import binlog_rows_worker as worker
+        bucket = self.bucket(self.PAYLOAD)
+        stream = worker.stream_ranges(bucket, "k", len(self.PAYLOAD), threading.Event(), streams=2, chunk=1000)
+        next(stream)
+        import time
+        time.sleep(0.05)
+        self.assertLessEqual(len(bucket.asked), 5)  # the first chunk plus at most 2 x streams ahead
+        stream.close()
+
+    def run_stream(self, payload, sha, parser_code, rows_in_buffer=None):
+        import hashlib
+        import sys
+        import threading
+        from app import binlog_rows_worker as worker
+        w = worker.Worker.__new__(worker.Worker)
+        w.stop = threading.Event()
+        w.commit = mock.Mock()
+        ingestor = mock.Mock()
+
+        def load(stream, entry):
+            while stream.read(4096):
+                pass
+            ingestor.loaded = stream.lines
+        ingestor.load_ndjson_stream.side_effect = load
+        ingestor.buffered_rows.side_effect = lambda: ingestor.loaded if rows_in_buffer is None else rows_in_buffer
+        archive = mock.Mock()
+        archive.bucket = self.bucket(payload)
+        descriptor = {"raw": {"oss_key": "k", "size_bytes": len(self.PAYLOAD), "sha256": sha or hashlib.sha256(self.PAYLOAD).hexdigest()}}
+        entry = {"file_id": "f", "instance_id": "i"}
+        with mock.patch.object(worker, "parser_command", return_value=[sys.executable, "-c", parser_code]):
+            total = w.ingest_raw_stream(ingestor, entry, 0, archive, descriptor)
+        return total, w, ingestor
+
+    # reads all of stdin, then prints one record per 1000 bytes
+    PARSER = "import sys\ndata = sys.stdin.buffer.read()\nfor i in range(len(data) // 1000):\n    print('{\"n\":%d}' % i)\n"
+
+    def test_a_good_stream_is_committed_with_the_parsers_row_count(self):
+        total, w, ingestor = self.run_stream(self.PAYLOAD, None, self.PARSER)
+        self.assertEqual(total, len(self.PAYLOAD) // 1000)
+        w.commit.assert_called_once()
+        self.assertEqual(w.commit.call_args.args[3], total)
+
+    def test_a_wrong_sha_is_never_committed(self):
+        with self.assertRaisesRegex(RawBinlogError, "SHA256"):
+            self.run_stream(self.PAYLOAD, "0" * 64, self.PARSER)
+
+    def test_a_short_object_is_never_committed(self):
+        import hashlib
+        with self.assertRaises(RawBinlogError):
+            self.run_stream(self.PAYLOAD[:-10], hashlib.sha256(self.PAYLOAD).hexdigest(), self.PARSER)
+
+    def test_a_failing_parser_is_never_committed(self):
+        with self.assertRaisesRegex(RawBinlogError, "解析器"):
+            self.run_stream(self.PAYLOAD, None, "import sys\nsys.stderr.write('bad event')\nsys.exit(3)\n")
+
+    def test_a_buffer_that_lost_rows_is_never_committed(self):
+        with self.assertRaisesRegex(RawBinlogError, "缓冲行数"):
+            self.run_stream(self.PAYLOAD, None, self.PARSER, rows_in_buffer=1)

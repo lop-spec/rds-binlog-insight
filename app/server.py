@@ -847,6 +847,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             return None
         return rows.write_hotspots(instance, start_us, end_us)
 
+    def _binlog_coverage(self, instance: str, start_us: int, end_us: int) -> dict[str, Any] | None:
+        """How much of a window the binlog row store holds (shown next to the rise ranking); none without the store."""
+        rows = getattr(self.app.storage, "binlog_rows", None)
+        return rows.coverage(instance, start_us, end_us) if rows is not None else None
+
     def _error(self, status: int, code: str, message: str) -> None:
         try:
             self._json(
@@ -1080,6 +1085,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     peer_loader=load_metric_points,
                     writes_lookup=self._write_hotspots,
                     tail=getattr(self.app, "slow_tails", None),
+                    counter_loader=load_metric_points,
+                    binlog_coverage=self._binlog_coverage,
                 )
                 if str(result.get("status") or "").startswith("incomplete_"):
                     # The index gap is ClickHouse's; say why its lane is behind (10-20: disk safety floor).

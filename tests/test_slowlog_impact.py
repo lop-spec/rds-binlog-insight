@@ -221,6 +221,49 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual((rows["plain"]["accounts"], rows["plain"]["account_count"]), ([], 0))                    # unknown stays unknown
         self.assertIn("metric_database_account AS account", backend._rows.call_args_list[0].args[0])
 
+    def test_one_statement_on_shard_tables_ranks_as_one_row_next_to_counters_and_binlog_coverage(self):
+        # 10-21: the order upsert came out as two SQL IDs (shard tables _38 / _563) and a steady statement outranked both halves.
+        backend, metadata = Mock(), Mock()
+        backend.serving_enabled = True
+        backend._window.side_effect = lambda q, retention: ((q["start_epoch_us"], q["end_epoch_us"])
+                                                             if "start_epoch_us" in q else (0, 6 * W - 1))
+        backend._manifest_coverage.return_value = {"complete": True, "total_parts": 1}
+        backend._scope_sql.side_effect = lambda q, low, high: ("SELECT 1", {"low": low})
+        upsert = "INSERT INTO `order_record_{}` (`id`) VALUES (?..) ON DUPLICATE KEY UPDATE `id`=VALUES(id)"
+        texts = {"s38": upsert.format(38), "s563": upsert.format(563), "steady": "SELECT * FROM `todo_9` WHERE a=?"}
+        backend.statement_index.statement_profiles.side_effect = lambda keys: {
+            key: {"normalized_sql": texts[key[1]], "fingerprint": key[1]} for key in keys if key[1] in texts}
+
+        def make(fp, sql_id, start, duration, op):
+            return dict(event_id=f"{fp}-{start}", start_us=start, node_id="a", database_name="d", fingerprint=fp, sql_id=sql_id,
+                        duration_ms=duration, rows_examined=1, lock_time_ms=None, account="root", operation=op)
+        steady_now = [make("steady", "T", 3 * W + 1, 170000, "SELECT")]
+        steady_before = [make("steady", "T", 3 * W + 1 - DAY_US, 100000, "SELECT")]
+        shards = [make("s38", "A", 3 * W + i * 1000, 40000, "INSERT") for i in range(1, 3)] + \
+                 [make("s563", "B", 4 * W + i * 1000, 40000, "INSERT") for i in range(1, 3)]
+        backend._rows.side_effect = lambda sql, params, _: steady_before if params["low"] < 0 else steady_now + shards
+        loader = Mock(return_value=points([10, 10, 10, 90, 90, 90]))
+
+        def counters(settings, start, end, instance, node, metric_name):
+            now = start >= 0
+            value = {"Cluster_ComInsert": 13000 if now else 4000, "Cluster_ThreadsRunning": 20 if now else 11}.get(metric_name, 100)
+            return [dict(timestamp=(start + (i + 1) * W) // 1000, nodeId="a", Average=value) for i in range(6)]
+        coverage = Mock(return_value={"covered_us": 3 * W, "requested_us": 6 * W, "pendingFiles": 7, "indexedFiles": 9})
+        result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x"}, Settings(), loader,
+                                        counter_loader=counters, binlog_coverage=coverage)
+        node = result["nodes"][0]
+        self.assertEqual(node["statements"][0]["merged_sql_ids"], 2)
+        self.assertEqual(sorted(node["statements"][0]["member_fingerprints"]), ["s38", "s563"])
+        self.assertEqual(len(node["statements"]), 2)
+        self.assertGreater(node["statements"][0]["growth_share"], node["statements"][1]["growth_share"])
+        self.assertIn("metric_operation AS operation", backend._rows.call_args_list[0].args[0])
+        evidence = node["evidence"]
+        self.assertEqual(evidence["lead"]["key"], "com_insert")
+        self.assertEqual(evidence["related_rows"], [1])
+        self.assertTrue(evidence["low_explained"])
+        self.assertEqual(result["binlog_coverage"], {"status": "ok", "covered_ratio": 0.5, "pending_files": 7,
+                                                     "missing_files": 0, "indexed_files": 9})
+
     def test_bound_enforced_before_cloud_call(self):
         backend, metadata, loader = Mock(), Mock(), Mock()
         backend._window.return_value = (0, 6 * W - 1)

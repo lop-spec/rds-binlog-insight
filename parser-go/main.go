@@ -1271,7 +1271,7 @@ func (x *extractor) parsePath(path string) error {
 func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int {
 	flags := flag.NewFlagSet("binlog-parser", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	input := flags.String("input", "", "path to a MySQL binlog or compressed archive")
+	input := flags.String("input", "", "path to a MySQL binlog or compressed archive; - reads a binlog stream from stdin (no zip, no --output-dir)")
 	sourceFileID := flags.String("source-file-id", "", "stable source-file identifier")
 	flavor := flags.String("flavor", "mysql", "binlog flavor: mysql or mariadb")
 	outputDir := flags.String("output-dir", "", "publish atomic NDJSON chunks and emit manifests")
@@ -1307,6 +1307,11 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 		fmt.Fprintln(stderr, "--flavor must be mysql or mariadb")
 		return 2
 	}
+	fromStdin := strings.TrimSpace(*input) == "-"
+	if fromStdin && strings.TrimSpace(*outputDir) != "" {
+		fmt.Fprintln(stderr, "--input - cannot be combined with --output-dir (stdin carries the chunk acknowledgements)")
+		return 2
+	}
 	var output *chunkedOutput
 	writer := stdout
 	if strings.TrimSpace(*outputDir) != "" {
@@ -1330,7 +1335,14 @@ func run(args []string, stdin io.Reader, stdout io.Writer, stderr io.Writer) int
 	if output != nil {
 		extractor.afterEncode = output.recordComplete
 	}
-	if err := extractor.parsePath(*input); err != nil {
+	var parseErr error
+	if fromStdin {
+		// The row-store worker streams the archived binlog straight from object storage: no local copy.
+		parseErr = extractor.parseStream(stdin)
+	} else {
+		parseErr = extractor.parsePath(*input)
+	}
+	if err := parseErr; err != nil {
 		if output != nil {
 			output.Abort()
 		}

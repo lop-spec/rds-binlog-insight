@@ -36,9 +36,14 @@ def family_key(event: dict[str, Any]) -> str:
 
     A statement ranked against another node's metric (replication lag: the primary's writes against a replica's lag)
     carries ``origin`` so it never merges with the same SQL running on the node itself; without it the key is unchanged.
+    A statement the caller has put into a template family (``family``: the same SQL on numbered shard tables, which DAS can
+    still split over several SQL IDs) uses that key instead of its own SQL ID.
     """
     sql_id = str(event.get("sql_id") or "")
-    key = [str(event.get("database_name") or ""), "sql_id" if sql_id else "fingerprint", sql_id or str(event["fingerprint"])]
+    if event.get("family"):
+        key = [str(event.get("database_name") or ""), "template", str(event["family"])]
+    else:
+        key = [str(event.get("database_name") or ""), "sql_id" if sql_id else "fingerprint", sql_id or str(event["fingerprint"])]
     if event.get("origin"):
         key.append(str(event["origin"]))
     return json.dumps(key, separators=(",", ":"))

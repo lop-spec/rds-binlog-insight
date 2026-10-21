@@ -14,6 +14,7 @@ from .clickhouse_manifest import part_identity
 from .credentials import load_credential
 from .lag_origin import describe_lag
 from .lag_peers import LOOKBACK_US, load_peer_series, peer_health
+from .rise_evidence import assign_template_families, load_counters, node_evidence
 from .slow_log_collector import DasRpcClient
 from .slowlog_impact import DAY_US, MAX_EVENTS, PERIOD_US, family_key, order_by_correlation, rank_performance_growth
 from .window_align import adjusted_payload
@@ -340,13 +341,78 @@ def tail_plan(metadata: Any, backend: Any, instance: str, start_us: int, end_us:
             "coverage": {**coverage, "complete": True, "tail_parts": pending}, "baseline_coverage": baseline}
 
 
+def _merge_template_families(events: list[dict[str, Any]], backend: Any, instance: str, tail: Any,
+                             cache: dict[tuple[str, str], dict[str, Any] | None]) -> dict[str, int]:
+    """Put the SQL-ID families of one statement on numbered shard tables into one (``rise_evidence``); evidence-grade:
+    without statement text (or on any failure) every family keeps its own SQL ID, as before. The profiles read here
+    land in ``cache`` so the rows shown later are not read twice."""
+    def profiles(fingerprints: set[str]) -> dict[str, dict[str, Any]]:
+        keys = {(instance, fp) for fp in fingerprints}
+        found = dict(backend.statement_index.statement_profiles(keys))
+        if tail is not None:
+            found.update(tail.profiles(keys - set(found)))
+        cache.update({key: found.get(key) for key in keys})  # None: asked, no text anywhere
+        return {fp: profile for (_instance, fp), profile in found.items()}
+    try:
+        return assign_template_families(events, profiles, family_key)
+    except Exception:  # noqa: BLE001
+        LOGGER.warning("slowlog_resource_query template families unavailable: instance=%s", instance, exc_info=True)
+        for event in events:
+            event.pop("family", None)
+        return {}
+
+
+def _add_node_evidence(result: dict[str, Any], events: list[dict[str, Any]], settings: Any, instance: str, node: str,
+                       start_us: int, end_us: int, loader: Callable[..., list[dict[str, Any]]],
+                       threads_points: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None) -> None:
+    """Statement counters and the slow log's explained share per node (``rise_evidence``), over all ranked families."""
+    nodes = result.get("nodes") or []
+    if not nodes:
+        return
+    operation: dict[tuple[str, str], str] = {}
+    for event in events:
+        operation.setdefault((str(event.get("node_id") or ""), family_key(event)), str(event.get("operation") or ""))
+    try:
+        counters = load_counters(loader, settings, instance, node, start_us, end_us, threads_points)
+    except Exception:  # noqa: BLE001 - evidence, never a reason to fail the ranking
+        LOGGER.warning("slowlog_resource_query counters unavailable: instance=%s", instance, exc_info=True)
+        counters = {"status": "unavailable", "nodes": {}}
+    for entry in nodes:
+        rows = entry.get("statements") or []
+        added = sum(max(int(row.get("runtime_delta_us") or 0), 0) for row in rows)
+        families = [{"fingerprint": row["fingerprint"],
+                     "action": operation.get((entry["node_id"], row["fingerprint"]), ""),
+                     "executions": (row.get("attribution") or {}).get("current_count", 0),
+                     "baseline_executions": (row.get("attribution") or {}).get("baseline_count", 0)} for row in rows]
+        entry["evidence"] = node_evidence(counters["nodes"].get(entry["node_id"]), added, end_us - start_us, families)
+
+
+def _binlog_window(lookup: Callable[[str, int, int], dict[str, Any] | None], instance: str, start_us: int,
+                   end_us: int) -> dict[str, Any] | None:
+    """How much of the window the binlog row store holds (the writes view and write hotspots read it)."""
+    try:
+        summary = lookup(instance, start_us, end_us)
+    except Exception:  # noqa: BLE001
+        LOGGER.warning("slowlog_resource_query binlog coverage unavailable: instance=%s", instance, exc_info=True)
+        return {"status": "unavailable"}
+    if not summary:
+        return None
+    requested = int(summary.get("requested_us") or 0)
+    covered = int(summary.get("covered_us") or 0)
+    return {"status": "ok", "covered_ratio": covered / requested if requested else None,
+            "pending_files": int(summary.get("pendingFiles") or 0), "missing_files": int(summary.get("missingFiles") or 0),
+            "indexed_files": int(summary.get("indexedFiles") or 0)}
+
+
 def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                            settings: Any, metrics_loader: Any = load_metric_points,
                            roles: Any = None,
                            ddl_lookup: Callable[[str, int, int], list[dict[str, Any]]] | None = None,
                            peer_loader: Callable[..., list[dict[str, Any]]] | None = None,
                            writes_lookup: Callable[[str, int, int], dict[str, Any] | None] | None = None,
-                           tail: Any = None) -> dict[str, Any]:
+                           tail: Any = None,
+                           counter_loader: Callable[..., list[dict[str, Any]]] | None = None,
+                           binlog_coverage: Callable[[str, int, int], dict[str, Any] | None] | None = None) -> dict[str, Any]:
     def unavailable(reason: str) -> dict[str, Any]:
         LOGGER.warning("slowlog_resource_query unavailable: %s", reason)
         return {"status": reason, "nodes": []}
@@ -430,7 +496,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         scope, parameters = backend._scope_sql(query, start, end)
         return backend._rows("SELECT scope_event_id AS event_id, "
                              "metric_event_epoch_us AS start_us, metric_node_id AS node_id, "
-                             "metric_database_name AS database_name, "
+                             "metric_database_name AS database_name, metric_operation AS operation, "
                              "metric_fingerprint AS fingerprint, metric_sql_id AS sql_id, "
                              # Legacy index maps unreported costs to 0: zero lacks presence proof.
                              "metric_query_time_ms AS duration_ms, nullIf(metric_rows_examined,0) AS rows_examined, "
@@ -458,6 +524,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     if len(baseline) > MAX_EVENTS:
         return unavailable("baseline_event_limit_exceeded")
     node_roles = _node_roles(roles, instance)
+    profile_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+    merged = _merge_template_families(rows + baseline, backend, instance, tail if tail_used is not None else None, profile_cache)
     try:
         # One sample before the window, so the first minute's growth can be told for the lag metric.
         lead = PERIOD_US if lag_mode else 0
@@ -500,6 +568,10 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             result["nodes"], result["status"] = [], "no_replica_lag_samples"
     if by_correlation:
         order_by_correlation(result)
+    if not lag_mode:
+        _add_node_evidence(result, ranked_rows, settings, instance, str(query.get("node_id") or ""), start_us, end_us,
+                           counter_loader or metrics_loader,
+                           (points, baseline_points) if metric_id == "threads" else None)
     top = TOP_PER_NODE_CORRELATION if by_correlation else TOP_PER_NODE
     counts = Counter((row["node_id"], family_key(row)) for row in ranked_rows)
     accounts: dict[tuple[str, str], Counter] = {}
@@ -514,13 +586,20 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             samples[key] = event
     selected = {(instance, samples[node["node_id"], row["fingerprint"]]["fingerprint"])
                 for node in result.get("nodes", []) for row in node.get("statements", [])[:top]}
-    profiles = backend.statement_index.statement_profiles(selected)
-    if tail_used is not None:
+    profiles = {key: profile_cache[key] for key in selected if profile_cache.get(key)}
+    unasked = selected - set(profile_cache)
+    profiles.update(backend.statement_index.statement_profiles(unasked) if unasked else {})
+    if tail_used is not None and unasked - set(profiles):
         # A fingerprint first seen in the last minutes is not in the SQLite statement table yet; the tail kept its text.
-        profiles.update(tail.profiles(selected - set(profiles)))
+        profiles.update(tail.profiles(unasked - set(profiles)))
     for node in result.get("nodes", []):
         node["total_fingerprints"] = len(node.get("statements", []))
         node["statements"] = node.get("statements", [])[:top]
+        evidence = node.get("evidence") or {}
+        if evidence.get("related_families") is not None:
+            # Family keys mean nothing to the page: point at the shown rows instead (1-based), dropping families not shown.
+            shown = {row["fingerprint"]: index for index, row in enumerate(node["statements"], 1)}
+            evidence["related_rows"] = [shown[key] for key in evidence.pop("related_families") if key in shown]
         known = node_roles.get(node["node_id"]) or {}
         node["role"], node["zone"] = known.get("role", ""), known.get("zone", "")
         for row in node["statements"]:
@@ -534,6 +613,10 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             row["accounts"] = [name for name, _ in ranked[:3]]
             row["account_count"] = len(ranked)
             row["sql_id"] = samples[key]["sql_id"]
+            family = json.loads(key[1]) if str(key[1]).startswith("[") else []  # the family key; the profile replaced row["fingerprint"]
+            if family[1:2] == ["template"]:
+                # Several SQL IDs (shard tables of one statement) ranked as one row.
+                row["merged_sql_ids"] = merged.get(family[2], 0)
             row["sample_event_id"] = samples[key].get("source_event_id") or samples[key]["event_id"]
             if lag_mode:
                 row["origin"], row["source_node_id"] = "primary", samples[key].get("source_node_id", "")
@@ -553,6 +636,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         _add_write_hotspots(result.get("nodes", []), instance, writes_lookup)
         result.update(candidate_scope="primary_statements", primary_nodes=sorted(
             node for node, info in node_roles.items() if info.get("role") == "primary"))
+    if binlog_coverage is not None and not lag_mode:
+        result["binlog_coverage"] = _binlog_window(binlog_coverage, instance, start_us, end_us)
     ready = ready_through(metadata, backend, instance, end_us, time.time_ns() // 1000)
     if tail_used is not None:
         ready = max(ready or 0, tail_used["newest_us"])
