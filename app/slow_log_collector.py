@@ -29,7 +29,6 @@ import json
 import logging
 import os
 import sqlite3
-import ssl
 import tempfile
 import threading
 import time
@@ -42,7 +41,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import NODE_ID_RE, Settings, utc_now_text
-from .rds_api import RemoteBinlog, RdsRpcClient
+from .rds_api import RemoteBinlog, RdsRpcClient, shared_ssl_context
 from .sql_fingerprint import FINGERPRINT_FORMAT_VERSION, statement_profile
 
 if TYPE_CHECKING:
@@ -112,7 +111,7 @@ class DasRpcClient(RdsRpcClient):
         )
         try:
             with urllib.request.urlopen(
-                request, timeout=self.timeout, context=ssl.create_default_context()
+                request, timeout=self.timeout, context=shared_ssl_context()
             ) as response:
                 body = response.read()
         except urllib.error.HTTPError as exc:
@@ -165,16 +164,19 @@ def build_slow_events(
     default_node_id: str = "",
     exclude_accounts: tuple[str, ...] = (),
     seen_ids: set[str] | frozenset[str] = frozenset(),
+    observed_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], set[str]]:
     """DAS slow-log records -> pipeline events, plus the ids of every record that was looked at.
 
     Ids in ``seen_ids`` are looked at but not returned; the collector passes the ids of its previous poll, the live tail
     passes the ids it already holds. Both build events with this one function, so an event has the same id, fingerprint
-    and cost fields whichever of them saw it first.
+    and cost fields whichever of them saw it first. A caller converting a window page by page passes one ``observed_ids``
+    set to every call: it is filled in place, so a record repeated on a later page is still dropped.
     """
 
     events: list[dict[str, Any]] = []
-    observed_ids: set[str] = set()
+    if observed_ids is None:
+        observed_ids = set()
     for record in records:
         sql_text = str(record.get("SQLText") or "").strip()
         if not sql_text:
@@ -379,6 +381,7 @@ class SlowLogCollector:
         self.archiver = archiver
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._start_delay = 0.0
         self._state_path = (
             storage.paths["root"] / f"slow_log_state-{config.state_suffix}.json"
         )
@@ -409,7 +412,8 @@ class SlowLogCollector:
 
     # ---------------- 生命周期 ----------------
 
-    def start(self) -> None:
+    def start(self, delay_seconds: float = 0.0) -> None:
+        """Begin polling after ``delay_seconds``; the service spreads its collectors over one poll interval."""
         if not self.config.enabled:
             LOGGER.info(
                 "慢日志采集未启用: instance=%s", self.config.instance_id or "(未配置)"
@@ -420,6 +424,7 @@ class SlowLogCollector:
             LOGGER.error("慢日志采集配置不完整: %s", "; ".join(problems))
             self._set_status(lastError="; ".join(problems))
             return
+        self._start_delay = max(float(delay_seconds), 0.0)
         self._thread = threading.Thread(
             target=self._run,
             name=f"slow-log-collector-{self.config.state_suffix}",
@@ -486,8 +491,18 @@ class SlowLogCollector:
         try:
             raw = json.loads(self._state_path.read_text("utf-8"))
             self._seen_ids = set(raw.get("recent_event_ids") or [])
+            # A restart keeps the window sizes the node's record rate had settled on. Starting over from the full replay
+            # made every collector of a busy instance read up to _MAX_PAGES pages right after each restart.
+            replay = int(raw.get("replay_now_seconds") or 0)
+            if replay > 0:
+                floor = min(self.config.replay_seconds, _MIN_ADAPTIVE_REPLAY_SECONDS)
+                self._replay_now = min(self.config.replay_seconds, max(floor, replay))
+                self._set_status(replayNowSeconds=int(self._replay_now))
+            forward = int(raw.get("forward_seconds") or 0)
+            if forward > 0:
+                self._forward_seconds = min(self.config.max_window_minutes * 60, max(_MIN_FORWARD_SECONDS, forward))
             return int(raw.get("watermark_epoch_us") or 0)
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             return 0
 
     def _save_watermark(self, epoch_us: int) -> None:
@@ -497,6 +512,8 @@ class SlowLogCollector:
                 # 单轮 API 最多返回 _MAX_PAGES * _API_PAGE_SIZE 条；完整保存
                 # 当前回放窗的 id，不能随机截断后让下一轮重新灌入旧事件。
                 "recent_event_ids": sorted(self._seen_ids),
+                "replay_now_seconds": int(self._replay_now),
+                "forward_seconds": int(self._forward_seconds),
                 "updated_utc": utc_now_text(),
             }
         )
@@ -521,6 +538,8 @@ class SlowLogCollector:
                 (time.time() - self.config.initial_lookback_minutes * 60) * 1_000_000
             )
         self._set_status(watermarkEpochUs=watermark)
+        if self._start_delay and self._stop.wait(self._start_delay):
+            return
         while not self._stop.is_set():
             started = time.monotonic()
             try:
@@ -587,7 +606,12 @@ class SlowLogCollector:
         )
 
         client = self._client()
-        records: list[dict[str, Any]] = []
+        # Every page becomes events right away and its raw records are dropped: holding the window's DAS records and then
+        # its events doubled the peak of a poll (up to _MAX_PAGES * _API_PAGE_SIZE records per node).
+        events: list[dict[str, Any]] = []
+        observed_ids: set[str] = set()
+        record_count = 0
+        oldest_us = 0
         page = 1
         truncated = False
         while not self._stop.is_set():
@@ -608,6 +632,7 @@ class SlowLogCollector:
                 data = response
             items = data.get("Logs") or []
             response_node_id = str(data.get("NodeId") or self.config.node_id).strip()
+            records: list[dict[str, Any]] = []
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -616,13 +641,17 @@ class SlowLogCollector:
                 if node_id:
                     record["NodeId"] = node_id
                 records.append(record)
+            record_count += len(records)
+            page_oldest = min((value for value in map(_epoch_us, records) if value > 0), default=0)
+            if page_oldest and (not oldest_us or page_oldest < oldest_us):
+                oldest_us = page_oldest
+            page_events, _observed = self._build_event_batch(records, observed_ids)
+            events.extend(page_events)
             total = int(data.get("TotalRecords") or 0)
-            if len(items) < _API_PAGE_SIZE or len(records) >= total:
+            if len(items) < _API_PAGE_SIZE or record_count >= total:
                 break
             page += 1
 
-        oldest_us = min((value for value in map(_epoch_us, records) if value > 0), default=0)
-        events, observed_ids = self._build_event_batch(records)
         if events:
             try:
                 existing_ids = self.storage.slowlog_existing_event_ids(
@@ -655,7 +684,7 @@ class SlowLogCollector:
         # The answer is newest first. When the page cap cut it, the oldest records are the ones missing: if the oldest one read
         # is not later than the old watermark, everything the watermark was waiting for was read and only the replay was cut.
         reached_old_watermark = not truncated or (0 < oldest_us <= int(forward_start * 1_000_000))
-        self._tune_window(len(records), forward_end - query_start, forward_end - forward_start, truncated, reached_old_watermark)
+        self._tune_window(record_count, forward_end - query_start, forward_end - forward_start, truncated, reached_old_watermark)
         # DAS 的 OrderBy 不支持按时间排序，拿不到"最后一条的时间"，所以水位线按
         # 前向窗口末尾推进。读到的最老一条还晚于旧水位线时不推进，下一轮用更短的前向窗口重来。
         if not reached_old_watermark:
@@ -689,6 +718,7 @@ class SlowLogCollector:
     def _build_event_batch(
         self,
         records: list[dict[str, Any]],
+        observed_ids: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], set[str]]:
         return build_slow_events(
             records,
@@ -696,6 +726,7 @@ class SlowLogCollector:
             default_node_id=self.config.node_id,
             exclude_accounts=self.config.exclude_accounts,
             seen_ids=self._seen_ids,
+            observed_ids=observed_ids,
         )
 
     def _build_events(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -728,10 +759,6 @@ class SlowLogCollector:
         log_file_name = f"slow-log/{source_scope}/{stamp}"
         staging = self.storage.paths["staging"]
         staging.mkdir(parents=True, exist_ok=True)
-        body = "\n".join(
-            json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-            for item in events
-        )
         temporary = tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -743,7 +770,10 @@ class SlowLogCollector:
         ndjson_path = Path(temporary.name)
         try:
             with temporary:
-                temporary.write(body + "\n")
+                # One line at a time: the batch is never held a second time as one joined string.
+                for event in events:
+                    temporary.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+                    temporary.write("\n")
             item = RemoteBinlog(
                 log_file_name=log_file_name,
                 log_begin_utc=iso(begin_us),

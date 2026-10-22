@@ -45,15 +45,18 @@ RUN python -m pip wheel --no-cache-dir --disable-pip-version-check --no-deps \
 FROM python:3.12-slim-bookworm@sha256:b64e9d3a71eddaa1b3f80c04abf292b3139e3b7c4dd272d19c31dc1f91194d1b
 
 LABEL org.opencontainers.image.title="RDS Binlog Insight" \
-      org.opencontainers.image.version="1.34.2-rawoss" \
+      org.opencontainers.image.version="1.34.3-rawoss" \
       org.opencontainers.image.sqlite.version="3.53.4"
 
 COPY --from=sqlite-builder /usr/local/lib/ /usr/local/lib/
 RUN ldconfig \
     && python -c "import sqlite3; assert sqlite3.sqlite_version == '3.53.4', sqlite3.sqlite_version; connection = sqlite3.connect(':memory:'); connection.execute('CREATE VIRTUAL TABLE probe USING fts5(value)'); assert connection.execute(\"SELECT count(*) FROM pragma_compile_options WHERE compile_options = 'ENABLE_DBSTAT_VTAB'\").fetchone()[0] == 1"
 
+# Two malloc arenas instead of eight per CPU: with ~90 threads the API service otherwise keeps freed windows in dozens of
+# 64 MB arenas (2026-10-22: 49 of them and RSS 2 GB 14 minutes after a restart; 660 MB at 10 minutes with this setting).
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    MALLOC_ARENA_MAX=2 \
     RDS_BINLOG_DATA_DIR=/data \
     RDS_BINLOG_STAGING_DIR=/tmp/rds-binlog-staging \
     RDS_BINLOG_PARSER=/app/tools/binlog-parser

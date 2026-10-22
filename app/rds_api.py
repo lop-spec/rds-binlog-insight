@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import ssl
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +19,27 @@ from .config import Settings
 from .credentials import CloudCredential
 
 LOGGER = logging.getLogger(__name__)
+
+_SSL_CONTEXT: ssl.SSLContext | None = None
+_SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def shared_ssl_context() -> ssl.SSLContext:
+    """One verifying client context for every cloud API call and download of the process.
+
+    ``ssl.create_default_context()`` parses the whole CA bundle each time. Every DAS/DDS/RDS page and every binlog download
+    used to build its own, so the eight slow-log collectors, the live tails and the Mongo lanes re-read the bundle several
+    times a second and left the parsed certificates to the allocator (2026-10-22: a faulthandler dump of the API service
+    caught two threads inside ``load_default_certs`` at once). An SSLContext is safe to share between threads.
+    """
+    global _SSL_CONTEXT
+    context = _SSL_CONTEXT
+    if context is None:
+        with _SSL_CONTEXT_LOCK:
+            if _SSL_CONTEXT is None:
+                _SSL_CONTEXT = ssl.create_default_context()
+            context = _SSL_CONTEXT
+    return context
 
 
 class RdsApiError(RuntimeError):
@@ -96,7 +118,7 @@ class RemoteBinlog:
         )
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), _NoDownloadRedirect(),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+            urllib.request.HTTPSHandler(context=shared_ssl_context()),
         )
         try:
             with opener.open(request, timeout=15) as response:
@@ -185,7 +207,7 @@ class RdsRpcClient:
             with urllib.request.urlopen(
                 request,
                 timeout=self.timeout,
-                context=ssl.create_default_context(),
+                context=shared_ssl_context(),
             ) as response:
                 body = response.read()
         except urllib.error.HTTPError as exc:

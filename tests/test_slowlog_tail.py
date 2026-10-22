@@ -134,6 +134,26 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(tail.profiles([fingerprint]), {})  # nothing keeps the old text alive any more
         self.assertGreaterEqual(tail.view()["covered_from_us"], int((clock.now - RETAIN_SECONDS) * US))
 
+    def test_past_the_event_cap_the_oldest_go_and_the_coverage_starts_after_them(self) -> None:
+        tail, das, _clock = make()
+        for number in range(30):
+            das.add(NOW - 600 + number * 10, published_after=1.0)
+        with patch.object(slowlog_tail, "MAX_EVENTS", 20):
+            tail.scan()
+        rows = sorted(tail.rows(0, 2**62, {}), key=lambda row: row["start_us"])
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(rows[0]["start_us"], int((NOW - 600 + 10 * 10) * US))  # the ten oldest were dropped
+        self.assertGreater(tail.view()["covered_from_us"], int((NOW - 600 + 9 * 10) * US))  # and are not vouched for
+
+    def test_kept_statement_texts_are_bounded(self) -> None:
+        tail, das, _clock = make()
+        das.add(NOW - 100, sql="SELECT * FROM orders WHERE note = '" + "x" * 9000 + "'", published_after=1.0)
+        tail.scan()
+        fingerprint = tail.rows(0, 2**62, {})[0]["fingerprint"]
+        profile = tail.profiles([fingerprint])[fingerprint]
+        self.assertLessEqual(len(profile["sample_sql"]), slowlog_tail.SQL_KEEP_CHARS)
+        self.assertLessEqual(len(profile["normalized_sql"]), slowlog_tail.SQL_KEEP_CHARS)
+
     def test_a_node_whose_scans_stopped_vouches_for_nothing(self) -> None:
         tail, _das, clock = make()
         tail.scan()

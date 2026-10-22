@@ -88,6 +88,9 @@ class MongoCollector:
         self.stop_event=threading.Event();self.threads=[];self.clients={};self.before={};self.unsupported_metrics={}
         self.history_retry={}
         self.slow_request_lock=threading.Lock();self.slow_next_request=0.0
+        # One window in memory at a time. The live and history lanes already share the request pace, but each held its own
+        # window (records, then the store's sorted, Arrow and rollup copies of them) and both could be at their peak together.
+        self.slow_window_lock=threading.Lock()
         self.state={'instanceId':self.instance,'label':entry.get('label',self.instance),'enabled':entry.get('enabled',False),
                     'slowlog':'not_started','metrics':'not_started','counters':'not_started','client_aggregates':'not_connected'}
 
@@ -106,6 +109,9 @@ class MongoCollector:
             return client.call('DescribeSlowLogRecords',params)
 
     def slow_window(self,start,end):
+        with self.slow_window_lock:return self._slow_window(start,end)
+
+    def _slow_window(self,start,end):
         client=self.rpc();records=[];total=None;begin=time.monotonic();deadline=begin+240
         for page in range(1,self.SLOWLOG_MAX_PAGES+1):
             if self.stop_event.is_set():raise RuntimeError('collector_stopping')

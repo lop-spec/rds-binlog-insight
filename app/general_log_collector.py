@@ -36,13 +36,15 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+# 一批的行、事件都在主服务进程里；20 万行一批时单批峰值约 1 GB，2026-10-22 起默认 5 万行。
+# 积压时满批 1 秒后接着拉，批小不影响追平速度。
 try:
     _BATCH_ROW_LIMIT = min(
-        max(int(os.environ.get("RDS_BINLOG_GLOG_BATCH_ROWS", "200000")), 10_000),
+        max(int(os.environ.get("RDS_BINLOG_GLOG_BATCH_ROWS", "50000")), 10_000),
         1_000_000,
     )
 except ValueError:
-    _BATCH_ROW_LIMIT = 200_000
+    _BATCH_ROW_LIMIT = 50_000
 _READ_STATEMENT_PREFIXES = ("select", "show", "with", "desc", "describe", "explain")
 # 真实执行的两类记录：直接执行(Query)与预处理语句执行(Execute，带绑定后的
 # 参数值)。应用普遍使用预处理语句，业务 SELECT 绝大多数只出现在 Execute 里。
@@ -423,6 +425,8 @@ class GeneralLogCollector:
             self._set_status(lastBatchRows=0)
             return watermark_epoch_us, 0, 0
         events, max_epoch_us = self._build_events(rows)
+        raw_count = len(rows)
+        del rows
         if events:
             self._ingest_batch(events)
             with self._status_lock:
@@ -432,12 +436,15 @@ class GeneralLogCollector:
             self._set_status(lastBatchRows=0)
         # 水位线推进到本批最大 event_time，无论是否有可入库语句，
         # 否则被过滤的批会导致重复扫描同一段。
-        return max(max_epoch_us, watermark_epoch_us), len(events), len(rows)
+        return max(max_epoch_us, watermark_epoch_us), len(events), raw_count
 
     def _fetch_rows(self, watermark_epoch_us: int) -> list[dict[str, Any]]:
+        import pymysql.cursors
+
         connection = self._connect(self.config.user, self.config.password)
         try:
-            with connection.cursor() as cursor:
+            # 无缓冲游标分块取：默认游标先把整批元组缓存在驱动里，再转一份 dict，同一批行同时有两份。
+            with connection.cursor(pymysql.cursors.SSCursor) as cursor:
                 # 时间基准自校准：general_log 会记录本连接刚执行的语句，用
                 # 「自己这行日志的 UNIX_TIMESTAMP 与本机真实时间的差」现场测出
                 # 偏移（正常为 0；若 RDS 侧写入语义变化会自动适应），按半小时
@@ -449,7 +456,7 @@ class GeneralLogCollector:
                     "  FROM mysql.general_log"
                     " WHERE thread_id = CONNECTION_ID()"
                 )
-                probe = cursor.fetchone()[0]
+                probe = cursor.fetchall()[0][0]  # 无缓冲游标：读完结果再发下一条
                 tz_offset_s = 0
                 if probe is not None:
                     drift = time.time() - float(probe)
@@ -482,7 +489,12 @@ class GeneralLogCollector:
                     ),
                 )
                 columns = [item[0] for item in cursor.description]
-                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+                rows: list[dict[str, Any]] = []
+                while True:
+                    chunk = cursor.fetchmany(5000)
+                    if not chunk:
+                        return rows
+                    rows.extend(dict(zip(columns, row)) for row in chunk)
         finally:
             connection.close()
 
@@ -600,12 +612,12 @@ class GeneralLogCollector:
         staging = self.storage.paths["staging"]
         staging.mkdir(parents=True, exist_ok=True)
         ndjson_path = staging / f"glog-{stamp}-{os.getpid()}.ndjson"
-        body = "\n".join(
-            json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-            for item in events
-        )
-        ndjson_path.write_text(body + "\n", "utf-8")
         try:
+            # 逐行写：不再把整批拼成一个字符串。
+            with ndjson_path.open("w", encoding="utf-8") as handle:
+                for event in events:
+                    handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+                    handle.write("\n")
             item = RemoteBinlog(
                 log_file_name=log_file_name,
                 log_begin_utc=iso(begin_us),

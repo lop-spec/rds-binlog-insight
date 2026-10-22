@@ -48,6 +48,9 @@ CATCH_UP_SLACK_SECONDS = 30
 STALE_SECONDS = 90
 MAX_PAGES = 120
 SQL_KEEP_CHARS = 2000
+# Retention is by time; this bounds a node in a storm too (a full scan is MAX_PAGES * PAGE_SIZE = 12,000 records). When it
+# bites, the oldest statements go first and the node's coverage starts after them, so the analysis never trusts a gap.
+MAX_EVENTS = 30_000
 CLIENT_REUSE_SECONDS = 300
 FAILURE_LOG_EVERY = 15
 ENV_SWITCH = "RDS_BINLOG_SLOWLOG_TAIL"
@@ -254,12 +257,13 @@ class NodeTail:
                     detail = extra.get("statement_profile") or {}
                     self._profiles[item.fingerprint] = {
                         "instance_id": item.instance_id, "fingerprint": item.fingerprint, "sql_id": item.sql_id,
-                        "action": str(detail.get("action") or ""), "normalized_sql": str(detail.get("normalized") or ""),
-                        "sample_sql": str(detail.get("sample") or ""), "first_seen_us": item.start_us,
+                        "action": str(detail.get("action") or ""),
+                        "normalized_sql": str(detail.get("normalized") or "")[:SQL_KEEP_CHARS],
+                        "sample_sql": str(detail.get("sample") or "")[:SQL_KEEP_CHARS], "first_seen_us": item.start_us,
                         "last_seen_us": item.start_us}
                 else:
                     profile["last_seen_us"] = max(int(profile["last_seen_us"]), item.start_us)
-            self._prune(cutoff_us)
+            cutoff_us = self._prune(cutoff_us)
             # One stretch of coverage: it starts where the first window started, restarts when two scans were too far apart for
             # their windows to overlap, and never reaches back past what is still retained.
             if first or not continuous:
@@ -275,8 +279,16 @@ class NodeTail:
                                                                     WINDOW_RECORD_BUDGET / rate if rate > 0 else MAX_WINDOW_SECONDS)))
         return added
 
-    def _prune(self, cutoff_us: int) -> None:
+    def _prune(self, cutoff_us: int) -> int:
+        """Drop what is older than ``cutoff_us`` and, past MAX_EVENTS, the oldest rest; returns where coverage may start."""
         expired = [key for key, item in self._events.items() if item.start_us < cutoff_us]
+        overflow = len(self._events) - len(expired) - MAX_EVENTS
+        if overflow > 0:
+            kept = sorted((item for item in self._events.values() if item.start_us >= cutoff_us), key=lambda item: item.start_us)
+            dropped = kept[:overflow]
+            expired.extend(item.event_id for item in dropped)
+            # Everything that started at or before the last dropped statement may be missing now.
+            cutoff_us = max(cutoff_us, dropped[-1].start_us + 1)
         for key in expired:
             item = self._events.pop(key)
             self._references[item.fingerprint] -= 1
@@ -285,6 +297,7 @@ class NodeTail:
                 self._profiles.pop(item.fingerprint, None)
         if expired:
             self._newest_us = max((item.start_us for item in self._events.values()), default=0)
+        return cutoff_us
 
     def note_failure(self, exc: BaseException) -> None:
         with self._lock:

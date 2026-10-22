@@ -278,6 +278,58 @@ class SlowLogPageCapTests(unittest.TestCase):
             self.assertEqual(collector._replay_now, collector.config.replay_seconds)
 
 
+class SlowLogMemoryTests(unittest.TestCase):
+    """1.34.3: a poll converts page by page, a restart keeps the tuned windows, and the nodes start spread out."""
+
+    NOW = SlowLogPageCapTests.NOW
+
+    def test_page_by_page_events_equal_the_whole_window_and_drop_a_record_repeated_on_a_later_page(self) -> None:
+        records = _burst(250, self.NOW - 100, 4)
+        # DAS can hand the same statement on two pages (here record 10 again at the top of page 2).
+        pages = [records[:100], [dict(records[10])] + records[100:199], records[199:]]
+
+        class Pages:
+            def call(self, _action: str, params: dict[str, object]) -> dict[str, object]:
+                rows = pages[int(params["PageNumber"]) - 1]  # type: ignore[arg-type]
+                return {"Data": {"Logs": [dict(row) for row in rows], "TotalRecords": 251, "NodeId": "rn-prod-01"}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            collector = _collector(Path(directory), _Storage(Path(directory)), Pages())  # type: ignore[arg-type]
+            ingested: list[dict[str, object]] = []
+            collector._ingest_batch = ingested.extend  # type: ignore[method-assign]
+            with patch("app.slow_log_collector.time.time", return_value=self.NOW):
+                collector._poll_once(int((self.NOW - 300) * 1_000_000))
+        whole, observed = build_slow_events(records, instance_id="rm-prod", default_node_id="rn-prod-01")
+        self.assertEqual(len(whole), 250)
+        self.assertEqual([row["event_id"] for row in ingested], [row["event_id"] for row in whole])
+        self.assertEqual(collector._seen_ids, observed)
+        self.assertEqual(collector.status()["windowRecords"], 251)
+
+    def test_a_restart_keeps_the_tuned_window_sizes_within_the_configured_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = _Storage(Path(directory))
+            first = _collector(Path(directory), storage, _Client(_record()))
+            first._replay_now, first._forward_seconds = 900, 240
+            first._save_watermark(123)
+            again = _collector(Path(directory), storage, _Client(_record()))
+            self.assertEqual(again._load_watermark(), 123)
+            self.assertEqual((again._replay_now, again._forward_seconds), (900, 240))
+            self.assertEqual(again.status()["replayNowSeconds"], 900)
+            first._replay_now, first._forward_seconds = 10**9, 1  # an edited or stale file cannot leave the bounds
+            first._save_watermark(124)
+            third = _collector(Path(directory), storage, _Client(_record()))
+            third._load_watermark()
+            self.assertEqual((third._replay_now, third._forward_seconds), (7200, 120))
+
+    def test_a_delayed_start_does_not_poll_before_its_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            collector = _collector(Path(directory), _Storage(Path(directory)), _Client(_record()))
+            collector._poll_once = Mock(return_value=(1, 0))  # type: ignore[method-assign]
+            collector.start(delay_seconds=60)
+            collector.shutdown()
+            collector._poll_once.assert_not_called()
+
+
 class SharedBuilderTests(unittest.TestCase):
     def test_the_collector_and_the_live_tail_build_the_same_event(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -600,8 +600,10 @@ class Application:
                 config.poll_seconds,
                 config.lag_seconds,
             )
-        for collector in collectors:
-            collector.start()
+        # Spread the nodes over one poll interval. Started together they kept polling together, every node holding its
+        # window at the same moment (2026-10-22: a stack dump of the service caught all of them inside one DAS call).
+        for index, collector in enumerate(collectors):
+            collector.start(delay_seconds=collector.config.poll_seconds * index / len(collectors))
         return collectors
 
     def secondary_sync(self, instance_id: str) -> SyncManager | None:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import ssl
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +14,7 @@ from .parser_bridge import (
     ParserError,
     checksum_file,
 )
+from .rds_api import shared_ssl_context
 
 
 class DownloadError(RuntimeError):
@@ -103,7 +103,7 @@ def download_file(
     request = urllib.request.Request(url, headers=headers, method="GET")
     try:
         response = urllib.request.urlopen(
-            request, timeout=timeout, context=ssl.create_default_context()
+            request, timeout=timeout, context=shared_ssl_context()
         )
     except urllib.error.HTTPError as exc:
         if exc.code == 416 and partial.exists() and (
