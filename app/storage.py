@@ -4702,14 +4702,25 @@ class EventStorage:
         errors: list[str] = []
 
         def acted_on(part: dict[str, Any]) -> bool:
+            """The branches of the loop below that do nothing (or only drop a body version file) are settled here."""
             try:
-                return int(part["min_event_epoch_us"]) < cutoff_us or not Path(part["path"]).is_file()
-            except Exception:  # noqa: BLE001 - the sweep below reports it
+                if int(part["max_event_epoch_us"]) < cutoff_us:
+                    return True
+                path = Path(part["path"])
+                if not path.is_file():
+                    if str(part.get("oss_key") or ""):
+                        self._remove_body_version(path)  # archived and evicted: all the loop would do
+                        return False
+                    return True
+                if int(part["min_event_epoch_us"]) >= cutoff_us:
+                    return False
+                return not (archive_enabled and str(part.get("oss_key") or ""))
+            except Exception:  # noqa: BLE001 - the loop below reports it
                 return True
 
-        # Stream every part once and keep only those this sweep acts on (expired, partly expired or missing locally);
-        # materializing all of them was ~1.9 GB in the API process at 670k parts. The work then runs without holding
-        # the read open.
+        # Stream every part once and keep only those this sweep changes. Materializing all of them was ~1.9 GB in the
+        # API process at 670k parts (2026-10-22), and most of them are archived parts evicted from the local cache, which
+        # the sweep leaves alone. The changes then run without holding the read open.
         candidates = [part for part in self.metadata.iter_parts() if acted_on(part)]
         for part in candidates:
             path = Path(part["path"])

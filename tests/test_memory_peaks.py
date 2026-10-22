@@ -162,10 +162,13 @@ class RetentionSweepTests(unittest.TestCase):
                 parts = []
                 for number in range(30):
                     path = storage.paths["events"] / f"part-{number:02d}.parquet"
-                    path.touch()
+                    archived_and_evicted = number % 2 == 1
+                    if not archived_and_evicted and number != 4:  # part-04: neither local nor archived
+                        path.touch()
                     parts.append({"path": str(path), "logical_part_id": f"part-{number}",
                                   "binlog_id": "hidden" if number % 3 == 0 else "visible",
                                   "event_date": f"2026-10-{1 + number % 20:02d}",
+                                  "oss_key": f"events/part-{number}" if archived_and_evicted else "",
                                   "min_event_epoch_us": now_us, "max_event_epoch_us": now_us + 1, "row_count": 1})
                 insert_fixture(conn, "parquet_parts", parts)
                 conn.commit()
@@ -173,9 +176,17 @@ class RetentionSweepTests(unittest.TestCase):
             self.assertEqual(list(store.iter_parts(visible_only=False, batch=7)),
                              store.list_parts(limit=1000, visible_only=False))
             self.assertEqual(sorted(store.iter_part_paths(batch=4)), sorted(part["path"] for part in parts))
-            with patch.object(store, "list_parts", side_effect=AssertionError("the sweep materialized every part")):
+            leftover = storage._body_version_path(Path(parts[1]["path"]))
+            leftover.parent.mkdir(parents=True, exist_ok=True)
+            leftover.write_text("stale")
+            touched: list[str] = []
+            with (patch.object(store, "list_parts", side_effect=AssertionError("the sweep materialized every part")),
+                  patch.object(storage.slowlog_index, "remove_path", side_effect=touched.append)):
                 result = storage.cleanup(30)
             self.assertEqual((result["deleted_parts"], result["errors"]), (0, []))
+            self.assertEqual(touched, [parts[4]["path"]])  # archived and evicted parts are left alone
+            self.assertFalse(leftover.exists())  # apart from their stale body version file, as before
+            self.assertEqual(sorted(store.iter_part_paths()), sorted(part["path"] for part in parts if part is not parts[4]))
 
 
 class SharedTlsContextTests(unittest.TestCase):
