@@ -46,6 +46,7 @@ from .credentials import (
 )
 from .general_log_collector import GeneralLogCollector, GeneralLogConfig
 from .live_sessions import LiveSessions, LiveSessionsError
+from .mongo_sessions import MongoNodeBook, is_mongo
 from .session_collector import SessionCollector, load_config as load_session_retention
 from .session_service import SessionRequestError, SessionService
 from .session_store import SessionStore
@@ -376,19 +377,25 @@ class Application:
             return DasRpcClient(replace(base, db_instance_id=instance_id, endpoint=DAS_ENDPOINT), credential, timeout=20)
 
         self.live_sessions = LiveSessions(das_client)
-        # Session management: the page reads through live_sessions; the retention loop keeps abnormal sessions for a week.
-        self.session_store = SessionStore(self.data_dir / "session-history.sqlite3")
-        registered_nodes = lambda: [(item.config.instance_id, item.config.node_id) for item in self.slow_logs if item.config.node_id]  # noqa: E731
-        self.session_collector = SessionCollector(
-            self.live_sessions, self.session_store, config_loader=lambda: load_session_retention(self.data_dir), nodes=registered_nodes,
-            default_instances=lambda: [self.metadata.load_settings().db_instance_id],
-        )
-        self.sessions = SessionService(self.live_sessions, self.session_store, self.session_collector, nodes=registered_nodes,
-                                       roles=self.node_roles.lookup)
-        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
-            self.session_collector.start()
+        from .mongo_collector import DdsClient
         from .mongo_service import MongoService
         self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
+        # Members of the MongoDB instances configured for Mongo analytics (role id, role, VPC address), for session management.
+        self.mongo_nodes = MongoNodeBook(self.metadata.load_settings, credential_loader, lambda: self.mongo.entries, DdsClient)
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self.mongo_nodes.start()
+        # Session management: the page reads through live_sessions; the retention loop keeps abnormal sessions for a week.
+        self.session_store = SessionStore(self.data_dir / "session-history.sqlite3")
+        registered_nodes = lambda: [(item.config.instance_id, item.config.node_id) for item in self.slow_logs if item.config.node_id] + self.mongo_nodes.pairs()  # noqa: E731
+        node_roles = lambda instance: self.mongo_nodes.lookup(instance) if is_mongo(instance) else self.node_roles.lookup(instance)  # noqa: E731
+        self.session_collector = SessionCollector(
+            self.live_sessions, self.session_store, config_loader=lambda: load_session_retention(self.data_dir), nodes=registered_nodes,
+            default_instances=lambda: [self.metadata.load_settings().db_instance_id] + [item["instanceId"] for item in self.mongo.entries if item.get("enabled")],
+        )
+        self.sessions = SessionService(self.live_sessions, self.session_store, self.session_collector, nodes=registered_nodes,
+                                       roles=node_roles, mongo_instances=self.mongo_nodes.instances)
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self.session_collector.start()
         try:
             self.schema_diff = SchemaDiffService(name_resolver=self._rds_instance_name)
         except SchemaDiffError as exc:
@@ -760,6 +767,8 @@ class Application:
             self.node_roles.shutdown()
         if getattr(self, 'session_collector', None) is not None:
             self.session_collector.shutdown()
+        if getattr(self, 'mongo_nodes', None) is not None:
+            self.mongo_nodes.shutdown()
         if getattr(self, 'mongo', None) is not None:
             self.mongo.shutdown()
         for collector in self.general_logs:

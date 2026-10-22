@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.34.5-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.34.5-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.34.6-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.34.6-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -263,7 +263,7 @@
       <section id="view-sessions" class="view">
         <div class="query-panel">
           <div class="panel-heading">
-            <div><h2>会话管理</h2><p>对齐阿里云会话管理：实时读取 DAS 的会话快照，列出异常会话和统计。结束会话换成 KILL 语句，只生成、不执行。</p></div>
+            <div><h2>会话管理</h2><p>对齐阿里云会话管理：实时读取 DAS 的会话快照（RDS MySQL 与 MongoDB），列出异常会话和统计。结束会话换成 KILL / killOp 语句，只生成、不执行。</p></div>
             <div class="segmented" id="sessions-modes" aria-label="实时或历史">
               <button data-session-mode="live" class="is-active" type="button">实时</button>
               <button data-session-mode="history" type="button" title="服务后台每分钟留存的异常会话，事后还能看到当时谁持锁">历史（留存）</button>
@@ -277,8 +277,8 @@
             <label class="field span-2" data-session-history-only hidden><span>结束时间</span><input id="sessions-end" type="datetime-local" step="1"></label>
             <details class="filter-disclosure span-8" data-session-live-only><summary>异常判定阈值（默认同阿里云）</summary><div class="query-grid">
               <label class="field"><span>语句运行超过（秒）</span><input id="sessions-blocking" type="number" min="1" max="86400" step="1" placeholder="30" title="运行中的语句超过这么久算异常（含在等元数据锁的）"></label>
-              <label class="field"><span>事务持续超过（秒）</span><input id="sessions-trx" type="number" min="1" max="86400" step="1" placeholder="30" title="会话里的事务持续超过这么久算异常"></label>
-              <label class="field"><span>事务空闲超过（秒）</span><input id="sessions-idle" type="number" min="1" max="86400" step="1" placeholder="10" title="事务开启后超过这么久没再执行语句算异常，可能漏了 COMMIT"></label>
+              <label class="field" data-session-mysql-only><span>事务持续超过（秒）</span><input id="sessions-trx" type="number" min="1" max="86400" step="1" placeholder="30" title="会话里的事务持续超过这么久算异常"></label>
+              <label class="field" data-session-mysql-only><span>事务空闲超过（秒）</span><input id="sessions-idle" type="number" min="1" max="86400" step="1" placeholder="10" title="事务开启后超过这么久没再执行语句算异常，可能漏了 COMMIT"></label>
             </div></details>
             <div class="form-actions span-2"><button id="sessions-refresh" class="button primary" type="submit">刷新</button></div>
           </form>
@@ -518,11 +518,11 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.34.5-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.34.5-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.34.5-rawoss" defer></script>
-  <script src="/assets/sessions.js?v=1.34.5-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.34.5-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.34.5-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.34.6-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.34.6-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.34.6-rawoss" defer></script>
+  <script src="/assets/sessions.js?v=1.34.6-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.34.6-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.34.6-rawoss" defer></script>
 </body>
 </html>

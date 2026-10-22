@@ -8,7 +8,7 @@ Nothing here is a second implementation of reading DAS: it shares the reader's c
 never runs against a node the service does not collect slow logs for, backs off when DAS refuses (a throttled or denied node
 is retried after 2x, 4x ... up to 10 minutes), says why in the log on the first failure of a streak, and is switched off by
 ``data/session-retention.json`` (``{"enabled": false}``) without a restart. Without that file it is on for the primary
-instance, every 60 seconds, for 7 days.
+instance and the configured MongoDB instances (each member, read with ``GetMongoDBCurrentOp``), every 60 seconds, for 7 days.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from .live_sessions import LiveSessions, LiveSessionsError
 from .session_store import SessionStore
+from .mongo_sessions import build_mongo_session_view, is_mongo
 from .session_view import build_session_view
 
 LOGGER = logging.getLogger(__name__)
@@ -85,7 +86,8 @@ class SessionCollector:
             if now < state["next_us"]:
                 return False
         try:
-            view = self.live.view(instance, node, lambda data, now_us: build_session_view(data, now_us))
+            build = build_mongo_session_view if is_mongo(instance) else build_session_view
+            view = self.live.view(instance, node, lambda data, now_us: build(data, now_us))
             written = self.store.record(instance, node, view)
         except LiveSessionsError as exc:
             self._failed(key, state, exc.code, str(exc), config)

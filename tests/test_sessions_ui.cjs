@@ -28,7 +28,7 @@ function context({status = null, api = async () => ({})} = {}) {
 const SNAP = 1_790_000_000_000_000;
 const row = (id, extra = {}) => ({session_id: id, user: 'app', client: '10.0.0.1', database: 'shop', command: 'Sleep', state: '', seconds: 0, trx_id: '', trx_seconds: 0,
   sql: '', sql_chars: 0, active: false, running: false, waiting: false, kinds: [], protected: '', holder: false, ...extra});
-const node = (id, role, sessions, extra = {}) => ({node_id: id, role, zone: 'cn-chengdu-b', status: 'ok', cached: false, observed_at_us: SNAP, instance_id: 'rm-x',
+const node = (id, role, sessions, extra = {}) => ({node_id: id, role, zone: 'cn-example-b', status: 'ok', cached: false, observed_at_us: SNAP, instance_id: 'rm-x',
   thresholds: {blocking_s: 30, trx_s: 30, idle_trx_s: 10}, truncated: false,
   overview: {total: 1170, listed_total: sessions.length, active: sessions.filter((r) => r.active).length, running: sessions.filter((r) => r.running).length,
     max_active_seconds: Math.max(0, ...sessions.filter((r) => r.running).map((r) => r.seconds)), abnormal: sessions.filter((r) => r.kinds.length).length,
@@ -63,7 +63,7 @@ test('the page is wired: nav item, view, assets, no inline script or style', () 
 test('the summary adds the nodes up and names each abnormal kind; a failed node says why and does not hide the others', () => {
   const {run, c} = context();
   const data = payload();
-  data.nodes.push({node_id: 'rn-third0000000003', role: 'secondary', zone: 'cn-chengdu-a', status: 'error', code: 'DAS_THROTTLED', message: 'Throttling.User'});
+  data.nodes.push({node_id: 'rn-third0000000003', role: 'secondary', zone: 'cn-example-a', status: 'error', code: 'DAS_THROTTLED', message: 'Throttling.User'});
   data.partial = true;
   c.data = data;
   const out = run('sessionSummaryHtml(data)');
@@ -239,7 +239,7 @@ test('a refresh that moves a picked session out of the list drops the pick', () 
 test('KILL statements: one request for every node with what the page showed, each node\'s snapshot time and waiters, and the mode; one text, escaped, copied, regenerated per mode', async () => {
   const written = (url, options) => {
     const body = JSON.parse(options.body);
-    const nodes = body.nodes.map((n) => ({node_id: n.node_id, role: n.node_id.startsWith('rn-primary') ? 'primary' : 'secondary', zone: 'cn-chengdu-b',
+    const nodes = body.nodes.map((n) => ({node_id: n.node_id, role: n.node_id.startsWith('rn-primary') ? 'primary' : 'secondary', zone: 'cn-example-b',
       hint: n.node_id.startsWith('rn-primary') ? 'FORCE_MASTER' : '', snapshot_us: n.snapshot_us, session_ids: n.sessions.map((s) => s.session_id),
       statements: n.sessions.map((s) => `KILL ${s.session_id};`), skipped: []}));
     const statements = nodes.flatMap((n) => n.statements);
@@ -334,7 +334,7 @@ test('history: coverage per node with a warning for a thin one, rows with their 
   const {run, c} = context();
   const hour = 3600 * 1_000_000;
   const data = {instance_id: 'rm-x', start_us: SNAP, end_us: SNAP + hour, truncated: true,
-    retention: {interval_seconds: 60, nodes: []}, nodes: [{node_id: 'rn-primary00000001', role: 'primary', zone: 'cn-chengdu-a'}, {node_id: 'rn-secondary0000b', role: 'secondary', zone: 'cn-chengdu-b'}],
+    retention: {interval_seconds: 60, nodes: []}, nodes: [{node_id: 'rn-primary00000001', role: 'primary', zone: 'cn-example-a'}, {node_id: 'rn-secondary0000b', role: 'secondary', zone: 'cn-example-b'}],
     coverage: [{node_id: 'rn-primary00000001', snapshots: 59, first_us: SNAP, last_us: SNAP + hour, most_abnormal: 3}, {node_id: 'rn-secondary0000b', snapshots: 10, first_us: SNAP, last_us: SNAP + 600_000_000, most_abnormal: 1}],
     sessions: [{node_id: 'rn-secondary0000b', session_id: 312, first_us: SNAP + 60_000_000, last_us: SNAP + 3_600_000_000, seen: 60, user: 'app', client: '10.0.0.1', database: 'shop',
       command: 'Sleep', state: '', max_seconds: 3600, max_trx_seconds: 3700, kinds: ['long_trx', 'idle_trx'], holder: true, holder_basis: 'transaction', sql: ''}]};
@@ -378,10 +378,10 @@ test('the retention strip says on, off, or failing, and what to do', () => {
 
 test('the instance and node lists come from the collected nodes, primary first, defaulting to the primary instance', () => {
   const status = {primaryInstance: {instanceId: 'rm-prod'}, slowLogs: [
-    {instanceId: 'rm-test', nodeId: 'rn-t1', label: 'demo-test', role: 'primary', zone: 'cn-chengdu-a'},
-    {instanceId: 'rm-prod', nodeId: 'rn-b', label: 'demo-main', role: 'secondary', zone: 'cn-chengdu-b'},
-    {instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary', zone: 'cn-chengdu-a'},
-    {instanceId: 'rm-prod', nodeId: 'rn-b', label: 'demo-main', role: 'secondary', zone: 'cn-chengdu-b'},
+    {instanceId: 'rm-test', nodeId: 'rn-t1', label: 'demo-test', role: 'primary', zone: 'cn-example-a'},
+    {instanceId: 'rm-prod', nodeId: 'rn-b', label: 'demo-main', role: 'secondary', zone: 'cn-example-b'},
+    {instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary', zone: 'cn-example-a'},
+    {instanceId: 'rm-prod', nodeId: 'rn-b', label: 'demo-main', role: 'secondary', zone: 'cn-example-b'},
     {instanceId: 'rm-prod', nodeId: '', label: 'demo-main'}]};
   const {run, nodes} = context({status});
   nodes['#sessions-instance'] = {innerHTML: '', value: '', options: []};
@@ -407,7 +407,7 @@ test('the request carries the instance, the node and only the thresholds that we
   assert.match(nodes['#sessions-summary'].innerHTML, /异常会话/);
   assert.match(nodes['#sessions-meta'].textContent, /快照时间/);
   nodes['#sessions-instance'].value = '';
-  assert.throws(() => run('sessionsQueryString()'), /请先选择一个 RDS 实例/);
+  assert.throws(() => run('sessionsQueryString()'), /请先选择一个实例/);
 });
 
 test('delegated clicks: tabs, stats rows, SQL expand and the mode switch work from data attributes', () => {
@@ -433,9 +433,9 @@ test('delegated clicks: tabs, stats rows, SQL expand and the mode switch work fr
 
 test('opened before the first status answer: the lists fill and the first read happens when it arrives; later polls leave the dropdowns and the data alone', async () => {
   const status = {primaryInstance: {instanceId: 'rm-prod'}, slowLogs: [
-    {instanceId: 'rm-test', nodeId: 'rn-t1', label: 'demo-test', role: 'primary', zone: 'cn-chengdu-a'},
-    {instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary', zone: 'cn-chengdu-a'},
-    {instanceId: 'rm-prod', nodeId: 'rn-b', label: 'demo-main', role: 'secondary', zone: 'cn-chengdu-b'}]};
+    {instanceId: 'rm-test', nodeId: 'rn-t1', label: 'demo-test', role: 'primary', zone: 'cn-example-a'},
+    {instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary', zone: 'cn-example-a'},
+    {instanceId: 'rm-prod', nodeId: 'rn-b', label: 'demo-main', role: 'secondary', zone: 'cn-example-b'}]};
   const retention = {enabled: true, interval_seconds: 60, retention_days: 7, nodes: [], store: {}};
   const {run, nodes, calls} = context({api: async (url) => (url.startsWith('/api/sessions?') ? payload() : retention)});
   nodes['#sessions-instance'] = {innerHTML: '', value: '', options: []};
@@ -471,7 +471,7 @@ test('opened before the first status answer: the lists fill and the first read h
   assert.equal(reads().length, 1);                                              // and it does not read again
 
   nodes['#sessions-node'].value = 'rn-t1';                                      // a node is added: that list is rewritten and the picked node stays picked
-  status.slowLogs.push({instanceId: 'rm-test', nodeId: 'rn-t2', label: 'demo-test', role: 'secondary', zone: 'cn-chengdu-b'});
+  status.slowLogs.push({instanceId: 'rm-test', nodeId: 'rn-t2', label: 'demo-test', role: 'secondary', zone: 'cn-example-b'});
   run(`state.status = ${JSON.stringify(status)}; onSessionsStatus()`);
   assert.match(nodes['#sessions-node'].innerHTML, /rn-t1[^]*rn-t2/);
   assert.equal(nodes['#sessions-node'].value, 'rn-t1');
@@ -485,7 +485,7 @@ test('opened before the first status answer: the lists fill and the first read h
 });
 
 test('status answered while another page is open: the lists are ready and the first visit reads once; the history mode never auto-reads', async () => {
-  const status = {primaryInstance: {instanceId: 'rm-prod'}, slowLogs: [{instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary', zone: 'cn-chengdu-a'}]};
+  const status = {primaryInstance: {instanceId: 'rm-prod'}, slowLogs: [{instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary', zone: 'cn-example-a'}]};
   const retention = {enabled: true, interval_seconds: 60, retention_days: 7, nodes: [], store: {}};
   const make = () => {
     const made = context({api: async (url) => (url.startsWith('/api/sessions?') ? payload() : retention)});
@@ -514,4 +514,95 @@ test('status answered while another page is open: the lists are ready and the fi
   history.run(`state.status = ${JSON.stringify(status)}; onSessionsStatus()`);
   await settle();
   assert.equal(history.reads().length, 0);
+});
+
+/* ---------------------------- MongoDB ---------------------------- */
+
+const MONGO = 'dds-example0000000';
+const HOST1 = 'dds-example00000001.mongodb.cn-example.rds.aliyuncs.com';
+const mongoRow = (opid, extra = {}) => row(opid, {connection: `conn${Math.abs(opid)}`, command_name: 'aggregate', user: 'mongo-go-driver@2.4.0', client: '10.0.0.2',
+  database: 'appdb.orders_70', command: 'command', state: 'IXSCAN { shop_id: 1 }', sql: '{"aggregate": "orders_70"}', ...extra});
+const mongoPayload = () => ({instance_id: MONGO, engine: 'mongo', thresholds: {blocking_s: 30}, partial: false, generated_us: SNAP, nodes: [
+  {...node('100000001', 'primary', [mongoRow(503368306, {seconds: 45, active: true, running: true, kinds: ['long_running']}), mongoRow(7, {active: true, running: true})]), host: HOST1, instance_id: MONGO},
+  {...node('100000003', 'hidden', [row(0, {session_id: null, user: '', command: '', protected: '没有 opid'})]), host: '', instance_id: MONGO}]});
+const mongoStatus = {enabled: true, interval_seconds: 60, retention_days: 7, nodes: [], store: {}, mongo: [{instance_id: MONGO, label: 'demo-mongo', nodes: [
+  {node_id: '100000001', role: 'primary', zone: 'cn-example-a', host: HOST1}, {node_id: '100000002', role: 'secondary', zone: 'cn-example-a', host: 'h2'},
+  {node_id: '100000003', role: 'hidden', zone: 'cn-example-a', host: ''}]}]};
+
+test('MongoDB instances join the list from the retention status, members primary first, and the transaction thresholds are hidden for them', async () => {
+  const status = {primaryInstance: {instanceId: 'rm-prod'}, slowLogs: [{instanceId: 'rm-prod', nodeId: 'rn-p', label: 'demo-main', role: 'primary'}]};
+  const {run, nodes, lists} = context({status, api: async () => mongoStatus});
+  nodes['#sessions-instance'] = {innerHTML: '', value: '', options: []};
+  nodes['#sessions-node'] = {innerHTML: '', value: ''};
+  const trx = {hidden: false}, idle = {hidden: false};
+  lists['[data-session-mysql-only]'] = [trx, idle];
+  await run('refreshSessionsRetention()');
+  assert.match(nodes['#sessions-instance'].innerHTML, /<option value="dds-example0000000">demo-mongo（MongoDB）<\/option>/);
+  assert.equal(nodes['#sessions-instance'].value, 'rm-prod');                              // the RDS primary instance stays the default
+  assert.equal(trx.hidden, false);
+  nodes['#sessions-instance'].value = MONGO;
+  run('syncSessionControls()');
+  const options = [...nodes['#sessions-node'].innerHTML.matchAll(/<option value="([^"]*)">([^<]*)<\/option>/g)].map((m) => [m[1], m[2]]);
+  assert.deepEqual(options, [['', '全部节点'], ['100000001', '主节点 · 可用区 A · 100000001'], ['100000002', '备节点 · 可用区 A · 100000002'],
+    ['100000003', '隐藏节点 · 可用区 A · 100000003']]);
+  assert.deepEqual([trx.hidden, idle.hidden], [true, true]);
+});
+
+test('a MongoDB snapshot reads with operation labels, only the blocking threshold, and opid with its connection', async () => {
+  const {run, nodes, calls} = context({api: async () => mongoPayload()});
+  nodes['#sessions-instance'] = {value: MONGO};
+  nodes['#sessions-node'] = {value: ''};
+  nodes['#sessions-blocking'] = {value: '20'};
+  nodes['#sessions-trx'] = {value: '9'};
+  await run('loadSessions()');
+  const params = new URL(calls[0][0], 'http://x').searchParams;
+  assert.deepEqual([params.get('instance'), params.get('blockingSeconds'), params.get('trxSeconds')], [MONGO, '20', null]);
+  assert.match(nodes['#sessions-summary'].innerHTML, /异常操作/);
+  assert.match(nodes['#sessions-summary'].innerHTML, /隐藏节点/);
+  assert.match(nodes['#sessions-stats'].innerHTML, /按驱动[^]*按集合/);
+  run('sessionsState.tab = "all"; renderSessionsList()');
+  const list = nodes['#sessions-list'].innerHTML;
+  assert.match(list, /<th>opid<\/th><th>驱动<\/th><th>来源<\/th><th>集合<\/th><th>操作 \/ 计划<\/th><th>执行时间<\/th><th>异常原因<\/th><th>命令<\/th>/);
+  assert.doesNotMatch(list, /事务时长/);
+  assert.match(list, /<td>503368306<br><span class="muted">conn503368306<\/span><\/td>/);
+  assert.match(list, /操作运行过久/);
+  assert.match(list, /生成 killOp 语句/);
+  assert.match(list, /disabled title="没有 opid：不生成 killOp 语句"/);
+});
+
+test('MongoDB killOp: the request carries connection and command name; one block per member with its own connect line and copy button', async () => {
+  const answer = {engine: 'mongo', mode: 'killop', kills: 1, generated_us: SNAP, text: 'all', checks: [], statements: [], session_ids: [503368306],
+    skipped: [{node_id: '100000001', session_id: 7, reason: '驱动探活 / 认证'}],
+    nodes: [{node_id: '100000001', role: 'primary', zone: 'cn-example-a', host: HOST1, connect: `mongosh "mongodb://${HOST1}:3717/admin?directConnection=true" -u <账号> -p`,
+      text: 'db.getSiblingDB("admin").aggregate([])\n[[503368306, "conn503368306"]].forEach(<x>)\n', snapshot_us: SNAP, session_ids: [503368306], statements: ['k'], checks: ['c'], skipped: []}]};
+  const {run, c, calls, nodes} = context({api: async () => answer});
+  c.data = mongoPayload();
+  run('sessionsState.data = data; sessionsState.tab = "all"; sessionsState.selected = new Set(["100000001:503368306", "100000001:7"])');
+  await run('generateSessionKill()');
+  const body = JSON.parse(calls[0][1].body);
+  assert.equal(body.instance, MONGO);
+  const sent = body.nodes[0].sessions.find((s) => s.session_id === 503368306);
+  assert.equal(sent.connection, 'conn503368306');
+  assert.equal(sent.command_name, 'aggregate');
+  assert.equal(nodes['#detail-title'].textContent, 'killOp 语句（MongoDB）');
+  const html = nodes['#detail-body'].innerHTML;
+  assert.match(html, /直连该成员/);
+  assert.doesNotMatch(html, /data-session-killmode/);                                    // one mode only: killOp
+  assert.match(html, /mongosh &quot;mongodb:\/\/dds-example00000001\.mongodb/);
+  assert.match(html, /forEach\(&lt;x&gt;\)/);
+  assert.equal(html.match(/data-session-copy="0"/g).length, 1);
+  assert.match(html, /跳过 1 个：7（驱动探活 \/ 认证）/);
+  let copied = '';
+  c.navigator = {clipboard: {writeText: async (text) => { copied = text; }}};
+  run('copySessionKill("0")');
+  assert.equal(copied, answer.nodes[0].text);
+});
+
+test('MongoDB CSV export uses operation columns', () => {
+  const {run, c, downloads} = context();
+  c.data = mongoPayload();
+  run('sessionsState.data = data; exportActiveSessions()');
+  const text = downloads[0].parts[1];
+  assert.match(text, /^成员,角色,opid,连接,驱动,来源,集合,操作,执行计划,执行秒,异常原因,命令/);
+  assert.match(text, /100000001,主节点,503368306,conn503368306,mongo-go-driver@2\.4\.0/);
 });

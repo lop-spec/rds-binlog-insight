@@ -25,16 +25,16 @@ on:
         default: false
   push:
     tags:
-      - v1.34.5-rawoss
+      - v1.34.6-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.34.5-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.34.5-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.34.5-rawoss
+  VERSION: 1.34.6-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.34.6-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.34.6-rawoss
 
 jobs:
   recovery-isolation:
@@ -224,6 +224,7 @@ jobs:
             tests.test_session_collector \
             tests.test_session_service \
             tests.test_live_sessions \
+            tests.test_mongo_sessions \
             tests.test_node_roles \
             tests.test_window_align \
             tests.test_server_roles_and_windows \

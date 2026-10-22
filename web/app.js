@@ -1162,7 +1162,7 @@ function syncInstanceOptions(instances, labels = new Map()) {
 
 // 节点的数据库角色（主 / 备）取自云上实例的节点信息，是「当前」角色；还没取到时标「角色未知」。
 function nodeRoleText(role) {
-  return role === "primary" ? "主节点" : role === "secondary" ? "备节点" : role || "角色未知";
+  return role === "primary" ? "主节点" : role === "secondary" ? "备节点" : role === "hidden" ? "隐藏节点" : role || "角色未知";
 }
 
 function nodeZoneText(zone) {

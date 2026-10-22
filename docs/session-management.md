@@ -59,13 +59,43 @@
 - 测试实例的代理地址不认 `FORCE_NODE`（两个节点 ID 都报 `force hint server node is not found`，原因不明），但认 `FORCE_SLAVE` / `FORCE_MASTER`；该实例只有一个备节点，可把备节点语句的 Hint 换成 `FORCE_SLAVE`。生产实例上试过的两个备节点没有这个问题。
 - 备选：阿里云 RDS 控制台「自治服务 → 一键诊断 → 会话管理」可以直接结束会话。
 
+## MongoDB（1.34.6 起）
+
+`mongo-instances.json` 里启用的 MongoDB 实例（`dds-…`）出现在同一个实例下拉框里，标「（MongoDB）」。页面、统计、列表、勾选、导出、留存和历史都是同一套，只是数据源、列和结束语句不同。
+
+**成员**：后台线程每 5 分钟用 DDS 只读接口 `DescribeRoleZoneInfo`（角色 ID、主 / 备 / 隐藏、可用区）和 `DescribeReplicaSetRole`（每个角色 ID 的 VPC 地址）刷新，查到之前下拉框里没有这个实例；成员列表经 `GET /api/sessions/status` 的 `mongo` 字段给页面。隐藏节点没有连接地址。
+
+**读取**：每个成员一次同步的 DAS `GetMongoDBCurrentOp`（`InstanceId` + `NodeId`=角色 ID，不带过滤条件，与 DAS 控制台一致：在跑的操作和后台线程，不含空闲连接）。2026-10-22 实测：`NodeId` 写一个不存在的号时接口**不报错、直接返回主节点的操作**，所以服务只发成员表里的角色 ID（其他一律 400 `SESSIONS_UNKNOWN_NODE`）；隐藏节点的角色 ID 可用。缓存、并发、失败码与 RDS 共用。
+
+**一行是一个操作**，按 RDS 行的字段放，页面换了列名：
+
+| 列 | 来源 |
+|---|---|
+| opid（下面一行是连接号 `connNNN`） | `OpId`（32 位整数，可能为负）、`Desc` |
+| 驱动 | `Driver`（DAS 不给 MongoDB 的用户名） |
+| 来源 | `Client` 的 IP（端口不参与统计） |
+| 集合 | `Ns` |
+| 操作 / 计划 | `Op`、`PlanSummary` |
+| 命令 | `Command`，去掉 `lsid`、`$clusterTime`、`$db`、`txnNumber` 等噪声字段；过长时是 DAS 截断后的文本 |
+
+异常只有一类「操作运行过久」：`Active` 且 `SecsRunning` 超过「语句运行超过」阈值（默认 30 秒）。DAS 对 MongoDB 不返回等锁、事务字段，所以没有等待锁 / 事务两类、没有疑似持锁，两个事务阈值输入框在选 MongoDB 时隐藏。「运行中」=`Active`。
+
+**受保护（不生成语句）**：没有 opid；`Desc` 不是 `connNNN`（`TTLMonitor` 等内部线程）；集合在 `local.`（oplog 读取）或驱动是 `NetworkInterfaceTL` / `MongoDB Internal Client`（副本集内部连接）；`hello` / `isMaster` / `ping` / 认证命令（驱动探活，长轮询的 `hello` 也不算异常）。
+
+**killOp 语句**：opid 是每个成员各自的计数器，同一个数在别的成员上是别人的操作，所以每个成员单独一段，用 mongosh **直连该成员**（`mongosh "mongodb://<成员 VPC 地址>:3717/admin?directConnection=true" -u <账号> -p`，页面写在每段上方，有单独的复制按钮）：
+
+1. 核对：`db.getSiblingDB("admin").aggregate([{$currentOp: {allUsers: true}}, {$match: {opid: {$in: […]}}}, {$project: …}])`，看 opid、连接号、集合、已运行秒数对得上；
+2. 结束：`[[opid, "connNNN"], …].forEach(…)`，每个 opid 在本成员的 `$currentOp` 里按 **opid + 连接号**重新找到才 `killOp`，找不到（连错成员、操作已结束号被复用）只打印「未执行」。
+
+文本里只有整数 opid 和匹配 `connNNN` 的连接号，客户端发来的内容进不了代码。killOp 只结束操作、连接保留，没有 KILL / KILL QUERY 两种模式；执行账号要有 `killop` 权限（只读账号不行）。隐藏节点没有地址，不生成，提示到 DAS 控制台的会话管理里结束。
+
 ## 留存
 
-后台线程 `session-retention`，随服务启动，默认开启：**每 60 秒、每个节点读一次**（一个节点每 `interval / 节点数` 秒轮到，至少间隔 5 秒），只留主实例的节点，异常会话和疑似持锁会话存 7 天。它和页面共用同一个读取器（`LiveSessions`），所以共用 10 秒缓存和「同时最多读两个节点」的限制；读的是已登记采集慢日志的节点，不会对别的实例用云身份。
+后台线程 `session-retention`，随服务启动，默认开启（MongoDB 实例的每个成员同样每分钟读一次、存「操作运行过久」的操作）：**每 60 秒、每个节点读一次**（一个节点每 `interval / 节点数` 秒轮到，至少间隔 5 秒），只留主实例的节点，异常会话和疑似持锁会话存 7 天。它和页面共用同一个读取器（`LiveSessions`），所以共用 10 秒缓存和「同时最多读两个节点」的限制；读的是已登记采集慢日志的节点，不会对别的实例用云身份。
 
 - **存什么**：`data/session-history.sqlite3`（WAL）。`snapshot` 每次读一行（会话总数、运行中、活跃、异常数、最长运行、等锁数）；`abnormal` 每个异常会话一行，跨快照合并——同实例、节点、会话号、用户、来源，且距上次看到不超过 5 分钟，就更新 `last_us` / 最大值 / 原因并集 / 最新状态和 SQL，一个异常一小时的会话是一行而不是六十行。普通会话只计数、不存。
 - **清理**：每小时删 `last_us`（快照 `ts_us`）早于保留天数的行。
-- **开关与参数**：`data/session-retention.json`，每个周期重读，不用重启——`{"enabled": false}` 关掉；`intervalSeconds`（30–3600，默认 60）、`retentionDays`（1–60，默认 7）、`instances`（实例 ID 数组，空表示主实例）。文件没有就用默认值；文件写错时按默认值运行并写 WARNING。
+- **开关与参数**：`data/session-retention.json`，每个周期重读，不用重启——`{"enabled": false}` 关掉；`intervalSeconds`（30–3600，默认 60）、`retentionDays`（1–60，默认 7）、`instances`（实例 ID 数组，空表示主实例加已启用的 MongoDB 实例）。文件没有就用默认值；文件写错时按默认值运行并写 WARNING。
 - **失败**：DAS 拒绝（限流、没权限、超时）时这个节点按 2×、4× … 最多 10 分钟退避重试，一段失败只在第一次写一条 WARNING（带错误码），恢复时写一条 INFO；别的节点不受影响，页面顶部的留存条显示「N / M 个节点最近读取失败（原因）」。`GET /api/sessions/status` 给开关、参数、每个节点最近一次成功时间、连续失败数和存储规模。
 - **成本**：阿里云「会话管理」（实时看会话、结束会话、SQL 限流等）属 DAS 基础服务，文档没有按调用次数收费的条目；本功能只调只读的 `GetMySQLAllSessionAsync`，不用收费的「会话管理与分析」（实时事务、锁等待、全量锁分析，运维服务）。6 个节点每分钟一次约 1.7 万次读取 / 天。本机成本是 yy-ecs 上每天几十 KB 到几 MB 的 SQLite。
 
@@ -90,4 +120,4 @@
 
 ## 验证
 
-`python -m unittest tests.test_session_view tests.test_session_store tests.test_session_collector tests.test_session_service tests.test_live_sessions tests.test_server_roles_and_windows -q`；`node --test tests/test_sessions_ui.cjs tests/test_workspace.cjs`。用线上节点的真实 DAS 快照回放过判定（事务字段只在有事务的会话上出现、`TrxId` 为 `"0"` 的 Sleep 不算事务、`Binlog Dump GTID` 被保护、运行中会话数与接口的 `ActiveSessionCount` 一致）。
+`python -m unittest tests.test_session_view tests.test_session_store tests.test_session_collector tests.test_session_service tests.test_live_sessions tests.test_mongo_sessions tests.test_server_roles_and_windows -q`；`node --test tests/test_sessions_ui.cjs tests/test_workspace.cjs`。用线上节点的真实 DAS 快照回放过判定（事务字段只在有事务的会话上出现、`TrxId` 为 `"0"` 的 Sleep 不算事务、`Binlog Dump GTID` 被保护、运行中会话数与接口的 `ActiveSessionCount` 一致）。

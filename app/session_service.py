@@ -1,7 +1,9 @@
 """What the session management endpoints do, kept out of the HTTP handler so it can be tested without a server.
 
-Only nodes whose slow log this service collects can be asked about (the same rule as the running-statements view): the
-service must never spend its cloud identity on an arbitrary instance a caller names.
+Only nodes whose slow log this service collects can be asked about (the same rule as the running-statements view), and the
+members of the MongoDB instances configured for Mongo analytics: the service must never spend its cloud identity on an
+arbitrary instance a caller names. A ``dds-…`` instance is MongoDB (``mongo_sessions``): same page, retention and history,
+its own view and its own text.
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from .live_sessions import LiveSessions, LiveSessionsError
+from .mongo_sessions import build_mongo_kill_statements, build_mongo_session_view, combine_mongo_kill_statements, is_mongo
 from .session_collector import SessionCollector
 from .session_store import SessionStore
 from .session_view import build_kill_statements, build_session_view, combine_kill_statements
@@ -19,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 
 MAX_HISTORY_DAYS = 31
 MAX_PARALLEL_NODES = 3
-ROLE_ORDER = {"primary": 0, "secondary": 1}
+ROLE_ORDER = {"primary": 0, "secondary": 1, "hidden": 2}
 
 
 class SessionRequestError(ValueError):
@@ -31,9 +34,10 @@ class SessionRequestError(ValueError):
 class SessionService:
     def __init__(self, live: LiveSessions, store: SessionStore, collector: SessionCollector, *,
                  nodes: Callable[[], list[tuple[str, str]]], roles: Callable[[str], dict[str, dict[str, str]]],
+                 mongo_instances: Callable[[], list[dict[str, Any]]] = lambda: [],
                  wall_us: Callable[[], int] = lambda: time.time_ns() // 1000) -> None:
         self.live, self.store, self.collector = live, store, collector
-        self._nodes, self._roles, self._wall_us = nodes, roles, wall_us
+        self._nodes, self._roles, self._mongo_instances, self._wall_us = nodes, roles, mongo_instances, wall_us
 
     # -- which nodes may be asked ---------------------------------------------
     def _known(self, instance: str) -> list[str]:
@@ -45,7 +49,10 @@ class SessionService:
         except Exception:  # noqa: BLE001 - a label, never a reason to fail
             LOGGER.warning("session management: node roles unavailable for %s", instance, exc_info=True)
             known = {}
-        return {"role": known.get("role", ""), "zone": known.get("zone", "")}
+        label = {"role": known.get("role", ""), "zone": known.get("zone", "")}
+        if is_mongo(instance):
+            label["host"] = known.get("host", "")
+        return label
 
     def _resolve(self, instance: str, node_id: str) -> list[str]:
         known = self._known(instance)
@@ -61,7 +68,9 @@ class SessionService:
     def overview(self, instance: str, node_id: str, thresholds: dict[str, int]) -> dict[str, Any]:
         """Every wanted node's session view, read in parallel (the reader still lets only two reads run at once)."""
         nodes = self._resolve(instance, node_id)
-        build = lambda data, now_us: build_session_view(data, now_us, thresholds)  # noqa: E731
+        engine = "mongo" if is_mongo(instance) else "mysql"
+        builder = build_mongo_session_view if engine == "mongo" else build_session_view
+        build = lambda data, now_us: builder(data, now_us, thresholds)  # noqa: E731
 
         def one(node: str) -> dict[str, Any]:
             label = {"node_id": node, **self._role(instance, node)}
@@ -72,7 +81,7 @@ class SessionService:
 
         with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_NODES, len(nodes))) as pool:
             results = list(pool.map(one, nodes))
-        return {"instance_id": instance, "thresholds": dict(thresholds), "nodes": results,
+        return {"instance_id": instance, "engine": engine, "thresholds": dict(thresholds), "nodes": results,
                 "partial": any(item["status"] != "ok" for item in results), "generated_us": self._wall_us()}
 
     def history(self, instance: str, node_id: str, start_us: int, end_us: int, limit: int) -> dict[str, Any]:
@@ -86,7 +95,13 @@ class SessionService:
         return result
 
     def status(self) -> dict[str, Any]:
-        return self.collector.status()
+        """The retention state, plus the MongoDB instances and members the page may pick (RDS ones come from /api/status)."""
+        try:
+            mongo = self._mongo_instances()
+        except Exception:  # noqa: BLE001 - the RDS part of the page must not depend on it
+            LOGGER.warning("session management: MongoDB members unavailable", exc_info=True)
+            mongo = []
+        return {**self.collector.status(), "mongo": mongo}
 
     # -- ending sessions is a text -------------------------------------------
     def kill_statements(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -99,6 +114,7 @@ class SessionService:
         if not isinstance(nodes, list) or not nodes or not all(isinstance(item, dict) for item in nodes):
             raise ValueError("nodes 必须是非空的节点数组")
         known, generated_us = self._known(instance), self._wall_us()
+        mongo = is_mongo(instance)
         parts: list[dict[str, Any]] = []
         for item in nodes:
             node = str(item.get("node_id") or "").strip()
@@ -112,10 +128,18 @@ class SessionService:
             snapshot_us = item.get("snapshot_us")
             if isinstance(snapshot_us, bool) or not isinstance(snapshot_us, int) or snapshot_us <= 0:
                 raise ValueError("snapshot_us 必须是快照时间（微秒）")
+            if mongo:
+                parts.append(build_mongo_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, snapshot_us=snapshot_us,
+                                                         generated_us=generated_us))
+                continue
             parts.append(build_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, mode=mode, snapshot_us=snapshot_us,
                                                generated_us=generated_us, lock_waiters=item.get("lock_waiters", 0)))
-        parts.sort(key=lambda part: (ROLE_ORDER.get(part["role"], 2), part["node_id"]))
-        result = combine_kill_statements(parts, mode=mode, generated_us=generated_us)
+        parts.sort(key=lambda part: (ROLE_ORDER.get(part["role"], 3), part["node_id"]))
+        if mongo:
+            mode = "killop"
+            result = combine_mongo_kill_statements(parts, generated_us=generated_us)
+        else:
+            result = combine_kill_statements(parts, mode=mode, generated_us=generated_us)
         LOGGER.info("session management: kill statements written instance=%s nodes=%s mode=%s sessions=%d skipped=%d (nothing was executed)",
-                    instance, ",".join(part["node_id"] for part in parts), mode, len(result["statements"]), len(result["skipped"]))
+                    instance, ",".join(part["node_id"] for part in parts), mode, len(result["session_ids"]), len(result["skipped"]))
         return result

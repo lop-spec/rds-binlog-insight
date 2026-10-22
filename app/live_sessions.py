@@ -1,4 +1,4 @@
-"""Sessions of one RDS node as they are right now, read from DAS ``GetMySQLAllSessionAsync``.
+"""Sessions of one RDS node as they are right now, read from DAS ``GetMySQLAllSessionAsync`` (a MongoDB member: ``GetMongoDBCurrentOp``).
 
 Slow-log records appear only after a statement finishes, so a query that is still holding the node cannot be seen in them.
 This asks DAS for the node's session list when a person clicks (or when the session retention loop is due), and keeps
@@ -16,6 +16,7 @@ from typing import Any, Callable
 LOGGER = logging.getLogger(__name__)
 
 ACTION = "GetMySQLAllSessionAsync"
+MONGO_ACTION = "GetMongoDBCurrentOp"
 POLL_SECONDS = 1.5
 DEADLINE_SECONDS = 25.0
 CACHE_SECONDS = 10.0
@@ -140,6 +141,19 @@ class LiveSessions:
             client = self._client_factory(instance_id)
         except Exception as exc:  # noqa: BLE001 - e.g. no credential: reported, not swallowed
             raise self._fail(instance_id, node_id, exc) from exc
+        if instance_id.startswith("dds-"):
+            # MongoDB: one synchronous call per member. Only role ids from the node book reach here: DAS answers for the
+            # primary when it does not know the NodeId, without saying so.
+            try:
+                response = client.call(MONGO_ACTION, {"InstanceId": instance_id, "NodeId": node_id})
+            except Exception as exc:  # noqa: BLE001 - every failure is reported with its reason, never swallowed
+                raise self._fail(instance_id, node_id, exc) from exc
+            data = response.get("Data")
+            if response.get("Success") is False or not isinstance(data, dict):
+                LOGGER.warning("live_sessions unavailable: instance=%s node=%s code=das_failed message=%s",
+                               instance_id, node_id, str(response.get("Message"))[:200])
+                raise LiveSessionsError("das_failed", f"DAS 会话读取失败：{response.get('Message') or '没有返回数据'}")
+            return data
         result_id = ""
         while True:
             params = {"InstanceId": instance_id, "NodeId": node_id}
