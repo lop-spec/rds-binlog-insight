@@ -304,17 +304,19 @@ class RetentionHandoffTests(unittest.TestCase):
         with (patch.object(self.owner, "client_factory", return_value=client),
               patch.object(self.owner, "archive_for_settings", return_value=None),
               patch.object(self.owner, "_discover", return_value=[]),
-              patch.object(self.store, "list_parts", wraps=self.store.list_parts) as sweeps):
+              patch.object(self.store, "iter_parts", wraps=self.store.iter_parts) as sweeps,
+              patch.object(self.store, "iter_part_paths", wraps=self.store.iter_part_paths) as path_sweeps):
             for cycle in range(4):
                 cases = [("before", None), ("after", Mock(is_alive=Mock(return_value=True)))]
                 for label, scheduler in (cases if cycle % 2 else cases[::-1]):
                     job = self.store.create_job("sync", "rm-test")
                     sweeps.reset_mock()
+                    path_sweeps.reset_mock()
                     with patch.object(self.owner, "_scheduler", scheduler):
                         started = time.perf_counter()
                         self.owner._run(job, self.settings, CloudCredential("fixture", "fixture"))
                         times[label].append((time.perf_counter() - started) * 1000)
-                    counts[label] = sweeps.call_count
+                    counts[label] = sweeps.call_count + path_sweeps.call_count
                     self.assertEqual(self.store.latest_job()["status"], "success")
         self.assertGreaterEqual(counts["before"], 2)
         self.assertEqual(counts["after"], 0)

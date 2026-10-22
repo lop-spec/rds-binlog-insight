@@ -143,6 +143,41 @@ class MongoWindowTests(unittest.TestCase):
             self.assertEqual(most, 1)
 
 
+class RetentionSweepTests(unittest.TestCase):
+    def test_parts_are_streamed_in_list_order_and_the_sweep_never_materializes_them(self) -> None:
+        from app.metadata import MetadataStore
+        from app.storage import EventStorage
+        from tests.test_sqlite_serving_performance import insert_fixture
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = MetadataStore(root / "metadata.sqlite3")
+            storage = EventStorage(store, root)
+            now_us = int(time.time() * 1_000_000)
+            with store.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                insert_fixture(conn, "binlog_files", [
+                    {"id": "visible", "instance_id": "rm-test", "log_file_name": "mysql-bin.1", "query_visible": 1},
+                    {"id": "hidden", "instance_id": "rm-test", "log_file_name": "mysql-bin.2", "query_visible": 0}])
+                parts = []
+                for number in range(30):
+                    path = storage.paths["events"] / f"part-{number:02d}.parquet"
+                    path.touch()
+                    parts.append({"path": str(path), "logical_part_id": f"part-{number}",
+                                  "binlog_id": "hidden" if number % 3 == 0 else "visible",
+                                  "event_date": f"2026-10-{1 + number % 20:02d}",
+                                  "min_event_epoch_us": now_us, "max_event_epoch_us": now_us + 1, "row_count": 1})
+                insert_fixture(conn, "parquet_parts", parts)
+                conn.commit()
+            self.assertEqual(list(store.iter_parts(batch=7)), store.list_parts(limit=1000))
+            self.assertEqual(list(store.iter_parts(visible_only=False, batch=7)),
+                             store.list_parts(limit=1000, visible_only=False))
+            self.assertEqual(sorted(store.iter_part_paths(batch=4)), sorted(part["path"] for part in parts))
+            with patch.object(store, "list_parts", side_effect=AssertionError("the sweep materialized every part")):
+                result = storage.cleanup(30)
+            self.assertEqual((result["deleted_parts"], result["errors"]), (0, []))
+
+
 class SharedTlsContextTests(unittest.TestCase):
     def test_every_caller_gets_the_one_verifying_context(self) -> None:
         import ssl

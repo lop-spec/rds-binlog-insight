@@ -4700,7 +4700,18 @@ class EventStorage:
         rewritten_parts = 0
         removed_rows = 0
         errors: list[str] = []
-        for part in self.metadata.list_parts(limit=1_000_000):
+
+        def acted_on(part: dict[str, Any]) -> bool:
+            try:
+                return int(part["min_event_epoch_us"]) < cutoff_us or not Path(part["path"]).is_file()
+            except Exception:  # noqa: BLE001 - the sweep below reports it
+                return True
+
+        # Stream every part once and keep only those this sweep acts on (expired, partly expired or missing locally);
+        # materializing all of them was ~1.9 GB in the API process at 670k parts. The work then runs without holding
+        # the read open.
+        candidates = [part for part in self.metadata.iter_parts() if acted_on(part)]
+        for part in candidates:
             path = Path(part["path"])
             try:
                 if int(part["max_event_epoch_us"]) < cutoff_us:
@@ -4789,11 +4800,7 @@ class EventStorage:
         pruned_analytics = 0
         try:
             pruned_analytics = self.analytics_index.prune_orphans(
-                str(part["path"])
-                for part in self.metadata.list_parts(
-                    limit=1_000_000,
-                    visible_only=False,
-                )
+                self.metadata.iter_part_paths()
             )
         except Exception as exc:
             errors.append(f"analytics prune: {exc}")

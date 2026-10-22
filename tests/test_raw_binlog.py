@@ -94,6 +94,15 @@ class LiteTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(),before)
         self.assertEqual(list(self.path.parent.glob('.raw-index-*')),[])
 
+    def test_isolated_sidecar_is_the_inline_directory_bytes_and_its_summary(self):
+        from app.binlog_lite import scan_isolated_sidecar
+        fixture(self.path)
+        directory=scan(self.path)
+        plain,summary=scan_isolated_sidecar(self.path)
+        self.assertEqual(plain,compact(directory).encode('utf-8'))  # the archived sidecar is byte for byte the old one
+        self.assertEqual(summary,json.loads(compact({k:v for k,v in directory.items() if k!='regions'})))
+        self.assertEqual(list(self.path.parent.glob('.raw-index-*')),[])
+
     def test_isolated_unknown_event_stays_conservative(self):
         from app.binlog_lite import scan_isolated
         fixture(self.path,opaque=True)

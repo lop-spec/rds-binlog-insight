@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .binlog_lite import RawBinlogError, allows, scan_isolated as scan
+from .binlog_lite import RawBinlogError, allows, scan_isolated_sidecar as scan
 from .oss_store import OssArchiveError
 
 LOGGER = logging.getLogger(__name__)
@@ -92,12 +92,12 @@ class RawBinlogStore:
             from .parser_bridge import checksum_file
             checksum = checksum_file(path)
             sha, crc = checksum.sha256, checksum.crc64
-        directory = scan(path)
+        # The child's serialized directory goes into the sidecar as is; the service only parses its summary.
+        plain, summary = scan(path)
         scan_seconds = time.time() - started
         key_base = f'{archive.prefix}raw-binlog/v1/{file_id}/{sha}'
         raw = self._put(archive, path, key_base + '.binlog', sha, crc)
         # Sidecar is content-addressed independently; raw bytes are never changed.
-        plain = compact(directory).encode('utf-8')
         if len(plain) > 256*1024**2:
             raise RawBinlogError('轻量索引超过查询解压预算，保留源文件且不标记完成', 'RAW_INDEX_SIZE_LIMIT')
         payload = gzip.compress(plain, compresslevel=1, mtime=0)
@@ -116,10 +116,9 @@ class RawBinlogStore:
             side = self._put(archive, side_path, key_base + f'.{side_sha}.lite.json.gz', side_sha, str(side_crc.crc))
         finally:
             side_path.unlink(missing_ok=True)
-        summary = {k: v for k, v in directory.items() if k != 'regions'}
         descriptor = dict(raw=raw, index=side, file_id=file_id, flavor=flavor,
                           instance_id=record['instance_id'], host_instance_id=item.host_instance_id,
-                          source_file_name=item.log_file_name, events=directory['events'],
+                          source_file_name=item.log_file_name, events=summary['events'],
                           scan_seconds=scan_seconds, archive_seconds=time.time()-started)
         # FULL synchronous metadata commit happens only after BOTH remote objects
         # have verified size, SHA metadata, and server CRC64. Crash before commit
@@ -128,9 +127,9 @@ class RawBinlogStore:
             conn.execute('''INSERT INTO raw_binlog_archives
                 (file_id,lo,hi,summary,descriptor,started,completed) VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(file_id) DO NOTHING''',
-                (file_id, directory['lo'], directory['hi'], compact(summary), compact(descriptor), started, time.time()))
+                (file_id, summary['lo'], summary['hi'], compact(summary), compact(descriptor), started, time.time()))
         LOGGER.info('RAW_BINLOG_ARCHIVED %s', compact(dict(file=item.log_file_name, bytes=path.stat().st_size,
-                    header_events=directory['events'], scan_seconds=round(scan_seconds, 3),
+                    header_events=summary['events'], scan_seconds=round(scan_seconds, 3),
                     seconds=round(time.time()-started, 3), sidecar_bytes=len(payload))))
         return descriptor
 

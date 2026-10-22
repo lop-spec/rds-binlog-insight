@@ -3259,6 +3259,36 @@ class MetadataStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def iter_parts(self, *, visible_only: bool = True, batch: int = 4096) -> Iterator[dict[str, Any]]:
+        """Every part, newest first like list_parts, read in batches instead of materialized at once.
+
+        The retention sweep used list_parts(limit=1_000_000): 670,708 parts on production on 2026-10-22, about 1.9 GB of
+        row dicts in the API process after every sync, a peak that grew with retention.
+        """
+        visibility = "AND b.query_visible = 1" if visible_only else ""
+        with self.connection() as conn:
+            cursor = conn.execute(
+                f"""
+                SELECT p.*, b.log_file_name
+                FROM parquet_parts p INDEXED BY idx_part_event_date_path
+                CROSS JOIN binlog_files b
+                WHERE b.id = p.binlog_id
+                {visibility}
+                ORDER BY p.event_date DESC, p.path DESC
+                """
+            )
+            while rows := cursor.fetchmany(max(int(batch), 1)):
+                for row in rows:
+                    yield dict(row)
+
+    def iter_part_paths(self, *, batch: int = 8192) -> Iterator[str]:
+        """The path of every part (visible or not), for orphan checks that need nothing else."""
+        with self.connection() as conn:
+            cursor = conn.execute("SELECT path FROM parquet_parts")
+            while rows := cursor.fetchmany(max(int(batch), 1)):
+                for row in rows:
+                    yield str(row[0])
+
     def part_by_path(self, path: str) -> dict[str, Any] | None:
         with self.connection() as conn:
             row = conn.execute(

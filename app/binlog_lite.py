@@ -165,12 +165,15 @@ def scan(path: Path) -> dict:
                 events=events, regions=regions, uncertainty=sorted(uncertainty))
 
 
-def scan_isolated(path: Path) -> dict:
-    """Release the service interpreter while scanning; the caller bounds lanes.
+def _summary_path(destination: Path) -> Path:
+    return destination.with_name(destination.stem + '.summary.json')
 
-    Only this CPU-bound directory scan moves to a short-lived child. Downloads,
-    checksum validation, OSS verification and manifest commits stay unchanged.
-    JSON goes through a bounded temporary file, not an unbounded stdout pipe.
+
+def _scan_child(path: Path, read):
+    """Run the CPU-bound directory scan in a short-lived child and hand its output files to ``read``.
+
+    Downloads, checksum validation, OSS verification and manifest commits stay in the service. JSON goes through bounded
+    temporary files, not an unbounded stdout pipe.
     """
     path = path.resolve()
     with tempfile.TemporaryDirectory(prefix='.raw-index-', dir=path.parent) as temp:
@@ -199,9 +202,30 @@ def scan_isolated(path: Path) -> dict:
         if result_path.stat().st_size > MAX_INDEX_BYTES:
             raise RawBinlogError('轻量索引超过查询解压预算，保留源文件', 'RAW_INDEX_SIZE_LIMIT')
         try:
-            return json.loads(result_path.read_bytes())
-        except (ValueError, OSError) as exc:
+            return read(result_path)
+        except (ValueError, OSError, KeyError) as exc:
             raise RawBinlogError('轻索引子进程输出无效；保留原文件', 'RAW_INDEX_WORKER_FAILED') from exc
+
+
+def scan_isolated(path: Path) -> dict:
+    """The whole directory of ``path``, scanned in a child process (the caller bounds lanes)."""
+    return _scan_child(path, lambda result: json.loads(result.read_bytes()))
+
+
+def scan_isolated_sidecar(path: Path) -> tuple[bytes, dict]:
+    """The directory as its serialized bytes plus the summary (everything but ``regions``), scanned in a child.
+
+    The archive only gzips the directory into the sidecar and keeps the summary. Parsing it back in the service built one
+    dict per GTID region of a 500 MB binlog (~580k header events, 2026-10-22) and serialized it a second time, in each of
+    the two archive lanes; the bytes are what the child wrote, so the sidecar is unchanged.
+    """
+    def read(result: Path) -> tuple[bytes, dict]:
+        summary = json.loads(_summary_path(result).read_bytes())
+        if not isinstance(summary, dict) or 'lo' not in summary or 'hi' not in summary or 'events' not in summary:
+            raise ValueError('summary missing fields')
+        return result.read_bytes(), summary
+
+    return _scan_child(path, read)
 
 
 def _write_directory(path: Path, destination: Path) -> None:
@@ -209,6 +233,8 @@ def _write_directory(path: Path, destination: Path) -> None:
     data = json.dumps(directory, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     if len(data) > MAX_INDEX_BYTES:
         raise RawBinlogError('轻量索引超过查询解压预算，保留源文件', 'RAW_INDEX_SIZE_LIMIT')
+    summary = {key: value for key, value in directory.items() if key != 'regions'}
+    _summary_path(destination).write_bytes(json.dumps(summary, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
     destination.write_bytes(data)
 
 
