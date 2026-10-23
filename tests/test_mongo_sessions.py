@@ -170,6 +170,7 @@ class KillTextTests(unittest.TestCase):
         self.assertEqual(hidden["text"], "")
         self.assertIn("DAS 控制台", hidden["skipped"][0]["reason"])
         self.assertEqual(protected_reason(1, "conn1", "appdb.a", "go", "saslStart"), "驱动探活 / 认证")
+        self.assertEqual(protected_reason(None, "conn2356913", "", "go", ""), "空闲连接（没有在跑的操作）")
 
 
 class FakeClient:

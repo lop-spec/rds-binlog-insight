@@ -158,7 +158,8 @@ def command_text(raw: Any) -> tuple[str, str]:
 def protected_reason(opid: Any, connection: str, namespace: str, driver: str, command_name: str) -> str:
     """Why no kill line is written for this operation ("" when it may be ended)."""
     if not isinstance(opid, int) or isinstance(opid, bool):
-        return "没有 opid"
+        # DAS lists every client connection; one that is not running anything has no opid (and nothing for killOp to end)
+        return "空闲连接（没有在跑的操作）" if CONNECTION_PATTERN.fullmatch(connection) else "没有 opid"
     if not CONNECTION_PATTERN.fullmatch(connection):
         return "内部线程"
     if namespace.startswith("local.") or any(word in driver for word in INTERNAL_DRIVERS):

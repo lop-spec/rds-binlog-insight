@@ -165,7 +165,7 @@ function sessionSummaryHtml(data) {
     { label: mongo ? "异常操作" : "异常会话", value: humanCount(totals.abnormal), hint: kindHint || (mongo ? "没有异常操作" : "没有异常会话") },
     mongo ? { label: "运行中操作", value: humanCount(totals.running), hint: "currentOp 里 active 的操作" }
       : { label: "运行中会话", value: humanCount(totals.running), hint: `活跃（含未结束事务）${humanCount(totals.active)}` },
-    mongo ? { label: "列出的操作", value: humanCount(totals.total), hint: `${humanCount(totals.nodes)} 个成员 · 含后台线程，不含空闲连接` }
+    mongo ? { label: "连接与操作", value: humanCount(totals.total), hint: `${humanCount(totals.nodes)} 个成员 · 含空闲连接和后台线程` }
       : { label: "会话总数", value: humanCount(totals.total), hint: `${humanCount(totals.nodes)} 个节点` },
     { label: "运行中最长", value: sessionSeconds(totals.longest) },
   ]);
@@ -181,7 +181,7 @@ function sessionSummaryHtml(data) {
       `<strong>${humanCount(overview.abnormal)}</strong>${waiting}`, sessionSeconds(overview.max_active_seconds),
       `${escapeHtml(sessionTimeText(node.observed_at_us))}${node.cached ? ' <span class="muted">（10 秒内缓存）</span>' : ""}`];
   });
-  return `${tiles}${analyticsTable(mongo ? ["成员", "列出的操作", "运行中", "活跃", "异常", "运行中最长", "快照时间 / 状态"]
+  return `${tiles}${analyticsTable(mongo ? ["成员", "连接与操作", "运行中", "活跃", "异常", "运行中最长", "快照时间 / 状态"]
     : ["节点", "会话总数", "运行中", "活跃", "异常", "运行中最长", "快照时间 / 状态"], rows, "没有节点")}`;
 }
 

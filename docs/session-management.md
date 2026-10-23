@@ -65,7 +65,7 @@
 
 **成员**：后台线程每 5 分钟用 DDS 只读接口 `DescribeRoleZoneInfo`（角色 ID、主 / 备 / 隐藏、可用区）和 `DescribeReplicaSetRole`（每个角色 ID 的 VPC 地址）刷新，查到之前下拉框里没有这个实例；成员列表经 `GET /api/sessions/status` 的 `mongo` 字段给页面。隐藏节点没有连接地址。
 
-**读取**：每个成员一次同步的 DAS `GetMongoDBCurrentOp`（`InstanceId` + `NodeId`=角色 ID，不带过滤条件，与 DAS 控制台一致：在跑的操作和后台线程，不含空闲连接）。2026-10-22 实测：`NodeId` 写一个不存在的号时接口**不报错、直接返回主节点的操作**，所以服务只发成员表里的角色 ID（其他一律 400 `SESSIONS_UNKNOWN_NODE`）；隐藏节点的角色 ID 可用。缓存、并发、失败码与 RDS 共用。
+**读取**：每个成员一次同步的 DAS `GetMongoDBCurrentOp`（`InstanceId` + `NodeId`=角色 ID，不带过滤条件，与 DAS 控制台一致：每个客户端连接一行（生产主节点约 1300、备节点约 1200，空闲连接没有 opid）加后台线程）。2026-10-22 实测：`NodeId` 写一个不存在的号时接口**不报错、直接返回主节点的操作**，所以服务只发成员表里的角色 ID（其他一律 400 `SESSIONS_UNKNOWN_NODE`）；隐藏节点的角色 ID 可用。缓存、并发、失败码与 RDS 共用。
 
 **一行是一个操作**，按 RDS 行的字段放，页面换了列名：
 
@@ -80,7 +80,7 @@
 
 异常只有一类「操作运行过久」：`Active` 且 `SecsRunning` 超过「语句运行超过」阈值（默认 30 秒）。DAS 对 MongoDB 不返回等锁、事务字段，所以没有等待锁 / 事务两类、没有疑似持锁，两个事务阈值输入框在选 MongoDB 时隐藏。「运行中」=`Active`。
 
-**受保护（不生成语句）**：没有 opid；`Desc` 不是 `connNNN`（`TTLMonitor` 等内部线程）；集合在 `local.`（oplog 读取）或驱动是 `NetworkInterfaceTL` / `MongoDB Internal Client`（副本集内部连接）；`hello` / `isMaster` / `ping` / 认证命令（驱动探活，长轮询的 `hello` 也不算异常）。
+**受保护（不生成语句）**：空闲连接 / 没有 opid（没有在跑的操作，killOp 无对象）；`Desc` 不是 `connNNN`（`TTLMonitor` 等内部线程）；集合在 `local.`（oplog 读取）或驱动是 `NetworkInterfaceTL` / `MongoDB Internal Client`（副本集内部连接）；`hello` / `isMaster` / `ping` / 认证命令（驱动探活，长轮询的 `hello` 也不算异常）。
 
 **killOp 语句**：opid 是每个成员各自的计数器，同一个数在别的成员上是别人的操作，所以每个成员单独一段，用 mongosh **直连该成员**（`mongosh "mongodb://<成员 VPC 地址>:3717/admin?directConnection=true" -u <账号> -p`，页面写在每段上方，有单独的复制按钮）：
 
