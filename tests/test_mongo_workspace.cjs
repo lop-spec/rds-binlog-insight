@@ -1,7 +1,8 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const source=fs.readFileSync('web/mongo.js','utf8');
 const escape=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
-function context(){return vm.createContext({console,escapeHtml:escape,URLSearchParams,Date,Number,Math,formatTime:v=>new Date(v/1000).toISOString()});}
+function context(){return vm.createContext({console,escapeHtml:escape,URLSearchParams,Date,Number,Math,formatTime:v=>new Date(v/1000).toISOString(),
+  ipNameSlot:(v,at)=>`<small class="ip-name" data-ip-name="${v}" data-ip-at="${at||''}"></small>`});}
 test('Mongo source is inside existing workspace, not a second application',()=>{
  const html=fs.readFileSync('web/index.html','utf8'),app=fs.readFileSync('web/app.js','utf8');
  assert.match(html,/value="mongodb"/);assert.match(html,/id="mongo-kind"/);assert.match(html,/id="mongo-baseline"/);
@@ -228,7 +229,7 @@ test('source IPs show with counts, and windows collected before them offer a raw
  const c=context();vm.runInContext(source,c);
  c.x={group_id:'g',role:'Primary',count:5,clients_known:5,client_count:3,clients:[{name:'172.16.1.95',count:3},{name:'172.16.0.97',count:2}],accounts:[{name:'root@admin',count:5}]};
  const html=vm.runInContext('mongoSources(x)',c);
- assert.match(html,/172\.16\.1\.95 <small>×3<\/small>/);assert.match(html,/另 1 个/);assert.match(html,/账号 root@admin/);
+ assert.match(html,/172\.16\.1\.95 <small>×3<\/small><small class="ip-name" data-ip-name="172\.16\.1\.95"/);assert.match(html,/另 1 个/);assert.match(html,/账号 root@admin/);
  c.y={group_id:'g',role:'Primary',count:5,clients_known:0,clients:[]};
  assert.match(vm.runInContext('mongoSources(y)',c),/data-mongo-sources="g"[\s\S]*查来源/);
  c.z={...c.x,clients_known:2};

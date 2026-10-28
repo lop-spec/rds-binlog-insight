@@ -25,16 +25,16 @@ on:
         default: false
   push:
     tags:
-      - v1.34.11-rawoss
+      - v1.34.12-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.34.11-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.34.11-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.34.11-rawoss
+  VERSION: 1.34.12-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.34.12-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.34.12-rawoss
 
 jobs:
   recovery-isolation:

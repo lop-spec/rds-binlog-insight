@@ -198,7 +198,7 @@ test('running statements are read on demand for one node and shown with their us
   assert.equal(button.textContent, '刷新正在跑的查询');
   assert.match(result.innerHTML, /共 1,066 个会话，2 个在执行，最长已运行 885 秒/);
   assert.match(result.innerHTML, /<th>用户<\/th><th>来源 IP<\/th><th>库<\/th><th>已运行<\/th><th>状态<\/th><th>SQL<\/th>/);
-  assert.match(result.innerHTML, /<td>analyst<\/td><td>10\.0\.0\.8<\/td><td>app<\/td><td><strong>14 分 45 秒<\/strong><\/td>/);
+  assert.match(result.innerHTML, /<td>analyst<\/td><td>10\.0\.0\.8<small class="ip-name" data-ip-name="10\.0\.0\.8" data-ip-at=""><\/small><\/td><td>app<\/td><td><strong>14 分 45 秒<\/strong><\/td>/);
   assert.doesNotMatch(result.innerHTML, /<b>x<\/b>/);                  // statement text is escaped
   assert.match(result.innerHTML, /SELECT &lt;b&gt;x&lt;\/b&gt; FROM t/);   // and its whitespace folded
 });

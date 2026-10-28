@@ -54,3 +54,7 @@ summary:focus-visible { outline: 3px solid #a8c9f7; outline-offset: 3px; border-
   .nav-management { margin-top: 0; padding-top: 0; border-top: 0; }
   .nav-management[open] { min-width: 140px; }
 }
+
+/* 来源 IP 下面的 Pod / ECS 名称 */
+.ip-name { display: block; color: var(--subtle); font-size: 11px; line-height: 1.3; word-break: break-all; }
+.ip-name:empty { display: none; }

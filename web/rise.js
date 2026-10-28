@@ -697,7 +697,7 @@ function liveSessionsHtml(data) {
   if (!rows.length) return `${head}<p class="analytics-empty">此刻没有在执行的语句。</p>`;
   return head + analyticsTable(["用户", "来源 IP", "库", "已运行", "状态", "SQL"], rows.map((row) => [
     escapeHtml(row.user || "—"),
-    escapeHtml(row.client || "—"),
+    ipCell(row.client),
     escapeHtml(row.database || "—"),
     `<strong>${escapeHtml(humanMicros(Number(row.seconds || 0) * 1_000_000))}</strong>`,
     escapeHtml(row.state || row.command || "—"),

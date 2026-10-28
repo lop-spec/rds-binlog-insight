@@ -36,7 +36,7 @@ function mongoCorrelation(x){
 function mongoSourceText(list,total,count){
   if(!list?.length)return '';
   const more=total>list.length?`<br><small>另 ${mongoNumber(total-list.length,0)} 个</small>`:'';
-  return list.map(x=>`${escapeHtml(x.name)} <small>×${mongoNumber(x.count,0)}</small>`).join('<br>')+more;
+  return list.map(x=>`<div>${escapeHtml(x.name)} <small>×${mongoNumber(x.count,0)}</small>${ipNameSlot(x.name,mongoResult?.end_us)}</div>`).join('')+more;
 }
 function mongoSources(x){
   if(x.clients_known>0){

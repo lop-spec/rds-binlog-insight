@@ -56,7 +56,8 @@ from .slowlog_impact_service import load_metric_points, query_resource_overlap
 from .slowlog_tail import SlowLogTails
 from .node_roles import NodeRoleBook
 from .window_align import align_binlog_query
-from .pod_lookup import attach_pod_detail
+from .pod_inventory import PodInventory
+from .pod_lookup import attach_pod_detail, inventory_path, name_ips
 from .metadata import MetadataStore
 from .pipeline import PipelineError, SyncManager
 from .sync_lifecycle import CollectorLease
@@ -367,6 +368,10 @@ class Application:
         )
         if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
             self.node_roles.start()
+        # Client IP → Pod / ECS name for the pages, from a once-a-minute ACK + ECS listing (pod_inventory).
+        self.pod_inventory = PodInventory(self.metadata.load_settings, credential_loader, inventory_path(self.data_dir))
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self.pod_inventory.start()
 
         def das_client(instance_id: str) -> DasRpcClient:
             """DAS client for one request, same identity as the slow-log collectors; built only when someone asks."""
@@ -765,6 +770,8 @@ class Application:
             self.slow_tails.shutdown()
         if getattr(self, 'node_roles', None) is not None:
             self.node_roles.shutdown()
+        if getattr(self, 'pod_inventory', None) is not None:
+            self.pod_inventory.shutdown()
         if getattr(self, 'session_collector', None) is not None:
             self.session_collector.shutdown()
         if getattr(self, 'mongo_nodes', None) is not None:
@@ -1135,6 +1142,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 start_us = int(_query_value(query, "startEpochUs") or end_us - 3600 * 1_000_000)
                 self._json({"ok": True, "data": self.app.sessions.history(_query_value(query, "instance").strip(), node_id, start_us, end_us,
                                                                           int(_query_value(query, "limit") or 200))})
+            elif parsed.path == "/api/ip-names":
+                # Pod (at that moment) or ECS name of each client IP; IPs with neither are left out.
+                ips = [value for value in _query_value(query, "ips").split(",") if value.strip()][:500]
+                at_us = int(_query_value(query, "atUs") or time.time_ns() // 1000)
+                self._json({"ok": True, "data": {"names": name_ips(ips, at_us, inventory_path(self.app.data_dir)),
+                                                 "inventory": self.app.pod_inventory.state}})
             elif parsed.path == "/api/sessions/status":
                 self._json({"ok": True, "data": self.app.sessions.status()})
             elif parsed.path == "/api/analytics":

@@ -186,3 +186,87 @@ async function openSlowSqlDetail(fingerprint) {
   }
   $('#detail-body').insertAdjacentHTML('afterbegin', sqlAggregateDetail(item, data));
 }
+
+/* 来源 IP 的 Pod / ECS 名称：渲染时只放占位，页面上出现新占位就按时间点合并成一次 /api/ip-names 查询再填上。
+   名称来自服务每分钟一次的 ACK Pod 列表和每 10 分钟一次的 ECS 列表；同一 IP 当时没有唯一 Pod、也不是 ECS 地址就留空。 */
+const ipNames = new Map(); // `${ip}@${分钟或 now}` → {value, at}
+const ipNamesPending = new Set();
+const IP_NAME_LIVE_MS = 5 * 60 * 1000;
+
+function ipOf(value) {
+  const match = String(value ?? '').trim().match(/^\[?(\d{1,3}(?:\.\d{1,3}){3})\]?(?::\d+)?$/);
+  return match ? match[1] : '';
+}
+
+function ipNameKey(ip, atUs) {
+  return `${ip}@${atUs ? Math.floor(Number(atUs) / 60_000_000) : 'now'}`;
+}
+
+function ipNameText(hit) {
+  if (!hit) return ['', ''];
+  return hit.kind === 'pod'
+    ? [hit.name, `Pod ${hit.namespace}/${hit.name} · 集群 ${hit.cluster} · 节点 ${hit.node}`]
+    : [`ECS ${hit.name}`, `ECS 实例 ${hit.name}（${hit.instance_id}）`];
+}
+
+function ipNameCached(ip, atUs) {
+  const entry = ipNames.get(ipNameKey(ip, atUs));
+  if (!entry || (!atUs && Date.now() - entry.at > IP_NAME_LIVE_MS)) return undefined;
+  return entry.value;
+}
+
+// 只放名称占位（块级，显示在 IP 下面）；atUs 为空表示「现在」。
+function ipNameSlot(value, atUs = 0) {
+  const ip = ipOf(value);
+  if (!ip) return '';
+  const [text, title] = ipNameText(ipNameCached(ip, atUs));
+  return `<small class="ip-name" data-ip-name="${ip}" data-ip-at="${atUs ? Number(atUs) : ''}"${title ? ` title="${escapeHtml(title)}"` : ''}>${escapeHtml(text)}</small>`;
+}
+
+function ipCell(value, atUs = 0) {
+  return `${escapeHtml(value || '—')}${ipNameSlot(value, atUs)}`;
+}
+
+async function fillIpNames() {
+  const groups = new Map();
+  for (const slot of document.querySelectorAll('[data-ip-name]:empty')) {
+    const ip = slot.dataset.ipName, at = slot.dataset.ipAt || '';
+    const key = ipNameKey(ip, at);
+    if (ipNameCached(ip, at) !== undefined) {
+      const [text, title] = ipNameText(ipNameCached(ip, at));
+      if (text) { slot.textContent = text; slot.title = title; }
+      continue;
+    }
+    if (ipNamesPending.has(key)) continue;
+    ipNamesPending.add(key);
+    if (!groups.has(at)) groups.set(at, new Set());
+    groups.get(at).add(ip);
+  }
+  for (const [at, ips] of groups) {
+    const list = [...ips];
+    try {
+      const params = new URLSearchParams({ ips: list.join(',') });
+      if (at) params.set('atUs', at);
+      const data = await api('/api/ip-names?' + params);
+      for (const ip of list) ipNames.set(ipNameKey(ip, at), { value: data.names?.[ip] || null, at: Date.now() });
+    } catch {
+      // 查不到名称不影响页面，下一次渲染再试
+    } finally {
+      for (const ip of list) ipNamesPending.delete(ipNameKey(ip, at));
+    }
+  }
+  if (groups.size) {
+    for (const slot of document.querySelectorAll('[data-ip-name]:empty')) {
+      const hit = ipNameCached(slot.dataset.ipName, slot.dataset.ipAt || '');
+      const [text, title] = ipNameText(hit);
+      if (text) { slot.textContent = text; slot.title = title; }
+    }
+  }
+}
+
+let ipNamesTimer = 0;
+if (typeof MutationObserver === 'function' && typeof document !== 'undefined' && document.documentElement) {
+  new MutationObserver(() => {
+    if (!ipNamesTimer) ipNamesTimer = setTimeout(() => { ipNamesTimer = 0; fillIpNames(); }, 50);
+  }).observe(document.documentElement, { childList: true, subtree: true });
+}

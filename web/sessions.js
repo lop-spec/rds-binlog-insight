@@ -215,7 +215,7 @@ function sessionStatsHtml(data) {
     const rows = [...merged[dimension].values()].sort((a, b) => b.abnormal - a.abnormal || b.active - a.active || b.total - a.total || String(a.key).localeCompare(String(b.key))).slice(0, 12);
     const picked = sessionsState.filters[field];
     const body = rows.map((row) => `<tr class="session-stat-row${picked === row.key ? " is-picked" : ""}" data-session-filter="${field}" data-session-value="${escapeHtml(row.key)}" title="点击只看这个${title.slice(1)}">
-      <td>${escapeHtml(row.key || "（空）")}</td><td>${humanCount(row.total)}</td><td>${humanCount(row.active)}</td><td>${row.abnormal ? `<strong>${humanCount(row.abnormal)}</strong>` : "0"}</td></tr>`).join("");
+      <td>${field === "client" && row.key ? ipCell(row.key) : escapeHtml(row.key || "（空）")}</td><td>${humanCount(row.total)}</td><td>${humanCount(row.active)}</td><td>${row.abnormal ? `<strong>${humanCount(row.abnormal)}</strong>` : "0"}</td></tr>`).join("");
     return `<div class="session-stat"><h3>${title}</h3><div class="table-wrap"><table class="data-table analytics-table"><thead><tr><th>${escapeHtml(title.slice(1))}</th><th>总数</th><th>活跃</th><th>异常</th></tr></thead><tbody>${body || '<tr><td colspan="4" class="muted">无</td></tr>'}</tbody></table></div></div>`;
   });
   return `<div class="session-stats">${blocks.join("")}</div>`;
@@ -238,7 +238,7 @@ function sessionRowHtml(row) {
     <td class="session-check"><input type="checkbox" data-session-pick="${escapeHtml(key)}" aria-label="选择会话 ${escapeHtml(row.session_id)}"${picked ? " checked" : ""}${row.protected ? ` disabled title="${escapeHtml(row.protected)}：不生成 ${sessionsMongoView() ? "killOp" : "KILL"} 语句"` : ""}></td>
     <td>${sessionNodeChip(row)}</td>
     <td>${id}</td>
-    <td>${escapeHtml(row.user)}</td><td>${escapeHtml(row.client)}</td><td>${escapeHtml(row.database)}</td>
+    <td>${escapeHtml(row.user)}</td><td>${ipCell(row.client)}</td><td>${escapeHtml(row.database)}</td>
     <td>${escapeHtml(row.command)}${row.state ? `<br><span class="muted">${escapeHtml(row.state)}</span>` : ""}</td>
     <td>${escapeHtml(sessionSeconds(row.seconds))}</td>${trx}
     <td>${sessionKindChips(row) || '<span class="muted">—</span>'}</td>
@@ -485,7 +485,7 @@ function sessionHistoryHtml(data) {
     const holder = row.holder ? ' <span class="chip session-holder" title="当时有会话在等锁，这个会话可能是持锁者（推断）">疑似持锁</span>' : "";
     const sql = String(row.sql || "").replace(/\s+/g, " ").slice(0, 160);
     return [sessionNodeChip(data.nodes.find((node) => node.node_id === row.node_id) || { node_id: row.node_id }), escapeHtml(row.session_id),
-      escapeHtml(row.user), escapeHtml(row.client), escapeHtml(row.database),
+      escapeHtml(row.user), ipCell(row.client, row.last_us), escapeHtml(row.database),
       `${escapeHtml(sessionTimeText(row.first_us))}<br><span class="muted">→ ${escapeHtml(sessionTimeText(row.last_us))}（${escapeHtml(span ? sessionSeconds(span / 1_000_000) : "单次快照")}）</span>`,
       `${escapeHtml(sessionSeconds(row.max_seconds))}${row.max_trx_seconds ? `<br><span class="muted">事务 ${escapeHtml(sessionSeconds(row.max_trx_seconds))}</span>` : ""}`,
       `${kinds}${holder}`, `${escapeHtml(row.command)}${row.state ? `<br><span class="muted">${escapeHtml(row.state)}</span>` : ""}`,
