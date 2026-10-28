@@ -1,4 +1,6 @@
+import itertools
 import json
+import random
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -13,12 +15,14 @@ from app.mongo_tail import MongoSlowTail, merge_rows
 from tests.test_mongo_insight import T
 
 SECOND = 1_000_000
+SEQUENCE = itertools.count(1)
 
 
 def dds(at_us, ns='demo.messages_1', ms=120, role='PRIMARY', client='10.0.0.1', shape=1):
-    """A DDS slow record with every field DDS returns."""
+    """A DDS slow record with every field DDS returns; ``lsid`` makes each execution distinct, as in production."""
+    n = next(SEQUENCE)
     q = dict(op='command', ns=ns, command={'find': ns.split('.')[1], 'filter': {'x' * shape: 42}}, millis=ms,
-             replRole={'stateStr': role}, cpuNanos=ms * 1000)
+             replRole={'stateStr': role}, cpuNanos=ms * 1000, lsid={'id': n})
     return {'AccountName': 'app@demo', 'DBName': 'demo', 'DocsExamined': 10,
             'ExecutionStartTime': datetime.fromtimestamp(at_us // SECOND, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             'HostAddress': client, 'KeysExamined': 11, 'QueryTimes': ms, 'ReturnRowCounts': 1,
@@ -29,7 +33,9 @@ def das_log(record):
     """The DAS entry DAS returns for a DDS record (field names and string counts as seen on 2026-10-28)."""
     at = int(datetime.fromisoformat(record['ExecutionStartTime'].replace('Z', '+00:00')).timestamp() * 1000)
     return {'Timestamp': at, 'QueryStartTime': record['ExecutionStartTime'], 'QueryTime': record['QueryTimes'],
-            'QueryTimeSeconds': record['QueryTimes'] / 1000, 'Command': record['SQLText'], 'DBName': record['DBName'],
+            # Microsecond durations: the fraction keeps executions with the same milliseconds apart, as they nearly always are.
+            'QueryTimeSeconds': round(record['QueryTimes'] / 1000 + json.loads(record['SQLText'])['lsid']['id'] % 997 * 1e-6, 6),
+            'Command': record['SQLText'], 'DBName': record['DBName'],
             'TableName': record['TableName'], 'Namespace': record['DBName'] + '.' + record['TableName'],
             'AccountName': record['AccountName'], 'HostAddress': record['HostAddress'],
             'DocsExamined': str(record['DocsExamined']), 'KeysExamined': str(record['KeysExamined']),
@@ -37,17 +43,29 @@ def das_log(record):
 
 
 class FakeDas:
-    """DescribeSlowLogRecords over a fixed set: [StartTime, EndTime) in ms, one page of PageSize."""
+    """DescribeSlowLogRecords over a fixed set: [StartTime, EndTime) in ms, pages ordered by QueryTimeSeconds.
 
-    def __init__(self, records):
+    Like DAS, a page above 100 records cuts the command text to 2,048 characters. ``unstable_above`` reorders every page of a
+    slice holding more records than that, as an unstable sort would.
+    """
+
+    def __init__(self, records, unstable_above=None):
         self.logs = [das_log(r) for r in records]
         self.calls = []
+        self.unstable_above = unstable_above
 
     def call(self, action, params):
         assert action == 'DescribeSlowLogRecords'
         self.calls.append(params)
-        hits = [x for x in self.logs if params['StartTime'] <= x['Timestamp'] < params['EndTime']]
-        return {'Success': 'true', 'Data': {'TotalRecords': len(hits), 'Logs': hits[:params['PageSize']]}}
+        hits = sorted((x for x in self.logs if params['StartTime'] <= x['Timestamp'] < params['EndTime']),
+                      key=lambda x: x['QueryTimeSeconds'])
+        if self.unstable_above is not None and len(hits) > self.unstable_above:
+            random.Random(len(self.calls)).shuffle(hits)
+        size, page = params['PageSize'], params['PageNumber']
+        logs = hits[(page - 1) * size:page * size]
+        if size > 100:
+            logs = [dict(x, Command=x['Command'][:2048]) for x in logs]
+        return {'Success': 'true', 'Data': {'TotalRecords': len(hits), 'Logs': logs}}
 
 
 def collector(store=None, records=(), source='das'):
@@ -67,15 +85,66 @@ class DasSource(unittest.TestCase):
         record = dds(T + 7 * SECOND)
         self.assertEqual(das_record(das_log(record)), record)
 
-    def test_dense_window_is_read_in_whole_second_slices_without_paging(self):
+    def test_dense_window_is_read_in_whole_second_slices_of_at_most_twenty_pages(self):
         records = [dds(T + (i * 300 // 5000) * SECOND) for i in range(5000)]
         c, fake = collector(records=records)
         c.slow_window(T, T + WINDOW)
         published = c.store.publish.call_args.args[3]
-        self.assertEqual(published, records)
-        self.assertTrue(all(p['PageNumber'] == 1 and p['StartTime'] % 1000 == 0 and p['EndTime'] % 1000 == 0 for p in fake.calls))
-        self.assertGreater(len(fake.calls), 3)
+        self.assertEqual(sorted(json.dumps(r) for r in published), sorted(json.dumps(r) for r in records))
+        self.assertTrue(all(p['PageSize'] == 100 and p['OrderBy'] == 'QueryTimeSeconds' for p in fake.calls))
+        self.assertTrue(all(p['StartTime'] % 1000 == 0 and p['EndTime'] % 1000 == 0 for p in fake.calls))
+        self.assertLessEqual(max(p['PageNumber'] for p in fake.calls), 20)
+        # 50 pages of records: one look at the window, then its slices; no slice is read twice
+        self.assertLess(len(fake.calls), 70)
         self.assertEqual(c.state['slowlog_source'], 'das')
+
+    def test_pages_never_ask_for_more_than_one_hundred_records(self):
+        # Above 100 DAS cuts the command text to 2,048 characters, which does not parse (the first 1.34.8 build).
+        long = dds(T, shape=3000)
+        c, fake = collector(records=[long])
+        c.slow_window(T, T + WINDOW)
+        self.assertEqual(c.store.publish.call_args.args[3], [long])
+        self.assertGreater(len(long['SQLText']), 2048)
+
+    def test_das_records_that_do_not_parse_are_read_again_from_dds(self):
+        long = dds(T, shape=3000)
+        with tempfile.TemporaryDirectory() as td:
+            c, _ = collector(store=MongoStore(Path(td), backend='parquet'), records=[long])
+            c.DAS_PAGE = 200  # what the first 1.34.8 build asked for: DAS cuts the text
+            client = Mock()
+            client.call.return_value = {'TotalRecordCount': 1, 'Items': {'LogRecords': [long]}}
+            c.rpc = lambda cms=False: client
+            with self.assertLogs('app.mongo_collector', 'WARNING') as logs:
+                manifest = c.slow_window(T, T + WINDOW)
+        self.assertEqual(manifest['records'], 1)
+        self.assertIn('JSONDecodeError', c.state['slowlog_source'])
+        self.assertTrue(any('reading DDS instead' in line for line in logs.output))
+
+    def test_a_busy_second_is_paged_and_checked(self):
+        records = [dds(T + 5 * SECOND) for _ in range(250)]
+        c, fake = collector(records=records)
+        c.slow_window(T, T + WINDOW)
+        self.assertEqual(sorted(json.dumps(r) for r in c.store.publish.call_args.args[3]), sorted(json.dumps(r) for r in records))
+
+    def test_unstable_pages_split_the_slice_and_a_second_that_stays_unstable_reads_dds(self):
+        records = [dds(T + (i % 4) * SECOND) for i in range(400)]
+        c, fake = collector(records=records)
+        c.das_rpc = lambda: fake
+        fake.unstable_above = 150
+        with self.assertLogs('app.mongo_collector', 'WARNING') as logs:
+            c.slow_window(T, T + WINDOW)
+        self.assertTrue(any('das_pages_unstable' in line and 'splitting' in line for line in logs.output))
+        # every second holds 100 records, so after splitting every slice is a single page and stable
+        self.assertEqual(len(c.store.publish.call_args.args[3]), 400)
+        self.assertEqual(c.state['slowlog_source'], 'das')
+        busy, _ = collector(records=[dds(T + 5 * SECOND) for _ in range(250)])
+        busy.das_rpc().unstable_above = 150
+        client = Mock()
+        client.call.return_value = {'TotalRecordCount': 1, 'Items': {'LogRecords': [dds(T)]}}
+        busy.rpc = lambda cms=False: client
+        with self.assertLogs('app.mongo_collector', 'WARNING'):
+            busy.slow_window(T, T + WINDOW)
+        self.assertIn('das_pages_unstable', busy.state['slowlog_source'])
 
     def test_window_over_the_record_cap_is_over_capacity_and_never_published(self):
         c, fake = collector(records=[dds(T + i * SECOND) for i in range(30)])
@@ -89,24 +158,14 @@ class DasSource(unittest.TestCase):
         c, _ = collector()
         c.das_rpc = Mock(side_effect=RuntimeError('DAS 调用失败：denied'))
         client = Mock()
-        client.call.return_value = {'TotalRecordCount': 1, 'Items': {'LogRecords': [dds(T)]}}
+        record = dds(T)
+        client.call.return_value = {'TotalRecordCount': 1, 'Items': {'LogRecords': [record]}}
         c.rpc = lambda cms=False: client
         with self.assertLogs('app.mongo_collector', 'WARNING') as logs:
             c.slow_window(T, T + WINDOW)
         self.assertIn('reading DDS instead', logs.output[0])
         self.assertTrue(c.state['slowlog_source'].startswith('dds_fallback'))
-        self.assertEqual(c.store.publish.call_args.args[3], [dds(T)])
-
-    def test_a_second_holding_more_than_a_page_falls_back_to_dds(self):
-        c, _ = collector(records=[dds(T + 5 * SECOND) for _ in range(5)])
-        c.DAS_PAGE = 3
-        client = Mock()
-        client.call.return_value = {'TotalRecordCount': 5, 'Items': {'LogRecords': [dds(T + 5 * SECOND)] * 5}}
-        c.rpc = lambda cms=False: client
-        with self.assertLogs('app.mongo_collector', 'WARNING'):
-            c.slow_window(T, T + WINDOW)
-        self.assertIn('das_second_exceeds_page', c.state['slowlog_source'])
-        self.assertEqual(len(c.store.publish.call_args.args[3]), 5)
+        self.assertEqual(c.store.publish.call_args.args[3], [record])
 
 
 class LiveTail(unittest.TestCase):

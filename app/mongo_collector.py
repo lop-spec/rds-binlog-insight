@@ -103,12 +103,15 @@ class MongoCollector:
     LIVE_SETTLE_US = 90_000_000
     # A caught-up live lane reads every closed window at most this many times more (late statements of long operations).
     LIVE_REFRESH_WINDOWS = 3
-    # DAS (DescribeSlowLogRecords) serves the same records as DDS without DDS's 30 requests/minute and pages of 100: one
-    # request returns a whole time slice of up to DAS_PAGE records (5,000 accepted, ~0.3 s). A slice holding more is split at
-    # whole seconds and read again; nothing is ever paged, because DAS's order inside a second is not stable across pages.
-    DAS_PAGE = 2000
+    # DAS (DescribeSlowLogRecords) serves the same records as DDS without DDS's 30 requests/minute (~0.3 s a request,
+    # 30 back to back without throttling). Pages stay at 100: above that DAS cuts the command text to 2,048 characters,
+    # which no longer parses (measured 2026-10-28; the first 1.34.8 build asked for 2,000). Pages are ordered by duration
+    # (microseconds, almost never equal), and a slice is accepted only when its distinct records add up to DAS's total.
+    DAS_PAGE = 100
+    # A slice above this many pages is split at whole seconds first, so a mismatch costs a small slice, not a window.
+    DAS_SLICE_PAGES = 20
     DAS_TIMEOUT = 30
-    DAS_REQUEST_INTERVAL = 0.5
+    DAS_REQUEST_INTERVAL = 0.1
 
     def __init__(self, store, entry, settings_loader, archive_loader=None):
         self.store=store;self.entry=entry;self.instance=entry['instanceId']
@@ -116,7 +119,8 @@ class MongoCollector:
         self.stop_event=threading.Event();self.threads=[];self.clients={};self.before={};self.unsupported_metrics={}
         self.history_retry={}
         self.slow_request_lock=threading.Lock();self.slow_next_request=0.0
-        self.das_request_lock=threading.Lock();self.das_next_request=0.0
+        # One pace per reader (live and history lanes share one, the live tail has its own): a busy tail cannot hold up windows.
+        self.das_pace={'lanes':[threading.Lock(),0.0],'tail':[threading.Lock(),0.0]}
         # One window in memory at a time. The live and history lanes already share the request pace, but each held its own
         # window (records, then the store's sorted, Arrow and rollup copies of them) and both could be at their peak together.
         self.slow_window_lock=threading.Lock()
@@ -143,63 +147,87 @@ class MongoCollector:
         if credential is None:raise RuntimeError('cloud_credential_unavailable')
         return DasRpcClient(replace(settings,db_instance_id=self.instance,endpoint=DAS_ENDPOINT),credential,timeout=self.DAS_TIMEOUT)
 
-    def _das_slice(self,client,lo_ms,hi_ms):
-        with self.das_request_lock:
-            delay=max(0.0,self.das_next_request-time.monotonic())
+    def _das_page(self,client,lo_ms,hi_ms,page,pace):
+        gate=self.das_pace[pace]
+        with gate[0]:
+            delay=max(0.0,gate[1]-time.monotonic())
             if self.stop_event.wait(delay):raise RuntimeError('collector_stopping')
-            self.das_next_request=time.monotonic()+self.DAS_REQUEST_INTERVAL
-            r=client.call('DescribeSlowLogRecords',{'InstanceId':self.instance,'StartTime':lo_ms,'EndTime':hi_ms,
-                                                     'PageNumber':1,'PageSize':self.DAS_PAGE})
+            gate[1]=time.monotonic()+self.DAS_REQUEST_INTERVAL
+        r=client.call('DescribeSlowLogRecords',{'InstanceId':self.instance,'StartTime':lo_ms,'EndTime':hi_ms,'PageNumber':page,
+                                                 'PageSize':self.DAS_PAGE,'OrderBy':'QueryTimeSeconds','Asc':'true'})
         data=r.get('Data') or {}
         logs=data.get('Logs')
         if not isinstance(logs,list) or 'TotalRecords' not in data:raise RuntimeError('invalid_das_slowlog_page')
         return int(data['TotalRecords']),logs
 
-    def das_records(self,start_us,end_us,*,client=None,limit=None):
+    def das_records(self,start_us,end_us,*,client=None,limit=None,pace='lanes'):
         """Every slow record that started in [start_us, end_us) (whole seconds), as DDS records, oldest slice first."""
         if start_us%1_000_000 or end_us%1_000_000 or end_us<=start_us:raise ValueError('das_slices_must_be_whole_seconds')
-        client=client or self.das_rpc();records=[];calls=0
+        client=client or self.das_rpc();records=[];first=True
         pending=[(start_us//1000,end_us//1000)]
         while pending:
             if self.stop_event.is_set():raise RuntimeError('collector_stopping')
             lo,hi=pending.pop()
-            total,logs=self._das_slice(client,lo,hi);calls+=1
-            if limit is not None and calls==1 and total>limit:
+            seconds=(hi-lo)//1000
+            total,logs=self._das_page(client,lo,hi,1,pace)
+            if first and limit is not None and total>limit:
                 raise SlowWindowOverCapacity('slowlog_record_limit_exceeded: records=%s cap=%s'%(total,limit))
-            if total>len(logs):
-                seconds=(hi-lo)//1000
-                if seconds<=1:raise RuntimeError('das_second_exceeds_page: records=%s'%total)
-                parts=min(seconds,math.ceil(total/(self.DAS_PAGE*0.75)))
+            first=False
+            pages=max(1,math.ceil(total/self.DAS_PAGE))
+            if pages>self.DAS_SLICE_PAGES and seconds>1:
+                parts=min(seconds,math.ceil(pages/(self.DAS_SLICE_PAGES*0.75)))
                 cuts=[lo+(seconds*i//parts)*1000 for i in range(parts)]+[hi]
                 # Pushed newest first so the oldest slice is read next.
                 pending.extend(reversed(list(zip(cuts,cuts[1:]))))
                 continue
-            if len(logs)!=total:raise RuntimeError('incomplete_das_slice')
-            records.extend(das_record(x) for x in logs if lo<=int(x['Timestamp'])<hi)
+            for page in range(2,pages+1):
+                count,more=self._das_page(client,lo,hi,page,pace)
+                if count!=total:raise RuntimeError('das_source_changed_during_pagination')
+                logs+=more
+            # QueryId names the statement shape, not the execution; a record is its time, duration, client and text.
+            seen={}
+            for log in logs:
+                seen.setdefault((log.get('Timestamp'),log.get('QueryTimeSeconds'),log.get('HostAddress'),log.get('Command')),log)
+            if len(seen)!=total:
+                if seconds>1:
+                    middle=lo+seconds//2*1000
+                    pending.extend([(middle,hi),(lo,middle)])
+                    LOGGER.warning('mongo_slowlog das_pages_unstable: instance=%s slice=%s-%s total=%s distinct=%s; splitting',
+                                   self.instance,lo,hi,total,len(seen))
+                    continue
+                raise RuntimeError('das_pages_unstable: records=%s distinct=%s'%(total,len(seen)))
+            batch=sorted(seen.values(),key=lambda x:(int(x['Timestamp']),str(x.get('QueryTimeSeconds'))))
+            records.extend(das_record(x) for x in batch if lo<=int(x['Timestamp'])<hi)
         return records
 
     def slow_window(self,start,end):
         with self.slow_window_lock:return self._slow_window(start,end)
 
     def _slow_window(self,start,end):
-        if self.entry.get('slowlogSource','das')=='das':
-            try:
-                records=self.das_records(start,end,limit=self.SLOWLOG_MAX_RECORDS)
-                self.state['slowlog_source']='das'
-            except SlowWindowOverCapacity:
-                raise
-            except Exception as exc:
-                if self.stop_event.is_set():raise
-                # DDS has the same records, only slower: a DAS failure costs speed, never a window.
-                self.state['slowlog_source']='dds_fallback: '+(type(exc).__name__+':'+str(exc))[:120]
-                LOGGER.warning('mongo_slowlog das unavailable: instance=%s window=%s reason=%s; reading DDS instead',
-                               self.instance,start,type(exc).__name__+':'+str(exc)[:160])
-                records=self._dds_records(start,end)
-        else:
-            self.state['slowlog_source']='dds'
-            records=self._dds_records(start,end)
         archive=self.archive_loader(self.settings_loader()) if self.archive_loader else None
-        return self.store.publish(self.instance,start,end,records,self.entry.get('families',[]),archive=archive)
+        publish=lambda records:self.store.publish(self.instance,start,end,records,self.entry.get('families',[]),archive=archive)
+        if self.entry.get('slowlogSource','das')!='das':
+            self.state['slowlog_source']='dds'
+            return publish(self._dds_records(start,end))
+        failure=None
+        try:
+            records=self.das_records(start,end,limit=self.SLOWLOG_MAX_RECORDS)
+        except SlowWindowOverCapacity:
+            raise
+        except Exception as exc:
+            if self.stop_event.is_set():raise
+            failure=exc
+        if failure is None:
+            try:
+                self.state['slowlog_source']='das'
+                return publish(records)
+            except ValueError as exc:  # a record that does not parse; storage failures are raised as they are
+                failure=exc
+        # DDS has the same records, only slower: a DAS failure, or DAS records that do not parse, costs speed, never a window.
+        reason=(type(failure).__name__+':'+str(failure))[:160]
+        self.state['slowlog_source']='dds_fallback: '+reason[:120]
+        LOGGER.warning('mongo_slowlog das unavailable: instance=%s window=%s reason=%s; reading DDS instead',self.instance,start,reason)
+        return publish(self._dds_records(start,end))
 
     def _dds_records(self,start,end):
         client=self.rpc();records=[];total=None;begin=time.monotonic();deadline=begin+240

@@ -119,7 +119,7 @@ class MongoSlowTail:
         lo = max(resume, published)
         if lo >= scan_us:
             return 0
-        records = self.collector.das_records(lo, scan_us)
+        records = self.collector.das_records(lo, scan_us, pace='tail')
         by_minute = {}
         for record in records:
             event = normalize_record(record, self.instance, self.prefixes)
