@@ -9,8 +9,9 @@ import time
 from pathlib import Path
 
 from .mongo_collector import MongoCollector, load_instances, METRICS
-from .mongo_insight import analyze, MINUTE, canonical, digest, summarize_namespace_intervals, summarize_native_intervals
+from .mongo_insight import analyze, MINUTE, WINDOW, canonical, digest, summarize_namespace_intervals, summarize_native_intervals
 from .mongo_store import MongoStore
+from .mongo_tail import MongoSlowTail
 from .mongo_metrics import ANALYSIS_METRICS, lock_wait_points
 from .resource_evidence import native_continuity
 
@@ -19,7 +20,7 @@ LOGGER=logging.getLogger(__name__)
 
 class MongoService:
     def __init__(self,root,settings_loader,archive_loader=None,*,start=True):
-        self.root=Path(root);self.collectors=[];self.stores={};self.error='';self.entries=[]
+        self.root=Path(root);self.collectors=[];self.stores={};self.tails={};self.error='';self.entries=[]
         try:
             self.entries=load_instances(self.root)
             for entry in self.entries:
@@ -28,7 +29,11 @@ class MongoService:
                 self.stores[entry['instanceId']]=store
                 collector=MongoCollector(store,entry,settings_loader,archive_loader)
                 self.collectors.append(collector)
-                if start:collector.start()
+                if entry.get('slowlogSource','das')=='das':
+                    self.tails[entry['instanceId']]=MongoSlowTail(collector,collector.slow_next)
+                if start:
+                    collector.start()
+                    if entry.get('enabled') and entry['instanceId'] in self.tails:self.tails[entry['instanceId']].start()
         except Exception as exc:
             self.error=type(exc).__name__+':'+str(exc)[:160]
             LOGGER.warning('mongo_service unavailable: %s; MySQL unchanged',self.error)
@@ -38,12 +43,28 @@ class MongoService:
         cases=json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
         return dict(status='unavailable' if self.error else 'ok' if self.entries else 'not_configured',reason=self.error,
                     instances=[{'id':e['instanceId'],'label':e.get('label',e['instanceId'])} for e in self.entries],
-                    collectors=[c.status() for c in self.collectors],metrics=list(ANALYSIS_METRICS),replays=cases,
+                    collectors=[self.collector_status(c) for c in self.collectors],metrics=list(ANALYSIS_METRICS),replays=cases,
                     scopes={'slowlog':'collected_records','native':'node_command_counters','client':'connected_services_only',
                             'namespaces':'namespace_lock_time_not_cpu'})
 
+    def collector_status(self, collector):
+        state=collector.status()
+        tail=self.tails.get(collector.instance)
+        if tail is not None:
+            state['slowlog_tail']=tail.status()
+        # Where an analysis that ends "now" can end: the live tail when it is current, else the last published window.
+        state['slowlog_data_through']=(tail.complete_through if tail is not None and tail.fresh() else state.get('slowlog_window'))
+        return state
+
     def shutdown(self):
         for c in self.collectors:c.shutdown()
+
+    def tail_rows(self, store, instance, start, end):
+        """``(through, rows by window)`` when the live tail stands in for every unpublished window of [start, end), else None."""
+        tail=self.tails.get(instance)
+        if tail is None:return None
+        missing=[t for t in range(start//WINDOW*WINDOW,((end-1)//WINDOW+1)*WINDOW,WINDOW) if not store.manifest_path(instance,t).exists()]
+        return tail.coverage(missing,start) if missing else None
 
     def query(self, params):
         def get(key,default=''):
@@ -62,8 +83,19 @@ class MongoService:
         metric=get('metric','CPUUtilization')
         if metric not in (*METRICS, 'LockWaits'):raise ValueError('unsupported_mongo_metric')
         store=self.stores[instance]
-        adjusted=None
+        adjusted=None;tail=None;base_tail=None
         if not store.windows_complete(instance,start,end):
+            covered=self.tail_rows(store,instance,start,end)
+            if covered is not None and covered[0]-start>=MINUTE:
+                through,tail=covered
+                if end>through:
+                    # The start stays; the end comes back to the last minute DAS has complete (about a minute ago).
+                    adjusted=dict(reason='source_delay',requested_start_us=start,requested_end_us=end,requested_baseline_start_us=base,
+                                  truncated_us=end-through,shift_us=0,baseline_complete=None)
+                    if base_end==start:base=start-(through-start)
+                    end=through;base_end=base+(end-start)
+                LOGGER.info('mongo_query live tail: instance=%s windows=%s end=%s',instance,len(tail),end)
+        if adjusted is None and tail is None and not store.windows_complete(instance,start,end):
             found=store.nearest_complete(instance,start,end,base)
             if found is None:
                 LOGGER.warning('mongo_query no complete window within 6h of the request: instance=%s start=%s end=%s',instance,start,end)
@@ -73,9 +105,12 @@ class MongoService:
                               shift_us=offset,baseline_complete=baseline_complete)
                 LOGGER.info('mongo_query window shifted: instance=%s shift_min=%s baseline_complete=%s',instance,offset//MINUTE,baseline_complete)
                 start+=offset;end+=offset;base+=offset;base_end+=offset
+        if not store.windows_complete(instance,base,base_end):
+            covered=self.tail_rows(store,instance,base,base_end)
+            base_tail=covered[1] if covered is not None and covered[0]>=base_end else None
         width=store.width(start,end)
-        rows,coverage=store.read(instance,start,end,role=role,kind=kind,command=command,namespace=namespace,width=width)
-        before,baseline=store.read(instance,base,base_end,role=role,kind=kind,command=command,namespace=namespace,width=width)
+        rows,coverage=store.read(instance,start,end,role=role,kind=kind,command=command,namespace=namespace,width=width,tail=tail)
+        before,baseline=store.read(instance,base,base_end,role=role,kind=kind,command=command,namespace=namespace,width=width,tail=base_tail)
         optional={}
         def read_optional(name,fn):
             try:return fn()

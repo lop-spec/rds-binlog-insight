@@ -24,6 +24,7 @@ from collections import Counter
 
 from .mongo_insight import COSTS, MINUTE, WINDOW, VERSION, NORMALIZATION_VERSION, canonical, digest, normalize_record, rollup_events, top_counts
 from .storage import _BodyFileLock
+from .mongo_tail import merge_rows
 
 LOGGER = logging.getLogger(__name__)
 NUMBERS = ('bucket','count','failed','collscan','spill','overlap_us','max_us','first_us','last_us') + COSTS + tuple(k+'_known' for k in COSTS)
@@ -217,15 +218,42 @@ class MongoStore:
     def width(start,end):
         return max(MINUTE,math.ceil((end-start)/MINUTE/180)*MINUTE)
 
-    def read(self, instance, start, end, *, role='', namespace='', command='', kind='', width=None):
+    def read(self, instance, start, end, *, role='', namespace='', command='', kind='', width=None, tail=None):
+        """``tail`` maps window starts to live-tail rollups standing in for windows not published yet."""
         manifests,coverage=self.manifests(instance,start,end)
         width=width or self.width(start,end)
-        if not manifests:
+        extra=[]
+        if tail is not None:
+            published={m['start'] for _,m in manifests}
+            missing=[t for t in range(start//WINDOW*WINDOW,((end-1)//WINDOW+1)*WINDOW,WINDOW) if t not in published]
+            # A window published since the tail was asked is read from ClickHouse only, never counted twice.
+            if missing and set(missing)<=set(tail):
+                extra=[row for t in missing for row in tail[t]]
+                coverage.update(complete=True,collected_windows=coverage['expected_windows'],missing_windows=[],missing_count=0,
+                                missing_ranges=[],tail_windows=len(missing),tail_records=sum(int(r['count']) for r in extra),
+                                source='dds_slow_records+live_tail')
+        if not manifests and not extra:
             return [],coverage
         # Partial edge minutes are deliberately excluded from exact comparisons.
         lo=((start+MINUTE-1)//MINUTE)*MINUTE
         hi=end//MINUTE*MINUTE
         coverage['excluded_partial_minutes']=int(lo!=start)+int(hi!=end)
+        rows=self._read_published(instance,manifests,coverage,lo,hi,role,width) if manifests else []
+        if extra:
+            rows=merge_rows(rows,extra,width=width,lo=lo,hi=hi,role=role)
+        if len(rows)>MAX_ROWS:
+            LOGGER.warning('mongo_query unavailable: aggregate_budget_exceeded')
+            raise RuntimeError('aggregate_budget_exceeded: narrow the window or scope')
+        selected=[]
+        for row in rows:
+            profile=json.loads(row['profile'])
+            if namespace and namespace not in profile['namespace']:continue
+            if command and command!=profile['command']:continue
+            if kind and kind!=profile['kind']:continue
+            selected.append(row)
+        return selected,coverage
+
+    def _read_published(self, instance, manifests, coverage, lo, hi, role, width):
         sums=('count','failed','collscan','spill','overlap_us')+COSTS+tuple(k+'_known' for k in COSTS)
         sample_expression='argMax(src.sample,tuple(src.max_us,src.sample))' if self.backend=='clickhouse' else 'arg_max(src.sample,row(src.max_us,src.sample))'
         selection=[f'CAST(floor(src.bucket / {width}) * {width} AS BIGINT) AS bucket','src.role AS role','src.group_id AS group_id','min(src.profile) AS profile',
@@ -257,7 +285,7 @@ class MongoStore:
             rows=self.client.json_rows(sql,parameters=params,settings=settings,timeout=15)
         else:
             files=[str(p.parent/m['rollup']) for p,m in manifests if m['rollup_rows']]
-            if not files:return [],coverage
+            if not files:return []
             # Rollups written before 1.33.12 have no source columns; union_by_name fills them only when some file has them.
             if not any('clients' in pq.read_schema(f).names for f in files):
                 selection=[c if not c.endswith((' AS clients',' AS accounts')) else "'' AS "+c.rsplit(' AS ',1)[1] for c in selection]
@@ -273,17 +301,7 @@ class MongoStore:
                     names=[c[0] for c in cursor.description]
                     rows=[dict(zip(names,row)) for row in cursor.fetchall()]
                 finally:timer.cancel()
-        if len(rows)>MAX_ROWS:
-            LOGGER.warning('mongo_query unavailable: aggregate_budget_exceeded')
-            raise RuntimeError('aggregate_budget_exceeded: narrow the window or scope')
-        selected=[]
-        for row in rows:
-            profile=json.loads(row['profile'])
-            if namespace and namespace not in profile['namespace']:continue
-            if command and command!=profile['command']:continue
-            if kind and kind!=profile['kind']:continue
-            selected.append(row)
-        return selected,coverage
+        return rows
 
     # The raw provider batches are read back on request only, for windows collected before the rollups had sources.
     RAW_SOURCE_MAX_WINDOWS = 36  # three hours of five-minute windows

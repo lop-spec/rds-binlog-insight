@@ -95,6 +95,35 @@ test('a window the server moved is applied to the form and baseline, and announc
  c2.data.adjusted=null;vm.runInContext('renderMongoAnalytics(data)',c2);
  assert.doesNotMatch(page['#analytics-panel-sql'].innerHTML,/已自动改查/);
 });
+test('a window the live tail ended early keeps its start and says the newest minute is not out yet',async()=>{
+ const {c,nodes,notices,run}=requestContext();
+ c.toLocalInput=d=>d.toISOString().slice(0,19);
+ const start=Date.parse('2026-10-28T03:18:00Z')*1000,end=Date.parse('2026-10-28T03:54:00Z')*1000;
+ const adjusted={reason:'source_delay',requested_start_us:start,requested_end_us:end+60e6,requested_baseline_start_us:start-37*60e6,truncated_us:60e6,shift_us:0,baseline_complete:null};
+ c.api=async()=>({total_groups:0,start_us:start,end_us:end,baseline_start:start-36*60e6,adjusted});
+ await run();
+ assert.equal(nodes['#analytics-start'].value,'2026-10-28T03:18:00');assert.equal(nodes['#analytics-end'].value,'2026-10-28T03:54:00');
+ assert.ok(notices.some(([message,kind])=>kind==='info'&&/阿里云还没放齐/.test(message)));
+ assert.ok(!notices.some(([message])=>/最近的完整时段/.test(message)));
+ const c2=context(),page={};c2.$=s=>page[s]??={value:s==='#mongo-role'?'Primary':''};
+ c2.analyticsTable=(headers,rows)=>headers.join('|')+rows.map(r=>r.join('|')).join('\n');
+ c2.detailBlock=(a,b)=>a+b;c2.switchAnalyticsTab=()=>{};vm.runInContext(source,c2);
+ c2.data={order:'correlation',metric:'CPUUtilization',total_groups:0,coverage:{complete:true,collected_windows:8,expected_windows:8,tail_windows:2},
+  baseline_coverage:{complete:true},ranking:{available:true},start_us:start,end_us:end,adjusted};
+ vm.runInContext('renderMongoAnalytics(data)',c2);
+ assert.match(page['#analytics-panel-sql'].innerHTML,/已截到最近放齐的整分钟（比所选结束早 1 分钟）/);
+ assert.doesNotMatch(page['#analytics-panel-sql'].innerHTML,/已自动改查/);
+ assert.match(page['#analytics-coverage'].innerHTML,/其中 2 个还在采集，由实时读取补上/);
+});
+test('a preset range ends where the live tail vouches, not at the last published window',async()=>{
+ const {c,calls,run}=requestContext({'#analytics-range':'1h'});
+ c.toLocalInput=d=>d.toISOString().slice(0,19);
+ const through=Date.parse('2026-10-28T03:54:00Z')*1000,published=Date.parse('2026-10-28T03:45:00Z')*1000;
+ c.api=async path=>{calls.push(path);return path==='/api/mongo/status'?{collectors:[{instanceId:'dds-example',slowlog_window:published,slowlog_data_through:through}]}:{total_groups:0};};
+ await run();
+ const q=new URL(calls[1],'http://fixture').searchParams;
+ assert.equal(Number(q.get('endEpochUs')),through);
+});
 test('exactly 24 hours preserves yesterday; 24h plus one second and seven days use previous',()=>{
  const c=context();vm.runInContext(source,c);c.start=Date.parse('2026-09-16T09:40:29Z')*1000;
  for(const hours of [1,24,24+1/3600,168]) {

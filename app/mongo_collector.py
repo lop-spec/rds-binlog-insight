@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -13,7 +14,7 @@ from pathlib import Path
 
 from .credentials import load_credential
 from .rds_api import RdsRpcClient
-from .slow_log_collector import DasRpcClient
+from .slow_log_collector import DAS_ENDPOINT, DasRpcClient
 from .mongo_insight import COMMANDS, MINUTE, TOP_NAMESPACES, WINDOW, collection_interval, counter_interval, epoch_us
 from .mongo_store import atomic_json
 
@@ -40,6 +41,20 @@ def bson_epoch_us(value):
     return epoch_us(value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value)
 
 
+def das_record(log):
+    """A DAS slow-log entry in DDS's field names and types.
+
+    Checked on 2026-10-28 against DDS for 61 records of the production instance: every field, the command text included,
+    is equal after this mapping, so a window keeps its revision whichever API read it.
+    """
+    def count(value):
+        return None if value in (None,'') else int(value)
+    return {'AccountName':log.get('AccountName'),'DBName':log.get('DBName'),'DocsExamined':count(log.get('DocsExamined')),
+            'ExecutionStartTime':datetime.fromtimestamp(int(log['Timestamp'])//1000,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'HostAddress':log.get('HostAddress'),'KeysExamined':count(log.get('KeysExamined')),'QueryTimes':count(log.get('QueryTime')),
+            'ReturnRowCounts':count(log.get('ReturnNum')),'SQLText':log['Command'],'TableName':log.get('TableName')}
+
+
 def load_instances(root: Path):
     path=root/'mongo-instances.json'
     if not path.exists():
@@ -58,6 +73,7 @@ def load_instances(root: Path):
             if not re.fullmatch(re.escape(instance)+r'\d+\.mongodb\.'+re.escape(region)+r'\.rds\.aliyuncs\.com',host):
                 raise ValueError('mongo_node_outside_instance_allowlist')
         if item.get('port',3717)!=3717:raise ValueError('mongo_port_not_allowlisted')
+        if item.get('slowlogSource','das') not in ('das','dds'):raise ValueError('invalid_mongo_slowlog_source')
         if not isinstance(item.get('families',[]),list) or any(not re.fullmatch(r'[A-Za-z0-9_-]+',p) for p in item.get('families',[])):
             raise ValueError('invalid_mongo_family_registry')
         limit=item.get('topNamespaceLimit',TOP_NAMESPACES)
@@ -79,8 +95,20 @@ class MongoCollector:
     # 500-page cap, and the live checkpoint stayed on it for 12 days. 2,000 pages = 200,000 records (~1.3 GiB as
     # Python objects at ~7 KB each; the app container has 6 GiB) covers that incident with headroom.
     SLOWLOG_MAX_PAGES = 2000
+    SLOWLOG_MAX_RECORDS = SLOWLOG_MAX_PAGES * 100
     # After an outage an hour of provider lag is normal; past six hours the live lane is stuck, not catching up.
     LIVE_MAX_LAG = 72 * WINDOW
+    # DAS shows a statement a few seconds after it started and has a minute complete about 20 s after the minute ends
+    # (measured 2026-10-28). A window is read once it ended this long ago and re-read later for statements that ran long.
+    LIVE_SETTLE_US = 90_000_000
+    # A caught-up live lane reads every closed window at most this many times more (late statements of long operations).
+    LIVE_REFRESH_WINDOWS = 3
+    # DAS (DescribeSlowLogRecords) serves the same records as DDS without DDS's 30 requests/minute and pages of 100: one
+    # request returns a whole time slice of up to DAS_PAGE records (5,000 accepted, ~0.3 s). A slice holding more is split at
+    # whole seconds and read again; nothing is ever paged, because DAS's order inside a second is not stable across pages.
+    DAS_PAGE = 2000
+    DAS_TIMEOUT = 30
+    DAS_REQUEST_INTERVAL = 0.5
 
     def __init__(self, store, entry, settings_loader, archive_loader=None):
         self.store=store;self.entry=entry;self.instance=entry['instanceId']
@@ -88,6 +116,7 @@ class MongoCollector:
         self.stop_event=threading.Event();self.threads=[];self.clients={};self.before={};self.unsupported_metrics={}
         self.history_retry={}
         self.slow_request_lock=threading.Lock();self.slow_next_request=0.0
+        self.das_request_lock=threading.Lock();self.das_next_request=0.0
         # One window in memory at a time. The live and history lanes already share the request pace, but each held its own
         # window (records, then the store's sorted, Arrow and rollup copies of them) and both could be at their peak together.
         self.slow_window_lock=threading.Lock()
@@ -108,10 +137,71 @@ class MongoCollector:
             self.slow_next_request=time.monotonic()+self.SLOWLOG_REQUEST_INTERVAL
             return client.call('DescribeSlowLogRecords',params)
 
+    def das_rpc(self):
+        settings=self.settings_loader()
+        credential=load_credential(settings.credential_target)
+        if credential is None:raise RuntimeError('cloud_credential_unavailable')
+        return DasRpcClient(replace(settings,db_instance_id=self.instance,endpoint=DAS_ENDPOINT),credential,timeout=self.DAS_TIMEOUT)
+
+    def _das_slice(self,client,lo_ms,hi_ms):
+        with self.das_request_lock:
+            delay=max(0.0,self.das_next_request-time.monotonic())
+            if self.stop_event.wait(delay):raise RuntimeError('collector_stopping')
+            self.das_next_request=time.monotonic()+self.DAS_REQUEST_INTERVAL
+            r=client.call('DescribeSlowLogRecords',{'InstanceId':self.instance,'StartTime':lo_ms,'EndTime':hi_ms,
+                                                     'PageNumber':1,'PageSize':self.DAS_PAGE})
+        data=r.get('Data') or {}
+        logs=data.get('Logs')
+        if not isinstance(logs,list) or 'TotalRecords' not in data:raise RuntimeError('invalid_das_slowlog_page')
+        return int(data['TotalRecords']),logs
+
+    def das_records(self,start_us,end_us,*,client=None,limit=None):
+        """Every slow record that started in [start_us, end_us) (whole seconds), as DDS records, oldest slice first."""
+        if start_us%1_000_000 or end_us%1_000_000 or end_us<=start_us:raise ValueError('das_slices_must_be_whole_seconds')
+        client=client or self.das_rpc();records=[];calls=0
+        pending=[(start_us//1000,end_us//1000)]
+        while pending:
+            if self.stop_event.is_set():raise RuntimeError('collector_stopping')
+            lo,hi=pending.pop()
+            total,logs=self._das_slice(client,lo,hi);calls+=1
+            if limit is not None and calls==1 and total>limit:
+                raise SlowWindowOverCapacity('slowlog_record_limit_exceeded: records=%s cap=%s'%(total,limit))
+            if total>len(logs):
+                seconds=(hi-lo)//1000
+                if seconds<=1:raise RuntimeError('das_second_exceeds_page: records=%s'%total)
+                parts=min(seconds,math.ceil(total/(self.DAS_PAGE*0.75)))
+                cuts=[lo+(seconds*i//parts)*1000 for i in range(parts)]+[hi]
+                # Pushed newest first so the oldest slice is read next.
+                pending.extend(reversed(list(zip(cuts,cuts[1:]))))
+                continue
+            if len(logs)!=total:raise RuntimeError('incomplete_das_slice')
+            records.extend(das_record(x) for x in logs if lo<=int(x['Timestamp'])<hi)
+        return records
+
     def slow_window(self,start,end):
         with self.slow_window_lock:return self._slow_window(start,end)
 
     def _slow_window(self,start,end):
+        if self.entry.get('slowlogSource','das')=='das':
+            try:
+                records=self.das_records(start,end,limit=self.SLOWLOG_MAX_RECORDS)
+                self.state['slowlog_source']='das'
+            except SlowWindowOverCapacity:
+                raise
+            except Exception as exc:
+                if self.stop_event.is_set():raise
+                # DDS has the same records, only slower: a DAS failure costs speed, never a window.
+                self.state['slowlog_source']='dds_fallback: '+(type(exc).__name__+':'+str(exc))[:120]
+                LOGGER.warning('mongo_slowlog das unavailable: instance=%s window=%s reason=%s; reading DDS instead',
+                               self.instance,start,type(exc).__name__+':'+str(exc)[:160])
+                records=self._dds_records(start,end)
+        else:
+            self.state['slowlog_source']='dds'
+            records=self._dds_records(start,end)
+        archive=self.archive_loader(self.settings_loader()) if self.archive_loader else None
+        return self.store.publish(self.instance,start,end,records,self.entry.get('families',[]),archive=archive)
+
+    def _dds_records(self,start,end):
         client=self.rpc();records=[];total=None;begin=time.monotonic();deadline=begin+240
         for page in range(1,self.SLOWLOG_MAX_PAGES+1):
             if self.stop_event.is_set():raise RuntimeError('collector_stopping')
@@ -141,9 +231,7 @@ class MongoCollector:
             if not batch:raise RuntimeError('incomplete_slowlog_pagination')
         if len(records)!=total:raise RuntimeError('slowlog_page_limit_or_count_mismatch')
         # Provider time endpoints can be inclusive; our ownership is [start,end).
-        records=[r for r in records if start<=epoch_us(r['ExecutionStartTime'])<end]
-        archive=self.archive_loader(self.settings_loader()) if self.archive_loader else None
-        return self.store.publish(self.instance,start,end,records,self.entry.get('families',[]),archive=archive)
+        return [r for r in records if start<=epoch_us(r['ExecutionStartTime'])<end]
 
     def cloud_window(self,start,end,*,state_key='metrics_unavailable'):
         client=self.rpc(cms=True);points=[]
@@ -295,8 +383,24 @@ class MongoCollector:
         entry=dict(start_us=start,end_us=end,reason=reason,at=int(time.time()))
         self.state['slowlog_skipped']=([entry]+list(self.state.get('slowlog_skipped',[])))[:10]
 
+    def slow_next(self):
+        """Start of the first window the live lane has not published, or None before its first window."""
+        path=self.store.base(self.instance)/'slow-checkpoint.json'
+        return int(json.loads(path.read_text())['next']) if path.exists() else None
+
+    def live_end(self):
+        return (int(time.time()*1e6)-self.LIVE_SETTLE_US)//WINDOW*WINDOW
+
     def slow_tick(self):
-        end=(int(time.time()*1e6)-180_000_000)//WINDOW*WINDOW
+        # With DAS a window takes seconds, so a lane behind after a restart catches up several per tick.
+        begin=time.monotonic();total=0
+        while True:
+            n,behind=self._slow_step()
+            total+=n
+            if not behind or self.stop_event.is_set() or time.monotonic()-begin>20:return total
+
+    def _slow_step(self):
+        end=self.live_end()
         checkpoint=self.store.base(self.instance)/'slow-checkpoint.json'
         start=int(json.loads(checkpoint.read_text())['next']) if checkpoint.exists() else end-3*WINDOW
         if start<end-self.LIVE_MAX_LAG:
@@ -317,16 +421,16 @@ class MongoCollector:
                                self.instance,start,exc)
                 self.note_skipped(start,start+WINDOW,str(exc))
                 atomic_json(checkpoint,{'next':start+WINDOW})
-                return 0
+                return 0,start+WINDOW<end
             atomic_json(checkpoint,{'next':start+WINDOW})
-            self.state['slowlog_window']=m['end'];return m['records']
+            self.state['slowlog_window']=m['end'];return m['records'],start+WINDOW<end
         # Refresh closed but recently completed windows for delayed provider logs.
         self.state['slowlog_window']=end
-        t=end-(1+int(time.time()//60)%3)*WINDOW
-        return self.slow_window(t,t+WINDOW)['records']
+        t=end-(1+int(time.time()//60)%self.LIVE_REFRESH_WINDOWS)*WINDOW
+        return self.slow_window(t,t+WINDOW)['records'],False
 
     def history_bounds(self):
-        end=(int(time.time()*1e6)-180_000_000)//WINDOW*WINDOW
+        end=self.live_end()
         path=self.store.base(self.instance)/'history-target.json'
         with self.store.lock:
             if not path.exists():atomic_json(path,{'start':end-48*60*MINUTE})
@@ -399,7 +503,7 @@ class MongoCollector:
     def start(self):
         if not self.entry.get('enabled'):
             LOGGER.warning('mongo_collector disabled: instance=%s configuration_disabled',self.instance);return
-        for name,callback,seconds in [('slowlog',self.slow_tick,30),
+        for name,callback,seconds in [('slowlog',self.slow_tick,20),
                 ('metrics',lambda:self.cloud_window(int(time.time()*1e6)-6*MINUTE,int(time.time()*1e6)),60),
                 ('counters',self.sample_nodes,60),
                 ('history_slowlog',self.history_slow_tick,60),

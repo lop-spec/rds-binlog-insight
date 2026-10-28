@@ -14,7 +14,7 @@ from tests.test_mongo_insight import record, T
 class CollectorGates(unittest.TestCase):
     def collector(self, responses):
         store=Mock();store.publish.return_value={'records':0}
-        c=MongoCollector(store,{'instanceId':'dds-example','region':'cn-example-1','families':[]},lambda:None)
+        c=MongoCollector(store,{'instanceId':'dds-example','region':'cn-example-1','families':[],'slowlogSource':'dds'},lambda:None)
         client=Mock();client.call.side_effect=responses;c.rpc=lambda cms=False:client
         return c
 
@@ -119,8 +119,9 @@ class CollectorGates(unittest.TestCase):
                 with self.assertLogs('app.mongo_collector',level='WARNING') as logs:
                     self.assertEqual(c.slow_tick(),0)
             self.assertIn('live_skip',logs.output[0]);self.assertIn('over_capacity',logs.output[0])
-            self.assertEqual(json.loads(checkpoint.read_text())['next'],T+5*MINUTE)
-            skipped=c.state['slowlog_skipped'][0]
+            # now-90 s ends the closed windows at T+15 min: one tick skips all three, oldest first
+            self.assertEqual(json.loads(checkpoint.read_text())['next'],T+15*MINUTE)
+            skipped=c.state['slowlog_skipped'][-1]
             self.assertEqual((skipped['start_us'],skipped['end_us']),(T,T+5*MINUTE))
             self.assertIn('records=300000',skipped['reason'])
 
@@ -134,10 +135,11 @@ class CollectorGates(unittest.TestCase):
             c.slow_window=Mock(return_value=dict(end=0,records=7))
             with patch('app.mongo_collector.time.time',return_value=now/1e6):
                 with self.assertLogs('app.mongo_collector',level='WARNING') as logs:
-                    self.assertEqual(c.slow_tick(),7)
-            end=(now-180_000_000)//(5*MINUTE)*(5*MINUTE)
+                    self.assertEqual(c.slow_tick(),21)
+            end=(now-90_000_000)//(5*MINUTE)*(5*MINUTE)
             self.assertIn('lag_exceeds_limit',logs.output[0])
-            c.slow_window.assert_called_once_with(end-3*5*MINUTE,end-2*5*MINUTE)
+            self.assertEqual([call.args for call in c.slow_window.call_args_list],
+                             [(end-k*5*MINUTE,end-(k-1)*5*MINUTE) for k in (3,2,1)])
             self.assertEqual(c.state['slowlog_skipped'][0]['reason'],'lag_exceeds_limit')
             self.assertEqual(c.state['slowlog_skipped'][0]['start_us'],T)
 
@@ -152,9 +154,9 @@ class CollectorGates(unittest.TestCase):
                 with self.assertRaises(TimeoutError):c.slow_tick()
                 self.assertEqual(checkpoint.read_bytes(),before)
                 c.slow_window=Mock(return_value=dict(end=T+5*MINUTE,records=28449))
-                self.assertEqual(c.slow_tick(),28449)
-            c.slow_window.assert_called_once_with(T,T+5*MINUTE)
-            self.assertEqual(json.loads(checkpoint.read_text())['next'],T+5*MINUTE)
+                self.assertEqual(c.slow_tick(),3*28449)
+            self.assertEqual(c.slow_window.call_args_list[0].args,(T,T+5*MINUTE))
+            self.assertEqual(json.loads(checkpoint.read_text())['next'],T+15*MINUTE)
 
     def test_empty_is_a_complete_source_window(self):
         c=self.collector([{'TotalRecordCount':0,'Items':{'LogRecords':[]}}])

@@ -70,7 +70,7 @@ function mongoAssessment(x){
 }
 function mongoCoverageText(c){
   const ranges=[...(c.missing_ranges||[]),...(c.index_missing_ranges||[])];
-  return `${c.collected_windows??0}/${c.expected_windows??0} 个五分钟窗口${c.complete?'，完整':`，缺 ${c.missing_count??'?'} 个${c.index_missing_count?`，另有 ${c.index_missing_count} 个索引缺口`:''}`}`+
+  return `${c.collected_windows??0}/${c.expected_windows??0} 个五分钟窗口${c.complete?`，完整${c.tail_windows?`（其中 ${c.tail_windows} 个还在采集，由实时读取补上）`:''}`:`，缺 ${c.missing_count??'?'} 个${c.index_missing_count?`，另有 ${c.index_missing_count} 个索引缺口`:''}`}`+
     (ranges.length?`；缺口 ${ranges.slice(0,3).map(x=>`${formatTime(x.start_us)}—${formatTime(x.end_us)}`).join('；')}${ranges.length>3?` 等 ${ranges.length} 段`:''}`:'');
 }
 function mongoOptions(rows) { return rows.map(([v,t])=>`<option value="${escapeHtml(v)}">${escapeHtml(t)}</option>`).join(''); }
@@ -118,7 +118,8 @@ function applyMongoAdjustment(data) {
   $('#analytics-range').value='custom';
   $('#mongo-baseline-start').value=toLocalInput(new Date(data.baseline_start/1000));
   syncMongoBaseline();
-  toast('所选时段的慢日志窗口不完整，已改查最近的完整时段','info',6000);
+  if (data.adjusted.reason==='source_delay') toast(`所选时段末尾阿里云还没放齐，已截到 ${formatTime(data.end_us)}`,'info',6000);
+  else toast('所选时段的慢日志窗口不完整，已改查最近的完整时段','info',6000);
 }
 function mongoAnalysisError(error) {
   const messages={baseline_must_not_overlap_current_window:'基线与分析时间重叠，请改选“前一个等长窗口”或更早的基线开始时间',mongo_window_exceeds_seven_days:'MongoDB 单次最多分析 7 天，请缩小时间范围'};
@@ -184,7 +185,8 @@ async function runMongoAnalytics() {
     if ($('#analytics-range').value!=='custom') {
       const current=await api('/api/mongo/status');
       if(request!==mongoRequest||$('#analytics-source').value!=='mongodb')return;
-      const watermark=current.collectors?.find(x=>x.instanceId===$('#mongo-instance').value)?.slowlog_window;
+      const collector=current.collectors?.find(x=>x.instanceId===$('#mongo-instance').value);
+      const watermark=collector?.slowlog_data_through??collector?.slowlog_window;
       if(Number.isFinite(watermark)&&watermark>0){const span=end-start;end=watermark;start=end-span;$('#analytics-start').value=toLocalInput(new Date(start/1000));$('#analytics-end').value=toLocalInput(new Date(end/1000));}
       baseline=syncMongoBaseline(start,end,true);
     }
@@ -257,7 +259,7 @@ function renderMongoAnalytics(data) {
     : `仅统计完整落在窗口内的区间：${mongoNumber(namespaceTop.intervals,0)} 个区间、覆盖 ${mongoNumber(namespaceTop.observed_seconds)} 秒。${namespaceTop.truncated_intervals?'单次采样的集合列表按锁时间截断，分表族合计不受截断影响。':''}`;
   const metricName=MONGO_METRICS[data.metric]||data.metric;
   const moved=data.adjusted;
-  const adjustBlock=moved?`<div class="notice info compact-notice"><div><strong>已自动改查最近的完整时段（${mongoShiftText(moved.shift_us)}）</strong><span>所选时段（${escapeHtml(formatTime(moved.requested_start_us))} → ${escapeHtml(formatTime(moved.requested_end_us))}）的慢日志窗口不完整，以下为 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))} 的结果；时间框已同步。${moved.baseline_complete===false?'附近没有对照窗口也完整的时段，对照窗口仍不完整。':''}</span></div></div>`:'';
+  const adjustBlock=moved?.reason==='source_delay'?`<div class="notice info compact-notice"><div><strong>已截到最近放齐的整分钟（比所选结束早 ${Math.round(moved.truncated_us/60_000_000)} 分钟）</strong><span>阿里云的慢日志要过几十秒才放齐，最近一两分钟可能还缺（所选 ${escapeHtml(formatTime(moved.requested_start_us))} → ${escapeHtml(formatTime(moved.requested_end_us))}）：起点不变，结果只到 ${escapeHtml(formatTime(data.end_us))}。</span></div></div>`:moved?`<div class="notice info compact-notice"><div><strong>已自动改查最近的完整时段（${mongoShiftText(moved.shift_us)}）</strong><span>所选时段（${escapeHtml(formatTime(moved.requested_start_us))} → ${escapeHtml(formatTime(moved.requested_end_us))}）的慢日志窗口不完整，以下为 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))} 的结果；时间框已同步。${moved.baseline_complete===false?'附近没有对照窗口也完整的时段，对照窗口仍不完整。':''}</span></div></div>`:'';
   const noticeBlock=scopeNotice||orderNotice?`<div class="notice"><div><strong>${escapeHtml(orderNotice||'窗口数据尚未完整')}</strong><p>${escapeHtml(scopeNotice)}</p><p class="analytics-note">${escapeHtml(recovery)} ${escapeHtml(historyErrors)} 重新分析可查看回补后的结果。</p><button type="button" class="button secondary compact" data-mongo-recent>改查最近 1 小时，对比前 1 小时</button></div></div>`:'';
   $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>${escapeHtml(metricName)} 上涨排查</h3>${adjustBlock}${noticeBlock}
     ${series.map(s=>`<h4>${escapeHtml(s.role)} · ${escapeHtml(s.node||'节点未标识')} · ${escapeHtml(metricName)}</h4>${mongoSparkline(s.points)}`).join('')||'<p>没有匹配的性能数据。</p>'}
