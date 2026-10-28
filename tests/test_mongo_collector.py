@@ -319,3 +319,20 @@ class CollectorGates(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class TelemetryQueries(unittest.TestCase):
+    def test_time_filter_runs_before_final_so_a_short_window_never_merges_seven_days(self):
+        # 2026-10-28: WHERE after FINAL merged every native/namespace row of the instance, 480 MiB for five minutes.
+        from app.mongo_store import MongoStore
+        with tempfile.TemporaryDirectory() as td:
+            client=Mock();client.json_rows.return_value=[]
+            store=MongoStore(Path(td),backend='clickhouse',client=client)
+            store.read_telemetry('dds-example','namespaces',T,T+5*MINUTE)
+            store.read_telemetry('dds-example','metrics',T,T+5*MINUTE,metric='CPUUtilization')
+            store.latest_native('dds-example',T)
+        for call in client.json_rows.call_args_list:
+            sql=call.args[0]
+            self.assertRegex(sql,r'FINAL PREWHERE instance=\{instance:String\} AND kind=\{kind:String\} AND timestamp >= \{start:Int64\} AND timestamp <= \{end:Int64\}')
+            self.assertIn('kind',call.kwargs['parameters'])
+        self.assertIn("WHERE JSONExtractString(payload,'metric')",client.json_rows.call_args_list[1].args[0])

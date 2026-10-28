@@ -351,12 +351,18 @@ class MongoStore:
         if self.backend=='clickhouse':
             for i in range(0,len(rows),200):self.client.insert_json_rows(self.table('telemetry'),rows[i:i+200],timeout=15)
 
+    # The sorting key is (instance, kind, id), so a time filter in WHERE came after FINAL had merged every row of the kind:
+    # seven days of node samples (~19 KB each) and namespace samples (~45 KB) went past the client's 500 MB query limit and
+    # the node counter and namespace panels were empty (2026-10-28: 480 MiB for a five-minute window). The id hashes the
+    # timestamp (no id has two timestamps), so PREWHERE may drop rows before the merge: 0.03 s for the same window.
+    TELEMETRY_SCOPE=' PREWHERE instance={instance:String} AND kind={kind:String} AND timestamp >= {start:Int64} AND timestamp <= {end:Int64}'
+
     def read_telemetry(self, instance, kind, start, end, *, metric='', compact=False):
         if self.backend=='clickhouse':
             select="concat('{\"interval\":', JSONExtractRaw(src.payload,'interval'), ',\"timestamp\":', toString(src.timestamp), ',\"node\":', toJSONString(src.node), ',\"role\":', toJSONString(src.role), ',\"epoch\":', if(empty(JSONExtractRaw(src.payload,'epoch')), 'null', JSONExtractRaw(src.payload,'epoch')), ',\"global_lock\":', if(empty(JSONExtractRaw(src.payload,'global_lock')), 'null', JSONExtractRaw(src.payload,'global_lock')), '}') AS payload" if compact else 'src.payload AS payload'
-            predicate=" AND JSONExtractString(payload,'metric')={metric:String}" if metric else ''
+            predicate=" WHERE JSONExtractString(payload,'metric')={metric:String}" if metric else ''
             rows=self.client.json_rows('SELECT '+select+' FROM (SELECT * FROM '+self.table('telemetry')+
-                ' FINAL WHERE instance={instance:String} AND kind={kind:String} AND timestamp >= {start:Int64} AND timestamp <= {end:Int64}'+predicate+') AS src LIMIT 100001',
+                ' FINAL'+self.TELEMETRY_SCOPE+predicate+') AS src LIMIT 100001',
                 parameters={'instance':instance,'kind':kind,'start':start//1000,'end':end//1000,'metric':metric},timeout=10)
         else:
             files=list((self.base(instance)/'telemetry'/kind).glob('*.parquet'))
@@ -371,8 +377,8 @@ class MongoStore:
     def latest_native(self, instance, end):
         if self.backend=='clickhouse':
             rows=self.client.json_rows('SELECT argMax(payload,timestamp) AS payload FROM '+self.table('telemetry')+
-                " FINAL WHERE instance={instance:String} AND kind='native' AND timestamp <= {end:Int64} AND timestamp >= {start:Int64} GROUP BY node LIMIT 10",
-                parameters={'instance':instance,'end':end//1000,'start':(end-120*MINUTE)//1000},timeout=5)
+                ' FINAL'+self.TELEMETRY_SCOPE+' GROUP BY node LIMIT 10',
+                parameters={'instance':instance,'kind':'native','end':end//1000,'start':(end-120*MINUTE)//1000},timeout=5)
             return [json.loads(r['payload']) for r in rows]
         values=self.read_telemetry(instance,'native',end-120*MINUTE,end)
         latest={}
