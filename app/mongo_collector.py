@@ -104,9 +104,11 @@ class MongoCollector:
     # A caught-up live lane reads every closed window at most this many times more (late statements of long operations).
     LIVE_REFRESH_WINDOWS = 3
     # DAS (DescribeSlowLogRecords) serves the same records as DDS without DDS's 30 requests/minute (~0.3 s a request,
-    # 30 back to back without throttling). Pages stay at 100: above that DAS cuts the command text to 2,048 characters,
-    # which no longer parses (measured 2026-10-28; the first 1.34.8 build asked for 2,000). Pages are ordered by duration
-    # (microseconds, almost never equal), and a slice is accepted only when its distinct records add up to DAS's total.
+    # 30 back to back without throttling). DAS cuts the command text to 2,048 characters, which no longer parses, when a
+    # page asks for more than 100 records or for any order but its default (measured 2026-10-28: 1.34.8 asked for 2,000,
+    # 1.34.9 for OrderBy=QueryTimeSeconds). Pages therefore keep the default order (newest second first; paging a second
+    # of 938 records in pages of 10 gave 938 distinct records), and a slice is accepted only when its distinct records add
+    # up to DAS's total.
     DAS_PAGE = 100
     # A slice above this many pages is split at whole seconds first, so a mismatch costs a small slice, not a window.
     DAS_SLICE_PAGES = 20
@@ -154,7 +156,7 @@ class MongoCollector:
             if self.stop_event.wait(delay):raise RuntimeError('collector_stopping')
             gate[1]=time.monotonic()+self.DAS_REQUEST_INTERVAL
         r=client.call('DescribeSlowLogRecords',{'InstanceId':self.instance,'StartTime':lo_ms,'EndTime':hi_ms,'PageNumber':page,
-                                                 'PageSize':self.DAS_PAGE,'OrderBy':'QueryTimeSeconds','Asc':'true'})
+                                                 'PageSize':self.DAS_PAGE})
         data=r.get('Data') or {}
         logs=data.get('Logs')
         if not isinstance(logs,list) or 'TotalRecords' not in data:raise RuntimeError('invalid_das_slowlog_page')

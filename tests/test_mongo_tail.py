@@ -43,10 +43,10 @@ def das_log(record):
 
 
 class FakeDas:
-    """DescribeSlowLogRecords over a fixed set: [StartTime, EndTime) in ms, pages ordered by QueryTimeSeconds.
+    """DescribeSlowLogRecords over a fixed set: [StartTime, EndTime) in ms, newest first.
 
-    Like DAS, a page above 100 records cuts the command text to 2,048 characters. ``unstable_above`` reorders every page of a
-    slice holding more records than that, as an unstable sort would.
+    Like DAS, a page above 100 records or with an ``OrderBy`` cuts the command text to 2,048 characters. ``unstable_above``
+    reorders every page of a slice holding more records than that, as an unstable sort would.
     """
 
     def __init__(self, records, unstable_above=None):
@@ -58,12 +58,12 @@ class FakeDas:
         assert action == 'DescribeSlowLogRecords'
         self.calls.append(params)
         hits = sorted((x for x in self.logs if params['StartTime'] <= x['Timestamp'] < params['EndTime']),
-                      key=lambda x: x['QueryTimeSeconds'])
+                      key=lambda x: -x['Timestamp'])
         if self.unstable_above is not None and len(hits) > self.unstable_above:
             random.Random(len(self.calls)).shuffle(hits)
         size, page = params['PageSize'], params['PageNumber']
         logs = hits[(page - 1) * size:page * size]
-        if size > 100:
+        if size > 100 or 'OrderBy' in params or 'Asc' in params:
             logs = [dict(x, Command=x['Command'][:2048]) for x in logs]
         return {'Success': 'true', 'Data': {'TotalRecords': len(hits), 'Logs': logs}}
 
@@ -91,7 +91,7 @@ class DasSource(unittest.TestCase):
         c.slow_window(T, T + WINDOW)
         published = c.store.publish.call_args.args[3]
         self.assertEqual(sorted(json.dumps(r) for r in published), sorted(json.dumps(r) for r in records))
-        self.assertTrue(all(p['PageSize'] == 100 and p['OrderBy'] == 'QueryTimeSeconds' for p in fake.calls))
+        self.assertTrue(all(p['PageSize'] == 100 and 'OrderBy' not in p and 'Asc' not in p for p in fake.calls))
         self.assertTrue(all(p['StartTime'] % 1000 == 0 and p['EndTime'] % 1000 == 0 for p in fake.calls))
         self.assertLessEqual(max(p['PageNumber'] for p in fake.calls), 20)
         # 50 pages of records: one look at the window, then its slices; no slice is read twice
@@ -110,7 +110,7 @@ class DasSource(unittest.TestCase):
         long = dds(T, shape=3000)
         with tempfile.TemporaryDirectory() as td:
             c, _ = collector(store=MongoStore(Path(td), backend='parquet'), records=[long])
-            c.DAS_PAGE = 200  # what the first 1.34.8 build asked for: DAS cuts the text
+            c.DAS_PAGE = 200  # what 1.34.8 asked for: DAS cuts the text
             client = Mock()
             client.call.return_value = {'TotalRecordCount': 1, 'Items': {'LogRecords': [long]}}
             c.rpc = lambda cms=False: client
