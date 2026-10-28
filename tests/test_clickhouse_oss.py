@@ -497,7 +497,8 @@ class ClickHouseOssConfigTests(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_raw_backend_serves_original_oss_without_source_part_enumeration(self):
-        event_us = int(datetime(2026, 8, 26, 0, 5, tzinfo=UTC).timestamp() * 1_000_000)
+        # Relative to today: a fixed date ages out of the 60-day retention the query is asked with (it did on 2026-10-25).
+        event_us = int((datetime.now(UTC) - timedelta(days=30)).replace(second=0, microsecond=0).timestamp() * 1_000_000)
 
         class _Metadata:
             @staticmethod
