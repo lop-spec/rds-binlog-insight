@@ -23,10 +23,11 @@ def dds(at_us, ns='demo.messages_1', ms=120, role='PRIMARY', client='10.0.0.1', 
     n = next(SEQUENCE)
     q = dict(op='command', ns=ns, command={'find': ns.split('.')[1], 'filter': {'x' * shape: 42}}, millis=ms,
              replRole={'stateStr': role}, cpuNanos=ms * 1000, lsid={'id': n})
-    return {'AccountName': 'app@demo', 'DBName': 'demo', 'DocsExamined': 10,
+    # DDS's field order (always this one in production raw batches).
+    return {'TableName': ns.split('.')[1], 'QueryTimes': ms,
             'ExecutionStartTime': datetime.fromtimestamp(at_us // SECOND, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'HostAddress': client, 'KeysExamined': 11, 'QueryTimes': ms, 'ReturnRowCounts': 1,
-            'SQLText': json.dumps(q), 'TableName': ns.split('.')[1]}
+            'ReturnRowCounts': 1, 'KeysExamined': 11, 'DBName': 'demo', 'HostAddress': client, 'DocsExamined': 10,
+            'SQLText': json.dumps(q), 'AccountName': 'app@demo'}
 
 
 def das_log(record):
@@ -84,6 +85,8 @@ class DasSource(unittest.TestCase):
     def test_das_entry_maps_to_the_dds_record_field_for_field(self):
         record = dds(T + 7 * SECOND)
         self.assertEqual(das_record(das_log(record)), record)
+        # same text, so the same revision as the DDS batch
+        self.assertEqual(json.dumps(das_record(das_log(record))), json.dumps(record))
 
     def test_dense_window_is_read_in_whole_second_slices_of_at_most_twenty_pages(self):
         records = [dds(T + (i * 300 // 5000) * SECOND) for i in range(5000)]
@@ -120,6 +123,24 @@ class DasSource(unittest.TestCase):
         self.assertIn('JSONDecodeError', c.state['slowlog_source'])
         self.assertTrue(any('reading DDS instead' in line for line in logs.output))
 
+    def test_records_arriving_while_a_slice_is_paged_are_read_again(self):
+        records = [dds(T + (i % 3) * SECOND) for i in range(300)]
+        late = [dds(T + 2 * SECOND) for _ in range(5)]
+        c, fake = collector(records=records)
+        original = fake.call
+
+        def arriving(action, params):
+            # DAS gets five more records for the newest second after the first page of the first read
+            if len(fake.calls) == 1:
+                fake.logs += [das_log(r) for r in late]
+            return original(action, params)
+        fake.call = arriving
+        with self.assertLogs('app.mongo_collector', 'INFO') as logs:
+            c.slow_window(T, T + WINDOW)
+        self.assertTrue(any('changed; splitting' in line for line in logs.output))
+        self.assertEqual(len(c.store.publish.call_args.args[3]), 305)
+        self.assertEqual(c.state['slowlog_source'], 'das')
+
     def test_a_busy_second_is_paged_and_checked(self):
         records = [dds(T + 5 * SECOND) for _ in range(250)]
         c, fake = collector(records=records)
@@ -131,7 +152,7 @@ class DasSource(unittest.TestCase):
         c, fake = collector(records=records)
         c.das_rpc = lambda: fake
         fake.unstable_above = 150
-        with self.assertLogs('app.mongo_collector', 'WARNING') as logs:
+        with self.assertLogs('app.mongo_collector', 'INFO') as logs:
             c.slow_window(T, T + WINDOW)
         self.assertTrue(any('das_pages_unstable' in line and 'splitting' in line for line in logs.output))
         # every second holds 100 records, so after splitting every slice is a single page and stable

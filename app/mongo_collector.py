@@ -42,17 +42,19 @@ def bson_epoch_us(value):
 
 
 def das_record(log):
-    """A DAS slow-log entry in DDS's field names and types.
+    """A DAS slow-log entry as DDS returns it: field names, types and field order.
 
-    Checked on 2026-10-28 against DDS for 61 records of the production instance: every field, the command text included,
-    is equal after this mapping, so a window keeps its revision whichever API read it.
+    Checked on 2026-10-28 against DDS on the production instance: 61 records, then a whole window of 2,677, were equal field
+    for field (the command text included). The order matters too: a window's revision hashes the records' JSON text, and DDS
+    always returns this order, so the same records keep their revision whichever API read them.
     """
     def count(value):
         return None if value in (None,'') else int(value)
-    return {'AccountName':log.get('AccountName'),'DBName':log.get('DBName'),'DocsExamined':count(log.get('DocsExamined')),
+    return {'TableName':log.get('TableName'),'QueryTimes':count(log.get('QueryTime')),
             'ExecutionStartTime':datetime.fromtimestamp(int(log['Timestamp'])//1000,timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'HostAddress':log.get('HostAddress'),'KeysExamined':count(log.get('KeysExamined')),'QueryTimes':count(log.get('QueryTime')),
-            'ReturnRowCounts':count(log.get('ReturnNum')),'SQLText':log['Command'],'TableName':log.get('TableName')}
+            'ReturnRowCounts':count(log.get('ReturnNum')),'KeysExamined':count(log.get('KeysExamined')),'DBName':log.get('DBName'),
+            'HostAddress':log.get('HostAddress'),'DocsExamined':count(log.get('DocsExamined')),'SQLText':log['Command'],
+            'AccountName':log.get('AccountName')}
 
 
 def load_instances(root: Path):
@@ -165,7 +167,7 @@ class MongoCollector:
     def das_records(self,start_us,end_us,*,client=None,limit=None,pace='lanes'):
         """Every slow record that started in [start_us, end_us) (whole seconds), as DDS records, oldest slice first."""
         if start_us%1_000_000 or end_us%1_000_000 or end_us<=start_us:raise ValueError('das_slices_must_be_whole_seconds')
-        client=client or self.das_rpc();records=[];first=True
+        client=client or self.das_rpc();records=[];first=True;retries={}
         pending=[(start_us//1000,end_us//1000)]
         while pending:
             if self.stop_event.is_set():raise RuntimeError('collector_stopping')
@@ -182,22 +184,29 @@ class MongoCollector:
                 # Pushed newest first so the oldest slice is read next.
                 pending.extend(reversed(list(zip(cuts,cuts[1:]))))
                 continue
+            changed=False
             for page in range(2,pages+1):
                 count,more=self._das_page(client,lo,hi,page,pace)
-                if count!=total:raise RuntimeError('das_source_changed_during_pagination')
+                if count!=total:
+                    changed=True;break
                 logs+=more
             # QueryId names the statement shape, not the execution; a record is its time, duration, client and text.
             seen={}
             for log in logs:
                 seen.setdefault((log.get('Timestamp'),log.get('QueryTimeSeconds'),log.get('HostAddress'),log.get('Command')),log)
-            if len(seen)!=total:
+            if changed or len(seen)!=total:
+                # Records still arriving (the newest seconds) or an unstable order: read the halves, or a second again.
+                reason='changed' if changed else 'distinct=%s'%len(seen)
                 if seconds>1:
                     middle=lo+seconds//2*1000
                     pending.extend([(middle,hi),(lo,middle)])
-                    LOGGER.warning('mongo_slowlog das_pages_unstable: instance=%s slice=%s-%s total=%s distinct=%s; splitting',
-                                   self.instance,lo,hi,total,len(seen))
+                    LOGGER.info('mongo_slowlog das_pages_unstable: instance=%s slice=%s-%s total=%s %s; splitting',
+                                self.instance,lo,hi,total,reason)
                     continue
-                raise RuntimeError('das_pages_unstable: records=%s distinct=%s'%(total,len(seen)))
+                retries[lo]=retries.get(lo,0)+1
+                if retries[lo]<3:
+                    pending.append((lo,hi));continue
+                raise RuntimeError('das_pages_unstable: records=%s %s'%(total,reason))
             batch=sorted(seen.values(),key=lambda x:(int(x['Timestamp']),str(x.get('QueryTimeSeconds'))))
             records.extend(das_record(x) for x in batch if lo<=int(x['Timestamp'])<hi)
         return records
