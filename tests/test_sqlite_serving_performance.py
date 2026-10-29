@@ -183,6 +183,9 @@ class SQLiteServingPerformanceTests(unittest.TestCase):
                                         "levels CROSS JOIN parquet_parts p INDEXED BY idx_part_cold_compression "
                                         "ON p.compression_level = levels.level CROSS JOIN binlog_files b",
                                         "parquet_parts p JOIN binlog_files b",
+                                    ).replace(
+                                        "parquet_parts p INDEXED BY idx_part_time JOIN binlog_files b",
+                                        "parquet_parts p JOIN binlog_files b",
                                     )
                                     expected = [dict(row) for row in conn.execute(baseline)]
                                     self.assertEqual(actual, expected, (source, instance, start, end, limit))
@@ -199,7 +202,9 @@ class SQLiteServingPerformanceTests(unittest.TestCase):
                                         elif source == "slowlog" and not instance and start in (BASE, BASE - DAY):
                                             label = "wide-500-days" if start == BASE else "earliest-boundary"
                                             result = compare(self, conn, f"parts-{label}", baseline, sql)
-                                            self.assertLessEqual(abs(result["before_steps"] - result["after_steps"]), 100)
+                                            # 1.34.14: a window at the start of the history seeks the (min, max)
+                                            # index and may take fewer steps; it must never take more.
+                                            self.assertLessEqual(result["after_steps"] - result["before_steps"], 100)
                 self.assertEqual(schema, list(conn.execute("SELECT name, sql FROM sqlite_master ORDER BY name")))
 
 

@@ -330,7 +330,8 @@ def partition_filter(partitions: Iterable[Iterable[Any]]) -> str:
 
 
 def purge_file_rows(ch: Any, part_keys: list[str], lo_us: int | None = None, hi_us: int | None = None, *,
-                    partitions: list[tuple[str, int]] | None = None, reason: str = "") -> None:
+                    partitions: list[tuple[str, int]] | None = None, reason: str = "",
+                    check_remaining: bool = False) -> None:
     """Delete one file's rows from the row store.
 
     The mutation still visits every part of the table (and waits behind merges for a pool slot), but parts
@@ -354,8 +355,74 @@ def purge_file_rows(ch: Any, part_keys: list[str], lo_us: int | None = None, hi_
         where = "event_date BETWEEN {d0:Date} AND {d1:Date} AND " + where
     else:
         LOGGER.warning("BINLOG_ROWS_PURGE_UNBOUNDED parts=%s reason=%s", len(part_keys), reason or "no time span")
+        ch.execute(f"DELETE FROM {ROWS_TABLE} WHERE {where}", params=params,
+                   settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
+        return
+    # Every DELETE is a mutation that gives all ~6,500 parts of the table a new version, whatever its WHERE (10-30:
+    # 16k MutatePart an hour and cleanup passes of up to 225 s). A purge that timed out keeps running on the server
+    # and its marker brings the file back here: wait for that mutation instead of queueing another, and (for a
+    # marker, ``check_remaining``) delete only when rows of these files are still there. The count reads the
+    # source-key column of the partitions (~20 s for a day), still far less than a redundant mutation.
+    pending = _pending_purges(ch, part_keys)
+    if pending:
+        LOGGER.warning("BINLOG_ROWS_PURGE_WAIT parts=%s mutations=%s reason=%s", len(part_keys), ",".join(pending), reason)
+        _wait_mutations_done(ch, pending, timeout=PURGE_WAIT_SECONDS)
+    if pending or check_remaining:
+        try:
+            text = ch.execute(f"SELECT count() FROM {ROWS_TABLE} WHERE {where} FORMAT TSV", params=params,
+                              settings={"max_execution_time": 600, "max_threads": 2}, timeout=660)
+        except RawBinlogError as exc:
+            text, error = None, str(exc)[:200]
+        else:
+            error = f"unexpected count {str(text)[:40]!r}"
+        if isinstance(text, str) and text.strip().isdigit():
+            left = int(text.strip())
+        else:  # unknown: delete as before
+            LOGGER.warning("BINLOG_ROWS_PURGE_COUNT_FAILED parts=%s error=%s", len(part_keys), error)
+            left = -1
+        if left == 0:
+            LOGGER.info("BINLOG_ROWS_PURGE_NOTHING_LEFT parts=%s reason=%s", len(part_keys), reason)
+            return
     ch.execute(f"DELETE FROM {ROWS_TABLE} WHERE {where}", params=params,
                settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
+
+
+PURGE_WAIT_SECONDS = 1800
+
+
+def _pending_purges(ch: Any, part_keys: list[str]) -> list[str]:
+    """Unfinished mutations of the row store that name any of ``part_keys`` (their command holds the key list)."""
+    keys = [k for k in part_keys if re.fullmatch(r"[A-Za-z0-9:_\-./]{1,200}", str(k))]
+    if not keys:
+        return []
+    try:
+        rows = ch.rows(
+            "SELECT mutation_id FROM system.mutations WHERE database = {db:String} AND table = {tbl:String} "
+            "AND NOT is_done AND multiSearchAny(command, JSONExtract({k:String}, 'Array(String)')) ORDER BY create_time",
+            params={"db": DATABASE, "tbl": ROWS_TABLE.split(".", 1)[1], "k": json.dumps(keys)},
+            settings={"max_execution_time": 30}, timeout=40)
+    except RawBinlogError as exc:
+        LOGGER.warning("BINLOG_ROWS_PURGE_PENDING_CHECK_FAILED error=%s", str(exc)[:200])
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [str(row["mutation_id"]) for row in rows if isinstance(row, dict) and row.get("mutation_id")]
+
+
+def _wait_mutations_done(ch: Any, mutation_ids: list[str], *, timeout: float) -> None:
+    """Block until the mutations are done; raises like a timed-out DELETE so the caller keeps its marker."""
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = ch.rows(
+            "SELECT count() AS n FROM system.mutations WHERE database = {db:String} AND table = {tbl:String} "
+            "AND NOT is_done AND has(JSONExtract({ids:String}, 'Array(String)'), mutation_id)",
+            params={"db": DATABASE, "tbl": ROWS_TABLE.split(".", 1)[1], "ids": json.dumps(mutation_ids)},
+            settings={"max_execution_time": 30}, timeout=40)
+        if not rows or int(rows[0]["n"]) == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise RawBinlogError(f"等待清理 mutation 超时：{','.join(mutation_ids)}", "BINLOG_ROWS_PURGE_TIMEOUT")
+        time.sleep(15)
 
 
 def _epoch_us(text: str) -> int:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import io
 import logging
@@ -551,11 +552,23 @@ class OssArchive:
             return True
         return isinstance(candidate, (TimeoutError, ConnectionError, OSError))
 
+    def _bucket_without_client_crc(self) -> Any:
+        """The bucket with the SDK's per-request CRC64 off; the shared bucket object is left untouched."""
+        if not getattr(self.bucket, "enable_crc", False):
+            return self.bucket
+        view = getattr(self, "_no_crc_bucket", None)
+        if view is None or getattr(self, "_no_crc_source", None) is not self.bucket:
+            view = copy.copy(self.bucket)
+            view.enable_crc = False
+            self._no_crc_bucket, self._no_crc_source = view, self.bucket
+        return view
+
     def _multipart_upload_from_file(
         self,
         key: str,
         path: Path,
         headers: dict[str, str],
+        bucket: Any = None,
     ) -> None:
         """Upload a large file in parts; one PutObject is capped at 5 GiB.
 
@@ -565,8 +578,9 @@ class OssArchive:
         part and the combined object CRC64. Any failure aborts the upload so no parts are left billed.
         """
 
+        bucket = self.bucket if bucket is None else bucket
         size = path.stat().st_size
-        upload_id = self.bucket.init_multipart_upload(key, headers=headers).upload_id
+        upload_id = bucket.init_multipart_upload(key, headers=headers).upload_id
         try:
             parts: list[oss2.models.PartInfo] = []
             with path.open("rb") as handle:
@@ -577,7 +591,7 @@ class OssArchive:
                     for attempt in range(self.upload_attempts):
                         handle.seek(offset)
                         try:
-                            result = self.bucket.upload_part(
+                            result = bucket.upload_part(
                                 key,
                                 upload_id,
                                 number,
@@ -605,7 +619,7 @@ class OssArchive:
                             number, result.etag, size=length, part_crc=result.crc
                         )
                     )
-            self.bucket.complete_multipart_upload(
+            bucket.complete_multipart_upload(
                 key,
                 upload_id,
                 parts,
@@ -613,7 +627,7 @@ class OssArchive:
             )
         except BaseException:
             try:
-                self.bucket.abort_multipart_upload(key, upload_id)
+                bucket.abort_multipart_upload(key, upload_id)
             except Exception:  # noqa: BLE001 - the original failure is the one to report
                 LOGGER.warning("OSS multipart abort failed key=%s upload_id=%s", key, upload_id, exc_info=True)
             raise
@@ -627,6 +641,7 @@ class OssArchive:
         verify: Callable[[], dict[str, Any] | None],
         missing_message: str,
         missing_code: str,
+        client_crc: bool = True,
     ) -> dict[str, Any]:
         """Upload a content-addressed object with bounded, idempotent retries.
 
@@ -634,16 +649,21 @@ class OssArchive:
         failed attempt therefore verifies the immutable destination first;
         only an absent object plus a transient transport/server failure is
         retried.  Permanent 4xx failures are returned immediately.
+
+        ``client_crc=False`` is for callers whose ``verify`` compares the server's object CRC64 with
+        one taken from the source bytes: the SDK would otherwise hash every uploaded byte again in
+        Python (the raw archive, 6.5% of the service's CPU on 10-30) to prove the same thing.
         """
 
+        bucket = self.bucket if client_crc else self._bucket_without_client_crc()
         last_error: BaseException | None = None
         for attempt in range(self.upload_attempts):
             request_error: BaseException | None = None
             try:
                 if path.stat().st_size > OSS_MULTIPART_THRESHOLD_BYTES:
-                    self._multipart_upload_from_file(key, path, headers)
+                    self._multipart_upload_from_file(key, path, headers, bucket)
                 else:
-                    self.bucket.put_object_from_file(
+                    bucket.put_object_from_file(
                         key,
                         str(path),
                         headers=headers,

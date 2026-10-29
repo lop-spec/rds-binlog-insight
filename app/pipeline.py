@@ -60,6 +60,8 @@ LOCAL_INDEX_HANDOFF_MAX_BYTES = 1024**3
 COLD_COMPRESSION_HOT_SECONDS = 24 * 60 * 60
 COLD_COMPRESSION_QUERY_GRACE_SECONDS = 30
 COLD_COMPRESSION_IDLE_SECONDS = 5
+# How often a caught-up sync job looks at the pending list again while its retained scan still runs.
+RETAINED_SCAN_POLL_SECONDS = 1.0
 
 
 class RdsClientLike(Protocol):
@@ -1905,8 +1907,9 @@ class SyncManager:
                  if streaming else nullcontext(None))
         completed, unavailable = 0, 0
         discovered_ids: set[str] = set()
+        written_view: list[tuple[int, str, bool] | None] = [None]
         with scope as discovery:
-            def refresh(*, force_recent=False):
+            def refresh(*, force_recent=False, skip_unchanged=False):
                 if discovery is not None:
                     pending = discovery.pending(force_recent=force_recent)
                 else:
@@ -1916,21 +1919,31 @@ class SyncManager:
                     pending = [entry for entry in pending
                                if (self.metadata.file_record(entry[0]) or {}).get("state") != "done"]
                 discovered_ids.update(entry[0] for entry in pending)
+                view = (len(discovered_ids), "" if not pending else pending[0][1].log_file_name, bool(pending))
+                # Idle polls rewrite an unchanged job row; nothing else writes it between two of them.
+                if skip_unchanged and view == written_view[0]:
+                    return pending
                 self.metadata.update_job(
                     job_id, total_files=len(discovered_ids), discovered_files=len(discovered_ids),
                     current_file="" if not pending else pending[0][1].log_file_name,
                     message=(f"发现 {len(discovered_ids)} 个待处理文件" if pending
                              else "正在确认是否已到 API 最新文件"))
+                written_view[0] = view
                 return pending
 
+            idle = False
             while not self._shutdown.is_set() and not self._pause_after_current.is_set():
-                pending = refresh()
+                pending = refresh(skip_unchanged=idle)
                 if not pending and discovery is not None:
                     if not discovery.finished:
-                        # A still-running retained scan is not evidence of catch-up.
-                        self._shutdown.wait(0.25)
+                        # A still-running retained scan is not evidence of catch-up. The scan of a 60-day
+                        # window takes ~40 minutes on production; polling it every 0.25 s re-read the
+                        # pending list and rewrote the job row ~4 times a second (10-30: 0.4 core).
+                        idle = True
+                        self._shutdown.wait(RETAINED_SCAN_POLL_SECONDS)
                         continue
                     pending = refresh(force_recent=True)
+                idle = False
                 if not pending:
                     return completed, unavailable, False
                 kwargs = {"refresh_pending": refresh} if discovery is not None else {}

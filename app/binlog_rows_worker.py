@@ -11,6 +11,7 @@ views and only then recorded in the manifest that proves coverage.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import re
 import hashlib
@@ -115,6 +116,15 @@ ROWBINARY = os.environ.get("RDS_BINLOG_ROWS_ROWBINARY", "1").strip() != "0"
 # waits to fill a batch; it takes what is already pending.
 BATCH_FILES = max(1, min(int(os.environ.get("RDS_BINLOG_ROWS_BATCH_FILES", "4") or 4), 8))
 PARSED_RE = re.compile(rb"parsed (\d+) audit records")
+# A move peaks at ~1.1-1.3 GB in ClickHouse (squashed 64 MB blocks plus the text index of each new part). Three
+# lanes moving at once next to the merges went past the server limit: 10-29/30, 25 batches in 15 hours were
+# killed by the overcommit tracker, and each failure queued lightweight DELETE mutations that rewrite the
+# version of every row-store part (~6,500) and held the lanes for up to 30 minutes. Moves take a slot and
+# start only while ClickHouse is below RDS_BINLOG_ROWS_MOVE_CH_MEMORY_MAX_GIB (waiting at most
+# RDS_BINLOG_ROWS_MOVE_WAIT_SECONDS); loading and parsing stay parallel.
+MOVE_SLOTS = max(1, min(int(os.environ.get("RDS_BINLOG_ROWS_MOVE_SLOTS", "2") or 2), WORKER_LANES_MAX))
+MOVE_MEMORY_MAX = int(float(os.environ.get("RDS_BINLOG_ROWS_MOVE_CH_MEMORY_MAX_GIB", "3.9") or 0) * 1024 ** 3)
+MOVE_WAIT_SECONDS = max(0.0, float(os.environ.get("RDS_BINLOG_ROWS_MOVE_WAIT_SECONDS", "300") or 0))
 
 
 def stream_ranges(bucket: Any, key: str, size: int, stop: threading.Event, *, streams: int | None = None,
@@ -295,6 +305,7 @@ class Worker:
         self._ingested: dict[str, tuple[float, set[str]]] = {}
         self._archive = None
         self._archive_at = 0.0
+        self.move_slots = threading.BoundedSemaphore(MOVE_SLOTS)
 
     # -- shared helpers -------------------------------------------------------
     def archive(self):
@@ -336,6 +347,43 @@ class Worker:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    @contextlib.contextmanager
+    def move_slot(self, lane: int):
+        """One of MOVE_SLOTS concurrent moves, entered once ClickHouse has room for it (see MOVE_SLOTS).
+
+        Taken before the inflight markers are written: a lane stopped while it waits leaves nothing to purge.
+        """
+        slots = getattr(self, "move_slots", None)
+        if slots is None:
+            slots = self.move_slots = threading.BoundedSemaphore(MOVE_SLOTS)
+        stop = getattr(self, "stop", None) or threading.Event()
+        while not slots.acquire(timeout=5):
+            if stop.is_set():
+                raise RawBinlogError("写入进程停止", "BINLOG_ROWS_STOPPED")
+        try:
+            deadline = time.monotonic() + MOVE_WAIT_SECONDS
+            waited = False
+            while MOVE_MEMORY_MAX > 0:
+                try:
+                    used = int(self.clickhouse_memory())
+                except Exception:  # noqa: BLE001 - advisory only; the move reports an unavailable server itself
+                    break
+                if used <= MOVE_MEMORY_MAX:
+                    break
+                if stop.is_set():
+                    raise RawBinlogError("写入进程停止", "BINLOG_ROWS_STOPPED")
+                if time.monotonic() >= deadline:
+                    LOGGER.warning("BINLOG_ROWS_MOVE_MEMORY_WAIT_EXPIRED lane=%s used=%s max=%s", lane, used, MOVE_MEMORY_MAX)
+                    break
+                if not waited:
+                    LOGGER.info("BINLOG_ROWS_MOVE_WAIT lane=%s used=%s max=%s", lane, used, MOVE_MEMORY_MAX)
+                    self.publish(lane, state="waiting", reason="move-memory")
+                    waited = True
+                stop.wait(5)
+            yield
+        finally:
+            slots.release()
+
     def commit(self, ingestor: RowsIngestor, entry: dict[str, Any], part_keys: list[str], rows: int, source: str,
                rq_complete: bool, lane: int) -> None:
         """Move + aggregates + manifest behind a durable marker.
@@ -348,18 +396,19 @@ class Worker:
             self.purge_marker(marker, reason="retry")
         tmp = marker.with_suffix(".tmp")
         partitions = ingestor.partitions()
-        tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
-                                   "part_keys": part_keys, "file": entry["source_file_name"],
-                                   "lo": entry.get("lo"), "hi": entry.get("hi"), "partitions": partitions}))
-        os.replace(tmp, marker)
-        # purges its own partial rows (bounded to the partitions it attempted) on failure
-        try:
-            ingestor.move(part_keys, f"binlog-rows-l{lane}", lo_us=entry.get("lo"), hi_us=entry.get("hi"),
-                          partitions=partitions)
-        except RawBinlogError as exc:
-            if getattr(exc, "rows_purged", False):
-                marker.unlink(missing_ok=True)
-            raise
+        with self.move_slot(lane):
+            tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
+                                       "part_keys": part_keys, "file": entry["source_file_name"],
+                                       "lo": entry.get("lo"), "hi": entry.get("hi"), "partitions": partitions}))
+            os.replace(tmp, marker)
+            # purges its own partial rows (bounded to the partitions it attempted) on failure
+            try:
+                ingestor.move(part_keys, f"binlog-rows-l{lane}", lo_us=entry.get("lo"), hi_us=entry.get("hi"),
+                              partitions=partitions)
+            except RawBinlogError as exc:
+                if getattr(exc, "rows_purged", False):
+                    marker.unlink(missing_ok=True)
+                raise
         ingestor.aggregate(entry["file_id"], f"binlog-rows-l{lane}")
         ingestor.record(entry, rows, source, rq_complete)
         marker.unlink(missing_ok=True)
@@ -390,7 +439,7 @@ class Worker:
         partitions = info.get("partitions")  # markers written before 1.29.14 carry none
         purge_file_rows(self.ch, info["part_keys"], lo, hi,
                         partitions=None if partitions is None else [tuple(p) for p in partitions],
-                        reason=reason)
+                        reason=reason, check_remaining=True)
         marker.unlink(missing_ok=True)
         return True
 
@@ -668,21 +717,22 @@ class Worker:
                 self.purge_marker(marker, reason="retry")
             markers.append(marker)
         partitions = ingestor.partitions()
-        for entry, marker in zip(entries, markers):
-            tmp = marker.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
-                                       "part_keys": ["raw:" + entry["file_id"]], "file": entry["source_file_name"],
-                                       "lo": entry.get("lo"), "hi": entry.get("hi"), "partitions": partitions}))
-            os.replace(tmp, marker)
         keys = ["raw:" + entry["file_id"] for entry in entries]
-        try:
-            ingestor.move(keys, f"binlog-rows-l{lane}", lo_us=min(e["lo"] for e in entries), hi_us=max(e["hi"] for e in entries),
-                          partitions=partitions)
-        except RawBinlogError as exc:
-            if getattr(exc, "rows_purged", False):
-                for marker in markers:
-                    marker.unlink(missing_ok=True)
-            raise
+        with self.move_slot(lane):
+            for entry, marker in zip(entries, markers):
+                tmp = marker.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"instance_id": entry["instance_id"], "file_id": entry["file_id"],
+                                           "part_keys": ["raw:" + entry["file_id"]], "file": entry["source_file_name"],
+                                           "lo": entry.get("lo"), "hi": entry.get("hi"), "partitions": partitions}))
+                os.replace(tmp, marker)
+            try:
+                ingestor.move(keys, f"binlog-rows-l{lane}", lo_us=min(e["lo"] for e in entries),
+                              hi_us=max(e["hi"] for e in entries), partitions=partitions)
+            except RawBinlogError as exc:
+                if getattr(exc, "rows_purged", False):
+                    for marker in markers:
+                        marker.unlink(missing_ok=True)
+                raise
         for entry, marker in zip(entries, markers):
             ingestor.aggregate(entry["file_id"], f"binlog-rows-l{lane}", only_file=len(entries) > 1)
             ingestor.record(entry, rows[entry["file_id"]], "raw", True)

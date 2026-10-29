@@ -429,6 +429,7 @@ class Release1293Tests(unittest.TestCase):
                           "raw", True, 0)
             self.assertEqual(list((worker.inflight_dir()).glob("*.json")), [])
             (worker.inflight_dir() / "f2.json").write_text(json.dumps({"instance_id": "i", "file_id": "f2", "part_keys": ["raw:f2"]}))
+            worker.ch.reset_mock()  # the move slot asked ClickHouse for its memory before the move
             self.assertEqual(worker.recover_inflight(), 0)
             worker.ch.execute.assert_not_called()
 
@@ -889,7 +890,10 @@ class Release12916Tests(unittest.TestCase):
             ingestor.record.side_effect = lambda *a, **k: calls.append("record")
             worker.ch.execute.side_effect = lambda sql, **k: calls.append("purge" if sql.startswith("DELETE") else sql)
             worker.commit(ingestor, entry, ["raw:f7"], 1, "raw", True, 0)
-            self.assertEqual(calls, ["purge", "move", "aggregate", "record"])
+            steps = [c for c in calls if c in ("purge", "move", "aggregate", "record")]
+            self.assertEqual(steps, ["purge", "move", "aggregate", "record"])
+            # 1.34.14: the retry first asks whether rows of the file are left; no answer means delete as before
+            self.assertTrue(str(calls[0]).startswith("SELECT count() FROM insight.binlog_rows_v1"), calls[0])
             self.assertEqual(list(worker.inflight_dir().glob("*.json")), [])
 
     def test_failed_move_that_purged_drops_its_marker(self):

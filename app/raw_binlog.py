@@ -70,11 +70,13 @@ class RawBinlogStore:
         descriptor = dict(oss_key=key, size_bytes=path.stat().st_size, sha256=sha, crc64=str(crc))
         verify = lambda: self._head(archive, descriptor)
         if verify() is None:
+            # _head compares the stored object's CRC64 with ``crc`` (taken from the source bytes) and its
+            # size/SHA256 metadata, so the SDK's own CRC pass over every uploaded byte is skipped.
             archive._put_object_from_file_verified(
                 key, path, {'Content-Type': 'application/octet-stream',
                             'x-oss-forbid-overwrite': 'true', 'x-oss-meta-sha256': sha},
                 verify=verify, missing_message='OSS 原文件上传后无法校验',
-                missing_code='RAW_ARCHIVE_VERIFY_MISSING')
+                missing_code='RAW_ARCHIVE_VERIFY_MISSING', client_crc=False)
         return descriptor
 
     def archive(self, archive, path: Path, file_id: str, item, flavor: str) -> dict:

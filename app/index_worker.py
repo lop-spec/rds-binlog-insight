@@ -18,7 +18,7 @@ os.environ.setdefault("ARROW_NUM_THREADS", "1")
 
 from .config import data_root, ensure_data_dirs
 from .credentials import load_credential
-from .maintenance_status import WORKER_PROGRESS_NAME, write_json_status
+from .maintenance_status import WORKER_PROGRESS_NAME, read_json_status, write_json_status
 from .scratch_sweep import sweep_stale_scratch
 from .metadata import MetadataStore, SLOW_LOG_FILE_PREFIX
 from .oss_store import OssArchive
@@ -35,6 +35,12 @@ CATALOG_INDEX_WORKERS = 16
 CATALOG_RECONCILE_BATCH_SIZE = 2048
 CATALOG_STORE_BACKFILL_BATCH_SIZE = 256
 CATALOG_STATS_CACHE_SECONDS = 5.0
+# Stats of indexes this deployment does not build (their phases are off) only change when another process
+# writes them. The supervisor starts a new worker every few minutes, so an in-process cache never hit and
+# each worker re-counted catalog.sqlite3 / search.sqlite3 from a cold page cache (10-30: ~2 MB/s of the
+# indexer's disk reads). Kept in a file next to the progress status instead.
+STATIC_STATS_NAME = "index-worker-static-stats.json"
+STATIC_STATS_CACHE_SECONDS = float(os.environ.get("RDS_BINLOG_INDEX_STATIC_STATS_SECONDS", "900") or 0)
 EXACT_INDEX_BATCH_SIZE = 4
 EXACT_INDEX_WORKERS = 4
 # 分析聚合要读几乎所有列并整对象下载，单批保持小量；两个工作线程用于让
@@ -544,6 +550,40 @@ def _advance_slowlog_index(
     return totals
 
 
+def cached_static_stats(
+    path: Path,
+    memo: dict[str, Any],
+    compute: dict[str, Callable[[], dict[str, Any]]],
+    keys: list[str],
+    *,
+    ttl_seconds: float | None = None,
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    """``compute[key]()`` for ``keys``, reused from ``path`` (shared by successive workers) while younger than the TTL.
+
+    ``memo`` holds what this process last read or wrote. Only the indexes no phase of this deployment writes belong
+    here (see STATIC_STATS_NAME); an empty ``keys`` or a TTL of 0 returns {} and the caller computes live.
+    """
+    ttl = STATIC_STATS_CACHE_SECONDS if ttl_seconds is None else ttl_seconds
+    wanted = sorted(keys)
+    if not wanted or ttl <= 0:
+        return {}
+    if not memo:
+        memo.update(read_json_status(path))
+    try:
+        age = now() - float(memo.get("computedAt") or 0)
+    except (TypeError, ValueError):
+        age = -1.0
+    if not (memo.get("keys") == wanted and isinstance(memo.get("data"), dict) and 0 <= age < ttl):
+        memo.clear()
+        memo.update(keys=wanted, computedAt=now(), data={key: compute[key]() for key in wanted})
+        try:
+            write_json_status(path, dict(memo))
+        except OSError:
+            pass  # display data only; the next worker recomputes it
+    return dict(memo["data"])
+
+
 def run_one(data_dir: Path, generation: str) -> int:
     _bound_arrow()
     paths = ensure_data_dirs(data_dir)
@@ -591,26 +631,51 @@ def run_one(data_dir: Path, generation: str) -> int:
         "value": {},
         "compressed": {},
     }
+    # Which stats come from indexes this worker never writes (see STATIC_STATS_NAME).
+    static_keys = {
+        "indexStats": "index" not in INDEX_PHASES and "structure" not in INDEX_PHASES,
+        "exactIndexStats": "exact" not in INDEX_PHASES,
+        "slowlogIndexStats": not SLOWLOG_INDEX_ENABLED,
+        "catalogStats": "catalog" not in INDEX_PHASES,
+        "compressedCatalogStats": "catalog" not in INDEX_PHASES,
+    }
+    static_path = paths["index"] / STATIC_STATS_NAME
+    static_cache: dict[str, Any] = {}
 
     def snapshots() -> dict[str, Any]:
         exact = getattr(storage, "exact_index", None)
         analytics = getattr(storage, "analytics_index", None)
         slowlog = getattr(storage, "slowlog_index", None)
+        cached = cached_static_stats(
+            static_path,
+            static_cache,
+            {
+                "indexStats": lambda: storage.search_index.stats(),
+                "exactIndexStats": lambda: exact.stats() if exact is not None else {},
+                "slowlogIndexStats": lambda: slowlog.stats() if slowlog is not None else {},
+                "catalogStats": metadata.part_catalog_stats,
+                "compressedCatalogStats": metadata.catalog_store_stats,
+            },
+            [key for key, static in static_keys.items() if static],
+        )
         now = time.monotonic()
-        if now >= float(catalog_stats_cache["deadline"]):
+        if "catalogStats" not in cached and now >= float(catalog_stats_cache["deadline"]):
             catalog_stats_cache["value"] = metadata.part_catalog_stats()
             catalog_stats_cache["compressed"] = metadata.catalog_store_stats()
             catalog_stats_cache["deadline"] = (
                 now + CATALOG_STATS_CACHE_SECONDS
             )
         return {
-            "indexStats": storage.search_index.stats(),
-            "exactIndexStats": exact.stats() if exact is not None else {},
+            "indexStats": cached["indexStats"] if "indexStats" in cached else storage.search_index.stats(),
+            "exactIndexStats": cached["exactIndexStats"] if "exactIndexStats" in cached
+            else (exact.stats() if exact is not None else {}),
             "analyticsStats": analytics.stats() if analytics is not None else {},
-            "slowlogIndexStats": slowlog.stats() if slowlog is not None else {},
-            "catalogStats": dict(catalog_stats_cache["value"]),
+            "slowlogIndexStats": cached["slowlogIndexStats"] if "slowlogIndexStats" in cached
+            else (slowlog.stats() if slowlog is not None else {}),
+            "catalogStats": dict(cached["catalogStats"] if "catalogStats" in cached else catalog_stats_cache["value"]),
             "compressedCatalogStats": dict(
-                catalog_stats_cache["compressed"]
+                cached["compressedCatalogStats"] if "compressedCatalogStats" in cached
+                else catalog_stats_cache["compressed"]
             ),
             "localBodyStats": storage.local_body_stats(),
         }

@@ -1660,10 +1660,13 @@ class MetadataStore:
             for offset in range(0, len(ids), 400):
                 batch_ids = ids[offset:offset + 400]
                 placeholders = ",".join("?" for _ in batch_ids)
+                # Unary + keeps instance_id out of index selection: without statistics the planner seeked
+                # (instance_id, state, ...) and walked every file of the instance per page (0.24 s for 100 ids
+                # on 390k files, 10-30) instead of the primary key (7 ms).
                 rows.extend(conn.execute(
                     "SELECT id, state, download_link, intranet_download_link, "
                     "link_expired_utc, remote_status FROM binlog_files "
-                    f"WHERE instance_id = ? AND id IN ({placeholders})",
+                    f"WHERE +instance_id = ? AND id IN ({placeholders})",
                     (settings.db_instance_id, *batch_ids),
                 ).fetchall())
         existing = {str(row["id"]): row for row in rows}
@@ -1754,17 +1757,22 @@ class MetadataStore:
     def recoverable_files(
         self, instance_id: str, *, include_discovered: bool = False,
     ) -> list[dict[str, Any]]:
+        states = ("failed", "downloading", "downloaded", "parsing", "stored")
+        if include_discovered:
+            states += ("discovered",)
+        # Seek (instance_id, state) for the few unfinished files. The planner otherwise took the
+        # ORDER BY index and read every file of the instance (0.17-0.46 s on 390k files, 10-30), and a
+        # sync job asks for this list several times a second while its retained scan runs.
         with self.connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT *
-                FROM binlog_files
+                FROM binlog_files INDEXED BY idx_binlog_completion
                 WHERE instance_id = ?
-                  AND (state IN ('failed', 'downloading', 'downloaded', 'parsing', 'stored')
-                       OR (? AND state = 'discovered'))
+                  AND state IN ({", ".join("?" for _ in states)})
                 ORDER BY log_begin_utc, log_end_utc, log_file_name, host_instance_id
                 """,
-                (instance_id, int(include_discovered)),
+                (instance_id, *states),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3469,12 +3477,26 @@ class MetadataStore:
             # A wide/all-history query gains little from the lower-end seek;
             # keep the planner's source-first path there (and for sparse audit).
             # This indexed MIN is only a plan heuristic, never a row filter.
-            oldest = None
+            oldest = newest = None
             if normalized != "audit":
-                oldest = conn.execute(
-                    "SELECT MIN(min_event_epoch_us) FROM parquet_parts"
-                ).fetchone()[0]
+                oldest, newest = conn.execute(
+                    "SELECT (SELECT MIN(min_event_epoch_us) FROM parquet_parts), "
+                    "(SELECT MAX(min_event_epoch_us) FROM parquet_parts)"
+                ).fetchone()
             if (
+                oldest is not None
+                and newest is not None
+                and int(end_epoch_us) - int(oldest) < int(newest) - int(start_epoch_us)
+            ):
+                # A window in the older half of the history: the max >= start seek below would walk
+                # nearly every part (and fetch each row to test min <= end). The (min, max) index holds
+                # both bounds, so the parts that start before the window end are filtered in the index
+                # (10-30: an hour of 09-01 took 10-17 s and ~1.3 GB of page reads; the rollup asked for
+                # 48 such hours per pass).
+                part_join = (
+                    "parquet_parts p INDEXED BY idx_part_time JOIN binlog_files b"
+                )
+            elif (
                 oldest is not None
                 and int(start_epoch_us) - int(oldest)
                 > max(int(end_epoch_us) - int(start_epoch_us), 0)

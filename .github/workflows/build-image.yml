@@ -25,16 +25,16 @@ on:
         default: false
   push:
     tags:
-      - v1.34.13-rawoss
+      - v1.34.14-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.34.13-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.34.13-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.34.13-rawoss
+  VERSION: 1.34.14-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.34.14-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.34.14-rawoss
 
 jobs:
   recovery-isolation:
@@ -240,6 +240,7 @@ jobs:
             tests.test_metadata_wal \
             tests.test_chunk_progress \
             tests.test_local_execution_detail \
+            tests.test_host_load_1030 \
             tests.test_public_config
           test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$LOCAL_IMAGE")" = "$VERSION"
           docker run --rm --entrypoint python "$LOCAL_IMAGE" -c \
