@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 import tempfile
@@ -19,7 +20,7 @@ from .oss_store import OssArchiveError
 LOGGER = logging.getLogger(__name__)
 MAX_FILES = 16
 MAX_BYTES = 8 * 1024**3
-# The status behind /api/status is two aggregates over the archive tables (a minute each when the page cache is cold).
+# The status behind /api/status is two aggregates over the archives, read from idx_raw_binlog_status.
 STATUS_CACHE_SECONDS = 60
 QUERY_SECONDS = 180
 RAW_ENABLED = 'RDS_BINLOG_RAW_ARCHIVE'
@@ -49,6 +50,16 @@ class RawBinlogStore:
                 CREATE INDEX IF NOT EXISTS idx_raw_binlog_time
                     ON raw_binlog_archives(lo,hi);
             ''')
+            # started/completed sit behind each row's descriptor, in its overflow pages: status() read 2.7 GB of
+            # them twice a minute for 64k archives (10-30) while a page polled /api/status. The build reads the
+            # table once under the write lock; a process that finds another one building goes on without it
+            # (status() then reads the table, as before).
+            try:
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_raw_binlog_status ON raw_binlog_archives(completed,started,file_id)')
+            except sqlite3.OperationalError as exc:
+                if 'locked' not in str(exc) and 'busy' not in str(exc):
+                    raise
+                LOGGER.warning('RAW_BINLOG_STATUS_INDEX_DEFERRED %s', exc)
 
     def get(self, file_id: str) -> dict | None:
         with self.metadata.connection() as conn:
@@ -212,13 +223,15 @@ class RawBinlogStore:
         if cached and now-cached[0] < STATUS_CACHE_SECONDS:
             return cached[1]
         with self.metadata.connection() as conn:
+            # CROSS JOIN keeps the archives outermost, read from idx_raw_binlog_status; driven from binlog_files
+            # the plan visited every file of the instance and read each archive row.
             archived = conn.execute('''SELECT count(*) n,min(r.started) first,max(r.completed) last,
                 min(b.log_begin_utc) begin,max(b.log_end_utc) finish,sum(b.file_size) bytes
-                FROM raw_binlog_archives r JOIN binlog_files b ON b.id=r.file_id
+                FROM raw_binlog_archives r CROSS JOIN binlog_files b ON b.id=r.file_id
                 WHERE b.instance_id=?''', (instance,)).fetchone()
             since = max(now-1800, float(archived['first'] or now))
             recent = conn.execute('''SELECT count(*) n,coalesce(sum(b.file_size),0) bytes
-                FROM raw_binlog_archives r JOIN binlog_files b ON b.id=r.file_id
+                FROM raw_binlog_archives r CROSS JOIN binlog_files b ON b.id=r.file_id
                 WHERE b.instance_id=? AND b.state='done' AND r.completed>=?''', (instance, since)).fetchone()
             remaining = conn.execute('''SELECT state,count(*) n,coalesce(sum(file_size),0) bytes
                 FROM binlog_files WHERE instance_id=? AND log_file_name LIKE 'mysql-bin.%'

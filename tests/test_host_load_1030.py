@@ -501,5 +501,79 @@ class RowBinaryLoadTests(unittest.TestCase):
         self.assertEqual(stream.lines, 0)
 
 
+class RawStatusIndexTests(unittest.TestCase):
+    """status() reads the archive times from idx_raw_binlog_status and answers as the join it replaced."""
+
+    OLD_ARCHIVED = '''SELECT count(*) n,min(r.started) first,min(b.log_begin_utc) begin,max(b.log_end_utc) finish,
+        sum(b.file_size) bytes FROM raw_binlog_archives r JOIN binlog_files b ON b.id=r.file_id WHERE b.instance_id=?'''
+    OLD_RECENT = '''SELECT count(*) n,coalesce(sum(b.file_size),0) bytes FROM raw_binlog_archives r
+        JOIN binlog_files b ON b.id=r.file_id WHERE b.instance_id=? AND b.state='done' AND r.completed>=?'''
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = MetadataStore(Path(self.temp.name) / "metadata.sqlite3")
+        self.raw = RawBinlogStore(self.store)
+        self.now = time.time()
+        self.instances = ("rm-test000001", "rm-test000002")
+        for n, instance in enumerate(self.instances):
+            items = [remote(f"mysql-bin.{i:06}", f"2026-10-{10 + i:02}T00:00:00Z") for i in range(6)]
+            ids = [file_id for file_id, _ in self.store.upsert_remotes(Settings(db_instance_id=instance), items)]
+            with self.store.connection() as conn:
+                for i, file_id in enumerate(ids[:5]):  # the sixth file has no archive
+                    conn.execute("UPDATE binlog_files SET state = ?, file_size = ? WHERE id = ?",
+                                 ("parsing" if i == 4 else "done", 1000 * (i + 1) + n, file_id))
+                    completed = self.now - 3500 + 700 * i + n  # the last two inside the 30-minute sample
+                    conn.execute("INSERT INTO raw_binlog_archives(file_id, lo, hi, summary, descriptor, started, completed) "
+                                 "VALUES (?, 0, 0, '{}', ?, ?, ?)", (file_id, "x" * 9000, completed - 100, completed))
+
+    def test_same_answer_as_the_join_it_replaced(self):
+        for instance in self.instances:
+            with mock.patch("app.raw_binlog.time.time", return_value=self.now):
+                status = self.raw.status(instance)
+            with self.store.connection() as conn:
+                old = conn.execute(self.OLD_ARCHIVED, (instance,)).fetchone()
+                since = max(self.now - 1800, float(old["first"] or self.now))
+                recent = conn.execute(self.OLD_RECENT, (instance, since)).fetchone()
+            self.assertEqual((status["archived_files"], status["archive_bytes"], status["first_file_begin_utc"],
+                              status["latest_file_end_utc"]), (old["n"], old["bytes"], old["begin"], old["finish"]))
+            self.assertEqual((status["sample_files"], status["sample_seconds"], status["bytes_per_second"]),
+                             (recent["n"], round(self.now - since, 1), round(recent["bytes"] / (self.now - since), 2)))
+            self.assertEqual((old["n"], recent["n"]), (5, 1))  # the parsing file is not counted as a sample
+
+    def test_archive_times_come_from_the_index(self):
+        with traced_statements(self.store) as seen:
+            self.raw.status(self.instances[0])
+        plans = [plan(self.store, sql) for sql in seen if "FROM raw_binlog_archives r" in sql]
+        self.assertEqual(len(plans), 2)
+        self.assertTrue(plans[0].startswith("SCAN r USING COVERING INDEX idx_raw_binlog_status"), plans[0])
+        self.assertTrue(plans[1].startswith("SEARCH r USING COVERING INDEX idx_raw_binlog_status (completed>?)"), plans[1])
+
+    def test_a_build_held_by_another_process_is_deferred(self):
+        with self.store.connection() as conn:
+            conn.execute("DROP INDEX idx_raw_binlog_status")
+        blocker = sqlite3.connect(self.store.path, isolation_level=None)
+        self.addCleanup(blocker.close)
+        blocker.execute("BEGIN IMMEDIATE")
+        real_connect = sqlite3.connect
+
+        class ShortBusy(sqlite3.Connection):
+            def execute(self, sql, *args):
+                return super().execute("PRAGMA busy_timeout=50" if sql.startswith("PRAGMA busy_timeout") else sql, *args)
+
+        def connect(*args, **kwargs):
+            return real_connect(*args, **{**kwargs, "timeout": 0.05, "factory": ShortBusy})
+
+        with mock.patch.object(metadata_module.sqlite3, "connect", side_effect=connect), \
+                self.assertLogs("app.raw_binlog", "WARNING") as logs:
+            RawBinlogStore(self.store)
+        self.assertIn("RAW_BINLOG_STATUS_INDEX_DEFERRED", logs.output[0])
+        self.assertEqual(self.raw.status(self.instances[0])["archived_files"], 5)  # without the index, as before
+        blocker.execute("ROLLBACK")
+        RawBinlogStore(self.store)
+        with self.store.connection() as conn:
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'idx_raw_binlog_status'").fetchone())
+
+
 if __name__ == "__main__":
     unittest.main()
