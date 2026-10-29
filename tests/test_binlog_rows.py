@@ -1183,9 +1183,11 @@ class StreamIngestTests(unittest.TestCase):
         ingestor = mock.Mock()
 
         def load(stream, entry):
-            while stream.read(4096):
-                pass
-            ingestor.loaded = stream.lines
+            # what ClickHouse would have buffered: one row per record the fake parser printed
+            loaded = 0
+            while chunk := stream.read(4096):
+                loaded += chunk.count(b"\n")
+            ingestor.loaded = loaded
         ingestor.load_ndjson_stream.side_effect = load
         ingestor.load_rowbinary_stream.side_effect = load
         ingestor.file_rows.side_effect = lambda _file: ingestor.loaded if rows_in_buffer is None else rows_in_buffer

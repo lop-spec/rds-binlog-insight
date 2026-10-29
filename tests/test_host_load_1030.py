@@ -365,5 +365,141 @@ class PurgeDedupTests(unittest.TestCase):
         self.assertEqual(self.deletes(ch), [])
 
 
+class CandidateTests(unittest.TestCase):
+    """Descriptors only for the files handed out; raw files older than the newest window are found by the gap sweep."""
+
+    def setUp(self):
+        from app import binlog_rows_worker as worker_module
+        self.module = worker_module
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = MetadataStore(Path(self.temp.name) / "metadata.sqlite3")
+        RawBinlogStore(self.store)  # creates raw_binlog_archives
+        self.settings = Settings(db_instance_id="rm-test000001")
+        now = datetime.now(UTC)
+        items = [remote(f"mysql-bin.{i:06}", (now - timedelta(minutes=10 * (40 - i))).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                 for i in range(40)]
+        self.ids = [file_id for file_id, _state in self.store.upsert_remotes(self.settings, items)]
+        with self.store.connection() as conn:
+            for index, file_id in enumerate(self.ids):
+                conn.execute("UPDATE binlog_files SET state = 'done' WHERE id = ?", (file_id,))
+                conn.execute("INSERT INTO raw_binlog_archives(file_id, lo, hi, summary, descriptor, started, completed) "
+                             "VALUES (?, 0, 0, '{}', ?, 0, 0)", (file_id, json.dumps({"raw": {"n": index}})))
+        self.worker = worker_module.Worker.__new__(worker_module.Worker)
+        self.worker.metadata = self.store
+        self.worker.lane_specs = [("live", None), ("window", (self.settings.db_instance_id, "2000-01-01T00:00:00Z",
+                                                                "2100-01-01T00:00:00Z"))]
+        self.worker.external_parquet = []
+        self.done: set[str] = set()
+        self.worker.ingested = lambda _instance: self.done
+
+    def test_newest_first_then_older_gaps_with_their_descriptors(self):
+        newest = self.ids[::-1]
+        self.done.update(newest[2:10])  # the newest window (10 files) has two pending ones
+        with mock.patch.object(self.module, "CANDIDATE_SCAN_ROWS", 10), self.assertLogs("binlog_rows_worker", "WARNING"):
+            entries = self.worker.candidates(0, limit=5)
+        self.assertEqual([e["file_id"] for e in entries], newest[:2] + newest[10:13])
+        self.assertTrue(all(e["kind"] == "raw" and "n" in e["descriptor"]["raw"] for e in entries))
+        self.assertEqual(entries[2]["descriptor"]["raw"]["n"], 29)
+
+    def test_the_sweep_is_reused_until_it_is_due(self):
+        newest = self.ids[::-1]
+        self.done.update(newest[:10])
+        with mock.patch.object(self.module, "CANDIDATE_SCAN_ROWS", 10), self.assertLogs("binlog_rows_worker", "WARNING"):
+            first = self.worker.candidates(0, limit=3)
+            self.done.update(e["file_id"] for e in first)  # loaded meanwhile
+            second = self.worker.candidates(0, limit=3)
+        self.assertEqual([e["file_id"] for e in first], newest[10:13])
+        self.assertEqual([e["file_id"] for e in second], newest[13:16])
+
+    def test_window_lanes_never_sweep(self):
+        self.done.update(self.ids)
+        with mock.patch.object(self.module, "CANDIDATE_SCAN_ROWS", 10):
+            self.assertEqual(self.worker.candidates(1, limit=5), [])
+        self.assertIsNone(getattr(self.worker, "_gap_cache", None))
+
+    def test_a_descriptor_gone_since_the_scan_drops_its_file(self):
+        newest = self.ids[::-1]
+        with self.store.connection() as conn:
+            conn.execute("DELETE FROM raw_binlog_archives WHERE file_id = ?", (newest[0],))
+        entries = self.worker.candidates(0, limit=2)
+        self.assertNotIn(newest[0], [e["file_id"] for e in entries])
+
+
+class StorageResponseTests(unittest.TestCase):
+    def app(self, tokens):
+        from app.server import Application
+        app = Application.__new__(Application)
+        app._storage_response = None
+        app.metadata = SimpleNamespace(load_settings=lambda: Settings(db_instance_id="rm-test000001"))
+        app.storage = mock.Mock()
+        app.storage.storage_stats_token.side_effect = tokens
+        app.storage.stats.side_effect = lambda days: {"retention_days": days, "parts": app.storage.stats.call_count}
+        return app
+
+    def test_one_encoding_per_snapshot(self):
+        app = self.app([(1, 1.0, 60), (1, 1.0, 60), (2, 2.0, 60), None, None])
+        first, again, refreshed = app.storage_response(), app.storage_response(), app.storage_response()
+        self.assertIs(first, again)
+        self.assertEqual(json.loads(first)["data"]["parts"], 1)
+        self.assertEqual(json.loads(refreshed)["data"]["parts"], 2)
+        self.assertTrue(json.loads(first)["ok"])
+        app.storage_response()
+        app.storage_response()  # no snapshot yet: never cached
+        self.assertEqual(app.storage.stats.call_count, 4)
+
+    def test_token_follows_the_published_snapshot(self):
+        from app.storage import EventStorage
+        storage = EventStorage.__new__(EventStorage)
+        storage._storage_stats_lock = threading.Lock()
+        storage._storage_stats_snapshot = None
+        storage.start_storage_stats_snapshot_refresh = mock.Mock(return_value=False)
+        self.assertIsNone(storage.storage_stats_token(60))
+        storage._storage_stats_snapshot, storage._storage_stats_refreshed_monotonic = {"a": 1}, 5.0
+        storage._storage_stats_retention_days = 60
+        token = storage.storage_stats_token(60)
+        self.assertEqual(token[1:], (5.0, 60))
+        storage._storage_stats_snapshot, storage._storage_stats_refreshed_monotonic = {"a": 2}, 6.0
+        self.assertNotEqual(storage.storage_stats_token(60), token)
+        storage.start_storage_stats_snapshot_refresh.assert_called_with(60)
+
+
+class RowBinaryLoadTests(unittest.TestCase):
+    def test_rowbinary_select_maps_the_same_columns_without_coalesce(self):
+        import re
+        ndjson, rowbinary = br.parser_select_sql(), br.parser_select_sql(rowbinary=True)
+
+        def aliases(sql):
+            return tuple(re.findall(r" AS ([a-z_]+)(?:,|$)", sql))
+
+        self.assertEqual(aliases(rowbinary), aliases(ndjson))
+        self.assertEqual(aliases(rowbinary), br.STAGE_COLUMN_NAMES)
+        self.assertNotIn("coalesce(", rowbinary)
+        self.assertIn("coalesce(sql_kind, '') = 'ORIGINAL'", ndjson)
+        self.assertIn("assumeNotNull(sql_kind) = 'ORIGINAL'", rowbinary)
+        self.assertIn("-1 AS statement_index", rowbinary)
+
+    def test_null_fields_are_the_trailing_input_fields(self):
+        names = [part.strip().split()[0] for part in br.PARSER_INPUT_STRUCTURE.split(",")]
+        self.assertEqual(set(names[names.index("row_query") + 1:]), br.ROWBINARY_NULL_FIELDS)
+        self.assertEqual(len(br.ROWBINARY_NULL_FIELDS), 11)  # rowBinaryNullFields in parser-go
+
+    def test_the_load_uses_the_rowbinary_select(self):
+        client = mock.Mock()
+        br.RowsIngestor(client, buffer_table="insight.buf").load_rowbinary_stream(b"", {
+            "file_id": "f", "instance_id": "i", "host_instance_id": "h", "source_file_name": "s"})
+        sql = client.execute.call_args.args[0]
+        self.assertIn("FORMAT RowBinary", sql)
+        self.assertNotIn("coalesce(", sql)
+
+    def test_rowbinary_stream_does_not_scan_for_newlines(self):
+        import io
+        from app.binlog_rows_worker import LineCountingStream
+        stream = LineCountingStream(io.BytesIO(b"a\nb\nc"), threading.Event(), count_lines=False)
+        self.assertEqual(stream.read(), b"a\nb\nc")
+        self.assertEqual(stream.read(), b"")
+        self.assertEqual(stream.lines, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

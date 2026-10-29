@@ -4889,6 +4889,15 @@ class EventStorage:
             with self._storage_stats_lock:
                 self._storage_stats_last_persisted_monotonic = time.monotonic()
 
+    def storage_stats_token(self, retention_days: int) -> tuple[int, float, int] | None:
+        """Identity of the published snapshot ``stats`` would copy (None before the first); starts a refresh like it."""
+        self.start_storage_stats_snapshot_refresh(int(retention_days))
+        with self._storage_stats_lock:
+            snapshot = self._storage_stats_snapshot
+            if snapshot is None:
+                return None
+            return (id(snapshot), self._storage_stats_refreshed_monotonic, int(self._storage_stats_retention_days))
+
     def start_storage_stats_snapshot_refresh(
         self,
         retention_days: int | None = None,

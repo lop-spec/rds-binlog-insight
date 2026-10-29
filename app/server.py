@@ -130,6 +130,15 @@ def _json_default(value: Any):
     raise TypeError(f"Cannot serialize {type(value).__name__}")
 
 
+def _encode_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=_json_default,
+    ).encode("utf-8")
+
+
 def _query_value(query: dict[str, list[str]], key: str, default: str = "") -> str:
     values = query.get(key)
     return values[0] if values else default
@@ -320,6 +329,7 @@ class Application:
         # startup critical path so transient SQLite or disk contention cannot
         # delay either service readiness or the first /api/storage request.
         self.storage.start_storage_stats_snapshot_refresh()
+        self._storage_response: tuple[Any, bytes] | None = None
         client_factory = None
         credential_loader = load_credential
         if os.environ.get("RDS_BINLOG_TEST_MODE") == "1":
@@ -448,6 +458,33 @@ class Application:
         if took > STATUS_SLOW_SECONDS:
             LOGGER.warning("status refresh was slow: %.1fs; pages keep the previous answer meanwhile", took)
         flight.set()
+
+    def storage_response(self) -> bytes:
+        """The /api/storage body, encoded once per published storage snapshot.
+
+        The slow-log indexer and ingester probe this endpoint as their serving canary, together about once a second
+        (10-30); deep-copying and encoding the ~290 KB snapshot for each probe was ~11 ms of the service's CPU.
+        """
+        settings = self.metadata.load_settings()
+        token = self.storage.storage_stats_token(settings.retention_days)
+        key = (token, int(settings.retention_days), settings.oss_retention_days, bool(settings.oss_enabled))
+        cached = self._storage_response
+        if token is not None and cached is not None and cached[0] == key:
+            return cached[1]
+        body = _encode_json(
+            {
+                "ok": True,
+                "data": {
+                    **self.storage.stats(settings.retention_days),
+                    "oss_retention_days": settings.oss_retention_days,
+                    "oss_enabled": settings.oss_enabled,
+                },
+            }
+        )
+        if token is not None:
+            # Keyed by the token read before stats(): a refresh in between costs one more encoding, never a stale body.
+            self._storage_response = (key, body)
+        return body
 
     def status_snapshot(self) -> dict[str, Any]:
         """The /api/status answer: the last computed one at once, refreshed in the background (``statusAgeSeconds`` says how old).
@@ -839,12 +876,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
 
     def _json(self, value: Any, status: int = 200) -> None:
-        body = json.dumps(
-            value,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=_json_default,
-        ).encode("utf-8")
+        self._json_body(_encode_json(value), status)
+
+    def _json_body(self, body: bytes, status: int = 200) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -1178,17 +1212,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     result["adjusted"], result["ready_through_us"] = adjusted, ready_through
                 self._json({"ok": True, "data": result})
             elif parsed.path == "/api/storage":
-                settings = self.app.metadata.load_settings()
-                self._json(
-                    {
-                        "ok": True,
-                        "data": {
-                            **self.app.storage.stats(settings.retention_days),
-                            "oss_retention_days": settings.oss_retention_days,
-                            "oss_enabled": settings.oss_enabled,
-                        },
-                    }
-                )
+                self._json_body(self.app.storage_response())
             elif parsed.path == "/api/export":
                 settings = self.app.metadata.load_settings()
                 event_query = _event_query(query)

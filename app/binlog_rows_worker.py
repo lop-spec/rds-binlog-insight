@@ -125,6 +125,8 @@ PARSED_RE = re.compile(rb"parsed (\d+) audit records")
 MOVE_SLOTS = max(1, min(int(os.environ.get("RDS_BINLOG_ROWS_MOVE_SLOTS", "2") or 2), WORKER_LANES_MAX))
 MOVE_MEMORY_MAX = int(float(os.environ.get("RDS_BINLOG_ROWS_MOVE_CH_MEMORY_MAX_GIB", "3.9") or 0) * 1024 ** 3)
 MOVE_WAIT_SECONDS = max(0.0, float(os.environ.get("RDS_BINLOG_ROWS_MOVE_WAIT_SECONDS", "300") or 0))
+CANDIDATE_SCAN_ROWS = 5000
+GAP_SWEEP_SECONDS = 600
 
 
 def stream_ranges(bucket: Any, key: str, size: int, stop: threading.Event, *, streams: int | None = None,
@@ -230,15 +232,22 @@ def read_slice_memory(path: str) -> int | None:
 
 
 class LineCountingStream:
-    """File-like view of parser stdout that counts NDJSON records while ClickHouse reads it."""
+    """File-like view of parser stdout that counts NDJSON records while ClickHouse reads it.
 
-    def __init__(self, raw: Any, stop: threading.Event):
+    ``count_lines=False`` for RowBinary, where the parser reports the count and a newline byte means nothing; scanning
+    every byte for it was ~3.6 GB per 512 MB binlog (10-30).
+    """
+
+    def __init__(self, raw: Any, stop: threading.Event, *, count_lines: bool = True):
         self.raw, self.stop, self.lines, self._last = raw, stop, 0, NEWLINE
+        self.count_lines = count_lines
 
     def read(self, size: int = -1) -> bytes:
         if self.stop.is_set():
             raise RawBinlogError("写入进程停止", "BINLOG_ROWS_STOPPED")
         data = self.raw.read(size if size and size > 0 else 1024 * 1024)
+        if not self.count_lines:
+            return data
         if data:
             self.lines += data.count(NEWLINE)
             self._last = data[-1:]
@@ -531,44 +540,82 @@ class Worker:
 
     # -- candidate selection --------------------------------------------------
     def candidates(self, lane: int, limit: int = 200) -> list[dict[str, Any]]:
+        """Files to load, newest first: the newest CANDIDATE_SCAN_ROWS done files, then (live lanes) older raw gaps.
+
+        Descriptors are read only for the files handed out (10-30: each call read the descriptors of 5000 files, ~5 MB,
+        and five finished window lanes repeated it every 30 s). A raw file that dropped out of the newest window
+        unloaded stayed out for good (562 files of 10-19 behind a disk-full fuse were still missing on 10-30): live
+        lanes take such files from a sweep of the whole retention once the newest are taken.
+        """
         settings = self.metadata.load_settings()
         floor = (datetime.now(UTC) - timedelta(days=max(int(settings.retention_days or 60) - 1, 1))
                  ).strftime("%Y-%m-%dT%H:%M:%SZ")
         kind, window = self.lane_specs[lane]
         sql = ("SELECT b.id, b.instance_id, b.host_instance_id, b.log_file_name, b.log_begin_utc, b.log_end_utc, "
-               "r.descriptor AS raw_descriptor FROM binlog_files b LEFT JOIN raw_binlog_archives r ON r.file_id = b.id "
+               "r.file_id IS NOT NULL AS has_raw FROM binlog_files b LEFT JOIN raw_binlog_archives r ON r.file_id = b.id "
                "WHERE b.state = 'done' AND b.host_instance_id NOT IN (" + ", ".join("?" * len(NON_BINLOG_HOSTS)) + ") "
                "AND instr(b.log_file_name, '/') = 0 AND b.log_end_utc >= ?")
         args: list[Any] = [*NON_BINLOG_HOSTS, floor]
         if window:
             sql += " AND b.instance_id = ? AND b.log_end_utc >= ? AND b.log_begin_utc < ?"
             args += [window[0], window[1], window[2]]
-        sql += " ORDER BY b.log_begin_utc DESC LIMIT ?"
-        args.append(5000)
-        out = []
         with self.metadata.connection() as conn:
-            for row in conn.execute(sql, args):
-                entry = {"file_id": row["id"], "instance_id": row["instance_id"], "host_instance_id": row["host_instance_id"],
-                         "source_file_name": row["log_file_name"], "lo": _epoch_us(row["log_begin_utc"]),
-                         "hi": _epoch_us(row["log_end_utc"]), "begin": row["log_begin_utc"]}
-                if entry["file_id"] in self.ingested(entry["instance_id"]):
-                    continue
-                if row["raw_descriptor"]:
-                    entry["kind"] = "raw"
-                    entry["descriptor"] = json.loads(row["raw_descriptor"])
-                else:
-                    if any(i == entry["instance_id"] and s <= entry["begin"] < e for i, s, e in self.external_parquet):
-                        continue  # another backfill owns this Parquet window
-                    parts = conn.execute("SELECT oss_key, row_count, oss_length FROM parquet_parts WHERE binlog_id = ? "
-                                         "ORDER BY path", (entry["file_id"],)).fetchall()
-                    if not parts or any(p["oss_length"] or not p["oss_key"] for p in parts):
-                        continue
-                    entry["kind"] = "parquet"
-                    entry["parts"] = [(p["oss_key"], int(p["row_count"])) for p in parts]
-                out.append(entry)
-                if len(out) >= limit:
-                    break
+            rows = conn.execute(sql + " ORDER BY b.log_begin_utc DESC LIMIT ?", [*args, CANDIDATE_SCAN_ROWS]).fetchall()
+            out = self._entries(conn, rows, limit)
+            if not window and len(out) < limit and len(rows) >= CANDIDATE_SCAN_ROWS:
+                out += self._entries(conn, self._gap_rows(conn, sql, args, rows[-1]["log_begin_utc"]), limit - len(out),
+                                     skip={entry["file_id"] for entry in out})
         return out
+
+    def _gap_rows(self, conn: Any, sql: str, args: list[Any], before: str) -> list[Any]:
+        """Raw-archived files older than the newest window that are not in the row store (swept every GAP_SWEEP_SECONDS)."""
+        now = time.monotonic()
+        cached = getattr(self, "_gap_cache", None)
+        if cached is None or now - cached[0] >= GAP_SWEEP_SECONDS:
+            rows = conn.execute(sql + " AND r.file_id IS NOT NULL AND b.log_begin_utc <= ? ORDER BY b.log_begin_utc DESC",
+                                [*args, before]).fetchall()
+            missing = [row for row in rows if row["id"] not in self.ingested(row["instance_id"])]
+            if missing:
+                LOGGER.warning("BINLOG_ROWS_GAP_FILES files=%s newest=%s oldest=%s", len(missing),
+                               missing[0]["log_begin_utc"], missing[-1]["log_begin_utc"])
+            cached = self._gap_cache = (now, missing)
+        return cached[1]
+
+    def _entries(self, conn: Any, rows: list[Any], limit: int, skip: set[str] | frozenset[str] = frozenset()
+                 ) -> list[dict[str, Any]]:
+        """Up to ``limit`` loadable entries of ``rows`` (in order) not yet in the row store."""
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            if len(out) >= limit:
+                break
+            entry = {"file_id": row["id"], "instance_id": row["instance_id"], "host_instance_id": row["host_instance_id"],
+                     "source_file_name": row["log_file_name"], "lo": _epoch_us(row["log_begin_utc"]),
+                     "hi": _epoch_us(row["log_end_utc"]), "begin": row["log_begin_utc"]}
+            if entry["file_id"] in skip or entry["file_id"] in self.ingested(entry["instance_id"]):
+                continue
+            if row["has_raw"]:
+                entry["kind"] = "raw"
+            else:
+                if any(i == entry["instance_id"] and s <= entry["begin"] < e for i, s, e in self.external_parquet):
+                    continue  # another backfill owns this Parquet window
+                parts = conn.execute("SELECT oss_key, row_count, oss_length FROM parquet_parts WHERE binlog_id = ? "
+                                     "ORDER BY path", (entry["file_id"],)).fetchall()
+                if not parts or any(p["oss_length"] or not p["oss_key"] for p in parts):
+                    continue
+                entry["kind"] = "parquet"
+                entry["parts"] = [(p["oss_key"], int(p["row_count"])) for p in parts]
+            out.append(entry)
+        raw = [entry for entry in out if entry["kind"] == "raw"]
+        found: dict[str, str] = {}
+        for offset in range(0, len(raw), 400):
+            ids = [entry["file_id"] for entry in raw[offset:offset + 400]]
+            found.update((r["file_id"], r["descriptor"]) for r in conn.execute(
+                "SELECT file_id, descriptor FROM raw_binlog_archives WHERE file_id IN (" + ", ".join("?" * len(ids)) + ")",
+                ids))
+        for entry in raw:
+            if entry["file_id"] in found:
+                entry["descriptor"] = json.loads(found[entry["file_id"]])
+        return [entry for entry in out if entry["kind"] != "raw" or "descriptor" in entry]
 
     # -- ingestion ------------------------------------------------------------
     def ingest_raw(self, ingestor: RowsIngestor, entry: dict[str, Any], lane: int) -> int:
@@ -652,7 +699,7 @@ class Worker:
                 stdout=subprocess.PIPE, stderr=stderr, stdin=subprocess.PIPE)
             feed = ParserFeed(stream_ranges(archive.bucket, raw["oss_key"], size, self.stop), process.stdin)
             feed.start()
-            stream = LineCountingStream(process.stdout, self.stop)
+            stream = LineCountingStream(process.stdout, self.stop, count_lines=not binary)
             try:
                 (ingestor.load_rowbinary_stream if binary else ingestor.load_ndjson_stream)(stream, entry)
             except BaseException:

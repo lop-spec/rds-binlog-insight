@@ -133,59 +133,82 @@ PARSER_INPUT_STRUCTURE = ", ".join((
 ))
 
 
-def parser_select_sql() -> str:
+def parser_select_sql(*, rowbinary: bool = False) -> str:
     """SELECT list turning parser NDJSON (``input()``) into stage columns.
 
     Uses ``{file_id}``/``{instance_id}``/``{host_instance_id}``/``{source_file_name}``
     query parameters; the fallback event id is DuckDB's
     ``sha256(file_id || chr(31) || start || chr(31) || end || chr(31) || row || chr(31) || op)``.
+
+    ``rowbinary``: the parser's RowBinary writer marks every field up to ``row_query`` present and the
+    ROWBINARY_NULL_FIELDS after it NULL (writeRowBinary in parser-go), so the present ones are read through
+    assumeNotNull and the others are their defaults. coalesce() materialized a copy of every string column,
+    row images included, in each block (10-30: ~14% of the load's ClickHouse CPU).
     """
+    def v(name: str, default: str) -> str:
+        """The field with its default where it may be NULL."""
+        if not rowbinary:
+            return f"coalesce({name}, {default})"
+        return default if name in ROWBINARY_NULL_FIELDS else f"assumeNotNull({name})"
+
+    def bare(name: str) -> str:
+        """The field where the NDJSON mapping uses it as is (an if() branch)."""
+        return f"assumeNotNull({name})" if rowbinary else name
+
+    e = "''"
     sep = "char(31)"
     fallback = (
-        "lower(hex(SHA256(concat({file_id:String}, " + sep + ", toString(coalesce(start_position, 0)), "
-        + sep + ", toString(coalesce(end_position, 0)), " + sep + ", toString(coalesce(row_index, 0)), "
-        + sep + ", coalesce(operation, '')))))"
+        "lower(hex(SHA256(concat({file_id:String}, " + sep + ", toString(" + v("start_position", "0") + "), "
+        + sep + ", toString(" + v("end_position", "0") + "), " + sep + ", toString(" + v("row_index", "0") + "), "
+        + sep + ", " + v("operation", e) + "))))"
     )
-    epoch = "coalesce(event_epoch_us, 0)"
+    epoch = v("event_epoch_us", "0")
     return ", ".join((
-        f"if(coalesce(event_id, '') = '', {fallback}, event_id) AS event_id",
+        f"if({v('event_id', e)} = '', {fallback}, {bare('event_id')}) AS event_id",
         f"{epoch} AS event_epoch_us",
         f"fromUnixTimestamp64Micro({epoch}, 'UTC') AS event_time_utc",
         f"toDate(fromUnixTimestamp64Micro({epoch}, 'UTC')) AS event_date",
         "{instance_id:String} AS instance_id",
         "{host_instance_id:String} AS host_instance_id",
         "{source_file_name:String} AS source_file_name",
-        "coalesce(raw_event_type, '') AS raw_event_type",
-        "upper(if(coalesce(operation, '') = '', 'OTHER', operation)) AS operation",
-        "coalesce(database_name, '') AS database_name",
-        "coalesce(table_name, '') AS table_name",
-        "coalesce(server_id, 0) AS server_id",
-        "coalesce(thread_id, 0) AS thread_id",
-        "coalesce(transaction_id, '') AS transaction_id",
-        "coalesce(gtid, '') AS gtid",
-        "coalesce(start_position, 0) AS start_position",
-        "coalesce(end_position, 0) AS end_position",
-        "coalesce(row_index, 0) AS row_index",
-        "coalesce(execution_time_ms, 0) AS execution_time_ms",
-        "coalesce(error_code, 0) AS error_code",
-        "coalesce(sql_kind, '') AS sql_kind",
-        "coalesce(before_json, '') AS before_json",
-        "coalesce(after_json, '') AS after_json",
-        "toLowCardinality(if(coalesce(row_query, '') = '' AND coalesce(sql_kind, '') = 'ORIGINAL', "
-        "coalesce(sql_text, ''), coalesce(row_query, ''))) AS row_query",
-        "coalesce(connection_id, '') AS connection_id",
-        "coalesce(connection_name, '') AS connection_name",
-        "coalesce(database_account, '') AS database_account",
-        "coalesce(execution_status, '') AS execution_status",
-        "coalesce(error_message, '') AS error_message",
-        "coalesce(affected_rows, 0) AS affected_rows",
-        "coalesce(started_epoch_us, 0) AS started_epoch_us",
-        "coalesce(finished_epoch_us, 0) AS finished_epoch_us",
-        "coalesce(batch_id, '') AS batch_id",
-        "coalesce(statement_index, -1) AS statement_index",
-        "coalesce(transaction_context_id, '') AS transaction_context_id",
+        f"{v('raw_event_type', e)} AS raw_event_type",
+        f"upper(if({v('operation', e)} = '', 'OTHER', {bare('operation')})) AS operation",
+        f"{v('database_name', e)} AS database_name",
+        f"{v('table_name', e)} AS table_name",
+        f"{v('server_id', '0')} AS server_id",
+        f"{v('thread_id', '0')} AS thread_id",
+        f"{v('transaction_id', e)} AS transaction_id",
+        f"{v('gtid', e)} AS gtid",
+        f"{v('start_position', '0')} AS start_position",
+        f"{v('end_position', '0')} AS end_position",
+        f"{v('row_index', '0')} AS row_index",
+        f"{v('execution_time_ms', '0')} AS execution_time_ms",
+        f"{v('error_code', '0')} AS error_code",
+        f"{v('sql_kind', e)} AS sql_kind",
+        f"{v('before_json', e)} AS before_json",
+        f"{v('after_json', e)} AS after_json",
+        f"toLowCardinality(if({v('row_query', e)} = '' AND {v('sql_kind', e)} = 'ORIGINAL', "
+        f"{v('sql_text', e)}, {v('row_query', e)})) AS row_query",
+        f"{v('connection_id', e)} AS connection_id",
+        f"{v('connection_name', e)} AS connection_name",
+        f"{v('database_account', e)} AS database_account",
+        f"{v('execution_status', e)} AS execution_status",
+        f"{v('error_message', e)} AS error_message",
+        f"{v('affected_rows', '0')} AS affected_rows",
+        f"{v('started_epoch_us', '0')} AS started_epoch_us",
+        f"{v('finished_epoch_us', '0')} AS finished_epoch_us",
+        f"{v('batch_id', e)} AS batch_id",
+        f"{v('statement_index', '-1')} AS statement_index",
+        f"{v('transaction_context_id', e)} AS transaction_context_id",
         "concat('raw:', {file_id:String}) AS _source_part_key",
     ))
+
+
+# The PARSER_INPUT_STRUCTURE fields the RowBinary writer always sends as NULL (rowBinaryNullFields = 11 in parser-go).
+ROWBINARY_NULL_FIELDS = frozenset((
+    "connection_id", "connection_name", "database_account", "execution_status", "error_message", "affected_rows",
+    "started_epoch_us", "finished_epoch_us", "batch_id", "statement_index", "transaction_context_id",
+))
 
 
 def worker_buffer_schema() -> list[str]:
@@ -965,8 +988,9 @@ class RowsIngestor:
                         body=stream, timeout=3600)
 
     def load_rowbinary_stream(self, stream: Any, entry: dict[str, Any]) -> None:
-        """Parser RowBinary (``--rowbinary``) straight into the buffer: same input structure and SELECT as the JSON path."""
-        sql = (f"INSERT INTO {self.buffer} ({', '.join(STAGE_COLUMN_NAMES)}) SELECT {parser_select_sql()} "
+        """Parser RowBinary (``--rowbinary``) straight into the buffer: same input structure and stage values as the
+        JSON path, read without coalesce() (see parser_select_sql)."""
+        sql = (f"INSERT INTO {self.buffer} ({', '.join(STAGE_COLUMN_NAMES)}) SELECT {parser_select_sql(rowbinary=True)} "
                f"FROM input('{PARSER_INPUT_STRUCTURE}') FORMAT RowBinary")
         self.ch.execute(sql, params={"file_id": entry["file_id"], "instance_id": entry["instance_id"],
                                      "host_instance_id": entry["host_instance_id"],
