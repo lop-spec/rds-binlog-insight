@@ -10,6 +10,7 @@ zero.
 from __future__ import annotations
 
 import base64
+import bisect
 import http.client
 import json
 import logging
@@ -482,23 +483,25 @@ def _union(spans: Iterable[tuple[int, int]], tolerance: int = 0) -> list[list[in
 
 
 def _subtract(intervals: list[list[int]], cuts: list[list[int]]) -> list[list[int]]:
+    """``intervals`` minus ``cuts``; ``cuts`` sorted and merged (as ``_union`` returns them).
+
+    Each interval looks up only the cuts that overlap it (binary search on the cut ends): one subtraction per missing
+    file over the whole retention window was quadratic (11 s for a 60-day coverage of the production instance).
+    """
+    ends = [hi for _lo, hi in cuts]
     out: list[list[int]] = []
     for lo, hi in intervals:
-        pieces = [[lo, hi]]
-        for c_lo, c_hi in cuts:
-            if c_hi <= lo or c_lo >= hi:
-                continue
-            nxt = []
-            for p_lo, p_hi in pieces:
-                if c_hi <= p_lo or c_lo >= p_hi:
-                    nxt.append([p_lo, p_hi])
-                    continue
-                if p_lo < c_lo:
-                    nxt.append([p_lo, c_lo])
-                if c_hi < p_hi:
-                    nxt.append([c_hi, p_hi])
-            pieces = nxt
-        out.extend(piece for piece in pieces if piece[0] < piece[1])
+        cursor, index = lo, bisect.bisect_right(ends, lo)
+        while index < len(cuts) and cuts[index][0] < hi:
+            c_lo, c_hi = cuts[index]
+            if c_lo > cursor:
+                out.append([cursor, c_lo])
+            cursor = max(cursor, c_hi)
+            if cursor >= hi:
+                break
+            index += 1
+        if cursor < hi:
+            out.append([cursor, hi])
     return out
 
 
@@ -530,12 +533,15 @@ def coverage_runs(files: Iterable[dict[str, Any]], ingested: set[str],
     for item in good:
         by_host.setdefault(str(item.get("host") or ""), []).append(_span(item))
     raw_gaps: list[dict[str, Any]] = []
+    others_of: dict[str, list[list[int]]] = {}
     for item in ordered:
         if item["id"] in ingested:
             continue
         host = str(item.get("host") or "")
-        others = _union([span for other, spans in by_host.items() if other != host for span in spans],
-                        COVER_TOLERANCE_US)
+        others = others_of.get(host)
+        if others is None:
+            others = others_of[host] = _union(
+                [span for other, spans in by_host.items() if other != host for span in spans], COVER_TOLERANCE_US)
         state = str(item.get("state") or "")
         reason = ("source_missing" if state == "unavailable" else
                   "collecting" if state in UNFINISHED_STATES else "pending")

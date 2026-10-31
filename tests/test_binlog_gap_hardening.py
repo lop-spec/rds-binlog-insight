@@ -651,6 +651,19 @@ class CoverageGapTests(unittest.TestCase):
         self.assertEqual([g["reason"] for g in result["gaps"]], ["no_data", "collecting", "pending"])
 
 
+class CoverageScaleTests(unittest.TestCase):
+    def test_a_long_window_with_many_missing_files_stays_fast(self):
+        # 1.35.2: one subtraction per missing file over the whole union was quadratic (11 s for 60 days of production).
+        step = 50 * 1_000_000
+        files = [{"id": f"f{i}", "lo": i * step, "hi": (i + 1) * step, "state": "done",
+                  "host": "old" if i < 80000 else "new"} for i in range(86000)]
+        ingested = {f["id"] for i, f in enumerate(files) if i % 20}
+        started = time.monotonic()
+        result = br.coverage_runs(files, ingested, 0, 86000 * step)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(result["gaps"]), 86000 // 20)
+
+
 class LightweightIndexFallbackTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

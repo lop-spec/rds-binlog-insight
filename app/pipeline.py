@@ -1711,7 +1711,9 @@ class SyncManager:
                 while entries or admitted:
                     stopping = self._stopping()
                     if not stopping:
-                        heads = list(admitted.values())[:1] + list(entries)[:1]
+                        heads = [next(iter(admitted.values()))] if admitted else []
+                        if entries:
+                            heads.append(entries[0])
                         urgent = any(self._is_urgent(e[1]) for e in heads)
                         file_limit = RAW_PREFETCH_FILES_URGENT if urgent else RAW_PREFETCH_FILES
                         byte_limit = RAW_PREFETCH_BYTES_URGENT if urgent else RAW_PREFETCH_BYTES
