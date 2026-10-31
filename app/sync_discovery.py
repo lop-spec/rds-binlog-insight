@@ -41,7 +41,8 @@ HOLE_QUERY_LIMIT = 3
 LIVE_FAILURE_GRACE_SECONDS = 600
 # Files this close to the end of the source retention go before everything else, oldest first.
 URGENT_MARGIN = timedelta(hours=48)
-PLAN_RELOAD_SECONDS = 30
+# Only this collector registers files, and it adds each one to the plan it holds; a reload only picks up settled rows.
+PLAN_RELOAD_SECONDS = 300
 # RDS writes the end of one file and the start of the next with the same second.
 COVER_TOLERANCE_SECONDS = 2
 NUMBER = re.compile(r"\.(\d+)$")
@@ -271,7 +272,9 @@ class RetainedDiscovery:
                 if file_id in known:
                     if known[file_id] not in ('skipped', 'superseded'):
                         items.append(item)
-                elif plan.accept_new(item):
+                elif item.remote_status.lower() == 'completed' and plan.accept_new(item):
+                    # A file still uploading is registered once it is complete: its size and span are final then (an
+                    # identity taken mid-upload would stay "collecting" for good).
                     plan.add(item)
                     items.append(item)
         records = metadata.upsert_remotes(self.settings, items)

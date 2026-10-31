@@ -2108,7 +2108,17 @@ class SyncManager:
         archive = self.archive_for_settings(settings)
         if archive is not None:
             try:
-                ready = archive.ensure_ready()
+                try:
+                    ready = archive.ensure_ready()
+                except OssArchiveError as exc:
+                    if exc.code not in {"OSS_LIFECYCLE_ERROR", "OSS_LIFECYCLE_VERIFY_FAILED"}:
+                        raise
+                    # The lifecycle rule decides when archived objects expire, not whether binlogs are collected: a
+                    # rule that cannot be read or written used to fail every job before discovery.
+                    ready = {"access": archive.probe(),
+                             "lifecycle": {"expirationDays": settings.oss_retention_days, "deferred": exc.code}}
+                    self._event(job_id, "warning", "OSS_LIFECYCLE_DEFERRED",
+                                f"OSS 生命周期规则检查失败（{exc.code}：{exc}）；不影响采集，下次任务重试")
                 self._archive_status = {
                     "enabled": True,
                     "ready": True,

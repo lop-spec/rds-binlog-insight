@@ -208,6 +208,20 @@ class DiscoveryTests(DiscoveryFixture):
         first = datetime.fromisoformat(windows[0][0].replace("Z", "+00:00"))
         self.assertLess(datetime.now(UTC) - first, timedelta(days=9))  # source retention + 1 day, not 60 days
 
+    def test_a_file_still_uploading_is_registered_once_complete(self):
+        now = datetime.now(UTC)
+        uploading = binlog("mysql-bin.000001", now - timedelta(minutes=30), now - timedelta(minutes=29),
+                           status="Uploading")
+        listing = {"items": [uploading]}
+        client = SimpleNamespace(iter_binlog_batches=lambda *_: iter([listing["items"]]))
+        with RetainedDiscovery(self.manager, self.job, client, self.settings, "host-a") as discovery:
+            discovery.future.result(timeout=5)
+            self.assertEqual(discovery.pending(), [])
+            self.assertIsNone(self.metadata.file_record(self.metadata.file_id(INSTANCE, uploading)))
+            done = replace(uploading, remote_status="Completed", file_size=999)
+            listing["items"] = [done]
+            self.assertEqual([e[1].file_size for e in discovery.pending(force_recent=True)], [999])
+
     def test_primary_change_inside_a_job_is_picked_up(self):
         discovery = RetainedDiscovery(self.manager, self.job, SimpleNamespace(), self.settings, "old",
                                       resolve_primary=lambda: "new")
@@ -328,6 +342,33 @@ class FileFailureTests(ManagerFixture):
             self.assertEqual(self.manager._download(self.job, Mock(), self.settings, file_id, item),
                              (result.path, result.sha256))
         self.assertEqual(dl.call_count, 2)
+
+
+class LifecycleTests(ManagerFixture):
+    def test_a_lifecycle_rule_failure_does_not_stop_collection(self):
+        from app.oss_store import OssArchiveError
+
+        class Stop(Exception):
+            pass
+        archive = Mock()
+        archive.ensure_ready.side_effect = OssArchiveError("rule", "OSS_LIFECYCLE_ERROR")
+        archive.probe.return_value = {"ok": True}
+        self.manager.archive_for_settings = Mock(return_value=archive)
+        self.manager._archive_existing_parts = Mock(return_value=0)
+        self.manager.client_factory = Mock(return_value=SimpleNamespace(verify_instance=Mock(side_effect=Stop())))
+        with self.assertRaises(Stop):
+            self.manager._run(self.job, self.settings, CloudCredential("fixture", "fixture"))
+        codes = [c.args[2] for c in self.manager._event.call_args_list]
+        self.assertIn("OSS_LIFECYCLE_DEFERRED", codes)
+        self.assertTrue(self.manager._archive_status["ready"])
+
+    def test_an_access_failure_still_stops_the_job(self):
+        from app.oss_store import OssArchiveError
+        archive = Mock()
+        archive.ensure_ready.side_effect = OssArchiveError("denied", "OSS_ACCESS_DENIED")
+        self.manager.archive_for_settings = Mock(return_value=archive)
+        with self.assertRaises(OssArchiveError):
+            self.manager._run(self.job, self.settings, CloudCredential("fixture", "fixture"))
 
 
 class RawLaneTests(unittest.TestCase):
