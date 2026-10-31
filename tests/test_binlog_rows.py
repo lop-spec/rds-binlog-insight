@@ -172,7 +172,7 @@ class SchemaTests(unittest.TestCase):
                 self.assertIn(name, view)
         self.assertIn("% 8) AS tbl_bucket", view)
         self.assertIn(f"leftUTF8(row_query, {br.STATEMENT_MAX_BYTES}))) AS row_query_hash", view)
-        lanes = [s for s in br.build_schema() if "binlog_rows_buf_worker_v4_" in s]
+        lanes = [s for s in br.build_schema() if "binlog_rows_buf_worker_v4_" in s and s.startswith("CREATE")]
         self.assertEqual(len(lanes), br.WORKER_LANES_MAX)
         for statement in lanes:
             self.assertIn(f"PARTITION BY toUInt8({br.BUCKET_EXPR}) ORDER BY _source_part_key", statement)

@@ -123,8 +123,16 @@ class LiteTests(unittest.TestCase):
         import subprocess
         from app.binlog_lite import scan_isolated
         before=fixture(self.path)
-        with patch('app.binlog_lite.subprocess.run',side_effect=subprocess.TimeoutExpired('worker',180)):
+        class Child:
+            killed=False
+            def __init__(self,*args,**kwargs): pass
+            def wait(self,timeout=None):
+                if timeout is not None and not Child.killed: raise subprocess.TimeoutExpired('worker',timeout)
+                return -9
+            def kill(self): Child.killed=True
+        with patch('app.binlog_lite.subprocess.Popen',Child), patch('app.binlog_lite.scan_timeout',return_value=0):
             with self.assertRaises(RawBinlogError) as caught:scan_isolated(self.path)
+        self.assertTrue(Child.killed)
         self.assertEqual(caught.exception.code,'RAW_INDEX_TIMEOUT')
         self.assertEqual(self.path.read_bytes(),before)
         self.assertEqual(list(self.path.parent.glob('.raw-index-*')),[])

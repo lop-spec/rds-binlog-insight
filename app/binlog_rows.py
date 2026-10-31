@@ -52,6 +52,8 @@ RAW_EXPR = "lower(concat(before_json, ' ', after_json, ' ', transaction_id, ' ',
 # Must stay byte-identical to the ``search`` index expression, otherwise the text index is silently not used.
 SEARCH_EXPR = "replaceRegexpAll(" + RAW_EXPR + ", '[^\\\\x00-\\\\x7f]+', ' ')"
 NON_BINLOG_HOSTS = ("slow-log", "tabularis", "general-log")
+# RDS keeps uploaded binlogs this long (LogBackupRetentionPeriod): an unlisted span older than that is gone for good.
+SOURCE_RETENTION_SECONDS = max(int(os.environ.get("RDS_BINLOG_SOURCE_RETENTION_DAYS", "7") or 7), 1) * 86400 + 86400
 QUERY_DEADLINE_SECONDS = 100
 PAGE_DEPTH_LIMIT = 2000
 DAY_US = 86_400_000_000
@@ -211,13 +213,22 @@ ROWBINARY_NULL_FIELDS = frozenset((
 ))
 
 
+# A buffer is never merged, so one large file is many parts: a 23 GB test-instance binlog (46.6 M rows) made 2,846
+# parts in one bucket, near the default limit of 3,000 that refuses the insert (TOO_MANY_PARTS, seen 10-30) and above the
+# 1,000 that delays every further insert (that batch took 1,815 s). A buffer lives for one batch and is truncated.
+BUFFER_PART_SETTINGS = "parts_to_delay_insert = 100000, parts_to_throw_insert = 200000, max_parts_in_total = 1000000"
+
+
 def worker_buffer_schema() -> list[str]:
     """The per-lane worker buffers; the worker also creates them itself at start (they are scratch tables)."""
-    return [f"CREATE TABLE IF NOT EXISTS {WORKER_BUFFER_TABLE}_{lane} AS {STAGE_TABLE} ENGINE = MergeTree "
-            f"PARTITION BY toUInt8({BUCKET_EXPR}) ORDER BY _source_part_key SETTINGS min_bytes_for_wide_part = 1073741824, "
-            # never merged: a buffer lives for one batch and is truncated (10-22: 619 merges in 15 min on v3)
-            "max_bytes_to_merge_at_max_space_in_pool = 1, max_bytes_to_merge_at_min_space_in_pool = 1"
-            for lane in range(WORKER_LANES_MAX)]
+    create = [f"CREATE TABLE IF NOT EXISTS {WORKER_BUFFER_TABLE}_{lane} AS {STAGE_TABLE} ENGINE = MergeTree "
+              f"PARTITION BY toUInt8({BUCKET_EXPR}) ORDER BY _source_part_key SETTINGS min_bytes_for_wide_part = 1073741824, "
+              # never merged: a buffer lives for one batch and is truncated (10-22: 619 merges in 15 min on v3)
+              "max_bytes_to_merge_at_max_space_in_pool = 1, max_bytes_to_merge_at_min_space_in_pool = 1, "
+              + BUFFER_PART_SETTINGS
+              for lane in range(WORKER_LANES_MAX)]
+    alter = [f"ALTER TABLE {WORKER_BUFFER_TABLE}_{lane} MODIFY SETTING {BUFFER_PART_SETTINGS}" for lane in range(WORKER_LANES_MAX)]
+    return create + alter
 
 
 def build_schema() -> list[str]:
@@ -452,44 +463,101 @@ def _epoch_us(text: str) -> int:
     return int(datetime.fromisoformat(str(text).replace("Z", "+00:00")).timestamp() * 1_000_000)
 
 
-def coverage_runs(files: Iterable[dict[str, Any]], ingested: set[str],
-                  start: int | None = None, end: int | None = None) -> dict[str, Any]:
-    """Consecutive ingested files form one covered interval; any other file is a gap.
+# Two files' spans that touch within this tolerance are one run (RDS writes the end of one file and the start of the
+# next with the same second); a file with an empty span (one transaction, begin = end) covers one second.
+COVER_TOLERANCE_US = 2_000_000
+POINT_SPAN_US = 1_000_000
+UNFINISHED_STATES = frozenset({"discovered", "failed", "downloading", "downloaded", "parsing", "stored"})
+SETTLED_STATES = frozenset({"skipped", "superseded"})
 
-    ``files`` carry ``id, lo, hi, state``. Gaps are merged per reason:
-    ``source_missing`` (collector could not obtain the binlog) or ``pending``
-    (collected but not yet in ClickHouse). Output is clipped to [start, end].
-    """
-    ordered = sorted(files, key=lambda f: (f["lo"], f["hi"], f["id"]))
-    intervals: list[list[int]] = []
-    gaps: list[dict[str, Any]] = []
-    run: list[int] | None = None
-    previous_was_gap = False
-    for item in ordered:
-        good = item["id"] in ingested
-        if good:
-            if run is None:
-                run = [item["lo"], item["hi"]]
-            else:
-                run[1] = max(run[1], item["hi"])
-            previous_was_gap = False
-            continue
-        if run is not None:
-            intervals.append(run)
-            run = None
-        reason = "source_missing" if item.get("state") == "unavailable" else "pending"
-        # Only neighbouring missing files merge; a covered run in between always splits gaps.
-        if previous_was_gap and gaps[-1]["reason"] == reason:
-            gaps[-1]["end"] = max(gaps[-1]["end"], item["hi"])
-            gaps[-1]["files"] += 1
+
+def _union(spans: Iterable[tuple[int, int]], tolerance: int = 0) -> list[list[int]]:
+    merged: list[list[int]] = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1] + tolerance:
+            merged[-1][1] = max(merged[-1][1], hi)
         else:
-            gaps.append({"start": item["lo"], "end": item["hi"], "reason": reason, "files": 1})
-        previous_was_gap = True
-    if run is not None:
-        intervals.append(run)
-    # A covered run wins where it overlaps a neighbouring gap's boundary second.
+            merged.append([lo, hi])
+    return merged
+
+
+def _subtract(intervals: list[list[int]], cuts: list[list[int]]) -> list[list[int]]:
+    out: list[list[int]] = []
+    for lo, hi in intervals:
+        pieces = [[lo, hi]]
+        for c_lo, c_hi in cuts:
+            if c_hi <= lo or c_lo >= hi:
+                continue
+            nxt = []
+            for p_lo, p_hi in pieces:
+                if c_hi <= p_lo or c_lo >= p_hi:
+                    nxt.append([p_lo, p_hi])
+                    continue
+                if p_lo < c_lo:
+                    nxt.append([p_lo, c_lo])
+                if c_hi < p_hi:
+                    nxt.append([c_hi, p_hi])
+            pieces = nxt
+        out.extend(piece for piece in pieces if piece[0] < piece[1])
+    return out
+
+
+def _span(item: dict[str, Any]) -> tuple[int, int]:
+    lo, hi = int(item["lo"]), int(item["hi"])
+    return (lo, hi) if hi > lo else (lo, lo + POINT_SPAN_US)
+
+
+def coverage_runs(files: Iterable[dict[str, Any]], ingested: set[str],
+                  start: int | None = None, end: int | None = None, *,
+                  expired_before: int | None = None) -> dict[str, Any]:
+    """Covered intervals and gaps of a window, from the collector catalog and the row-store manifest.
+
+    ``files`` carry ``id, lo, hi, state`` and optionally ``host``. Covered = the union of ingested files' spans
+    minus every gap. A file that is not ingested is a gap where no ingested file of *another* host covers it (a
+    replica's copy holds the same changes); its reason follows its state: ``source_missing`` (the collector could not
+    obtain it), ``collecting`` (not collected yet) or ``pending`` (collected, not in ClickHouse yet). A file with an
+    empty span covers one second, so a missing single-transaction file is reported (it was hidden between its
+    neighbours' boundary seconds). Time that no registered file covers at all is ``source_unlisted`` (discovery never
+    saw a file there; ``source_missing`` once ``expired_before`` says the source is gone) instead of being merged into
+    the covered run around it. ``skipped``/``superseded`` files are other copies and never a gap.
+    Output is clipped to [start, end]; with a window, time after the newest file is ``not_collected_yet`` and time
+    before the oldest is ``no_data``.
+    """
+    ordered = [f for f in sorted(files, key=lambda f: (f["lo"], f["hi"], f["id"]))
+               if str(f.get("state") or "") not in SETTLED_STATES]
+    good = [f for f in ordered if f["id"] in ingested]
+    by_host: dict[str, list[tuple[int, int]]] = {}
+    for item in good:
+        by_host.setdefault(str(item.get("host") or ""), []).append(_span(item))
+    raw_gaps: list[dict[str, Any]] = []
+    for item in ordered:
+        if item["id"] in ingested:
+            continue
+        host = str(item.get("host") or "")
+        others = _union([span for other, spans in by_host.items() if other != host for span in spans],
+                        COVER_TOLERANCE_US)
+        state = str(item.get("state") or "")
+        reason = ("source_missing" if state == "unavailable" else
+                  "collecting" if state in UNFINISHED_STATES else "pending")
+        for lo, hi in _subtract([list(_span(item))], others):
+            raw_gaps.append({"start": lo, "end": hi, "reason": reason, "files": 1})
+    registered = _union([_span(f) for f in ordered], COVER_TOLERANCE_US)
+    for (_lo, left_hi), (right_lo, _hi) in zip(registered, registered[1:]):
+        expired = expired_before is not None and right_lo <= expired_before
+        raw_gaps.append({"start": left_hi, "end": right_lo, "reason": "source_missing" if expired else "source_unlisted",
+                         "files": 0})
+    raw_gaps.sort(key=lambda g: (g["start"], g["end"]))
+    gaps: list[dict[str, Any]] = []
+    for gap in raw_gaps:
+        if gaps and gaps[-1]["reason"] == gap["reason"] and gap["start"] <= gaps[-1]["end"]:
+            gaps[-1]["end"] = max(gaps[-1]["end"], gap["end"])
+            gaps[-1]["files"] += gap["files"]
+        else:
+            gaps.append(dict(gap))
+    intervals = _subtract(_union([_span(f) for f in good], COVER_TOLERANCE_US),
+                          _union([[g["start"], g["end"]] for g in gaps]))
     if start is not None and end is not None:
-        intervals = [[max(lo, start), min(hi, end)] for lo, hi in intervals if max(lo, start) <= min(hi, end)]
+        intervals = [[max(lo, start), min(hi, end)] for lo, hi in intervals if max(lo, start) < min(hi, end)]
         clipped = []
         for gap in gaps:
             lo, hi = max(gap["start"], start), min(gap["end"], end)
@@ -498,16 +566,22 @@ def coverage_runs(files: Iterable[dict[str, Any]], ingested: set[str],
         gaps = clipped
         covered = sum(hi - lo for lo, hi in intervals)
         latest = max((f["hi"] for f in ordered), default=None)
+        earliest = min((f["lo"] for f in ordered), default=None)
         if latest is None:
             gaps.append({"start": start, "end": end, "reason": "no_data", "files": 0})
-        elif latest < end and max(latest, start) < end:
-            gaps.append({"start": max(latest, start), "end": end, "reason": "not_collected_yet", "files": 0})
+        else:
+            if earliest > start:
+                gaps.insert(0, {"start": start, "end": min(earliest, end), "reason": "no_data", "files": 0})
+            if latest < end and max(latest, start) < end:
+                gaps.append({"start": max(latest, start), "end": end, "reason": "not_collected_yet", "files": 0})
         return {"intervals": intervals, "gaps": gaps, "covered_us": covered, "requested_us": max(end - start, 0)}
     return {"intervals": intervals, "gaps": gaps}
 
 
 GAP_LABELS = {
     "source_missing": "源 Binlog 缺失",
+    "source_unlisted": "源未列出（补查中）",
+    "collecting": "采集中",
     "pending": "未入库",
     "not_collected_yet": "尚未采集",
     "no_data": "无数据",
@@ -774,7 +848,8 @@ class BinlogRows:
                "WHERE instance_id = ?")
         args: list[Any] = [instance]
         if start is not None and end is not None:
-            lo = datetime.fromtimestamp(start / 1e6 - 86400, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            # A low-traffic instance rotates its binlog every few hours; three days covers any file reaching into the window.
+            lo = datetime.fromtimestamp(start / 1e6 - 3 * 86400, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             hi = datetime.fromtimestamp(end / 1e6, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             sql += " AND log_begin_utc >= ? AND log_begin_utc <= ?"
             args += [lo, hi]
@@ -789,7 +864,8 @@ class BinlogRows:
                     continue
                 if start is not None and end is not None and (hi_us < start or lo_us > end):
                     continue
-                out.append({"id": row["id"], "lo": lo_us, "hi": hi_us, "state": row["state"]})
+                out.append({"id": row["id"], "lo": lo_us, "hi": hi_us, "state": row["state"],
+                            "host": str(row["host_instance_id"] or "")})
         return out
 
     def ingested(self, instance: str, *, max_age: float = 15.0) -> set[str]:
@@ -807,10 +883,13 @@ class BinlogRows:
             return {"intervals": [], "gaps": [], "reason": "请选择一个实例", "mode": "binlog-rows"}
         files = self._files(instance, start, end)
         ingested = self.ingested(instance)
-        summary = coverage_runs(files, ingested, start, end)
-        summary.update(mode="binlog-rows", indexedFiles=sum(1 for f in files if f["id"] in ingested),
-                       pendingFiles=sum(1 for f in files if f["id"] not in ingested and f["state"] != "unavailable"),
-                       missingFiles=sum(1 for f in files if f["state"] == "unavailable"))
+        expired_before = int((time.time() - SOURCE_RETENTION_SECONDS) * 1_000_000)
+        summary = coverage_runs(files, ingested, start, end, expired_before=expired_before)
+        live = [f for f in files if f["state"] not in SETTLED_STATES]
+        summary.update(mode="binlog-rows", indexedFiles=sum(1 for f in live if f["id"] in ingested),
+                       pendingFiles=sum(1 for f in live if f["id"] not in ingested and f["state"] != "unavailable"),
+                       collectingFiles=sum(1 for f in live if f["id"] not in ingested and f["state"] in UNFINISHED_STATES),
+                       missingFiles=sum(1 for f in live if f["state"] == "unavailable"))
         summary["reason"] = "" if summary["intervals"] else "该实例尚无已入库的 Binlog 区间"
         return summary
 
@@ -954,8 +1033,10 @@ class RowsIngestor:
         self.oss_base = oss_base
 
     LOAD_SETTINGS = {"max_threads": 1, "max_insert_threads": 1, "max_memory_usage": 1_200_000_000,
-                     "min_insert_block_size_rows": 16384, "min_insert_block_size_bytes": 16777216,
-                     "max_insert_block_size": 16384, "max_execution_time": 0,
+                     # Blocks close at 65,536 rows or 32 MB, whichever comes first: a quarter of the parts per file
+                     # (1.35.0; 16,384 rows made ~2,800 parts of one 23 GB binlog).
+                     "min_insert_block_size_rows": 65536, "min_insert_block_size_bytes": 33554432,
+                     "max_insert_block_size": 65536, "max_execution_time": 0,
                      # Rows run to hundreds of KB (wide row images): 16384 of them overran the 1.2 GB query limit on
                      # RowBinary (10-22, mysql-bin.130020: a 1 GB column buffer); cut input blocks by bytes as well.
                      "input_format_max_block_size_bytes": 33554432, "max_insert_block_size_bytes": 33554432,

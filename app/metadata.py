@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -26,6 +29,51 @@ SLOW_LOG_FILE_PREFIX = "slow-log/"
 SLOW_LOG_HOST_INSTANCE_ID = "slow-log"
 METADATA_SCHEMA_VERSION = 1
 LOGGER = logging.getLogger(__name__)
+
+# Binlog files of these pseudo hosts are other sources (slow log, general log, Tabularis audit) kept in the same table.
+NON_BINLOG_HOST_IDS = ("slow-log", "tabularis", "general-log")
+# A binlog row: a real host and a plain file name (pseudo sources carry a '/' in theirs).
+BINLOG_ROW_SQL = ("instr(log_file_name, '/') = 0 AND host_instance_id NOT IN ('slow-log', 'tabularis', 'general-log')")
+# States that never become collected data and are no gap of the instance timeline: a file another host's copy
+# covers (skipped) or whose listing identity was replaced by a newer one (superseded).
+SETTLED_STATES = ("done", "unavailable", "skipped", "superseded")
+# How long a collector write waits out another process's write transaction before it gives up. The collector used
+# to fail its whole job after the 5 s busy timeout (19 jobs in three weeks, 2026-10-14..10-29: "database is locked").
+BUSY_RETRY_SECONDS = max(float(os.environ.get("RDS_BINLOG_METADATA_BUSY_RETRY_SECONDS", "60") or 0), 0.0)
+
+
+def is_busy_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    text = str(exc).lower()
+    return "database is locked" in text or "database table is locked" in text or "busy" in text
+
+
+def retry_busy(operation, *, label: str = "metadata", seconds: float | None = None):
+    """Run ``operation`` again while SQLite reports another writer; any other error, or the deadline, raises.
+
+    A statement refused with SQLITE_BUSY did not run, and every caller is a single statement or a transaction
+    that rolls back, so running it again is safe.
+    """
+    deadline = time.monotonic() + (BUSY_RETRY_SECONDS if seconds is None else max(float(seconds), 0.0))
+    delay = 0.2
+    while True:
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if not is_busy_error(exc) or time.monotonic() + delay > deadline:
+                raise
+            LOGGER.warning("METADATA_BUSY_RETRY op=%s wait=%.1fs", label, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
+
+
+def busy_retry(method):
+    """Method form of ``retry_busy`` for the writes the binlog collector cannot afford to lose a job over."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        return retry_busy(lambda: method(self, *args, **kwargs), label=method.__name__)
+    return wrapper
 
 REQUIRED_RUNTIME_TABLES = frozenset(
     {
@@ -1567,6 +1615,7 @@ class MetadataStore:
             ).fetchone()
         return int(row["n"]) if row else 0
 
+    @busy_retry
     def upsert_remote(
         self, settings: Settings, item: RemoteBinlog
     ) -> tuple[str, str]:
@@ -1632,6 +1681,7 @@ class MetadataStore:
             )
         return file_id, "discovered"
 
+    @busy_retry
     def upsert_remotes(
         self,
         settings: Settings,
@@ -1673,9 +1723,18 @@ class MetadataStore:
         now = utc_now_text()
         updates: dict[str, tuple[Any, ...]] = {}
         inserts: dict[str, tuple[Any, ...]] = {}
+        revivals: dict[str, tuple[Any, ...]] = {}
         results: list[tuple[str, str]] = []
         for file_id, item in prepared:
             row = existing.get(file_id)
+            if (row is not None and str(row["state"]) == "unavailable"
+                    and item.remote_status.lower() == "completed"):
+                # RDS lists the file again: "not found" was a listing hiccup or an expired link, not a lost source.
+                # Before 1.35.0 such a file stayed unavailable for good while the source was still downloadable.
+                revivals[file_id] = (item.download_link, item.intranet_download_link, item.link_expired_utc,
+                                     item.remote_status, now, file_id)
+                results.append((file_id, "discovered"))
+                continue
             if row is None:
                 results.append((file_id, "discovered"))
                 inserts[file_id] = (
@@ -1712,11 +1771,23 @@ class MetadataStore:
             )
             if current != desired:
                 updates[file_id] = (*desired, now, file_id)
-        if not updates and not inserts:
+        if not updates and not inserts and not revivals:
             return results
+        for file_id in revivals:
+            LOGGER.warning("BINLOG_FILE_REVIVED file_id=%s reason=listed-again", file_id)
         with self._write_lock, self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                conn.executemany(
+                    """
+                    UPDATE binlog_files
+                    SET state = 'discovered', error_code = '', error_message = '',
+                        download_link = ?, intranet_download_link = ?, link_expired_utc = ?,
+                        remote_status = ?, updated_at = ?
+                    WHERE id = ? AND state = 'unavailable'
+                    """,
+                    revivals.values(),
+                )
                 conn.executemany(
                     """
                     UPDATE binlog_files
@@ -1811,6 +1882,146 @@ class MetadataStore:
             ).fetchone()
         return str(row["latest"] or "") if row else ""
 
+    def existing_file_states(self, instance_id: str, file_ids: list[str]) -> dict[str, str]:
+        """State of each already registered file id (absent ids are new to the catalog)."""
+        found: dict[str, str] = {}
+        ids = list(dict.fromkeys(file_ids))
+        with self.connection() as conn:
+            for offset in range(0, len(ids), 400):
+                batch = ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                for row in conn.execute(
+                    f"SELECT id, state FROM binlog_files WHERE +instance_id = ? AND id IN ({placeholders})",
+                    (instance_id, *batch),
+                ):
+                    found[str(row["id"])] = str(row["state"])
+        return found
+
+    def binlog_host_rows(self, instance_id: str, since_utc: str) -> list[dict[str, Any]]:
+        """Registered binlog files of one instance whose span starts at or after ``since_utc``, per host and name.
+
+        These are the files the collector chose (only the then-primary's files are ever registered), so the hosts in
+        here are the current and former primaries; skipped and superseded rows are not part of the timeline.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, host_instance_id, log_file_name, log_begin_utc, log_end_utc, state
+                FROM binlog_files INDEXED BY idx_binlog_order
+                WHERE instance_id = ? AND log_begin_utc >= ? AND {BINLOG_ROW_SQL}
+                  AND state NOT IN ('skipped', 'superseded')
+                """,
+                (instance_id, since_utc),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @busy_retry
+    def mark_files_state(self, file_ids: list[str], state: str, error_code: str, error_message: str,
+                         *, only_states: tuple[str, ...]) -> int:
+        """Move files that are still in one of ``only_states`` to a settled state; returns the rows changed."""
+        if state not in SETTLED_STATES or not file_ids:
+            return 0
+        changed = 0
+        now = utc_now_text()
+        with self._write_lock, self.connection() as conn:
+            for offset in range(0, len(file_ids), 400):
+                batch = file_ids[offset:offset + 400]
+                cursor = conn.execute(
+                    f"UPDATE binlog_files SET state = ?, error_code = ?, error_message = ?, updated_at = ? "
+                    f"WHERE id IN ({','.join('?' for _ in batch)}) "
+                    f"AND state IN ({','.join('?' for _ in only_states)})",
+                    (state, error_code, error_message, now, *batch, *only_states),
+                )
+                changed += int(cursor.rowcount or 0)
+        return changed
+
+    def expired_source_candidates(self, instance_id: str, cutoff_utc: str) -> list[dict[str, Any]]:
+        """Unfinished binlog files whose span ended before ``cutoff_utc`` (past the source retention).
+
+        ``has_raw`` marks files whose original is already archived; those are not lost, only unfinished.
+        """
+        states = ("discovered", "failed", "downloading", "downloaded")
+        with self.connection() as conn:
+            rows = [dict(row) for row in conn.execute(
+                f"""
+                SELECT id, state, log_file_name, log_end_utc
+                FROM binlog_files INDEXED BY idx_binlog_completion
+                WHERE instance_id = ? AND state IN ({", ".join("?" for _ in states)})
+                  AND log_end_utc < ? AND {BINLOG_ROW_SQL}
+                """,
+                (instance_id, *states, cutoff_utc),
+            )]
+            archived: set[str] = set()
+            has_archive = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'raw_binlog_archives'"
+            ).fetchone() is not None
+            ids = [row["id"] for row in rows]
+            for offset in range(0, len(ids) if has_archive else 0, 400):
+                batch = ids[offset:offset + 400]
+                archived.update(str(r[0]) for r in conn.execute(
+                    f"SELECT file_id FROM raw_binlog_archives WHERE file_id IN ({','.join('?' for _ in batch)})", batch))
+        for row in rows:
+            row["has_raw"] = row["id"] in archived
+        return rows
+
+    def latest_done_host(self, instance_id: str) -> str:
+        """Host of the most recently collected binlog file (the primary as of then)."""
+        with self.connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT host_instance_id FROM binlog_files INDEXED BY idx_binlog_completion
+                WHERE instance_id = ? AND state = 'done' AND {BINLOG_ROW_SQL}
+                ORDER BY completed_at DESC LIMIT 1
+                """,
+                (instance_id,),
+            ).fetchone()
+        return str(row["host_instance_id"]) if row else ""
+
+    def binlog_health_summary(self, instance_id: str, now_utc: str, *, day_ago_utc: str,
+                              lost_since_end_utc: str = "") -> dict[str, Any]:
+        """Collector backlog of one instance from the unfinished files only (no scan of the done history).
+
+        ``oldest_pending_end`` is the end of the oldest listed (Completed) binlog that is not collected yet; together
+        with the source retention it says how close the backlog is to RDS deleting it.
+        """
+        unfinished = ("discovered", "failed", "downloading", "downloaded", "parsing", "stored")
+        result: dict[str, Any] = {"pending_files": 0, "oldest_pending_end": "", "failed_files": 0,
+                                  "stuck_files": 0, "newest_done_end": "", "unavailable_last_day": 0}
+        with self.connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT count(*) AS n, min(log_end_utc) AS oldest,
+                       sum(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS failed,
+                       sum(CASE WHEN attempts >= 5 AND state <> 'done' THEN 1 ELSE 0 END) AS stuck
+                FROM binlog_files INDEXED BY idx_binlog_completion
+                WHERE instance_id = ? AND state IN ({", ".join("?" for _ in unfinished)})
+                  AND lower(remote_status) = 'completed' AND {BINLOG_ROW_SQL}
+                """,
+                (instance_id, *unfinished),
+            ).fetchone()
+            if row:
+                result.update(pending_files=int(row["n"] or 0), oldest_pending_end=str(row["oldest"] or ""),
+                              failed_files=int(row["failed"] or 0), stuck_files=int(row["stuck"] or 0))
+            newest = conn.execute(
+                f"""
+                SELECT log_end_utc FROM binlog_files INDEXED BY idx_binlog_completion
+                WHERE instance_id = ? AND state = 'done' AND {BINLOG_ROW_SQL}
+                ORDER BY completed_at DESC LIMIT 200
+                """,
+                (instance_id,),
+            ).fetchall()
+            result["newest_done_end"] = max((str(r["log_end_utc"]) for r in newest), default="")
+            lost = conn.execute(
+                f"""
+                SELECT count(*) FROM binlog_files INDEXED BY idx_binlog_completion
+                WHERE instance_id = ? AND state = 'unavailable' AND updated_at >= ? AND log_end_utc >= ?
+                  AND {BINLOG_ROW_SQL}
+                """,
+                (instance_id, day_ago_utc, lost_since_end_utc),
+            ).fetchone()
+            result["unavailable_last_day"] = int(lost[0] or 0) if lost else 0
+        return result
+
     def parts_for_file(self, file_id: str) -> list[dict[str, Any]]:
         with self.connection() as conn:
             rows = conn.execute(
@@ -1819,6 +2030,7 @@ class MetadataStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    @busy_retry
     def set_file_state(
         self,
         file_id: str,
@@ -1892,6 +2104,7 @@ class MetadataStore:
                 f"UPDATE binlog_files SET {', '.join(updates)} WHERE id = ?", values
             )
 
+    @busy_retry
     def record_file_chunk_progress(
         self,
         file_id: str,
@@ -1933,6 +2146,7 @@ class MetadataStore:
                 conn.rollback()
                 raise
 
+    @busy_retry
     def set_file_visibility(self, file_id: str, visible: bool) -> None:
         with self._write_lock, self.connection() as conn:
             cursor = conn.execute(
@@ -1943,6 +2157,7 @@ class MetadataStore:
         if cursor.rowcount != 1:
             raise RuntimeError("待切换可见性的 Binlog 元数据不存在")
 
+    @busy_retry
     def update_download_progress(self, file_id: str, byte_count: int) -> None:
         with self._write_lock, self.connection() as conn:
             conn.execute(
@@ -4008,6 +4223,7 @@ class MetadataStore:
                 conn.execute("ROLLBACK")
                 raise
 
+    @busy_retry
     def create_job(
         self,
         kind: str,
@@ -4067,6 +4283,7 @@ class MetadataStore:
             )
         return len(job_ids)
 
+    @busy_retry
     def update_job(self, job_id: str, **values: Any) -> None:
         allowed = {
             "status",
@@ -4099,6 +4316,7 @@ class MetadataStore:
             current_file="",
         )
 
+    @busy_retry
     def add_job_event(
         self, job_id: str, level: str, code: str, message: str
     ) -> None:

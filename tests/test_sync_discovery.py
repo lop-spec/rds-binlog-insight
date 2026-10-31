@@ -108,19 +108,26 @@ class DiscoveryTests(unittest.TestCase):
             finally: release.set()
             self.assertTrue(discovery.future.result(timeout=2))
 
-    def test_unavailable_done_synthetic_and_other_host_are_not_readmitted(self):
-        records = [item('bin.1'),item('bin.2'),item('bin.3'),item('slow-log/fixture'),item('bin.5',host='host-b')]
+    def test_done_synthetic_and_covered_other_host_are_not_readmitted_but_a_relisted_unavailable_is(self):
+        # 1.35.0: a file RDS lists again exists; "unavailable" was a listing hiccup and is collected after all.
+        when = datetime.now(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+        records = [remote(name,when,host=host) for name,host in
+                   (('bin.1','host-a'),('bin.2','host-a'),('bin.3','host-a'),('slow-log/fixture','host-a'),('bin.5','host-b'))]
         ids = self.manager.metadata.upsert_remotes(self.settings,records)
         self.manager.metadata.set_file_state(ids[0][0],'unavailable')
         self.manager.metadata.set_file_state(ids[1][0],'done')
         client = SimpleNamespace(iter_binlog_batches=lambda *_:iter([records]))
-        with RetainedDiscovery(self.manager,self.job,client,self.settings,'host-a') as discovery:
-            discovery.future.result(timeout=2)
-            pending = discovery.pending()
-            self.assertEqual([e[1].log_file_name for e in pending],['bin.3'])
-            self.assertEqual(self.manager.metadata.file_record(ids[1][0])['download_link'],'')
+        with self.assertLogs('app.metadata','WARNING'):
+            with RetainedDiscovery(self.manager,self.job,client,self.settings,'host-a') as discovery:
+                discovery.future.result(timeout=2)
+                pending = discovery.pending()
+        self.assertEqual([e[1].log_file_name for e in pending],['bin.1','bin.3'])
+        self.assertEqual(self.manager.metadata.file_record(ids[1][0])['download_link'],'')
+        self.assertEqual(self.manager.metadata.file_record(ids[4][0])['state'],'skipped')
 
-    def test_interrupted_other_host_resumes_only_without_primary_window_duplicate(self):
+    def test_interrupted_other_host_resumes_and_the_primary_copy_of_its_window_is_not_taken(self):
+        # 1.35.0 (HostPlan): host-b's registered files are part of the timeline; host-a's file for the same window
+        # is a second copy of the same changes and is not registered. host-b's other file is resumed.
         when = (datetime.now(UTC)-timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
         duplicate = remote('bin.other',when,host='host-b')
         independent = item('bin.recoverable',5,host='host-b')
@@ -132,7 +139,8 @@ class DiscoveryTests(unittest.TestCase):
         with RetainedDiscovery(self.manager,self.job,client,self.settings,'host-a') as discovery:
             discovery.future.result(timeout=2)
             names = [entry[1].log_file_name for entry in discovery.pending()]
-            self.assertEqual(set(names),{'bin.primary','bin.recoverable'})
+            self.assertEqual(set(names),{'bin.other','bin.recoverable'})
+            self.assertIsNone(self.manager.metadata.file_record(self.manager.metadata.file_id(self.settings.db_instance_id,primary)))
 
     def test_pause_stops_retained_scan_between_pages_without_claiming_complete(self):
         calls = []

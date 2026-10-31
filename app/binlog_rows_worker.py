@@ -127,6 +127,12 @@ MOVE_MEMORY_MAX = int(float(os.environ.get("RDS_BINLOG_ROWS_MOVE_CH_MEMORY_MAX_G
 MOVE_WAIT_SECONDS = max(0.0, float(os.environ.get("RDS_BINLOG_ROWS_MOVE_WAIT_SECONDS", "300") or 0))
 CANDIDATE_SCAN_ROWS = 5000
 GAP_SWEEP_SECONDS = 600
+# A file that fails is retried after this backoff (doubling, capped) by any lane. Three failures used to drop the file
+# until the worker restarted, also for errors that pass (memory, too many parts, a dropped OSS read).
+RETRY_BASE_SECONDS = 30.0
+RETRY_MAX_SECONDS = 1800.0
+# Files with this many failures are listed in the status file (``stuckFiles``) and the health endpoint.
+STUCK_FAILURES = 5
 
 
 def stream_ranges(bucket: Any, key: str, size: int, stop: threading.Event, *, streams: int | None = None,
@@ -308,6 +314,8 @@ class Worker:
         self.backfill = backfill
         self.external_parquet = external_parquet
         self.claims = Claims()
+        self.retry_at: dict[str, tuple[int, float, str]] = {}
+        self.retry_lock = threading.Lock()
         self.stop = threading.Event()
         self.status: dict[str, Any] = {"lanes": {}, "startedAt": datetime.now(UTC).isoformat()}
         self.status_lock = threading.Lock()
@@ -317,6 +325,43 @@ class Worker:
         self.move_slots = threading.BoundedSemaphore(MOVE_SLOTS)
 
     # -- shared helpers -------------------------------------------------------
+    def _retry_state(self) -> tuple[dict[str, tuple[int, float, str]], threading.Lock]:
+        if getattr(self, "retry_at", None) is None:
+            self.retry_at = {}
+        if getattr(self, "retry_lock", None) is None:
+            self.retry_lock = threading.Lock()
+        return self.retry_at, self.retry_lock
+
+    def due(self, file_id: str) -> bool:
+        retry, _lock = self._retry_state()
+        entry = retry.get(file_id)
+        return entry is None or entry[1] <= time.monotonic()
+
+    def failed(self, entry: dict[str, Any], failures: dict[str, int], error: BaseException) -> float:
+        """Count one failure of ``entry`` and schedule its retry; returns the backoff in seconds."""
+        file_id = entry["file_id"]
+        failures[file_id] = failures.get(file_id, 0) + 1
+        retry, lock = self._retry_state()
+        with lock:
+            count = retry.get(file_id, (0, 0.0, ""))[0] + 1
+            delay = min(RETRY_BASE_SECONDS * 2 ** (count - 1), RETRY_MAX_SECONDS)
+            retry[file_id] = (count, time.monotonic() + delay, entry.get("source_file_name", ""))
+        if count >= STUCK_FAILURES:
+            LOGGER.error("BINLOG_ROWS_FILE_STUCK file=%s failures=%s error=%s", entry.get("source_file_name"), count,
+                         str(error)[:300])
+        return delay
+
+    def succeeded(self, file_id: str) -> None:
+        retry, lock = self._retry_state()
+        with lock:
+            retry.pop(file_id, None)
+
+    def stuck_files(self) -> list[dict[str, Any]]:
+        retry, lock = self._retry_state()
+        with lock:
+            return [{"fileId": file_id, "file": name, "failures": count}
+                    for file_id, (count, _due, name) in retry.items() if count >= STUCK_FAILURES]
+
     def archive(self):
         from .credentials import load_credential
         from .oss_store import OssArchive
@@ -346,6 +391,7 @@ class Worker:
         with self.status_lock:
             state = self.status["lanes"].setdefault(str(lane), {})
             state.update(fields, updatedAt=datetime.now(UTC).isoformat())
+            self.status["stuckFiles"] = self.stuck_files()
             path = self.storage.paths["index"] / STATUS_NAME
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.status, ensure_ascii=False, sort_keys=True))
@@ -702,8 +748,21 @@ class Worker:
             stream = LineCountingStream(process.stdout, self.stop, count_lines=not binary)
             try:
                 (ingestor.load_rowbinary_stream if binary else ingestor.load_ndjson_stream)(stream, entry)
-            except BaseException:
+            except BaseException as load_error:
                 process.kill()
+                process.wait(timeout=600)
+                feed.join(timeout=60)
+                # ClickHouse only sees a cut stream ("Cannot read all data"); the cause is the object read or the
+                # parser, which is what the retry and the operator need to know.
+                if feed.error is not None and not isinstance(load_error, KeyboardInterrupt):
+                    cause = feed.error if isinstance(feed.error, RawBinlogError) else RawBinlogError(
+                        f"原档读取失败：{feed.error}", "RAW_INDEX_DOWNLOAD_FAILED")
+                    raise cause from load_error
+                stderr.seek(0)
+                tail = stderr.read()[-400:].decode("utf-8", errors="replace").strip()
+                if tail and "parsed " not in tail and not isinstance(load_error, KeyboardInterrupt):
+                    raise RawBinlogError(f"解析器中断：{tail}；ClickHouse：{str(load_error)[:200]}",
+                                         "PARSER_FAILED") from load_error
                 raise
             finally:
                 returncode = process.wait(timeout=600)
@@ -840,7 +899,7 @@ class Worker:
                 LOGGER.warning("BINLOG_ROWS_CANDIDATES_FAILED lane=%s error=%s", lane, exc)
                 self.stop.wait(30)
                 continue
-            todo = [e for e in todo if failures.get(e["file_id"], 0) < 3]
+            todo = [e for e in todo if self.due(e["file_id"])]
             if not todo:
                 self.publish(lane, state="idle", reason="caught-up" if self.lane_specs[lane][0] == "live" else "window-complete")
                 self.stop.wait(30)
@@ -870,10 +929,12 @@ class Worker:
                                 lane, entry["source_file_name"], entry["kind"], rows, seconds)
                     self.publish(lane, state="running", lastFile=entry["source_file_name"], lastRows=rows,
                                  lastSeconds=seconds, lastEventEnd=entry["hi"])
+                    self.succeeded(entry["file_id"])
                 except Exception as exc:
-                    failures[entry["file_id"]] = failures.get(entry["file_id"], 0) + 1
-                    LOGGER.error("BINLOG_ROWS_INGEST_FAILED lane=%s file=%s kind=%s attempt=%s error=%s", lane,
-                                 entry["source_file_name"], entry["kind"], failures[entry["file_id"]], str(exc)[:300])
+                    delay = self.failed(entry, failures, exc)
+                    LOGGER.error("BINLOG_ROWS_INGEST_FAILED lane=%s file=%s kind=%s attempt=%s retry_in=%.0fs error=%s",
+                                 lane, entry["source_file_name"], entry["kind"], failures[entry["file_id"]], delay,
+                                 str(exc)[:300])
                     self.publish(lane, state="error", lastError=str(exc)[:300], errorFile=entry["source_file_name"])
                     try:
                         ingestor.truncate()
@@ -892,7 +953,7 @@ class Worker:
         for entry in rest:
             if len(batch) >= BATCH_FILES:
                 break
-            if entry["kind"] != "raw" or failures.get(entry["file_id"], 0) >= 3:
+            if entry["kind"] != "raw" or not self.due(entry["file_id"]):
                 continue
             if entry["instance_id"] != first["instance_id"] or not self.claims.take(entry["file_id"]):
                 continue
@@ -910,15 +971,16 @@ class Worker:
             seconds = round(time.monotonic() - started, 1)
             for entry in batch:
                 self.mark_ingested(entry["instance_id"], entry["file_id"])
+                self.succeeded(entry["file_id"])
                 LOGGER.info("BINLOG_ROWS_INGESTED lane=%s file=%s kind=raw rows=%s seconds=%s batch=%s",
                             lane, entry["source_file_name"], rows[entry["file_id"]], seconds, len(batch))
             self.publish(lane, state="running", lastFile=batch[-1]["source_file_name"], lastRows=sum(rows.values()),
                          lastSeconds=seconds, lastEventEnd=max(entry["hi"] for entry in batch))
         except Exception as exc:
             failed = exc.entry if isinstance(exc, BatchLoadError) else None
-            for entry in batch if failed is None else [failed]:
-                failures[entry["file_id"]] = failures.get(entry["file_id"], 0) + 1
             error = exc.error if isinstance(exc, BatchLoadError) else exc
+            for entry in batch if failed is None else [failed]:
+                self.failed(entry, failures, error)
             LOGGER.error("BINLOG_ROWS_INGEST_FAILED lane=%s file=%s kind=raw batch=%s error=%s", lane,
                          failed["source_file_name"] if failed else names, len(batch), str(error)[:300])
             self.publish(lane, state="error", lastError=str(error)[:300], errorFile=failed["source_file_name"] if failed else names)

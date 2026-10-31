@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -22,6 +23,14 @@ MAGIC = b'\xfebin'
 MAX_TIME = 2**62
 MAX_INDEX_BYTES = 256 * 1024**2
 INDEX_WORKER_TIMEOUT = 180
+# Seconds of scan budget per GiB on top of INDEX_WORKER_TIMEOUT: a fixed 180 s timed out a large file on every
+# attempt (2026-10-15, test instance), which kept it from being archived at all.
+INDEX_WORKER_SECONDS_PER_GIB = 60
+# Failures of the lightweight scan after which the original is archived anyway with a whole-file directory
+# (``opaque_directory``). A file that is not a MySQL binlog at all still fails.
+OPAQUE_FALLBACK_CODES = frozenset({
+    'RAW_INDEX_TIMEOUT', 'RAW_INDEX_SIZE_LIMIT', 'RAW_INDEX_WORKER_FAILED', 'RAW_BINLOG_INVALID',
+})
 ROWS = {20, 21, 22, 23, 24, 25, 30, 31, 32, 39}
 # Known non-row event types that cannot hide tables. Query events are handled
 # separately; their SQL is NOT parsed to guess table names.
@@ -169,33 +178,50 @@ def _summary_path(destination: Path) -> Path:
     return destination.with_name(destination.stem + '.summary.json')
 
 
-def _scan_child(path: Path, read):
+def scan_timeout(size: int) -> float:
+    return INDEX_WORKER_TIMEOUT + INDEX_WORKER_SECONDS_PER_GIB * max(int(size), 0) / 1024**3
+
+
+def _scan_child(path: Path, read, progress=None):
     """Run the CPU-bound directory scan in a short-lived child and hand its output files to ``read``.
 
     Downloads, checksum validation, OSS verification and manifest commits stay in the service. JSON goes through bounded
-    temporary files, not an unbounded stdout pipe.
+    temporary files, not an unbounded stdout pipe. ``progress`` is called every few seconds while the child runs (the
+    collector's watchdog counts a long scan as progress).
     """
     path = path.resolve()
+    timeout = scan_timeout(path.stat().st_size)
     with tempfile.TemporaryDirectory(prefix='.raw-index-', dir=path.parent) as temp:
         result_path = Path(temp) / 'directory.json'
-        try:
-            result = subprocess.run(
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            child = subprocess.Popen(
                 [sys.executable, '-m', 'app.binlog_lite', str(path), str(result_path)],
-                cwd=Path(__file__).resolve().parent.parent,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=INDEX_WORKER_TIMEOUT,
+                cwd=Path(__file__).resolve().parent.parent, stdout=out, stderr=err,
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise RawBinlogError('轻索引子进程超时；保留原文件', 'RAW_INDEX_TIMEOUT') from exc
-        if result.stderr:
-            LOGGER.warning('RAW_INDEX_WORKER_DIAGNOSTIC %s', result.stderr.decode('utf-8', errors='replace').strip())
-        if result.returncode:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    returncode = child.wait(timeout=5)
+                    break
+                except subprocess.TimeoutExpired:
+                    if callable(progress):
+                        progress()
+                    if time.monotonic() >= deadline:
+                        child.kill()
+                        child.wait()
+                        raise RawBinlogError('轻索引子进程超时；保留原文件', 'RAW_INDEX_TIMEOUT') from None
+            out.seek(0)
+            err.seek(0)
+            stdout, stderr = out.read(), err.read()
+        if stderr:
+            LOGGER.warning('RAW_INDEX_WORKER_DIAGNOSTIC %s', stderr.decode('utf-8', errors='replace').strip())
+        if returncode:
             try:
-                failure = json.loads(result.stdout)
+                failure = json.loads(stdout)
                 code, message = failure['code'], failure['message']
             except (ValueError, KeyError, TypeError):
-                code, message = 'RAW_INDEX_WORKER_FAILED', f'轻索引子进程退出 {result.returncode}；保留原文件'
+                code, message = 'RAW_INDEX_WORKER_FAILED', f'轻索引子进程退出 {returncode}；保留原文件'
             raise RawBinlogError(message, code)
         if not result_path.is_file():
             raise RawBinlogError('轻索引子进程未输出目录；保留原文件', 'RAW_INDEX_WORKER_FAILED')
@@ -212,7 +238,21 @@ def scan_isolated(path: Path) -> dict:
     return _scan_child(path, lambda result: json.loads(result.read_bytes()))
 
 
-def scan_isolated_sidecar(path: Path) -> tuple[bytes, dict]:
+def opaque_directory(path: Path, reasons: list[str]) -> tuple[bytes, dict]:
+    """A whole-file directory for an original archived without a successful scan (every query treats it as a candidate).
+
+    Same shape as ``scan``: one region over the file, unknown tables and unbounded time, which is what the scan
+    itself writes for files it cannot index precisely.
+    """
+    size = path.stat().st_size
+    directory = dict(version=1, size=size, prefix_end=4, lo=0, hi=MAX_TIME, tables=[], unknown=True, events=0,
+                     regions=[dict(start=4, end=size, tables=[], lo=0, hi=MAX_TIME, unknown=True)],
+                     uncertainty=sorted({'opaque-archive', *reasons}))
+    summary = {key: value for key, value in directory.items() if key != 'regions'}
+    return json.dumps(directory, ensure_ascii=False, separators=(',', ':')).encode('utf-8'), summary
+
+
+def scan_isolated_sidecar(path: Path, progress=None) -> tuple[bytes, dict]:
     """The directory as its serialized bytes plus the summary (everything but ``regions``), scanned in a child.
 
     The archive only gzips the directory into the sidecar and keeps the summary. Parsing it back in the service built one
@@ -225,7 +265,7 @@ def scan_isolated_sidecar(path: Path) -> tuple[bytes, dict]:
             raise ValueError('summary missing fields')
         return result.read_bytes(), summary
 
-    return _scan_child(path, read)
+    return _scan_child(path, read, progress)
 
 
 def _write_directory(path: Path, destination: Path) -> None:

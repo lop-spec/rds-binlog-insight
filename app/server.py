@@ -61,6 +61,7 @@ from .pod_lookup import attach_pod_detail, inventory_path, name_ips
 from .metadata import MetadataStore
 from .pipeline import PipelineError, SyncManager
 from .sync_lifecycle import CollectorLease
+from .sync_watchdog import SyncWatchdog
 from .query_tasks import QueryTaskManager
 from .rds_api import RdsApiError, RdsRpcClient
 from .schema_diff import SchemaDiffError, SchemaDiffService
@@ -361,6 +362,13 @@ class Application:
         self.secondary_syncs: list[SyncManager] = self._start_secondary_syncs(
             client_factory, credential_loader
         )
+        # A stalled collector job is stopped and a stuck process restarted (sync_watchdog).
+        self.sync_watchdog: SyncWatchdog | None = None
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self.sync_watchdog = SyncWatchdog(lambda: [self.sync, *self.secondary_syncs], self.data_dir / "logs")
+            self.sync_watchdog.start()
+        self._binlog_health_cache: dict[str, tuple[float, Any]] = {}
+        self._binlog_health_lock = threading.Lock()
         self.general_logs = self._start_general_log_collectors()
         # 兼容既有调用与状态字段：第一个采集器仍作为 general_log 暴露。
         self.general_log = self.general_logs[0]
@@ -510,6 +518,80 @@ class Application:
 
     def _with_live_sections(self, cached: tuple[float, dict[str, Any]], now: float) -> dict[str, Any]:
         return {**cached[1], **self._live_status_sections(), "statusAgeSeconds": round(now - cached[0], 1)}
+
+    def binlog_guard(self, manager: SyncManager) -> dict[str, Any]:
+        """``SyncManager.binlog_guard`` of one collector, cached 30 s (monitors poll the health endpoint)."""
+        key = "guard:" + manager._job_scope()
+        with self._binlog_health_lock:
+            cached = self._binlog_health_cache.get(key)
+            if cached and time.monotonic() - cached[0] < 30:
+                return cached[1]
+        try:
+            value = manager.binlog_guard()
+        except Exception as exc:  # noqa: BLE001 - a broken check is reported, not hidden
+            LOGGER.warning("Binlog guard failed: %s", exc)
+            value = {"ok": False, "state": "check_failed", "message": f"采集积压检查失败：{exc}", "issues": ["check_failed"]}
+        with self._binlog_health_lock:
+            self._binlog_health_cache[key] = (time.monotonic(), value)
+        return value
+
+    def rows_ingest_health(self, guards: list[dict[str, Any]], instances: list[str]) -> dict[str, Any]:
+        """Row store behind the collector: newest ingested file end vs newest collected file end per instance.
+
+        Raw originals stay in object storage 60 days, so this is about query visibility, not data loss; the worker's
+        status file also lists files that keep failing (``stuckFiles``) and pauses.
+        """
+        with self._binlog_health_lock:
+            cached = self._binlog_health_cache.get("rows")
+            if cached and time.monotonic() - cached[0] < 60:
+                return cached[1]
+        rows = getattr(self.storage, "binlog_rows", None)
+        result: dict[str, Any] = {"ok": True, "state": "ok", "message": "按表存储入库正常", "instances": {}}
+        if rows is None:
+            result.update(state="disabled", message="按表存储未启用")
+            return result
+        from .binlog_rows_worker import STATUS_NAME
+        from .maintenance_status import read_json_status
+        worker = read_json_status(self.storage.paths["index"] / STATUS_NAME)
+        issues: list[str] = []
+        try:
+            text = rows.ch.execute(
+                "SELECT instance_id, max(hi_us) FROM insight.binlog_rows_files_v1 GROUP BY instance_id FORMAT TSV",
+                settings={"max_execution_time": 20}, timeout=30)
+            ingested = {line.split("\t")[0]: int(line.split("\t")[1]) for line in text.splitlines() if "\t" in line}
+        except Exception as exc:  # noqa: BLE001
+            ingested = None
+            issues.append(f"无法读取入库清单：{exc}")
+        for instance, guard in zip(instances, guards):
+            newest = str(guard.get("newestCollectedEnd") or "")
+            if ingested is None or not newest or instance not in ingested:
+                continue
+            try:
+                collected_us = int(datetime.fromisoformat(newest.replace("Z", "+00:00")).timestamp() * 1_000_000)
+            except ValueError:
+                continue
+            behind = max(collected_us - ingested.get(instance, 0), 0) / 1e6
+            result["instances"][instance] = {"behindSeconds": round(behind, 1)}
+            if behind > 3600:
+                issues.append(f"{instance} 按表存储落后采集 {behind / 60:.0f} 分钟")
+        stuck = worker.get("stuckFiles") or []
+        if stuck:
+            issues.append(f"按表存储有 {len(stuck)} 个文件反复失败")
+        updated = [lane.get("updatedAt") for lane in (worker.get("lanes") or {}).values() if lane.get("updatedAt")]
+        if updated:
+            newest_update = max(updated)
+            try:
+                age = (datetime.now(UTC) - datetime.fromisoformat(newest_update)).total_seconds()
+            except ValueError:
+                age = 0
+            if age > 900:
+                issues.append(f"按表存储写入进程 {age / 60:.0f} 分钟没有更新状态")
+        result["stuckFiles"] = stuck[:20]
+        if issues:
+            result.update(ok=False, state="rows_behind", message="；".join(issues))
+        with self._binlog_health_lock:
+            self._binlog_health_cache["rows"] = (time.monotonic(), result)
+        return result
 
     def _start_secondary_syncs(
         self,
@@ -1038,10 +1120,20 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "data": snapshot() if snapshot is not None else self.app.public_status()})
             elif parsed.path == "/api/sync/health":
                 managers = [self.app.sync, *self.app.secondary_syncs]
-                data = [{"instanceId": manager._job_scope(), **manager.status()["health"]}
-                        for manager in managers]
-                ok = all(item["ok"] for item in data)
-                self._json({"ok": ok, "data": data}, 200 if ok else 503)
+                data, guards = [], []
+                for manager in managers:
+                    guard = self.app.binlog_guard(manager)
+                    item = {"instanceId": manager._job_scope(), **manager.status()["health"], "binlog": guard}
+                    if not guard.get("ok", False):
+                        # The collector may be running fine and still be about to lose data (backlog near the
+                        # source retention, files that keep failing, sources that went unavailable).
+                        item["ok"] = False
+                        item["message"] = f'{item.get("message", "")}；{guard.get("message", "")}'.strip("；")
+                    data.append(item)
+                    guards.append(guard)
+                rows = self.app.rows_ingest_health(guards, [item["instanceId"] for item in data])
+                ok = all(item["ok"] for item in data) and rows.get("ok", True)
+                self._json({"ok": ok, "data": data, "rows": rows}, 200 if ok else 503)
             elif parsed.path == "/api/settings":
                 settings = self.app.metadata.load_settings()
                 self._json(

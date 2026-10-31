@@ -11,3 +11,5 @@
 升级只切换主服务镜像，不修改业务数据库、不覆盖凭据或实例配置，也不重启独立 worker/ClickHouse。先用隔离目录验证新镜像，再让旧服务的所有 Binlog 任务在文件边界暂停，确认无活动查询后切换；切换失败恢复原镜像并按原自动同步设置恢复。不要为维护将自动同步改为 false。
 
 回归入口：`python -m unittest tests.test_sync_lifecycle` 和 `node --test tests/test_sync_lifecycle.cjs`。云端发布回归同时覆盖下载校验、凭据刷新、文件原子发布和已有查询行为。
+
+1.35.0 起 `/api/sync/health` 每个实例另带 `binlog`（最老未采集文件的滞后、距源端删除的剩余时间、近 24 小时变为不可用的源文件、反复失败的文件），并带按表存储的 `rows`；这些问题同样返回 503。任务停滞由服务内的看门狗处理（先在文件边界中止任务并立即重开，仍卡住则写线程栈并退出进程交给 supervisor），外部仍不要用此端点做自动重启。细节见 `docs/binlog-gap-hardening.md`。

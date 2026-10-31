@@ -4,6 +4,8 @@ import json
 import logging
 import multiprocessing
 import os
+import re
+import shutil
 import threading
 import time
 from collections import deque
@@ -62,6 +64,45 @@ COLD_COMPRESSION_QUERY_GRACE_SECONDS = 30
 COLD_COMPRESSION_IDLE_SECONDS = 5
 # How often a caught-up sync job looks at the pending list again while its retained scan still runs.
 RETAINED_SCAN_POLL_SECONDS = 1.0
+# RDS keeps uploaded binlogs this many days (LogBackupRetentionPeriod, read from the backup policy at every job);
+# whatever is not collected by then is gone. Discovery only lists this window plus one day.
+SOURCE_RETENTION_DAYS = max(int(os.environ.get("RDS_BINLOG_SOURCE_RETENTION_DAYS", "7") or 7), 1)
+# A file that fails is retried after this backoff (doubling, capped) while the other files go on. A failing file
+# used to fail the whole job and was the first file of the next job again (10-14..10-20: one test-instance file
+# failed 143 jobs a day for six days, one day short of the source deleting everything behind it).
+FILE_RETRY_BASE_SECONDS = 60.0
+FILE_RETRY_MAX_SECONDS = 1800.0
+# This many failed files in a row without one success is an outage of something they share (network,
+# credentials, OSS): the job fails and the scheduler starts a new one, as before.
+FILE_FAILURE_BREAKER = 8
+# Download failures retried in place, resuming the partial file, before the file is deferred.
+DOWNLOAD_RETRY_DELAYS = (5.0, 20.0)
+TRANSIENT_DOWNLOAD_CODES = frozenset({
+    "NETWORK_ERROR", "DOWNLOAD_INTERRUPTED", "SIZE_MISMATCH", "CRC64_MISMATCH",
+    "HTTP_408", "HTTP_429", "HTTP_500", "HTTP_502", "HTTP_503", "HTTP_504",
+    "CHECKSUM_STREAM_FAILED", "CHECKSUM_PROCESS_FAILED",
+})
+# Failures every file of the instance shares: the job fails at once instead of deferring each file.
+SYSTEMIC_FAILURE_CODES = frozenset({
+    "BINLOG_DOWNLOAD_FORBIDDEN", "RAW_ARCHIVE_OSS_REQUIRED", "OSS_DISABLED", "OSS_CREDENTIAL_MISSING",
+    "OSS_CREDENTIAL_ERROR", "OSS_ACCESS_DENIED", "AccessDenied", "InvalidAccessKeyId", "InvalidAccessKeyId.NotFound",
+    "Forbidden.RAM", "SignatureDoesNotMatch", "InvalidSecurityToken.Expired", "InvalidSecurityToken.Malformed",
+    "IDENTITY_MISMATCH", "IDENTITY_NOT_FOUND", "ENGINE_NOT_SUPPORTED", "CREDENTIAL_MISSING",
+})
+# Free space a download must leave on the data disk (ClickHouse stops writing below 120 GB of its own).
+DOWNLOAD_DISK_RESERVE_BYTES = int(float(os.environ.get("RDS_BINLOG_DOWNLOAD_DISK_RESERVE_GIB", "20") or 20) * 1024**3)
+# When files are this close to the end of the source retention, admission widens and archival keeps the original
+# bytes first (the lightweight scan is skipped): the backlog has to reach object storage before RDS deletes it.
+URGENT_MARGIN_SECONDS = 48 * 3600
+RAW_PREFETCH_FILES_URGENT = 12
+RAW_PREFETCH_BYTES_URGENT = 6 * 1024**3
+# Leftovers in the download directory: verification copies of a corrupt download, scan temp directories and
+# originals of files that are settled. Nothing removed them (512 MB each).
+DOWNLOAD_SWEEP_SECONDS = 3600
+FORENSIC_KEEP_SECONDS = 24 * 3600
+FORENSIC_KEEP_FILES = 4
+ORPHAN_KEEP_SECONDS = 6 * 3600
+FILE_ID_RE = re.compile(r"^([0-9a-f]{64})\.binlog(\.part)?$")
 
 
 class RdsClientLike(Protocol):
@@ -206,6 +247,20 @@ class SyncManager:
         self._retention_cleanup_lock = threading.Lock()
         self._client_refresh_lock = threading.Lock()
         self._cold_boundary_lock = threading.Lock()
+        # Gap guards (1.35.0): per-file retry backoff, progress heartbeat for the watchdog, source retention.
+        self._file_backoff: dict[str, tuple[int, float]] = {}
+        self._backoff_lock = threading.Lock()
+        self._progress_at = time.monotonic()
+        self._scheduler_beat = time.monotonic()
+        self._abort = threading.Event()
+        self._abort_reason = ""
+        self._abort_at = 0.0
+        self._last_primary = ""
+        self._source_retention_days = SOURCE_RETENTION_DAYS
+        self._consecutive_failures = 0
+        self._job_failures = 0
+        self._last_expiry_sweep = float("-inf")
+        self._last_download_sweep = float("-inf")
         self._archive_status: dict[str, Any] = {
             "enabled": False,
             "ready": False,
@@ -293,6 +348,143 @@ class SyncManager:
 
     def _settings(self) -> Settings:
         return self._settings_loader()
+
+    # -- gap guards ---------------------------------------------------------------------------------------------
+    def _touch(self) -> None:
+        """Record collection progress (a file moved, bytes arrived, a listing page came back) for the watchdog."""
+        self._progress_at = time.monotonic()
+
+    def _abort_requested(self) -> bool:
+        event = getattr(self, "_abort", None)
+        return bool(event is not None and event.is_set())
+
+    def _stopping(self) -> bool:
+        return (self._pause_after_current.is_set() or self._shutdown.is_set()
+                or self._abort_requested())
+
+    def request_abort(self, reason: str) -> bool:
+        """Ask the running job to stop at its next file boundary (the watchdog's first step); True if newly asked."""
+        event = getattr(self, "_abort", None)
+        if event is None or event.is_set():
+            return False
+        self._abort_reason = reason
+        self._abort_at = time.monotonic()
+        event.set()
+        LOGGER.error("SYNC_ABORT_REQUESTED instance=%s reason=%s", self._job_scope(), reason)
+        return True
+
+    def watchdog_state(self) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._state_lock:
+            running = bool(self._worker and self._worker.is_alive())
+        settings_ok = True
+        try:
+            settings = self._settings()
+            auto = bool(settings.auto_sync and settings.db_instance_id)
+        except Exception:  # noqa: BLE001 - the watchdog must not die on a settings read
+            auto, settings_ok = False, False
+        return {
+            "instance": self._job_scope(),
+            "running": running,
+            "progressAge": now - getattr(self, "_progress_at", now),
+            "schedulerAge": now - getattr(self, "_scheduler_beat", now),
+            "abortRequested": self._abort_requested(),
+            "abortAge": (now - self._abort_at) if self._abort_requested() else 0.0,
+            "autoSync": auto and not self._pause_after_current.is_set() and settings_ok,
+            "schedulerAlive": bool(self._scheduler is not None and self._scheduler.is_alive()),
+        }
+
+    def _file_due(self, file_id: str) -> bool:
+        entry = getattr(self, "_file_backoff", {}).get(file_id)
+        return entry is None or entry[1] <= time.monotonic()
+
+    def _defer_file(self, file_id: str) -> float:
+        lock = getattr(self, "_backoff_lock", None) or threading.Lock()
+        with lock:
+            backoff = getattr(self, "_file_backoff", None)
+            if backoff is None:
+                backoff = self._file_backoff = {}
+            failures = backoff.get(file_id, (0, 0.0))[0] + 1
+            delay = min(FILE_RETRY_BASE_SECONDS * 2 ** (failures - 1), FILE_RETRY_MAX_SECONDS)
+            backoff[file_id] = (failures, time.monotonic() + delay)
+        return delay
+
+    def _clear_backoff(self, file_id: str) -> None:
+        backoff = getattr(self, "_file_backoff", None)
+        if backoff:
+            backoff.pop(file_id, None)
+        self._consecutive_failures = 0
+
+    def deferred_files(self) -> int:
+        now = time.monotonic()
+        return sum(1 for _count, due in getattr(self, "_file_backoff", {}).values() if due > now)
+
+    def _source_retention(self) -> int:
+        value = getattr(self, "_source_retention_days", SOURCE_RETENTION_DAYS)
+        return value if isinstance(value, int) and value > 0 else SOURCE_RETENTION_DAYS
+
+    def _age_seconds(self, end_text: str) -> float:
+        end = _parse_utc(end_text)
+        return (datetime.now(UTC) - end).total_seconds() if end else 0.0
+
+    def _is_urgent(self, item: RemoteBinlog) -> bool:
+        end = str(getattr(item, "log_end_utc", "") or "")
+        return bool(end) and self._age_seconds(end) >= self._source_retention() * 86400 - URGENT_MARGIN_SECONDS
+
+    def _source_expired(self, item: RemoteBinlog) -> bool:
+        """Past the source retention (minus half a day): a file RDS no longer lists is deleted, not delayed."""
+        end = str(getattr(item, "log_end_utc", "") or "")
+        return bool(end) and self._age_seconds(end) >= self._source_retention() * 86400 - 12 * 3600
+
+    def _resolve_primary(self, client: Any) -> str:
+        """The primary node; the last known one (or the host of the newest collected file) when HA config fails.
+
+        DescribeDBInstanceHAConfig answers zero or two masters during a switch; that failed the whole job.
+        """
+        resolver = getattr(client, "primary_host_instance_id", None)
+        if not callable(resolver):
+            return ""
+        try:
+            primary = str(resolver() or "")
+        except RdsApiError as exc:
+            fallback = getattr(self, "_last_primary", "") or self.metadata.latest_done_host(self._job_scope())
+            if not fallback:
+                raise
+            LOGGER.warning("PRIMARY_RESOLVE_FAILED code=%s fallback=%s", exc.code, fallback)
+            return fallback
+        if primary:
+            self._last_primary = primary
+        return primary
+
+    def _refresh_source_retention(self, client: Any) -> None:
+        reader = getattr(client, "log_backup_retention_days", None)
+        if not callable(reader):
+            return
+        try:
+            days = reader()
+        except Exception as exc:  # noqa: BLE001 - keep the previous value; the default is the RDS default
+            LOGGER.warning("SOURCE_RETENTION_UNKNOWN keep=%s error=%s", self._source_retention(), exc)
+            return
+        if isinstance(days, int) and not isinstance(days, bool) and 1 <= days <= 7300:
+            if days != self._source_retention():
+                LOGGER.info("SOURCE_RETENTION instance=%s days=%s", self._job_scope(), days)
+            self._source_retention_days = days
+
+    def _disk_admits(self, size: int) -> bool:
+        try:
+            free = shutil.disk_usage(self.storage.paths["downloads"]).free
+        except Exception:  # noqa: BLE001 - no reading is no reason to stop collecting
+            return True
+        return free >= max(int(size), 0) + DOWNLOAD_DISK_RESERVE_BYTES
+
+    def _raw_archived(self, file_id: str) -> bool:
+        raw_store = getattr(getattr(self, "storage", None), "raw_binlogs", None)
+        if raw_store is None:
+            return False
+        try:
+            return raw_store.get(file_id) is not None
+        except Exception:  # noqa: BLE001 - the shortcut is an optimisation; the normal path still works
+            return False
 
     def _pause_control(self) -> PauseControl:
         instance_id = self.scope_instance_id or self._settings().db_instance_id
@@ -571,6 +763,12 @@ class SyncManager:
                 raise PipelineError("采集已暂停；自动任务或查询补采不得清除操作暂停", "SYNC_PAUSED")
             control.clear()
             self._pause_after_current.clear()
+            abort = getattr(self, "_abort", None)
+            if abort is not None:
+                abort.clear()
+            self._consecutive_failures = 0
+            self._job_failures = 0
+            self._touch()
             LOGGER.info("SYNC_START instance=%s reason=%s autoSync=%s", settings.db_instance_id, reason, settings.auto_sync)
             window_text = (
                 f"{_utc_api(requested_start)} 至 {_utc_api(requested_end)}"
@@ -634,6 +832,9 @@ class SyncManager:
         # job_id 为空表示不属于任何同步任务(如 general log 采集端自行归档)：
         # job_events 对 jobs 有外键，写入会失败，这里只落日志。
         if job_id:
+            # Only a sync job's own events are progress: the general-log archiver calls this every two minutes
+            # through the primary manager and would otherwise hide a stalled binlog job from the watchdog.
+            self._touch()
             self.metadata.add_job_event(job_id, level, code, message)
         getattr(LOGGER, level if level in {"info", "warning", "error"} else "info")(
             "%s %s %s", job_id, code, message
@@ -682,12 +883,14 @@ class SyncManager:
 
     def _scan_start(self, settings: Settings) -> datetime:
         # Reconcile the complete retained window every run so a delayed OSS upload
-        # cannot be skipped by a moving checkpoint.
+        # cannot be skipped by a moving checkpoint. RDS keeps binlogs only for its log backup retention (7 days by
+        # default), so listing 60 days asked for 53 days of nothing on every job.
         days = max(
             settings.initial_lookback_days,
             settings.retention_days,
             settings.oss_retention_days if settings.oss_enabled else 0,
         )
+        days = min(days, self._source_retention() + 1)
         return datetime.now(UTC) - timedelta(days=days)
 
     def _discover(
@@ -793,14 +996,26 @@ class SyncManager:
         settings: Settings,
         old: RemoteBinlog,
     ) -> RemoteBinlog:
+        # The file's own span (+-1 minute) is one page of all nodes' files; +-1 hour was ~26 pages per refresh, under
+        # one lock, and after an outage every stored link has expired at once.
         begin = _parse_utc(old.log_begin_utc) or self._scan_start(settings)
-        end = (_parse_utc(old.log_end_utc) or datetime.now(UTC)) + timedelta(hours=1)
-        for item in client.list_binlogs(_utc_api(begin - timedelta(hours=1)), _utc_api(end)):
-            if self.metadata.file_id(settings.db_instance_id, item) == self.metadata.file_id(
-                settings.db_instance_id, old
-            ):
+        end = _parse_utc(old.log_end_utc) or datetime.now(UTC)
+        wanted = self.metadata.file_id(settings.db_instance_id, old)
+        renamed = None
+        for item in client.list_binlogs(_utc_api(begin - timedelta(minutes=1)), _utc_api(end + timedelta(minutes=1))):
+            if self.metadata.file_id(settings.db_instance_id, item) == wanted:
                 self.metadata.upsert_remote(settings, item)
                 return item
+            if (item.log_file_name == old.log_file_name and item.host_instance_id == old.host_instance_id
+                    and item.remote_status.lower() == "completed"):
+                renamed = item
+        if renamed is not None:
+            # Same file, new size or span: the new identity is registered and collected; this one is settled.
+            self.metadata.upsert_remotes(settings, [renamed])
+            raise DownloadError(
+                f"{old.log_file_name} 的源文件标识已变化（大小或时间不同），按新标识采集",
+                "SOURCE_IDENTITY_CHANGED",
+            )
         raise DownloadError(
             f"刷新下载链接后未找到 {old.log_file_name}", "DOWNLOAD_LINK_REFRESH_MISSING"
         )
@@ -829,6 +1044,7 @@ class SyncManager:
         def on_progress(value: int) -> None:
             nonlocal last_progress, last_progress_at, progress_writes, progress_seconds
             now = time.monotonic()
+            self._progress_at = now
             if value == item.file_size or (value - last_progress >= 8 * 1024 * 1024
                     and now - last_progress_at >= progress_interval):
                 self.metadata.update_download_progress(file_id, value)
@@ -837,7 +1053,7 @@ class SyncManager:
                 progress_writes += 1
                 last_progress = value
 
-        def attempt(remote: RemoteBinlog):
+        def attempt_once(remote: RemoteBinlog):
             return download_file(
                 remote.selected_url(),
                 path,
@@ -845,6 +1061,22 @@ class SyncManager:
                 expected_crc64=remote.checksum_crc64,
                 progress=on_progress,
             )
+
+        def attempt(remote: RemoteBinlog):
+            # A dropped connection, a 5xx or a bad checksum is retried here, resuming the partial file; it used to
+            # end the whole job (and every download in flight with it).
+            for delay in (*DOWNLOAD_RETRY_DELAYS, None):
+                try:
+                    return attempt_once(remote)
+                except DownloadError as exc:
+                    if delay is None or exc.code not in TRANSIENT_DOWNLOAD_CODES:
+                        raise
+                    self._event(job_id, "warning", "DOWNLOAD_RETRY",
+                                f"{item.log_file_name} 下载失败（{exc.code}），{delay:.0f} 秒后续传重试")
+                    shutdown = getattr(self, "_shutdown", None)
+                    if shutdown is not None and shutdown.wait(delay):
+                        raise
+            raise AssertionError("unreachable")
 
         try:
             result = attempt(item)
@@ -1134,7 +1366,10 @@ class SyncManager:
         if raw_archive_enabled():
             raw_started = time.monotonic()
             self.metadata.set_file_state(file_id, 'parsing')
-            descriptor = self.storage.raw_binlogs.archive(archive, path, file_id, item, flavor)
+            # Near the end of the source retention the original bytes go to object storage first; the lightweight
+            # scan is skipped (a whole-file directory), which roughly halves the archive lane's CPU per file.
+            descriptor = self.storage.raw_binlogs.archive(archive, path, file_id, item, flavor,
+                                                          progress=self._touch, full_index=not self._is_urgent(item))
             # Header events are not decoded rows: never inflate the row counter.
             self.metadata.set_file_state(file_id, 'stored', event_count=0)
             prepared = PreparedBinlog(file_id=file_id, item=item, raw_path=path,
@@ -1353,7 +1588,7 @@ class SyncManager:
         unavailable: int,
     ) -> int:
         code = getattr(exc, "code", exc.__class__.__name__.upper())
-        if code == "DOWNLOAD_LINK_REFRESH_MISSING":
+        if code == "DOWNLOAD_LINK_REFRESH_MISSING" and self._source_expired(item):
             unavailable += 1
             message = (
                 f"实例未找到 {item.log_begin_utc} 至 "
@@ -1393,6 +1628,53 @@ class SyncManager:
         )
         raise exc
 
+    def _file_failed(
+        self,
+        job_id: str,
+        file_id: str,
+        item: RemoteBinlog,
+        exc: Exception,
+        unavailable: int,
+    ) -> int:
+        """Settle one failed file of the raw pipeline without stopping the others.
+
+        Expired sources become ``unavailable``; failures every file shares fail the job (``_record_file_error``
+        raises); anything else is recorded and retried after a backoff while the job goes on. A run of
+        FILE_FAILURE_BREAKER failed files without a success fails the job too.
+        """
+        code = str(getattr(exc, "code", "") or exc.__class__.__name__.upper())
+        if code == "DOWNLOAD_LINK_REFRESH_MISSING" and self._source_expired(item):
+            return self._record_file_error(job_id, file_id, item, exc, unavailable)
+        if code in SYSTEMIC_FAILURE_CODES:
+            return self._record_file_error(job_id, file_id, item, exc, unavailable)
+        if code == "SOURCE_IDENTITY_CHANGED":
+            self.metadata.mark_files_state(
+                [file_id], "superseded", code, str(exc)[:2000],
+                only_states=("discovered", "failed", "downloading", "downloaded", "parsing"))
+            self._event(job_id, "warning", code, str(exc))
+            return unavailable
+        record = self.metadata.file_record(file_id) or {}
+        current = str(record.get("state") or "")
+        self.metadata.set_file_state(
+            file_id, "stored" if current == "stored" else "failed",
+            error_code=code, error_message=str(exc)[:2000],
+        )
+        delay = self._defer_file(file_id)
+        self._consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
+        self._job_failures = getattr(self, "_job_failures", 0) + 1
+        self.metadata.update_job(job_id, failed_files=unavailable + self._job_failures)
+        if code == "DOWNLOAD_LINK_REFRESH_MISSING":
+            message = (f"{item.log_file_name} 暂未被 RDS 列出（未到源保留期，不判定缺失）；"
+                       f"{delay:.0f} 秒后重试，其他文件继续")
+        else:
+            message = f"{item.log_file_name} 失败（{code}）：{exc}；{delay:.0f} 秒后重试，其他文件继续"
+        self._event(job_id, "warning", "FILE_DEFERRED", message)
+        if self._consecutive_failures >= FILE_FAILURE_BREAKER:
+            LOGGER.error("SYNC_FAILURE_BREAKER instance=%s consecutive=%s last=%s",
+                         self._job_scope(), self._consecutive_failures, code)
+            raise exc
+        return unavailable
+
     def _run_pending_raw(
         self, job_id, client, settings, pending, flavor, archive,
         *, completed, unavailable, refresh_pending=None,
@@ -1402,36 +1684,65 @@ class SyncManager:
         Unlike partially published Parquet, a raw manifest is atomically visible
         only after BOTH complete objects are verified, so no file-order barrier
         is needed. Admission includes downloading, prepared and uploading bytes.
+
+        Since 1.35.0 a failed file is deferred with a backoff instead of failing the job, a file larger than the byte
+        budget gets a lane of its own instead of holding admission for everything behind it, a file whose original
+        is already archived is completed without downloading it again, and admission waits for disk space instead
+        of failing mid-download. Files close to the end of the source retention widen admission.
         """
         entries = deque(pending)
         downloads, prepared, processing = {}, {}, {}
         admitted, retired = {}, set()
         workers = threading.local()
         refreshed_at = time.monotonic()
+        disk_wait_logged = 0.0
         def process(entry, download):
             file_id, item, prior_state = entry
             if not hasattr(workers, 'archive'):
                 workers.archive = self.archive_for_settings(settings)
             return self._process_one(job_id, client, settings, file_id, item,
                         prior_state, flavor, workers.archive, prepared_download=download)
+        def oversize(entry):
+            return max(entry[1].file_size, 0) > RAW_PREFETCH_BYTES
         self._update_pipeline_status(active=True, downloadWorkers=RAW_DOWNLOAD_WORKERS)
         try:
-            with ThreadPoolExecutor(max_workers=RAW_DOWNLOAD_WORKERS, thread_name_prefix='raw-download') as down, \
+            with ThreadPoolExecutor(max_workers=RAW_PREFETCH_FILES_URGENT, thread_name_prefix='raw-download') as down, \
                  ThreadPoolExecutor(max_workers=FILE_PIPELINE_WORKERS, thread_name_prefix='raw-archive') as work:
                 while entries or admitted:
-                    stopping = self._pause_after_current.is_set() or self._shutdown.is_set()
+                    stopping = self._stopping()
                     if not stopping:
-                        while entries and len(admitted) < RAW_PREFETCH_FILES:
+                        heads = list(admitted.values())[:1] + list(entries)[:1]
+                        urgent = any(self._is_urgent(e[1]) for e in heads)
+                        file_limit = RAW_PREFETCH_FILES_URGENT if urgent else RAW_PREFETCH_FILES
+                        byte_limit = RAW_PREFETCH_BYTES_URGENT if urgent else RAW_PREFETCH_BYTES
+                        skipped = []
+                        while entries and len(admitted) < file_limit:
                             entry = entries[0]
                             file_id, item, prior_state = entry
-                            if file_id in admitted or file_id in retired:
+                            if file_id in admitted or file_id in retired or not self._file_due(file_id):
                                 entries.popleft()
                                 continue
-                            size = sum(max(e[1].file_size, 0) for e in admitted.values())
-                            if admitted and size+item.file_size > RAW_PREFETCH_BYTES:
+                            if oversize(entry):
+                                if any(oversize(e) for e in admitted.values()):
+                                    skipped.append(entries.popleft())
+                                    continue
+                                LOGGER.warning('RAW_OVERSIZED_FILE own-lane bytes=%s', item.file_size)
+                            else:
+                                size = sum(max(e[1].file_size, 0) for e in admitted.values() if not oversize(e))
+                                if size and size+item.file_size > byte_limit:
+                                    break
+                            if prior_state != 'stored' and self._raw_archived(file_id):
+                                # The original is already in object storage (an earlier run stopped before 'done'):
+                                # verify and finish it; the source may be gone by now.
+                                entry = (file_id, item, 'stored')
+                                prior_state = 'stored'
+                            if prior_state != 'stored' and not self._disk_admits(item.file_size):
+                                if time.monotonic() - disk_wait_logged >= 60:
+                                    LOGGER.warning('RAW_DISK_RESERVE_WAIT bytes=%s reserve=%s', item.file_size,
+                                                   DOWNLOAD_DISK_RESERVE_BYTES)
+                                    disk_wait_logged = time.monotonic()
+                                self._touch()
                                 break
-                            if item.file_size > RAW_PREFETCH_BYTES:
-                                LOGGER.warning('RAW_OVERSIZED_FILE admitted-alone bytes=%s', item.file_size)
                             entries.popleft()
                             admitted[file_id] = entry
                             self.metadata.set_file_visibility(file_id, False)
@@ -1439,6 +1750,7 @@ class SyncManager:
                                 prepared[file_id] = None
                             else:
                                 downloads[down.submit(self._download, job_id, client, settings, file_id, item)] = file_id
+                        entries.extendleft(reversed(skipped))
                     for future in list(downloads):
                         if not future.done():
                             continue
@@ -1447,9 +1759,8 @@ class SyncManager:
                         try:
                             prepared[file_id] = future.result()
                         except Exception as exc:
-                            unavailable = self._record_file_error(job_id, file_id, entry[1], exc, unavailable)
                             admitted.pop(file_id)
-                            retired.add(file_id)
+                            unavailable = self._file_failed(job_id, file_id, entry[1], exc, unavailable)
                     for file_id in list(prepared):
                         if len(processing) >= FILE_PIPELINE_WORKERS or stopping:
                             break
@@ -1459,12 +1770,14 @@ class SyncManager:
                             continue
                         file_id = processing.pop(future)
                         entry = admitted.pop(file_id)
-                        retired.add(file_id)
                         try:
                             future.result()
                         except Exception as exc:
-                            unavailable = self._record_file_error(job_id, file_id, entry[1], exc, unavailable)
+                            unavailable = self._file_failed(job_id, file_id, entry[1], exc, unavailable)
                         else:
+                            retired.add(file_id)
+                            self._clear_backoff(file_id)
+                            self._touch()
                             completed += 1
                             self.metadata.update_job(job_id, completed_files=completed,
                                 message=f'原文件与轻量索引已校验归档 {completed} 个；有界滚动采集')
@@ -1473,7 +1786,7 @@ class SyncManager:
                     if stopping and not processing:
                         for future in downloads:
                             future.cancel()
-                        self.metadata.finish_job(job_id, 'paused', '已停止原文件归档；已下载文件保留，下次从断点继续')
+                        self._finish_stopped_job(job_id, '已停止原文件归档；已下载文件保留，下次从断点继续')
                         return completed, unavailable, True
                     if not stopping and refresh_pending is not None and ((not entries and not admitted) or time.monotonic()-refreshed_at >= 60):
                         entries = deque(e for e in refresh_pending() if e[0] not in admitted and e[0] not in retired)
@@ -1483,9 +1796,22 @@ class SyncManager:
                         wait(futures, timeout=0.2, return_when=FIRST_COMPLETED)
                     elif not entries and not prepared:
                         break
+                    elif not admitted and all(not self._file_due(e[0]) for e in entries):
+                        # Everything left waits for its retry: this round ends; the job or the next one retries them.
+                        break
+                    elif not admitted and entries:
+                        # Waiting for disk space: no busy loop; the wait counts as progress for the watchdog.
+                        self._shutdown.wait(1)
         finally:
             self._update_pipeline_status(active=False, inFlightFiles=[], visibleFile='')
         return completed, unavailable, False
+
+    def _finish_stopped_job(self, job_id: str, paused_message: str) -> None:
+        if self._abort_requested():
+            reason = getattr(self, "_abort_reason", "") or "采集长时间无进展"
+            self.metadata.finish_job(job_id, 'failed', f'看门狗中止：{reason}；调度器随即重新开始采集', 'SYNC_STALLED')
+        else:
+            self.metadata.finish_job(job_id, 'paused', paused_message)
 
     def _run_pending_parallel(
         self,
@@ -1797,11 +2123,21 @@ class SyncManager:
                     f"OSS={settings.oss_bucket}/{settings.oss_prefix}；"
                     f"生命周期={lifecycle['expirationDays']}天",
                 )
-                migrated = self._archive_existing_parts(
-                    job_id,
-                    settings,
-                    archive,
-                )
+                try:
+                    migrated = self._archive_existing_parts(
+                        job_id,
+                        settings,
+                        archive,
+                    )
+                except (StorageError, OssArchiveError) as exc:
+                    from .raw_binlog import enabled as raw_archive_enabled
+                    if not raw_archive_enabled():
+                        raise
+                    # Legacy Parquet migration has nothing to do with original-binlog collection: one missing legacy
+                    # part file used to fail every job before discovery, i.e. stop collection for good.
+                    migrated = 0
+                    self._event(job_id, "warning", "OSS_LEGACY_MIGRATION_DEFERRED",
+                                f"旧 Parquet 迁移未完成（{getattr(exc, 'code', '')}：{exc}）；不影响原始 Binlog 采集")
                 if migrated:
                     self._event(
                         job_id,
@@ -1826,10 +2162,8 @@ class SyncManager:
         identity = client.verify_instance()
         engine = str(identity.get("engine") or "").lower()
         flavor = "mariadb" if engine == "mariadb" else "mysql"
-        primary_host_instance_id = ""
-        primary_resolver = getattr(client, "primary_host_instance_id", None)
-        if callable(primary_resolver):
-            primary_host_instance_id = str(primary_resolver())
+        self._refresh_source_retention(client)
+        primary_host_instance_id = self._resolve_primary(client)
         self._event(
             job_id,
             "info",
@@ -1887,6 +2221,15 @@ class SyncManager:
                 completed_message,
                 "INSTANCE_BINLOG_NOT_FOUND",
             )
+        elif self.deferred_files():
+            # A job with files waiting for their retry is not a clean success: the status says so, the next job
+            # retries them.
+            self.metadata.finish_job(
+                job_id,
+                "warning",
+                completed_message + f"；{self.deferred_files()} 个文件失败后等待重试，下一轮任务继续处理",
+                "FILES_DEFERRED",
+            )
         else:
             self.metadata.finish_job(
                 job_id,
@@ -1903,7 +2246,9 @@ class SyncManager:
         if not streaming:
             LOGGER.info("Streaming live discovery not used: %s",
                         "explicit-time-window" if start_utc or end_utc else "client-has-no-page-iterator")
-        scope = (RetainedDiscovery(self, job_id, client, settings, primary_host_instance_id)
+        scope = (RetainedDiscovery(self, job_id, client, settings, primary_host_instance_id,
+                                   resolve_primary=lambda: self._resolve_primary(client),
+                                   eligible=self._file_due, retention_days=self._source_retention())
                  if streaming else nullcontext(None))
         completed, unavailable = 0, 0
         discovered_ids: set[str] = set()
@@ -1917,7 +2262,8 @@ class SyncManager:
                         client, settings, primary_host_instance_id=primary_host_instance_id,
                         start_utc=start_utc, end_utc=end_utc)
                     pending = [entry for entry in pending
-                               if (self.metadata.file_record(entry[0]) or {}).get("state") != "done"]
+                               if (self.metadata.file_record(entry[0]) or {}).get("state") != "done"
+                               and self._file_due(entry[0])]
                 discovered_ids.update(entry[0] for entry in pending)
                 view = (len(discovered_ids), "" if not pending else pending[0][1].log_file_name, bool(pending))
                 # Idle polls rewrite an unchanged job row; nothing else writes it between two of them.
@@ -1932,7 +2278,7 @@ class SyncManager:
                 return pending
 
             idle = False
-            while not self._shutdown.is_set() and not self._pause_after_current.is_set():
+            while not self._stopping():
                 pending = refresh(skip_unchanged=idle)
                 if not pending and discovery is not None:
                     if not discovery.finished:
@@ -1955,7 +2301,7 @@ class SyncManager:
                 self.metadata.update_job(
                     job_id, current_file="",
                     message="当前清单已处理完，正在确认是否有新的 Completed Binlog")
-            self.metadata.finish_job(job_id, "paused", "已在文件边界暂停；下次从断点继续")
+            self._finish_stopped_job(job_id, "已在文件边界暂停；下次从断点继续")
             return completed, unavailable, True
 
     def _cleanup_after_sync(self, settings: Settings) -> dict[str, Any]:
@@ -2238,6 +2584,7 @@ class SyncManager:
 
     def _scheduler_loop(self) -> None:
         while not self._shutdown.wait(15):
+            self._scheduler_beat = time.monotonic()
             try:
                 settings = self._settings()
                 # 保留期清理作用于整个 storage(所有实例的分区)，只能由 primary
@@ -2249,6 +2596,9 @@ class SyncManager:
                         sweep_stale_scratch(self.storage.paths["scratch"])
                     except Exception:  # noqa: BLE001 - housekeeping must not stop auto sync
                         LOGGER.warning("Scratch sweep failed", exc_info=True)
+                    self._sweep_downloads_if_due()
+                self._settle_expired_sources_if_due(settings)
+                self._scheduler_beat = time.monotonic()
                 # Only an explicitly timed maintenance pause expires. Never
                 # flip autoSync or resume an indefinite operator pause.
                 with self._state_lock:
@@ -2261,6 +2611,10 @@ class SyncManager:
                 self._log_collection_health(running)
                 if paused or not settings.auto_sync or not settings.db_instance_id:
                     continue
+                if not running and self._abort_requested():
+                    # The watchdog stopped a stalled job: start the next one now, not one poll interval later.
+                    self._abort.clear()
+                    self._last_auto_start = float("-inf")
                 interval = settings.poll_minutes * 60
                 if time.monotonic() - self._last_auto_start < interval:
                     continue
@@ -2278,6 +2632,117 @@ class SyncManager:
             except Exception:
                 self._last_auto_error = "SYNC_SCHEDULER_ERROR"
                 LOGGER.exception("Auto sync scheduler failed")
+
+    def _settle_expired_sources_if_due(self, settings: Settings) -> int:
+        """Unfinished files whose source is past the RDS retention become ``unavailable`` (SOURCE_EXPIRED).
+
+        They used to stay "pending" for good (29 files of a former primary since 07-22), which made every backlog,
+        ETA and coverage figure wrong. Files with an archived original or a local copy are left to finish.
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_last_expiry_sweep", float("-inf")) < 3600:
+            return 0
+        self._last_expiry_sweep = now
+        instance = self._job_scope()
+        if not instance:
+            return 0
+        cutoff = _utc_api(datetime.now(UTC) - timedelta(days=self._source_retention() + 1))
+        try:
+            candidates = self.metadata.expired_source_candidates(instance, cutoff)
+            downloads = self.storage.paths["downloads"]
+            expired = [row["id"] for row in candidates
+                       if not row["has_raw"]
+                       and not (downloads / f"{row['id']}.binlog").is_file()
+                       and not (downloads / f"{row['id']}.binlog.part").is_file()]
+            changed = self.metadata.mark_files_state(
+                expired, "unavailable", "SOURCE_EXPIRED",
+                "源 Binlog 已超过 RDS 日志保留期且未采集到；该时间段永久缺失",
+                only_states=("discovered", "failed", "downloading", "downloaded"))
+        except Exception:  # noqa: BLE001 - housekeeping must not stop auto sync
+            LOGGER.warning("Expired source sweep failed", exc_info=True)
+            return 0
+        if changed:
+            LOGGER.warning("BINLOG_SOURCE_EXPIRED instance=%s files=%s cutoff=%s", instance, changed, cutoff)
+        return changed
+
+    def _sweep_downloads_if_due(self) -> dict[str, int]:
+        """Remove leftovers of the download directory: old forensic copies, scan temp dirs, settled originals."""
+        now = time.monotonic()
+        result = {"forensic": 0, "temp": 0, "orphans": 0}
+        if now - getattr(self, "_last_download_sweep", float("-inf")) < DOWNLOAD_SWEEP_SECONDS:
+            return result
+        self._last_download_sweep = now
+        try:
+            root = self.storage.paths["downloads"]
+            wall = time.time()
+            forensic = sorted((path for path in root.iterdir() if path.is_file()
+                               and (".corrupt-" in path.name or ".oversize-" in path.name)),
+                              key=lambda path: path.stat().st_mtime, reverse=True)
+            for index, path in enumerate(forensic):
+                if index >= FORENSIC_KEEP_FILES or wall - path.stat().st_mtime > FORENSIC_KEEP_SECONDS:
+                    path.unlink(missing_ok=True)
+                    result["forensic"] += 1
+            for path in root.glob(".raw-index-*"):
+                if path.is_dir() and wall - path.stat().st_mtime > ORPHAN_KEEP_SECONDS:
+                    shutil.rmtree(path, ignore_errors=True)
+                    result["temp"] += 1
+            for path in root.iterdir():
+                match = FILE_ID_RE.match(path.name)
+                if not match or not path.is_file() or wall - path.stat().st_mtime <= ORPHAN_KEEP_SECONDS:
+                    continue
+                record = self.metadata.file_record(match.group(1))
+                if record is None or str(record.get("state") or "") in {"done", "unavailable", "skipped", "superseded"}:
+                    path.unlink(missing_ok=True)
+                    result["orphans"] += 1
+        except Exception:  # noqa: BLE001 - housekeeping must not stop auto sync
+            LOGGER.warning("Download directory sweep failed", exc_info=True)
+            return result
+        if any(result.values()):
+            LOGGER.info("DOWNLOAD_SWEEP %s", json.dumps(result))
+        return result
+
+    def binlog_guard(self) -> dict[str, Any]:
+        """Collection backlog of this instance against the source retention: what can still be lost and when.
+
+        ``lagSeconds`` is the age of the oldest listed binlog not collected yet; ``expiresInSeconds`` is the time left
+        before RDS deletes it. States: ok, behind (> 30 min), expiry_risk (< 2 days left), lost (files went
+        unavailable in the last 24 hours), stuck (files that failed five or more times).
+        """
+        instance = self._job_scope()
+        now = datetime.now(UTC)
+        retention = self._source_retention() * 86400
+        # "Lost" counts files of the last retention window only: settling a long-expired leftover is no news.
+        summary = self.metadata.binlog_health_summary(
+            instance, _utc_api(now), day_ago_utc=_utc_api(now - timedelta(days=1)),
+            lost_since_end_utc=_utc_api(now - timedelta(seconds=retention + 2 * 86400)))
+        oldest = _parse_utc(summary["oldest_pending_end"]) if summary["oldest_pending_end"] else None
+        lag = (now - oldest).total_seconds() if oldest else 0.0
+        expires = retention - lag if oldest else None
+        issues = []
+        if summary["unavailable_last_day"]:
+            issues.append(("lost", f"近 24 小时有 {summary['unavailable_last_day']} 个源 Binlog 已不可用（永久缺失）"))
+        if expires is not None and expires < URGENT_MARGIN_SECONDS:
+            issues.append(("expiry_risk", f"最老未采集 Binlog 距 RDS 删除只剩 {expires / 3600:.1f} 小时"))
+        if summary["stuck_files"]:
+            issues.append(("stuck", f"{summary['stuck_files']} 个文件已失败 5 次以上"))
+        if lag > 1800:
+            issues.append(("behind", f"最老未采集 Binlog 已滞后 {lag / 60:.0f} 分钟"))
+        return {
+            "ok": not issues,
+            "state": issues[0][0] if issues else "ok",
+            "message": "；".join(text for _code, text in issues) or "采集无积压",
+            "issues": [code for code, _text in issues],
+            "pendingFiles": summary["pending_files"],
+            "oldestPendingEnd": summary["oldest_pending_end"],
+            "lagSeconds": round(lag, 1),
+            "expiresInSeconds": round(expires, 1) if expires is not None else None,
+            "sourceRetentionDays": self._source_retention(),
+            "failedFiles": summary["failed_files"],
+            "stuckFiles": summary["stuck_files"],
+            "deferredFiles": self.deferred_files(),
+            "newestCollectedEnd": summary["newest_done_end"],
+            "unavailableLastDay": summary["unavailable_last_day"],
+        }
 
     def _index_loop(self) -> None:
         # Keep startup health/status responsive before the parallel workers

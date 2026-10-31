@@ -7,6 +7,7 @@ import json
 import logging
 import ssl
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -192,7 +193,28 @@ class RdsRpcClient:
         values["Signature"] = base64.b64encode(digest).decode("ascii")
         return values
 
+    # Listing and link refresh failed a whole sync job on one throttled or dropped request; these are retried with a
+    # fresh signature (new nonce and timestamp). Permission and parameter errors are never retried.
+    TRANSIENT_CODES = frozenset({
+        "NETWORK_ERROR", "INVALID_RESPONSE", "Throttling", "Throttling.User", "Throttling.Api",
+        "ServiceUnavailable", "InternalError", "UnknownError", "RequestTimeout", "SignatureNonceUsed",
+        "HTTP_500", "HTTP_502", "HTTP_503", "HTTP_504",
+    })
+    RETRY_DELAYS = (1.0, 3.0)
+
     def call(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        for attempt, delay in enumerate((*self.RETRY_DELAYS, None)):
+            try:
+                return self._call_once(action, params)
+            except RdsApiError as exc:
+                if delay is None or exc.code not in self.TRANSIENT_CODES:
+                    raise
+                LOGGER.warning("RDS_API_RETRY action=%s code=%s attempt=%s wait=%.0fs", action, exc.code,
+                               attempt + 1, delay)
+                time.sleep(delay)
+        raise AssertionError("unreachable")
+
+    def _call_once(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
         signed = self._signed_params(action, params)
         url = self.endpoint + "/?" + urllib.parse.urlencode(signed, quote_via=urllib.parse.quote)
         request = urllib.request.Request(
@@ -288,6 +310,18 @@ class RdsRpcClient:
                 request_id=str(payload.get("RequestId") or ""),
             )
         return masters[0]
+
+    def log_backup_retention_days(self) -> int | None:
+        """Days RDS keeps uploaded binlogs (``LogBackupRetentionPeriod``); None when the policy cannot be read.
+
+        Everything not collected within this many days of its end is deleted at the source for good.
+        """
+        payload = self.call("DescribeBackupPolicy", {"DBInstanceId": self.settings.db_instance_id})
+        try:
+            days = int(str(payload.get("LogBackupRetentionPeriod") or "").strip())
+        except ValueError:
+            return None
+        return days if 1 <= days <= 7300 else None
 
     def iter_binlog_batches(self, start_utc: str, end_utc: str):
         """Yield one API page at a time; callers may stop between bounded RPCs."""

@@ -14,7 +14,8 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .binlog_lite import RawBinlogError, allows, scan_isolated_sidecar as scan
+from .metadata import retry_busy
+from .binlog_lite import OPAQUE_FALLBACK_CODES, RawBinlogError, allows, opaque_directory, scan_isolated_sidecar as scan
 from .oss_store import OssArchiveError
 
 LOGGER = logging.getLogger(__name__)
@@ -77,20 +78,28 @@ class RawBinlogStore:
             raise OssArchiveError('OSS 原始对象 CRC64 不一致', 'OSS_OBJECT_VERIFY_FAILED')
         return verified
 
-    def _put(self, archive, path, key, sha, crc):
+    def _put(self, archive, path, key, sha, crc, progress=None):
         descriptor = dict(oss_key=key, size_bytes=path.stat().st_size, sha256=sha, crc64=str(crc))
         verify = lambda: self._head(archive, descriptor)
         if verify() is None:
             # _head compares the stored object's CRC64 with ``crc`` (taken from the source bytes) and its
             # size/SHA256 metadata, so the SDK's own CRC pass over every uploaded byte is skipped.
+            options = {'progress': progress} if progress is not None else {}
             archive._put_object_from_file_verified(
                 key, path, {'Content-Type': 'application/octet-stream',
                             'x-oss-forbid-overwrite': 'true', 'x-oss-meta-sha256': sha},
                 verify=verify, missing_message='OSS 原文件上传后无法校验',
-                missing_code='RAW_ARCHIVE_VERIFY_MISSING', client_crc=False)
+                missing_code='RAW_ARCHIVE_VERIFY_MISSING', client_crc=False, **options)
         return descriptor
 
-    def archive(self, archive, path: Path, file_id: str, item, flavor: str) -> dict:
+    def archive(self, archive, path: Path, file_id: str, item, flavor: str, *, progress=None, full_index=True) -> dict:
+        """Archive the original and its lightweight directory; the original's bytes come first.
+
+        A scan that times out, overruns its size budget or meets an event layout it cannot follow no longer keeps the
+        original out of object storage until RDS deletes it: the original is archived with a whole-file directory
+        (``opaque_directory``, every query treats it as a candidate) and RAW_INDEX_OPAQUE is logged. ``full_index=False``
+        does that directly (a backlog close to the source retention). A file that is not a MySQL binlog still fails.
+        """
         if archive is None:
             raise RawBinlogError('原始 Binlog 模式必须启用 OSS；拒绝静默切回全量行解析', 'RAW_ARCHIVE_OSS_REQUIRED')
         previous = self.get(file_id)
@@ -106,16 +115,28 @@ class RawBinlogStore:
             checksum = checksum_file(path)
             sha, crc = checksum.sha256, checksum.crc64
         # The child's serialized directory goes into the sidecar as is; the service only parses its summary.
-        plain, summary = scan(path)
+        if full_index:
+            try:
+                plain, summary = scan(path, progress)
+            except RawBinlogError as exc:
+                if exc.code not in OPAQUE_FALLBACK_CODES:
+                    raise
+                LOGGER.warning('RAW_INDEX_OPAQUE file=%s reason=%s detail=%s', item.log_file_name, exc.code, exc)
+                plain, summary = opaque_directory(path, [f'scan-{exc.code.lower()}'])
+        else:
+            LOGGER.warning('RAW_INDEX_OPAQUE file=%s reason=preserve-first', item.log_file_name)
+            plain, summary = opaque_directory(path, ['preserve-first'])
         scan_seconds = time.time() - started
         key_base = f'{archive.prefix}raw-binlog/v1/{file_id}/{sha}'
-        raw = self._put(archive, path, key_base + '.binlog', sha, crc)
+        raw = self._put(archive, path, key_base + '.binlog', sha, crc, progress)
         # Sidecar is content-addressed independently; raw bytes are never changed.
-        if len(plain) > 256*1024**2:
-            raise RawBinlogError('轻量索引超过查询解压预算，保留源文件且不标记完成', 'RAW_INDEX_SIZE_LIMIT')
-        payload = gzip.compress(plain, compresslevel=1, mtime=0)
-        if len(payload) > 32*1024**2:
-            raise RawBinlogError('轻量索引超过查询读取预算，保留源文件且不标记完成', 'RAW_INDEX_SIZE_LIMIT')
+        payload = gzip.compress(plain, compresslevel=1, mtime=0) if len(plain) <= 256*1024**2 else b''
+        if not payload or len(payload) > 32*1024**2:
+            # The directory overruns the query budget: archive the whole-file directory instead; the original is
+            # already in object storage.
+            LOGGER.warning('RAW_INDEX_OPAQUE file=%s reason=RAW_INDEX_SIZE_LIMIT plain_bytes=%s', item.log_file_name, len(plain))
+            plain, summary = opaque_directory(path, ['scan-raw_index_size_limit'])
+            payload = gzip.compress(plain, compresslevel=1, mtime=0)
         side_sha = hashlib.sha256(payload).hexdigest()
         from oss2.utils import Crc64
         side_crc = Crc64()
@@ -136,11 +157,13 @@ class RawBinlogStore:
         # FULL synchronous metadata commit happens only after BOTH remote objects
         # have verified size, SHA metadata, and server CRC64. Crash before commit
         # is an idempotent retry, not a completed file.
-        with self.metadata._write_lock, self.metadata.connection() as conn:
-            conn.execute('''INSERT INTO raw_binlog_archives
-                (file_id,lo,hi,summary,descriptor,started,completed) VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(file_id) DO NOTHING''',
-                (file_id, summary['lo'], summary['hi'], compact(summary), compact(descriptor), started, time.time()))
+        def commit():
+            with self.metadata._write_lock, self.metadata.connection() as conn:
+                conn.execute('''INSERT INTO raw_binlog_archives
+                    (file_id,lo,hi,summary,descriptor,started,completed) VALUES(?,?,?,?,?,?,?)
+                    ON CONFLICT(file_id) DO NOTHING''',
+                    (file_id, summary['lo'], summary['hi'], compact(summary), compact(descriptor), started, time.time()))
+        retry_busy(commit, label='raw_binlog_archives')
         LOGGER.info('RAW_BINLOG_ARCHIVED %s', compact(dict(file=item.log_file_name, bytes=path.stat().st_size,
                     header_events=summary['events'], scan_seconds=round(scan_seconds, 3),
                     seconds=round(time.time()-started, 3), sidecar_bytes=len(payload))))

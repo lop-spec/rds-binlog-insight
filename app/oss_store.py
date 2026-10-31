@@ -569,6 +569,7 @@ class OssArchive:
         path: Path,
         headers: dict[str, str],
         bucket: Any = None,
+        progress: Callable[[], None] | None = None,
     ) -> None:
         """Upload a large file in parts; one PutObject is capped at 5 GiB.
 
@@ -619,6 +620,8 @@ class OssArchive:
                             number, result.etag, size=length, part_crc=result.crc
                         )
                     )
+                    if progress is not None:
+                        progress()
             bucket.complete_multipart_upload(
                 key,
                 upload_id,
@@ -642,6 +645,7 @@ class OssArchive:
         missing_message: str,
         missing_code: str,
         client_crc: bool = True,
+        progress: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Upload a content-addressed object with bounded, idempotent retries.
 
@@ -661,12 +665,29 @@ class OssArchive:
             request_error: BaseException | None = None
             try:
                 if path.stat().st_size > OSS_MULTIPART_THRESHOLD_BYTES:
-                    self._multipart_upload_from_file(key, path, headers, bucket)
-                else:
+                    if progress is None:
+                        self._multipart_upload_from_file(key, path, headers, bucket)
+                    else:
+                        self._multipart_upload_from_file(key, path, headers, bucket, progress=progress)
+                elif progress is None:
                     bucket.put_object_from_file(
                         key,
                         str(path),
                         headers=headers,
+                    )
+                else:
+                    last = [time.monotonic()]
+
+                    def report(_consumed: int, _total: int | None) -> None:
+                        if time.monotonic() - last[0] >= 2:
+                            last[0] = time.monotonic()
+                            progress()
+
+                    bucket.put_object_from_file(
+                        key,
+                        str(path),
+                        headers=headers,
+                        progress_callback=report,
                     )
             except Exception as exc:  # noqa: BLE001 - SDK error hierarchy varies
                 request_error = exc

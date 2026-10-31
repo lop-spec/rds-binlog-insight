@@ -168,7 +168,7 @@ function isIndexedBinlogQuery() {
   return $("#filter-query-mode").value !== "keyword" || ["", "binlog"].includes($("#filter-source").value);
 }
 
-const GAP_LABELS = { source_missing: "源 Binlog 缺失", pending: "未入库", not_collected_yet: "尚未采集", no_data: "无数据" };
+const GAP_LABELS = { source_missing: "源 Binlog 缺失", source_unlisted: "源未列出（补查中）", collecting: "采集中", pending: "未入库", not_collected_yet: "尚未采集", no_data: "无数据" };
 function gapCopy(gaps, startMs, endMs) {
   const { total, counts } = gapsWithin(gaps, startMs, endMs);
   if (!total) return "所选时段已完整入库";
