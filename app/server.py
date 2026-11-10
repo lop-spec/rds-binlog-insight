@@ -405,6 +405,10 @@ class Application:
         self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
         from .starrocks_service import StarRocksService
         self.starrocks = StarRocksService(self.data_dir, self.metadata.load_settings, credential_loader)
+        from .redis_service import RedisService
+        self.redis = RedisService(self.data_dir, self.metadata.load_settings, credential_loader)
+        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
+            self.redis.start()
         # Members of the MongoDB instances configured for Mongo analytics (role id, role, VPC address), for session management.
         self.mongo_nodes = MongoNodeBook(self.metadata.load_settings, credential_loader, lambda: self.mongo.entries, DdsClient)
         if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
@@ -434,6 +438,7 @@ class Application:
     def _live_status_sections(self) -> dict[str, Any]:
         """The parts of the status that cost nothing to compute: collector and live-tail state, always read at request time."""
         return {
+            "redis": self.redis.status() if getattr(self, "redis", None) is not None else {},
             "generalLog": (self.general_log.status() if getattr(self, "general_log", None) is not None else {}),
             "generalLogs": [item.status() for item in getattr(self, "general_logs", [])],
             "slowLogs": [self._slow_log_status(item) for item in getattr(self, "slow_logs", [])],
@@ -887,6 +892,8 @@ class Application:
         }
 
     def stop(self) -> None:
+        if getattr(self, 'redis', None) is not None:
+            self.redis.stop()
         if getattr(self, 'slow_tails', None) is not None:
             self.slow_tails.shutdown()
         if getattr(self, 'node_roles', None) is not None:
@@ -1072,6 +1079,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("workspace.css")
             elif parsed.path == "/assets/mongo.js":
                 self._serve_static("mongo.js")
+            elif parsed.path == "/assets/redis.js":
+                self._serve_static("redis.js")
             elif parsed.path == "/assets/starrocks.js":
                 self._serve_static("starrocks.js")
             elif parsed.path == "/assets/rise.js":
@@ -1086,6 +1095,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "data": self.app.mongo.sources(query)})
             elif parsed.path == "/api/mongo/investigate":
                 self._json({"ok": True, "data": self.app.mongo.investigator.run(query)})
+            elif parsed.path == "/api/redis/status":
+                self._json({"ok": True, "data": self.app.redis.status()})
+            elif parsed.path == "/api/redis/investigate":
+                self._json({"ok": True, "data": self.app.redis.query(query)})
             elif parsed.path == "/api/starrocks/status":
                 self._json({"ok": True, "data": self.app.starrocks.status()})
             elif parsed.path == "/api/starrocks/metrics":
@@ -1395,6 +1408,20 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/ingest/redis-samples":
+            if not self._valid_host():
+                self._error(421, "INVALID_HOST", "请求 Host 不受信任")
+                return
+            if not self.app.redis.authorized(self.headers.get("Authorization", "")):
+                self._error(401, "REDIS_AUTH_REQUIRED", "Redis sample authentication required")
+                return
+            try:
+                self._json({"ok": True, "data": self.app.redis.ingest(self._body_json())}, 202)
+            except (ValueError, TypeError, KeyError):
+                self._error(400, "REDIS_INVALID_SAMPLE", "采样字段、窗口或速率不符合约束")
+            except Exception:
+                self._error(503, "REDIS_INGEST_FAILED", "采样写入不可用；原ID可去重重试")
+            return
         if parsed.path == "/api/ingest/mongo-commands":
             if not self._valid_host():
                 self._error(421, "INVALID_HOST", "请求 Host 不受信任")

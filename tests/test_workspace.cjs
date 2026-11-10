@@ -641,9 +641,9 @@ test('sorting a Binlog result re-renders the writes panel and keeps orders per k
   assert.match(vm.runInContext('analyticsQueryString("", "slowlog")', c), /order=executions/);
 });
 
-test('data sources include RDS, MongoDB and StarRocks; RDS evidence and tabs stay intact', () => {
+test('data sources include RDS, MongoDB, StarRocks and Redis; RDS evidence and tabs stay intact', () => {
   const options = [...html.matchAll(/<select id="analytics-source"[^>]*>(.*?)<\/select>/gs)][0][1];
-  assert.deepEqual([...options.matchAll(/value="([^"]+)"/g)].map((m) => m[1]), ['rds', 'mongodb', 'starrocks']);
+  assert.deepEqual([...options.matchAll(/value="([^"]+)"/g)].map((m) => m[1]), ['rds', 'mongodb', 'starrocks', 'redis']);
   for (const id of ['analytics-use-slowlog', 'analytics-use-binlog']) {
     assert.match(html, new RegExp(`<input id="${id}" type="checkbox" checked>`), id);
   }

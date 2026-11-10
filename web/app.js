@@ -1820,11 +1820,12 @@ function analyticsTabKind(name) {
 
 function syncAnalyticsMode() {
   const source = $("#analytics-source").value;
-  const mongo = source === "mongodb", starrocks = source === "starrocks";
+  const mongo = source === "mongodb", starrocks = source === "starrocks", redis = source === "redis";
   if (typeof syncMongoMode === 'function') syncMongoMode(mongo);
   if (typeof syncStarRocksMode === 'function') syncStarRocksMode(starrocks);
-  if (typeof syncRdsControls === 'function') syncRdsControls(!mongo && !starrocks);
-  if (mongo || starrocks) return;
+  if (typeof syncRedisMode === 'function') syncRedisMode(redis);
+  if (typeof syncRdsControls === 'function') syncRdsControls(!mongo && !starrocks && !redis);
+  if (mongo || starrocks || redis) return;
   $("#analytics-tabs").hidden = false;
   switchAnalyticsTab(state.rdsTab || "rise");
   syncAnalyticsSources(); // 性能指标 / Node ID / 页签跟着勾选的证据来源走
@@ -1931,6 +1932,7 @@ function analyticsQueryString(orderOverride = "", kind = "slowlog") {
 async function runAnalytics(orderOverride = "") {
   if ($("#analytics-source").value === "mongodb") return runMongoAnalytics();
   if ($("#analytics-source").value === "starrocks") return runStarRocks();
+  if ($("#analytics-source").value === "redis") return runRedis();
   return runRise();
 }
 

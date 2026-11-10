@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.37.0-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.37.0-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.38.0-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.38.0-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -181,7 +181,7 @@
           </div>
 
           <form id="analytics-form" class="query-grid">
-            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="按数据库选择数据来源"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option><option value="starrocks">StarRocks</option></select></label>
+            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="按数据库选择数据来源"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option><option value="starrocks">StarRocks</option><option value="redis">Redis</option></select></label>
             <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
             <fieldset id="rds-sources" class="operation-filter span-2" title="证据来源：慢日志给出真实扫描行数和耗时（上涨排查），Binlog 给出写入与事务推断（写入 SQL / 事务 / 锁争用推断）。只请求勾选的。">
               <legend>证据来源</legend>
@@ -214,6 +214,10 @@
               <p id="mongo-baseline-hint" class="analytics-note span-8" role="status" aria-live="polite"></p>
               <label class="field span-2"><span>关联 SLS</span><select id="mongo-log-source"><option value="">不关联日志</option></select></label>
               <div class="form-actions span-8"><button id="mongo-investigate" class="button secondary" type="button">缓存与 ticket 专项排查</button><span class="analytics-note">更新缓存指标点“开始排查”即执行；整分钟窗口最多30分钟，不挪时间、不改参数。</span></div>
+            </div>
+            <div id="redis-controls" class="query-grid span-8" hidden>
+              <label class="field span-4"><span>Redis实例</span><select id="redis-instance" title="已登记只读实例"></select></label>
+              <label class="field span-4"><span>分片</span><select id="redis-node" title="分片内独立对照"><option value="">全部分片</option></select></label>
             </div>
             <div id="starrocks-controls" class="query-grid span-8" hidden>
               <label class="field span-2"><span>StarRocks 实例</span><select id="starrocks-instance"></select></label>
@@ -530,12 +534,13 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.37.0-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.37.0-rawoss" defer></script>
-  <script src="/assets/starrocks.js?v=1.37.0-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.37.0-rawoss" defer></script>
-  <script src="/assets/sessions.js?v=1.37.0-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.37.0-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.37.0-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.38.0-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.38.0-rawoss" defer></script>
+  <script src="/assets/starrocks.js?v=1.38.0-rawoss" defer></script>
+  <script src="/assets/redis.js?v=1.38.0-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.38.0-rawoss" defer></script>
+  <script src="/assets/sessions.js?v=1.38.0-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.38.0-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.38.0-rawoss" defer></script>
 </body>
 </html>
