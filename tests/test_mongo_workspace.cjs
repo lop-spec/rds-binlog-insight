@@ -173,9 +173,28 @@ test('source switching suppresses late Mongo errors',async()=>{
 test('database-scoped statements, outliers and details are labeled without a fabricated collection',()=>{
  assert.equal((source.match(/x\.scope==='database'\?' · 库级命令':''/g)||[]).length,3);
 });
-test('workspace offers exactly the five requested metrics and no independent sort selector',()=>{
+test('pressure diagnostics render evidence, missing data and escaped sources',()=>{
+ const c=context(),nodes={};c.$=s=>nodes[s]??={value:s==='#mongo-role'?'Primary':''};
+ c.analyticsTable=(headers,rows,empty)=>headers.join('|')+(rows.length?rows.map(r=>r.join('|')).join('\n'):empty);
+ c.detailBlock=(a,b)=>escape(a)+escape(b);c.switchAnalyticsTab=()=>{};vm.runInContext(source,c);
+ c.data={instance:'fixture',requests:3,warning:'未证明唯一根因',performance:{nodes:[]},coverage:{complete:false},baseline_coverage:{complete:false},sls:{status:'not_configured'},audit:{status:'Disabled'},workload:{groups:[]},gaps:{fixture:'missing'}};
+ vm.runInContext('renderMongoInvestigation(data)',c);
+ let html=nodes['#analytics-panel-sql'].innerHTML;
+ assert.match(html,/没有可用五秒性能点/);assert.match(html,/未配置实例SLS映射/);assert.match(html,/不包含该Pod的CPU/);
+ assert.match(nodes['#analytics-coverage'].textContent,/当前慢记录回读有缺口/);
+ c.data.sls={status:'partial',kind:'http',tenants:[{shop:'<script>',requests:2,observed_overlap_lower_bound:5,max_duration_ms:60000,exceeded:true}]};
+ vm.runInContext('renderMongoInvestigation(data)',c);html=nodes['#analytics-panel-sql'].innerHTML;
+ assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>/);assert.match(html,/保守并发下界/);assert.match(html,/部分结果/);
+});
+test('pressure diagnostics reject a broad range without silently moving it',async()=>{
+ const {c,calls}=requestContext();await assert.rejects(vm.runInContext('runMongoInvestigation()',c),/30分钟/);
+ assert.equal(calls.length,0);
+ assert.match(fs.readFileSync('web/index.html','utf8'),/id="mongo-investigate"/);
+ assert.match(source,/更新缓存占比 %/);
+});
+test('workspace includes update cache ratio and no independent sort selector',()=>{
  const c=context();vm.runInContext(source,c);
- assert.deepEqual(Array.from(vm.runInContext('Object.keys(MONGO_METRICS)',c)),['CPUUtilization','IOPSUtilization','ScannedDocs','LockWaits','AvgRt']);
+ assert.deepEqual(Array.from(vm.runInContext('Object.keys(MONGO_METRICS)',c)),['CPUUtilization','IOPSUtilization','WtCacheUpdatesUsage','ScannedDocs','LockWaits','AvgRt']);
  assert.doesNotMatch(fs.readFileSync('web/index.html','utf8'),/id="mongo-order"/);
  assert.doesNotMatch(source,/\$\('#mongo-order'\)/);
 });

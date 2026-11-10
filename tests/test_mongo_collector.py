@@ -172,6 +172,10 @@ class CollectorGates(unittest.TestCase):
     def test_unsupported_metric_does_not_discard_other_series(self):
         response={'Code':200,'Datapoints':json.dumps([dict(instanceId='dds-example',role='Primary',timestamp=T//1000,Average=42)])}
         c=self.collector([RuntimeError('the metric(NoMetric) is not exist'),response,response])
+        cms=c.rpc()
+        dds=Mock();dds.call.return_value={}
+        c.rpc=lambda cms=False: c.clients['cms'] if cms else dds
+        c.clients['cms']=cms
         with patch('app.mongo_collector.METRICS',('NoMetric','CPUUtilization')):
             self.assertEqual(c.cloud_window(T,T+MINUTE),1)
             self.assertEqual(c.state['metrics_unavailable']['NoMetric'],'provider_unsupported')

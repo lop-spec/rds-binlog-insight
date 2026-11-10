@@ -21,7 +21,7 @@ LOGGER = logging.getLogger(__name__)
 MINUTE = 60_000_000
 WINDOW = 5 * MINUTE
 VERSION = 2  # Existing collection fingerprints must remain comparable.
-NORMALIZATION_VERSION = 3  # Reprocess source windows when parsing changes.
+NORMALIZATION_VERSION = 4  # Retain cache/queue costs in samples; no rollup schema change.
 DATABASE_COMMANDS = ('dbStats',)
 TOP_COUNTERS = ('read_count', 'read_us', 'write_count', 'write_us')
 TOP_NAMESPACES = 150
@@ -174,12 +174,21 @@ def normalize_record(record: dict, instance: str, prefixes: list[str]) -> dict:
                   cpu_ns=number(q.get('cpuNanos')), bytes_read=number(data.get('bytesRead')),
                   read_us=number(data.get('timeReadingMicros')), planning_us=number(q.get('planningTimeMicros')),
                   modified=number(q.get('nModified')))
-    wait = number(q.get('waitForWriteConcernDuration'))
+    wait = number(q.get('waitForWriteConcernDurationMillis', q.get('waitForWriteConcernDuration')))
     values['write_wait_us'] = None if wait is None else wait * 1000
     sample = dict(namespace=ns, command=op, kind=kind, shape=shape, start_us=start, duration_us=ms*1000,
                   plan=q.get('planSummary'), used_disk=q.get('usedDisk'), error_code=q.get('errCode'),
                   error_name=q.get('errName'), role=role, costs=values,
-                  query_shape_hash=q.get('queryShapeHash'), plan_cache_key=q.get('planCacheKey'))
+                  query_shape_hash=q.get('queryShapeHash', q.get('planCacheShapeHash', q.get('queryHash'))), plan_cache_key=q.get('planCacheKey'))
+    sample['pressure_costs'] = dict(
+        cache_wait_us=number(q.get('storage', {}).get('timeWaitingMicros', {}).get('cache')),
+        execution_queue_us=number(q.get('queues', {}).get('execution', {}).get('totalTimeQueuedMicros')),
+        txn_dirty_bytes=number(data.get('txnBytesDirty')),
+        bytes_written=number(data.get('bytesWritten')),
+        working_us=None if q.get('workingMillis') is None else number(q['workingMillis']) * 1000)
+    sample['execution_options'] = {k: cmd[k] for k in ('limit', 'skip', 'maxTimeMS', 'batchSize')
+                                   if isinstance(cmd.get(k), (int, float)) and not isinstance(cmd[k], bool)}
+    sample['projection_fields'] = list(cmd['projection'])[:100] if isinstance(cmd.get('projection'), dict) else None
     # Who sent it: the provider's client address and account. Not part of the template identity.
     client = client_host(record.get('HostAddress') or q.get('remote'))
     account = str(record.get('AccountName') or q.get('user') or '').strip()

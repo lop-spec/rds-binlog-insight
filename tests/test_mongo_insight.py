@@ -357,8 +357,11 @@ class CorrelationRankingGates(unittest.TestCase):
 
     def test_all_five_metrics_rank_by_signed_correlation_not_cost_or_growth(self):
         from app.mongo_metrics import ANALYSIS_METRICS
-        self.assertEqual(len(ANALYSIS_METRICS),5)
-        for metric in ANALYSIS_METRICS:
+        self.assertEqual(len(ANALYSIS_METRICS),6)
+        self.assertIn('WtCacheUpdatesUsage',ANALYSIS_METRICS)
+        stock=self.query('WtCacheUpdatesUsage')
+        self.assertFalse(stock['ranking']['available'])
+        for metric in (m for m in ANALYSIS_METRICS if m != 'WtCacheUpdatesUsage'):
             with self.subTest(metric=metric):
                 result=self.query(metric)
                 self.assertEqual(result['order'],'correlation');self.assertEqual(result['order_reason'],'')

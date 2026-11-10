@@ -337,6 +337,35 @@ class MongoStore:
                     account_count=len(accounts), matched=matched, clients_known=sum(clients.values()), scanned=scanned,
                     windows=len(manifests), missing_raw_windows=unreadable, complete=coverage['complete'] and not unreadable)
 
+    def pressure_records(self, instance, start, end, prefixes, *, role='', max_records=50000, max_bytes=64*1024*1024, deadline=None):
+        """On-demand raw evidence, not a schema migration or a business query."""
+        if end <= start or end-start > 30*MINUTE:
+            raise ValueError('pressure_window_exceeds_thirty_minutes')
+        manifests, coverage = self.manifests(instance, start, end)
+        events = []; scanned = size = missing = invalid = 0
+        stopped = False; deadline = min(deadline or float('inf'), time.monotonic() + 12)
+        for path, manifest in manifests:
+            raw = path.parent / str(manifest.get('raw') or '')
+            if not manifest.get('raw') or not raw.is_file():
+                missing += 1; continue
+            for batch in pq.ParquetFile(raw).iter_batches(batch_size=128, columns=['record']):
+                for text in batch.column(0).to_pylist():
+                    scanned += 1; size += len(text.encode('utf-8'))
+                    if scanned > max_records or size > max_bytes or time.monotonic() > deadline:
+                        stopped = True; break
+                    try:
+                        e = normalize_record(json.loads(text), instance, prefixes)
+                        if start <= e['start_us'] < end and e['kind'] == 'command' and (not role or e['role'] == role):
+                            events.append(e)
+                    except (ValueError, TypeError, KeyError):
+                        invalid += 1
+                if stopped: break
+            if stopped: break
+        complete = coverage['complete'] and not (missing or invalid or stopped)
+        return events, dict(complete=complete, source_windows=coverage, scanned=scanned,
+                            missing_raw_windows=missing, invalid_records=invalid, budget_exhausted=stopped,
+                            scope='retained_command_slow_records_not_all_operations')
+
     def telemetry(self, instance, kind, points):
         if not points:return
         rows=[]

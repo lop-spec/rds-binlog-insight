@@ -4,7 +4,7 @@ import logging
 import math
 
 LOGGER = logging.getLogger(__name__)
-ANALYSIS_METRICS = ('CPUUtilization', 'IOPSUtilization', 'ScannedDocs', 'LockWaits', 'AvgRt')
+ANALYSIS_METRICS = ('CPUUtilization', 'IOPSUtilization', 'WtCacheUpdatesUsage', 'ScannedDocs', 'LockWaits', 'AvgRt')
 MINUTE_MS = 60_000
 
 

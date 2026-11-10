@@ -17,6 +17,7 @@ from .rds_api import RdsRpcClient
 from .slow_log_collector import DAS_ENDPOINT, DasRpcClient
 from .mongo_insight import COMMANDS, MINUTE, TOP_NAMESPACES, WINDOW, collection_interval, counter_interval, epoch_us
 from .mongo_store import atomic_json
+from .mongo_pressure import PERFORMANCE, COLLECTED_DDS, performance_points
 
 LOGGER=logging.getLogger(__name__)
 METRICS=('CPUUtilization','MemoryUtilization','ConnectionAmount','IOPSUtilization','ReplicationLag',
@@ -76,6 +77,8 @@ def load_instances(root: Path):
                 raise ValueError('mongo_node_outside_instance_allowlist')
         if item.get('port',3717)!=3717:raise ValueError('mongo_port_not_allowlisted')
         if item.get('slowlogSource','das') not in ('das','dds'):raise ValueError('invalid_mongo_slowlog_source')
+        from .mongo_sls import validate_sources
+        validate_sources(item.get('logSources', []))
         if not isinstance(item.get('families',[]),list) or any(not re.fullmatch(r'[A-Za-z0-9_-]+',p) for p in item.get('families',[])):
             raise ValueError('invalid_mongo_family_registry')
         limit=item.get('topNamespaceLimit',TOP_NAMESPACES)
@@ -310,9 +313,30 @@ class MongoCollector:
                 unavailable[metric]='no_points'
                 LOGGER.warning('mongo_metric unavailable: instance=%s metric=%s no_points',self.instance,metric)
         self.state[state_key]=unavailable
-        if not points:raise RuntimeError('cms_no_points')
-        self.store.telemetry(self.instance,'metrics',points)
-        return len(points)
+        if points: self.store.telemetry(self.instance,'metrics',points)
+        # Separate kind avoids mixing CMS period-end and DDS period-start gauges.
+        # One bounded call per role; failure leaves the original CMS lane intact.
+        added = []
+        failures = {}
+        dds = None
+        for role in ('Primary', 'Secondary'):
+            try:
+                if dds is None: dds = self.rpc()
+                payload = dds.call('DescribeDBInstancePerformance', {
+                    'DBInstanceId': self.instance, 'ReplicaSetRole': role,
+                    'StartTime': iso(start), 'EndTime': iso(end), 'Interval': '60',
+                    'Key': ','.join(dict.fromkeys(PERFORMANCE[m][0] for m in COLLECTED_DDS))})
+                batch = performance_points(payload, role, start, end, 60, COLLECTED_DDS)
+                absent = sorted(set(COLLECTED_DDS) - {p['metric'] for p in batch})
+                if absent: failures[role] = {'missing_metrics': absent}
+                added.extend(batch)
+            except Exception as exc:
+                failures[role] = {'reason': type(exc).__name__}
+                LOGGER.warning('mongo_cache_metrics unavailable: role=%s reason=%s', role, type(exc).__name__)
+        self.state['cache_metrics_unavailable'] = failures
+        if added: self.store.telemetry(self.instance, 'pressure', added)
+        if not points and not added: raise RuntimeError('mongo_no_metric_points')
+        return len(points) + len(added)
 
     def namespace_totals(self, host):
         """Cumulative per-namespace lock counters from `top`.
@@ -514,7 +538,8 @@ class MongoCollector:
         start,end=self.history_bounds();start=start//hour*hour;end=end//hour*hour
         path=self.store.base(self.instance)/'history-metrics.json'
         done=json.loads(path.read_text()) if path.exists() else {}
-        pending=[t for t in range(end-hour,start-hour,-hour) if str(t) not in done]
+        pending=[t for t in range(end-hour,start-hour,-hour)
+                 if not isinstance(done.get(str(t)), dict) or done[str(t)].get('metric_version') != 2]
         self.state['history_metric_progress']=dict(collected_hours=(end-start)//hour-len(pending),expected_hours=(end-start)//hour,missing_hours=len(pending))
         for t in pending:
             if self.history_retry.get(('metrics',t),0)>time.time():continue
@@ -524,7 +549,7 @@ class MongoCollector:
                 self.history_retry[('metrics',t)]=time.time()+600
                 raise
             # This records completed provider fetches, not guaranteed metric coverage.
-            done[str(t)]=dict(points=n,fetched_at=time.time())
+            done[str(t)]=dict(points=n,fetched_at=time.time(),metric_version=2)
             atomic_json(path,done)
             return n
         return 0

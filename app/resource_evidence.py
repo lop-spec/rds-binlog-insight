@@ -8,7 +8,7 @@ import math
 LOGGER = logging.getLogger(__name__)
 MINUTE = 60_000_000
 STOCK_METRICS = {'MemoryUtilization', 'WtCacheUsage', 'CentralCacheFree',
-                 'TcmallocCacheMemRatio', 'WtCacheDirtyUsage', 'DirtyCacheBytes'}
+                 'TcmallocCacheMemRatio', 'WtCacheDirtyUsage', 'DirtyCacheBytes', 'WtCacheUpdatesUsage'}
 # Read bytes are NOT physical I/O operations; latency is an outcome, not CPU.
 RESOURCE_COST = {'CPUUtilization': ('cpu_ns', 'direct'),
                  'ScannedDocs': ('docs', 'direct'),

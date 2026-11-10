@@ -1080,6 +1080,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "data": self.app.mongo.query(query)})
             elif parsed.path == "/api/mongo/sources":
                 self._json({"ok": True, "data": self.app.mongo.sources(query)})
+            elif parsed.path == "/api/mongo/investigate":
+                self._json({"ok": True, "data": self.app.mongo.investigator.run(query)})
             elif parsed.path == "/favicon.svg":
                 self._serve_static("favicon.svg")
             elif parsed.path == "/healthz":

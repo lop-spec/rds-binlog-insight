@@ -14,6 +14,7 @@ from .mongo_store import MongoStore
 from .mongo_tail import MongoSlowTail
 from .mongo_metrics import ANALYSIS_METRICS, lock_wait_points
 from .resource_evidence import native_continuity
+from .mongo_investigation import MongoInvestigator
 
 LOGGER=logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ LOGGER=logging.getLogger(__name__)
 class MongoService:
     def __init__(self,root,settings_loader,archive_loader=None,*,start=True):
         self.root=Path(root);self.collectors=[];self.stores={};self.tails={};self.error='';self.entries=[]
+        self.investigator = MongoInvestigator(self)
         try:
             self.entries=load_instances(self.root)
             for entry in self.entries:
@@ -42,7 +44,8 @@ class MongoService:
         path=self.root/'mongo-replays.json'
         cases=json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
         return dict(status='unavailable' if self.error else 'ok' if self.entries else 'not_configured',reason=self.error,
-                    instances=[{'id':e['instanceId'],'label':e.get('label',e['instanceId'])} for e in self.entries],
+                    instances=[{'id':e['instanceId'],'label':e.get('label',e['instanceId']),
+                                'logSources':[{'id':s['id'],'label':s.get('label',s['id'])} for s in e.get('logSources',[])]} for e in self.entries],
                     collectors=[self.collector_status(c) for c in self.collectors],metrics=list(ANALYSIS_METRICS),replays=cases,
                     scopes={'slowlog':'collected_records','native':'node_command_counters','client':'connected_services_only',
                             'namespaces':'namespace_lock_time_not_cpu'})
@@ -81,7 +84,7 @@ class MongoService:
         if role not in ('','Primary','Secondary','Unknown'):raise ValueError('invalid_role')
         if kind not in ('command','suboperation',''):raise ValueError('invalid_record_kind')
         metric=get('metric','CPUUtilization')
-        if metric not in (*METRICS, 'LockWaits'):raise ValueError('unsupported_mongo_metric')
+        if metric not in (*METRICS, 'LockWaits', 'WtCacheUpdatesUsage'):raise ValueError('unsupported_mongo_metric')
         store=self.stores[instance]
         adjusted=None;tail=None;base_tail=None
         if not store.windows_complete(instance,start,end):
@@ -117,12 +120,20 @@ class MongoService:
             except Exception as exc:
                 optional[name]=type(exc).__name__+':'+str(exc)[:100]
                 LOGGER.warning('mongo_query %s unavailable: %s',name,optional[name]);return []
+        def metric_points(lo, hi, samples):
+            if metric == 'LockWaits':
+                return lock_wait_points(samples, lo, hi)
+            if metric == 'WtCacheUpdatesUsage':
+                raw = store.read_telemetry(instance, 'pressure', lo-MINUTE, hi, metric=metric)
+                return [dict(p, timestamp=p['timestamp']+p['period']*1000, timestamp_semantics='period_end')
+                        for p in raw if p.get('source') == 'dds' and p.get('period') == 60
+                        and p.get('timestamp_semantics') == 'period_start'
+                        and lo < (p['timestamp']+60000)*1000 <= hi]
+            return store.read_telemetry(instance, 'metrics', lo, hi, metric=metric)
         native=read_optional('native',lambda:store.read_telemetry(instance,'native',start,end,compact=True))
-        points=(lock_wait_points(native,start,end) if metric=='LockWaits' else
-                read_optional('metrics',lambda:store.read_telemetry(instance,'metrics',start,end,metric=metric)))
+        points=read_optional('metrics',lambda:metric_points(start,end,native))
         native_before=read_optional('native_baseline',lambda:store.read_telemetry(instance,'native',base,base_end,compact=True))
-        baseline_points=(lock_wait_points(native_before,base,base_end) if metric=='LockWaits' else
-                         read_optional('metrics_baseline',lambda:store.read_telemetry(instance,'metrics',base,base_end,metric=metric)))
+        baseline_points=read_optional('metrics_baseline',lambda:metric_points(base,base_end,native_before))
         latest=read_optional('native_latest',lambda:store.latest_native(instance,end))
         clients=read_optional('client',lambda:store.read_telemetry(instance,'client',start,end))
         # Namespace intervals carry one row per collection per minute per node; the same
