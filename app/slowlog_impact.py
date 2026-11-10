@@ -134,23 +134,29 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
             before = sum(previous_series.get(key, {}).values())
             current = row["runtime_us_total"]
             # Elapsed growth minus the lock wait inside it: time spent waiting is not work the statement added.
-            grown = max(Fraction(0), net_now.get(key, Fraction(0)) - net_before.get(key, Fraction(0)))
+            baseline_observed = key in before_costs
+            grown = max(Fraction(0), net_now.get(key, Fraction(0)) - net_before.get(key, Fraction(0))) if baseline_observed else Fraction(0)
             scores[row["fingerprint"]] = Fraction(row["score_numerator"]) * grown / (current or 1)
-            row.update(raw_overlap_rank=row["rank"], baseline_runtime_us_total=before,
-                       runtime_delta_us=current - before, sql_id=ids[key],
+            row.update(raw_overlap_rank=row["rank"], baseline_runtime_us_total=before if baseline_observed else None,
+                       runtime_delta_us=current - before if baseline_observed else None, sql_id=ids[key],
                        lock_wait_excluded_us=int(max(Fraction(0), max(0, current - before) - grown)),
                        member_fingerprints=sorted(members[key]))
             now = now_costs[key]; old = before_costs.get(key, dict(count=0,rows_examined=0,lock_time_ms=0,rows_examined_known=0,lock_time_ms_known=0))
             evidence = dict(status='elapsed_overlap_only', causal=False, scope='collected_slow_records',
-                            current_count=now['count'],baseline_count=old['count'],
+                            current_count=now['count'],baseline_count=old['count'] if baseline_observed else None,
                             warnings=['runtime_includes_waits','scans_not_physical_iops','index_coverage_not_source_completeness'])
             for field in ('rows_examined','lock_time_ms'):
-                complete = now[field+'_known']==now['count'] and old[field+'_known']==old['count']
+                complete = baseline_observed and now[field+'_known']==now['count'] and old[field+'_known']==old['count']
                 evidence[field] = dict(current=now[field] if now[field+'_known'] else None,
-                                       baseline=old[field] if old[field+'_known'] or not old['count'] else None,
+                                       baseline=old[field] if baseline_observed and old[field+'_known'] else None,
                                        delta=now[field]-old[field] if complete else None,
                                        known=now[field+'_known'],total=now['count'],
                                        baseline_known=old[field+'_known'],baseline_total=old['count'])
+            evidence['grade'] = '时间相关候选'
+            evidence['counterevidence'] = '慢阈值以下的执行及其他等待未被覆盖，重叠不能证明资源因果'
+            if not baseline_observed:
+                evidence['status'] = 'baseline_shape_unobserved'
+                evidence['warnings'].append('missing_slow_baseline_not_zero')
             scan_delta = evidence['rows_examined']['delta']
             if scan_delta is not None:
                 evidence['status'] = 'scan_growth_related_evidence' if scan_delta>0 else 'no_scan_growth'
@@ -171,7 +177,7 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
                        growth_score_denominator=str(score.denominator),
                        growth_share=float(score / total) if total else None)
         if any((row['attribution']['rows_examined']['delta'] or 0)>0 for row in rows):
-            node['status'] = 'ok'
+            node['status'] = 'ok' if total else 'scan_growth_without_overlap'
         elif rows and not total:
             node["status"] = "no_growth_overlap"
             LOGGER.warning("slowlog_performance_growth unavailable: node=%s no growth overlap", node["node_id"])

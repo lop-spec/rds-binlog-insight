@@ -13,7 +13,7 @@ LOGGER = logging.getLogger(__name__)
 
 APP_NAME = "RDS SQL Insight"
 APP_ID = "rds-binlog-insight"
-APP_VERSION = "1.39.1-rawoss"
+APP_VERSION = "1.39.2-rawoss"
 DEFAULT_PORT = 8769
 MAX_PORT = 8799
 
@@ -96,11 +96,11 @@ class Settings:
         if not _REGION_RE.fullmatch(self.region_id):
             raise ValueError("Region ID 格式无效")
         host = self.endpoint.strip().lower()
-        if host.startswith("https://") or host.startswith("http://"):
-            host = host.split("://", 1)[1].split("/", 1)[0]
-        if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
-            if not (host == "rds.aliyuncs.com" or host.endswith(".aliyuncs.com")):
-                raise ValueError("API Endpoint 必须是阿里云 aliyuncs.com 域名")
+        if os.environ.get('RDS_BINLOG_TEST_MODE') != '1':
+            if host.startswith('https://'):
+                host = host[8:]
+            if not re.fullmatch(r'(?:rds|das|mongodb|dds|ecs|metrics|r-kvstore)(?:-vpc)?(?:\.[a-z]{2}-[a-z0-9-]+)?\.aliyuncs\.com', host):
+                raise ValueError('API Endpoint 必须是HTTPS受信云API端点，不接受HTTP、OSS站点或自定义路径')
         if not 1 <= int(self.initial_lookback_days) <= 365:
             raise ValueError("首次回看天数必须在 1 到 365 之间")
         if not 1 <= int(self.retention_days) <= 365:
@@ -197,7 +197,10 @@ def parse_settings_payload(payload: dict[str, Any], current: Settings) -> Settin
         "page_size",
         "oss_retention_days",
     ):
-        mapping[key] = int(mapping[key])
+        value = mapping[key]
+        if isinstance(value, bool) or not (isinstance(value, int) or isinstance(value, str) and re.fullmatch(r'[+-]?\d+', value.strip())):
+            raise ValueError(f'{key} 必须是整数，不能使用布尔或小数')
+        mapping[key] = int(value)
     for key in ("auto_sync", "prefer_intranet_download", "oss_enabled"):
         value = mapping[key]
         if isinstance(value, bool):

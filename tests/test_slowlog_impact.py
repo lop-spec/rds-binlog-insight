@@ -101,7 +101,7 @@ class GrowthTests(unittest.TestCase):
     def test_large_unchanged_load_does_not_outrank_growing_load(self):
         steady = event('steady', 3*W, 180000)
         growing = event('growing', 3*W, 60000)
-        rows = self.rank([steady, growing], [steady])['nodes'][0]['statements']
+        rows = self.rank([steady, growing], [steady, dict(growing, duration_ms=0, rows_examined=0)])['nodes'][0]['statements']
         self.assertEqual(rows[0]['sql_id'], 'growing')
         self.assertEqual(rows[0]['growth_share'], 1)
         self.assertIsNone(rows[1]['rank'])
@@ -137,7 +137,7 @@ class GrowthTests(unittest.TestCase):
         # yesterday" is evidence, not a gate: thirty statements that scanned a million rows each must not bury it.
         long_run = dict(event('long', 3*W, 180000), rows_examined=9)
         noise = [dict(event(f'noise-{i}', 3*W, 1000), rows_examined=1_000_000 + i) for i in range(30)]
-        rows = self.rank([long_run, *noise], [])['nodes'][0]['statements']
+        rows = self.rank([long_run, *noise], [dict(e, duration_ms=0, rows_examined=0) for e in [long_run, *noise]])['nodes'][0]['statements']
         self.assertEqual((rows[0]['sql_id'], rows[0]['rank']), ('long', 1))
         self.assertAlmostEqual(rows[0]['growth_share'], 180 / 210)
         self.assertEqual(rows[0]['attribution']['status'], 'scan_growth_related_evidence')   # its own few rows still count as evidence
@@ -150,7 +150,7 @@ class GrowthTests(unittest.TestCase):
         self.assertEqual([row['sql_id'] for row in node['statements']], ['big', 'small'])
         self.assertEqual([row['rank'] for row in node['statements']], [1, 2])
         self.assertTrue(all(row['growth_share'] is None for row in node['statements']))   # no runtime grew: no share is invented
-        self.assertEqual(node['status'], 'ok')
+        self.assertEqual(node['status'], 'scan_growth_without_overlap')
 
     def test_growth_that_is_only_recorded_lock_wait_scores_nothing(self):
         before = [dict(event('waits', 3*W, 10000), lock_time_ms=0), event('works', 3*W, 10000)]
@@ -241,7 +241,8 @@ class ServiceTests(unittest.TestCase):
         steady_before = [make("steady", "T", 3 * W + 1 - DAY_US, 100000, "SELECT")]
         shards = [make("s38", "A", 3 * W + i * 1000, 40000, "INSERT") for i in range(1, 3)] + \
                  [make("s563", "B", 4 * W + i * 1000, 40000, "INSERT") for i in range(1, 3)]
-        backend._rows.side_effect = lambda sql, params, _: steady_before if params["low"] < 0 else steady_now + shards
+        baseline_shards = [dict(e, event_id='before-'+e['event_id'], start_us=e['start_us']-DAY_US, duration_ms=0, rows_examined=0) for e in shards[::2]]
+        backend._rows.side_effect = lambda sql, params, _: steady_before + baseline_shards if params['low'] < 0 else steady_now + shards
         loader = Mock(return_value=points([10, 10, 10, 90, 90, 90]))
 
         def counters(settings, start, end, instance, node, metric_name):
@@ -270,6 +271,7 @@ class ServiceTests(unittest.TestCase):
         backend._manifest_coverage.return_value = {"complete": True, "total_parts": 1}
         backend._scope_sql.return_value = ("SELECT 1", {})
         backend._rows.return_value = [None] * 250001
+        backend._window.side_effect = lambda q, _: (q.get('start_epoch_us', 0), q.get('end_epoch_us', 6*W-1))
         with self.assertLogs("app.slowlog_impact_service", "WARNING"):
             result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x"}, Settings(), loader)
         self.assertEqual(result["status"], "event_limit_exceeded")
@@ -448,12 +450,11 @@ class IndexedWindowTests(unittest.TestCase):
         loader = Mock(return_value=[])
         result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x", "start_epoch_us": start,
                                                             "end_epoch_us": end}, Settings(), loader)
-        self.assertEqual(result["adjusted"], dict(kind="shifted", reason="incomplete_baseline_index", requested_start_us=start,
-                                                  requested_end_us=end, shift_us=shift))
-        self.assertEqual((result["start_us"], result["end_us"]), (start + shift, end + shift))
-        self.assertEqual(loader.call_args_list[0].args[1:3], (start + shift, end + shift))
-        self.assertEqual(loader.call_args_list[1].args[1:3], (start + shift - DAY_US, end + shift - DAY_US))
-        self.assertTrue(result["coverage"]["complete"] and result["baseline_coverage"]["complete"])
+        self.assertEqual(result['status'], 'incomplete_baseline_index')
+        self.assertEqual((result['start_us'], result['end_us']), (start, end))
+        self.assertEqual(result['window_policy'], 'never_shift_incident_window')
+        self.assertFalse(result['baseline_coverage']['complete'])
+        loader.assert_not_called()
 
     def test_indexed_window_is_left_alone(self):
         metadata, backend = self.fixture()
@@ -491,9 +492,10 @@ class IndexedWindowTests(unittest.TestCase):
         metadata, backend = self.fixture({p["path"] for p in self.parts if p["max_event_epoch_us"] > ready_until})
         start = ready_until - 4 * MIN  # only 3 clean minutes would be left
         result, _loader = self.query(metadata, backend, start, self.NOW)
-        self.assertEqual(result["adjusted"]["kind"], "shifted")
-        self.assertLessEqual(result["end_us"], ready_until - MIN)
-        self.assertEqual(result["end_us"] - result["start_us"], self.NOW - start)
+        self.assertEqual(result['status'], 'incomplete_index')
+        self.assertEqual((result['start_us'], result['end_us']), (start, self.NOW))
+        self.assertEqual(result['window_policy'], 'never_shift_incident_window')
+        _loader.assert_not_called()
 
     def test_truncate_to_ready_needs_an_indexed_start_and_stops_before_the_first_unready_part(self):
         hole = self.overlapping(self.NOW - 40 * MIN, self.NOW - 31 * MIN)
@@ -573,7 +575,9 @@ class IndexedWindowTests(unittest.TestCase):
         self.assertEqual((result["start_us"], result["end_us"]), (start, cut))
         self.assertEqual(loader.call_args_list[0].args[1:3], (start, cut))
         self.assertEqual(loader.call_args_list[1].args[1:3], (start - DAY_US, cut - DAY_US))  # the baseline day is read from ClickHouse
-        self.assertTrue(result["coverage"]["complete"])
+        self.assertFalse(result['coverage']['complete'])
+        self.assertEqual(result['status'], 'partial')
+        self.assertFalse(result['source_complete'])
         self.assertGreater(result["coverage"]["tail_parts"], 0)
         self.assertEqual(result["tail"], dict(from_us=self.NOW - 30 * MIN, through_us=cut, newest_us=self.NOW - 30_000_000, events=1,
                                               pending_parts=result["coverage"]["tail_parts"]))
@@ -861,7 +865,7 @@ class LagPeerEvidenceTests(unittest.TestCase):
         with self.assertLogs("app.lag_peers", "WARNING"):
             nodes, result = self.analyse(peer_loader=self.peer_loader(fail=(METRIC_NAMES["slow"],)))
         self.assertEqual(nodes["r"]["lag_origin"]["peer_health"], {"status": "unavailable"})
-        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result['status'], 'partial')
         self.assertTrue(nodes["r"]["statements"])
         # a metric that only decorates the table (CPU) leaves the verdict standing
         with self.assertLogs("app.lag_peers", "WARNING"):
@@ -902,7 +906,8 @@ class LagPeerEvidenceTests(unittest.TestCase):
             _add_write_hotspots(nodes, "x", lambda *args: calls.append(args) or {"status": "ok", "tables": []})
         self.assertEqual(len(calls), MAX_WRITE_LOOKUPS)                                                   # no call for the stall, none past the limit
         self.assertNotIn("writes", stall)
-        self.assertEqual(sum("writes" in e for e in behind), MAX_WRITE_LOOKUPS)
+        self.assertEqual(sum(e.get('writes', {}).get('status') == 'ok' for e in behind), MAX_WRITE_LOOKUPS)
+        self.assertTrue(any(e.get('writes', {}).get('reason') == 'lookup_limit_exceeded' for e in behind))
         self.assertTrue(any("skipped for later episodes" in line for line in logs.output))
 
     def test_a_failing_or_absent_row_store_is_logged_and_never_fails_the_analysis(self):
@@ -912,7 +917,7 @@ class LagPeerEvidenceTests(unittest.TestCase):
             nodes, result = self.analyse(writes_lookup=broken)
         self.assertEqual(nodes["r"]["lag_origin"]["episodes"][0]["writes"], {"status": "unavailable"})
         self.assertTrue(any("write hotspots unavailable" in line for line in logs.output))
-        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result['status'], 'partial')
         nodes, _ = self.analyse(writes_lookup=lambda *_: None)                                   # the server returns None without the store
         self.assertNotIn("writes", nodes["r"]["lag_origin"]["episodes"][0])
 

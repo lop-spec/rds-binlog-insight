@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import faulthandler
+import gzip
 import json
 import logging
 import logging.handlers
@@ -67,6 +68,10 @@ from .rds_api import RdsApiError, RdsRpcClient
 from .schema_diff import SchemaDiffError, SchemaDiffService
 from .storage import EventStorage
 from .tabularis_audit import AuditIngestError, TabularisAuditIngest
+from .http_access import load_networks, peer_allowed, validate_event_query
+import ipaddress
+
+_LOOPBACK_NETWORKS = (ipaddress.ip_network('127.0.0.0/8'), ipaddress.ip_network('::1/128'))
 
 LOGGER = logging.getLogger(__name__)
 _LOCAL_ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -178,6 +183,7 @@ def _event_query(query: dict[str, list[str]]) -> dict[str, Any]:
         value = _query_value(query, source)
         if value:
             result[target] = int(value)
+    validate_event_query(result)
     if result['source'].lower() == 'binlog':
         result['source'] = 'binlog'
         result['indexed_only'] = True
@@ -279,6 +285,7 @@ def _event_query_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("limit 必须在 1 到 1000 之间")
     if not 0 <= result["offset"] <= 100_000:
         raise ValueError("offset 必须在 0 到 100000 之间")
+    validate_event_query(result)
     binlog_only = result['source'].lower() == 'binlog'
     indexed_only = payload.get('indexedOnly', payload.get('indexed_only', binlog_only))
     if not isinstance(indexed_only, bool):
@@ -359,6 +366,8 @@ class Application:
             self.storage,
             archiver=self.sync,
         )
+        if os.environ.get('RDS_BINLOG_TEST_MODE') != '1':
+            self.audit_ingest.start()
         self.secondary_syncs: list[SyncManager] = self._start_secondary_syncs(
             client_factory, credential_loader
         )
@@ -806,9 +815,7 @@ class Application:
         sync_status = self.sync.status()
         raw_status = sync_status.get('rawBinlog') or {}
         raw_end = raw_status.get('latest_file_end_utc')
-        if raw_end:
-            raw_end_us = int(datetime.fromisoformat(raw_end.replace('Z', '+00:00')).timestamp()*1_000_000)
-            stats['latest_epoch_us'] = max(int(stats.get('latest_epoch_us') or 0), raw_end_us)
+        # Downloaded raw-file time is not the latest queryable event time.
         index_stats = sync_status.get("index") or {}
         catalog_stats = index_stats.get("catalog") or {}
         part_count = int(stats.get("part_count") or 0)
@@ -837,7 +844,9 @@ class Application:
             "timeUtc": utc_now_text(),
             "sync": sync_status,
             "credential": credential_status(settings.credential_target),
+            "auditIngest": self.audit_ingest.status() if getattr(self, 'audit_ingest', None) is not None else {},
             "summary": {
+                "rawDownloadedThroughUtc": raw_end,
                 "eventCount": stats.get("event_count", 0),
                 "parquetBytes": stats.get("parquet_bytes", 0),
                 "localParquetBytes": local_body_bytes,
@@ -852,20 +861,20 @@ class Application:
                 "structuralIndexedParts": structural_indexed_parts,
                 "indexBlocks": index_stats.get("block_count", 0),
                 "indexCoverage": (
-                    indexed_parts / part_count
+                    min(indexed_parts / part_count, 1.0)
                     if part_count
-                    else 1.0
+                    else None
                 ),
                 "structuralIndexCoverage": (
-                    structural_indexed_parts / part_count
+                    min(structural_indexed_parts / part_count, 1.0)
                     if part_count
-                    else 1.0
+                    else None
                 ),
                 "catalogedParts": cataloged_parts,
                 "catalogCoverage": (
-                    cataloged_parts / part_count
+                    min(cataloged_parts / part_count, 1.0)
                     if part_count
-                    else 1.0
+                    else None
                 ),
                 "ossRetentionDays": settings.oss_retention_days,
             },
@@ -893,6 +902,12 @@ class Application:
         }
 
     def stop(self) -> None:
+        if getattr(self, 'audit_ingest', None) is not None:
+            self.audit_ingest.shutdown()
+        if getattr(self, 'sync_watchdog', None) is not None:
+            self.sync_watchdog.stop()
+        for collector in getattr(self, 'slow_logs', []):
+            collector.shutdown()
         if getattr(self, 'redis', None) is not None:
             self.redis.stop()
         if getattr(self, 'slow_tails', None) is not None:
@@ -924,7 +939,34 @@ class AppHTTPServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], application: Application):
         self.application = application
         self.allowed_hosts = _allowed_hosts()
+        self.trusted_networks = load_networks(getattr(application, 'data_dir', data_root()))
+        self._request_slots = threading.BoundedSemaphore(32)
+        self.analysis_slots = threading.BoundedSemaphore(2)
         super().__init__(address, RequestHandler)
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(15)
+        return request, address
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\nRetry-After: 5\r\n\r\n')
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -940,7 +982,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         # logging lock long enough for every supervisor probe to time out.
         if str(getattr(self, "path", "")).partition("?")[0] == "/healthz":
             return
-        LOGGER.info("%s %s", self.address_string(), format % args)
+        LOGGER.info('%s %s %s', self.address_string(), getattr(self, 'command', ''),
+                    str(getattr(self, 'path', '')).partition('?')[0])
+
+    def _require_access(self) -> bool:
+        if peer_allowed(self.client_address[0], getattr(self.server, 'trusted_networks', _LOOPBACK_NETWORKS)):
+            return True
+        self.close_connection = True
+        self._error(403, 'PRIVATE_ACCESS_REQUIRED', '公网匿名接口已关闭；请使用受控内网或 SSH 转发入口')
+        return False
 
     def _valid_host(self) -> bool:
         return _host_allowed(
@@ -971,7 +1021,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._json_body(_encode_json(value), status)
 
     def _json_body(self, body: bytes, status: int = 200) -> None:
+        compressed = len(body) >= 2048 and 'gzip' in [p.strip().lower() for p in self.headers.get('Accept-Encoding', '').split(',')]
+        if compressed:
+            body = gzip.compress(body, compresslevel=1, mtime=0)
         self.send_response(status)
+        self.send_header('Vary', 'Accept-Encoding')
+        if compressed:
+            self.send_header('Content-Encoding', 'gzip')
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self._security_headers()
@@ -1007,6 +1063,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
 
     def _body_json(self) -> dict[str, Any]:
+        if self.headers.get('Transfer-Encoding') or self.headers.get('Content-Length') is None:
+            raise ValueError('需要 Content-Length，不支持分块请求体')
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
@@ -1014,6 +1072,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         if length < 0 or length > 1024 * 1024:
             raise ValueError("请求体过大")
         raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise ValueError('请求体未完整接收')
         value = json.loads(raw.decode("utf-8")) if raw else {}
         if not isinstance(value, dict):
             raise ValueError("请求 JSON 必须是对象")
@@ -1060,8 +1120,24 @@ class RequestHandler(BaseHTTPRequestHandler):
             shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
 
     def do_GET(self) -> None:
+        path = urllib.parse.urlsplit(self.path).path
+        if path.startswith('/api/') and not self._require_access():
+            return
+        expensive = path in {'/api/slowlog-impact', '/api/mongo/investigate', '/api/mongo/analytics',
+                             '/api/redis/investigate', '/api/starrocks/query', '/api/starrocks/metrics',
+                             '/api/sessions', '/api/live-sessions'}
+        if expensive and not self.server.analysis_slots.acquire(blocking=False):
+            self._error(429, 'ANALYSIS_BUSY', '分析并发已满，请稍后重试')
+            return
+        try:
+            self._get()
+        finally:
+            if expensive:
+                self.server.analysis_slots.release()
+
+    def _get(self) -> None:
         if not self._valid_host():
-            self._error(421, "INVALID_HOST", "仅允许本机访问")
+            self._error(421, "INVALID_HOST", "请求 Host 不在允许列表")
             return
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
@@ -1185,6 +1261,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/query-tasks":
                 limit = int(_query_value(query, "limit", "50"))
+                if not 1 <= limit <= 100:
+                    raise ValueError('limit 必须在 1 到 100 之间')
                 self._json(
                     {"ok": True, "data": self.app.queries.list(limit=limit)}
                 )
@@ -1350,18 +1428,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     if getattr(exc, "code", "") != "TIER_COVERAGE_MISSING":
                         raise
-                    start_us, end_us = self.app.storage._query_window(
-                        event_query,
-                        settings.retention_days,
-                    )
-                    backfill = self.app.sync.request_backfill_for_range(
-                        start_us,
-                        end_us,
-                    )
-                    raise PipelineError(
-                        backfill["message"] + "；解析完成后再导出",
-                        "BINLOG_BACKFILL_QUEUED",
-                    ) from exc
+                    raise PipelineError('导出区间未完整覆盖；请通过采集管理显式回补后重试',
+                                        'TIER_COVERAGE_MISSING') from exc
                 self._send_file(path, f"binlog-events-{count}.csv")
             elif parsed.path == "/api/schema/instances":
                 self._json(
@@ -1395,7 +1463,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._error(400, "SCHEMA_DIFF_ERROR", str(exc))
         except SessionRequestError as exc:
             self._error(400, exc.code, str(exc))
-        except (ValueError, TypeError) as exc:
+        except ValueError as exc:
+            LOGGER.warning('Invalid GET path=%s', parsed.path, exc_info=True)
             self._error(400, "INVALID_REQUEST", str(exc))
         except Exception as exc:
             LOGGER.exception("GET request failed")
@@ -1411,9 +1480,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if code in {"CLICKHOUSE_RAW_OSS_QUERY_UNAVAILABLE", "CLICKHOUSE_BINLOG_ROWS_UNAVAILABLE"}
                 else 500
             )
-            self._error(status, code, str(exc))
+            self._error(status, code, str(exc) if status < 500 else '服务暂时不可用，请查看服务端日志')
 
     def do_POST(self) -> None:
+        if not self._require_access():
+            return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in ("/api/ingest/redis-aggregates","/api/ingest/redis-profiles"):
             if not self._valid_host():
@@ -1428,6 +1499,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             except (ValueError, TypeError, KeyError):
                 self._error(400,"REDIS_INVALID_AGGREGATE","全量计数批次字段、时间或去重ID不符合约束")
             except Exception:
+                LOGGER.exception('Redis aggregate ingestion failed')
                 self._error(503,"REDIS_AGGREGATE_UNAVAILABLE","聚合队列不可用；请用原批次ID重试")
             return
         if parsed.path == "/api/ingest/redis-samples":
@@ -1442,6 +1514,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             except (ValueError, TypeError, KeyError):
                 self._error(400, "REDIS_INVALID_SAMPLE", "采样字段、窗口或速率不符合约束")
             except Exception:
+                LOGGER.exception('Redis sample ingestion failed')
                 self._error(503, "REDIS_INGEST_FAILED", "采样写入不可用；原ID可去重重试")
             return
         if parsed.path == "/api/ingest/mongo-commands":
@@ -1472,23 +1545,28 @@ class RequestHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._body_json()
                 result = audit_ingest.ingest(payload)
-                self._json({"ok": True, "data": result}, 202)
+                self._json({'ok': not bool(result.get('rejected')), 'data': result}, 207 if result.get('rejected') else 202)
             except (AuditIngestError, ValueError, TypeError) as exc:
                 self._error(400, getattr(exc, "code", "AUDIT_INVALID_PAYLOAD"), str(exc))
             except Exception as exc:
                 LOGGER.exception("Tabularis audit ingest failed")
-                self._error(503, getattr(exc, "code", "AUDIT_INGEST_FAILED"), str(exc))
+                self._error(503, 'AUDIT_INGEST_FAILED', '审计持久化失败；请按原事件ID重试')
             return
         if not self._valid_host() or not self._valid_origin():
-            self._error(403, "LOCAL_ORIGIN_REQUIRED", "仅允许本机同源请求")
+            self._error(403, "LOCAL_ORIGIN_REQUIRED", "请求 Host 或 Origin 不在允许列表")
             return
         try:
             payload = self._body_json()
+            LOGGER.warning('API_OPERATION path=%s peer=%s transport=trusted-network', parsed.path, self.client_address[0])
             if parsed.path == "/api/settings":
                 current = self.app.metadata.load_settings()
                 updated = parse_settings_payload(payload, current)
                 if current.auto_sync and not updated.auto_sync and payload.get("confirmDisableAutoSync") is not True:
                     raise PipelineError("关闭自动同步会无限期停止后续采集；请显式确认 confirmDisableAutoSync=true。临时维护请使用带 resumeAfterSeconds 的暂停接口", "AUTO_SYNC_DISABLE_CONFIRMATION_REQUIRED")
+                if (updated.db_instance_id, updated.region_id) != (current.db_instance_id, current.region_id):
+                    raise ValueError('运行中不允许切换实例或地域；请在受控配置发布后重启')
+                if updated.oss_auth_mode == 'ecs_ram_role' and any(payload.get(k) for k in ('accessKeyId', 'accessKeySecret', 'securityToken')):
+                    raise ValueError('ECS角色模式不接受长期凭据')
                 if payload.get("clearCredentials"):
                     delete_credential(current.credential_target)
                 access_id = str(payload.get("accessKeyId") or "").strip()
@@ -1677,16 +1755,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._error(400, "SCHEMA_DIFF_ERROR", str(exc))
         except SessionRequestError as exc:
             self._error(400, exc.code, str(exc))
-        except (ValueError, TypeError) as exc:
-            self._error(400, "INVALID_REQUEST", str(exc))
+        except ValueError as exc:
+            LOGGER.warning('Invalid POST path=%s', parsed.path, exc_info=True)
+            self._error(400, 'INVALID_REQUEST', str(exc))
         except Exception as exc:
-            code = getattr(exc, "code", "INTERNAL_ERROR")
-            status = 409 if code in {"JOB_ALREADY_RUNNING"} else 400
-            LOGGER.exception("POST request failed")
-            message = str(exc)
-            if getattr(exc, "request_id", ""):
-                message += f"；RequestId={exc.request_id}"
-            self._error(status, code, message)
+            code = getattr(exc, 'code', 'INTERNAL_ERROR')
+            status = 409 if code == 'JOB_ALREADY_RUNNING' else 500
+            LOGGER.exception('POST request failed')
+            self._error(status, code, str(exc) if status < 500 else '服务端处理失败，请查看服务端日志')
 
 
 def run_server(
@@ -1738,8 +1814,7 @@ def _run_server_owned(port: int, *, root: Path | None, host: str) -> None:
     try:
         httpd.serve_forever(poll_interval=0.25)
     finally:
-        application.queries.shutdown()
-        application.sync.shutdown()
+        application.stop()
         httpd.server_close()
         try:
             current = json.loads(runtime.read_text(encoding="utf-8"))

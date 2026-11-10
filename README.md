@@ -467,9 +467,11 @@ Compose 按需求将 `8769` 发布到服务器公网地址；必须继续在阿�
    并重建 `insight`。单纯启动 ClickHouse 或 ingester 不会改变生产查询路径。
 7. 执行 `docker compose up -d` 启动其余服务。所有容器共用有界、自动轮转的
    `local` 日志驱动和 4 MB 非阻塞缓冲，磁盘日志回压不会卡住健康探针。
-8. 打开 `http://192.0.2.10:8769/`。Compose 已绑定 `0.0.0.0`，并通过
-   `RDS_BINLOG_ALLOWED_HOSTS` 限定 Host；该管理界面没有登录认证，不应在
-   云安全组中对 `0.0.0.0/0` 开放。
+8. 1.39.2 起所有敏感 API 默认只允许回环 TCP 对端；`RDS_BINLOG_ALLOWED_HOSTS`
+   仍只是 Host 校验，不是身份认证。部署可在私有 `data/http-access.json` 的
+   `trustedNetworks` 显式登记隔离 worker 网络（不接受公网网段或默认路由）。
+   公网匿名 API 已关闭；公网登录和 HTTPS 入口需另外审定，没有该入口时使用
+   受控 SSH 转发，禁止把认证令牌直接发往公网 HTTP。该策略不改变云安全组或数据库权限。
 
 Linux 环境变量中的凭据优先级最高。GUI 保存的凭据原子写入数据卷
 `/data/.credentials`，目录和文件权限分别为 `0700`、`0600`；它是权限保护

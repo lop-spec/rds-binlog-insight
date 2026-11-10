@@ -1416,7 +1416,7 @@ class MetadataStore:
         return [
             event_id
             for event_id in event_ids
-            if rows.get(event_id, {}).get("state") == "archived"
+            if self.local_execution_event_detail(event_id) is not None
         ]
 
     TABULARIS_AUDIT_LOG_COLUMNS = (
@@ -1444,8 +1444,24 @@ class MetadataStore:
         "source_file_name",
     )
 
+    def pending_audit_events(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT event_id,source_file_id FROM tabularis_audit_events WHERE state <> 'archived' ORDER BY updated_at LIMIT ?", (limit,))]
+
+    def audit_delivery_status(self) -> dict[str, Any]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT state,count(*) AS n,max(accepted_at) AS latest FROM tabularis_audit_events GROUP BY state").fetchall()
+        counts = {row['state']: row['n'] for row in rows}
+        latest = max((row['latest'] or '' for row in rows), default='')
+        age = (datetime.now(UTC) - datetime.fromisoformat(latest.replace('Z', '+00:00'))).total_seconds() if latest else None
+        return {'status': 'never_received' if age is None else 'stale' if age > 86400 else 'ok',
+                'lastAcceptedUtc': latest, 'ageSeconds': age, 'states': counts,
+                'pendingArchive': sum(n for state, n in counts.items() if state != 'archived'),
+                'scope': 'workstation_execution_history_not_database_audit'}
+
     def record_tabularis_audit_log(self, events: list[dict[str, Any]]) -> int:
-        """把本地执行日志写进可查询副本（幂等，按 event_id 覆盖）。"""
+        """Append-only query index. A repeated identity can never rewrite history."""
 
         if not events:
             return 0
@@ -1472,8 +1488,8 @@ class MetadataStore:
         placeholders = ",".join("?" for _ in columns)
         with self._write_lock, self.connection() as conn:
             conn.executemany(
-                f"INSERT OR REPLACE INTO tabularis_audit_log("
-                f"{','.join(columns)}) VALUES({placeholders})",
+                f"INSERT INTO tabularis_audit_log("
+                f"{','.join(columns)}) VALUES({placeholders}) ON CONFLICT(event_id) DO NOTHING",
                 rows,
             )
         return len(rows)
@@ -1504,14 +1520,14 @@ class MetadataStore:
                 continue
             if key in {"instance", "status"}:
                 clauses.append(
-                    "(" + " OR ".join(f"lower({c}) = ?" for c in columns) + ")"
+                    "(" + " OR ".join(f"{c} = ?" for c in columns) + ")"
                 )
                 params.extend([value.lower()] * len(columns))
             else:
                 clauses.append(
-                    "(" + " OR ".join(f"lower({c}) LIKE ?" for c in columns) + ")"
+                    "(" + " OR ".join(f"lower({c}) LIKE ? ESCAPE '\\'" for c in columns) + ")"
                 )
-                params.extend(["%" + value.lower() + "%"] * len(columns))
+                params.extend(['%' + value.lower().replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'] * len(columns))
         operations = [
             str(value).strip().upper()
             for value in (query.get("operations") or [])
@@ -1534,7 +1550,7 @@ class MetadataStore:
                 term_clauses.append(
                     "("
                     + " OR ".join(
-                        f"lower({column}) LIKE ?"
+                        f"lower({column}) LIKE ? ESCAPE '\\'"
                         for column in (
                             "sql_text",
                             "connection_name",
@@ -1546,7 +1562,7 @@ class MetadataStore:
                     )
                     + ")"
                 )
-                params.extend(["%" + term.lower() + "%"] * 6)
+                params.extend(['%' + term.lower().replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'] * 6)
             clauses.append("(" + joiner.join(term_clauses) + ")")
         where = " AND ".join(clauses) if clauses else "1 = 1"
         columns = ",".join(self.TABULARIS_AUDIT_LOG_COLUMNS)

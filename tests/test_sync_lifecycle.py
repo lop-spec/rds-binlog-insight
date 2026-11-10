@@ -254,6 +254,7 @@ class ApiTests(unittest.TestCase):
         app = Mock()
         app.metadata.load_settings.return_value = Settings(db_instance_id='rm-fixture001')
         h.server = SimpleNamespace(application=app)
+        h.client_address = ('127.0.0.1', 0)
         h.path, h.headers = path, {}
         h._valid_host = h._valid_origin = Mock(return_value=True)
         h._body_json = Mock(return_value=payload)

@@ -486,15 +486,16 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
                    clients=top_counts(a['clients'], 5), client_count=len(a['clients']), clients_known=sum(a['clients'].values()),
                    accounts=top_counts(a['accounts'], 3), account_count=len(a['accounts']))
         valid = coverage and baseline_coverage and comparable_minutes
-        row['baseline_count'] = (b['count'] if b else 0) if baseline_coverage else None
-        row['count_delta'] = a['count'] - row['baseline_count'] if valid else None
-        row['new_slow_shape'] = valid and row['baseline_count'] == 0
+        row['baseline_count'] = b['count'] if baseline_coverage and b else None
+        row['count_delta'] = a['count'] - row['baseline_count'] if valid and b else None
+        row['new_slow_shape'] = False
+        row['baseline_shape_status'] = 'observed' if b else 'unobserved_not_zero'
         row['costs'] = {}
         for k in COSTS:
             known = a[k+'_known']
             before_known = b[k+'_known'] if b else 0
             value = a[k] if known else None
-            before_value = (b[k] if b else 0) if baseline_coverage and (not b or before_known) else None
+            before_value = b[k] if baseline_coverage and b and before_known else None
             complete_cost = known == a['count'] and (not b or before_known == b['count'])
             delta = value-before_value if value is not None and before_value is not None and valid and complete_cost else None
             row['costs'][k] = dict(observed=value, known=known, total=a['count'], baseline=before_value, delta=delta,

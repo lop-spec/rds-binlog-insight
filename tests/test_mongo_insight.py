@@ -158,7 +158,11 @@ class MongoGates(unittest.TestCase):
         before={**old,'start_us':T-10*MINUTE,'finish_us':T-10*MINUTE+65_000_000}
         metrics=[dict(timestamp=(T+i*MINUTE)//1000,role='Primary',metric='CPUUtilization',value=90 if i==2 else 10) for i in range(1,11)]
         result=analyze(rollup_events([old,fast]),rollup_events([before]),metrics,T,T+10*MINUTE,coverage=True,baseline_coverage=True,limit=1)
-        self.assertNotEqual(result['statements'][0]['group_id'],old['group_id'])
+        for row in result['statements']:
+            if row['group_id'] == fast['group_id']:
+                self.assertIsNone(row['count_delta'])
+                self.assertFalse(row['new_slow_shape'])
+        self.assertTrue(result['outliers'])
         self.assertEqual(result['outliers'][0]['max_us'],65_000_000)
         self.assertTrue(result['outliers'][0]['evidence']['sample_after_resource_peak'])
 

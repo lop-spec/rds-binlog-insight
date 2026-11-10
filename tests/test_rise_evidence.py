@@ -84,7 +84,8 @@ class CounterTests(unittest.TestCase):
                            {"Cluster_ComInsert": 4000, "Cluster_ThreadsRunning": 11, "Cluster_ComSelect": 480},
                            fail={"Cluster_ComReplace"})
         found = load_counters(load, None, "i", "", self.START, self.END)
-        self.assertEqual(found["status"], "ok")
+        self.assertEqual(found['status'], 'partial')
+        self.assertTrue(found['failed_metrics'])
         node = found["nodes"]["n1"]
         self.assertEqual(node["com_insert"], (13000, 4000))
         self.assertEqual(node["threads"], (20, 11))
@@ -136,7 +137,8 @@ class NodeEvidenceTests(unittest.TestCase):
 
     def test_the_explained_share_is_capped(self):
         block = node_evidence({"threads": (12.0, 10.0)}, 3600_000_000, 10 * MIN, [])
-        self.assertEqual(block["explained_ratio"], 1.0)
+        self.assertEqual(block['explained_ratio'], 3.0)
+        self.assertTrue(block['scope_mismatch'])
 
     def test_without_counters_unavailable(self):
         self.assertEqual(node_evidence(None, 0, MIN, []), {"status": "unavailable"})

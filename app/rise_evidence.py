@@ -45,7 +45,10 @@ def sql_template(normalized_sql: str) -> str:
     head = _INSERT_HEAD.match(text)
     if head:
         text = head.group(1)
-    return _SHARD.sub(r"\1_#", text)
+    # Only syntactic table positions are eligible. col_1/col_2 and literals
+    # must never be merged just because their suffix looks like a shard id.
+    return re.sub(r'(\b(?:FROM|JOIN|UPDATE|INTO)\s+(?:`?[A-Za-z_][\w$]*`?\.)?`?)([A-Za-z_][\w$]*?)_\d+(`?)(?=\s|\(|$)',
+                  lambda m: m.group(1) + m.group(2) + '_#' + m.group(3), text, flags=re.I)
 
 
 def assign_template_families(events: list[dict[str, Any]], profiles: Callable[[set[str]], dict[str, dict[str, Any]]],
@@ -155,7 +158,7 @@ def load_counters(loader: Callable[..., list[dict[str, Any]]], settings: Any, in
             nodes.setdefault(node_id, {})[key] = (now.get(node_id), before.get(node_id))
     if not nodes:
         return {"status": "unavailable", "nodes": {}}
-    return {"status": "ok", "nodes": nodes}
+    return {"status": "partial" if failed else "ok", "failed_metrics": failed, "nodes": nodes}
 
 
 def _change(now: float | None, before: float | None) -> dict[str, Any]:
@@ -182,7 +185,7 @@ def node_evidence(counters: dict[str, tuple[float | None, float | None]] | None,
     added = max(int(slowlog_added_us), 0) / window_us if window_us > 0 else 0.0
     explained = None
     if threads and threads["delta"] is not None and threads["delta"] >= MIN_THREADS_DELTA:
-        explained = min(added / threads["delta"], 1.0)
+        explained = added / threads['delta']
     # The statement type that grew most (by its own share of growth, at least 20% and +50 per second).
     grown = [item for item in items if item["operation"] and item["delta"] is not None and item["ratio"] is not None
              and item["ratio"] >= 0.2 and item["delta"] >= 50]
@@ -195,5 +198,6 @@ def node_evidence(counters: dict[str, tuple[float | None, float | None]] | None,
         related = [row["fingerprint"] for row in same[:3]
                    if int(row.get("executions") or 0) > int(row.get("baseline_executions") or 0)]
     return {"status": "ok", "items": items, "threads": threads, "slowlog_added_concurrency": added,
-            "explained_ratio": explained, "low_explained": explained is not None and explained < LOW_EXPLAINED,
+            "explained_ratio": explained, "scope_mismatch": explained is not None and explained > 1,
+            "low_explained": explained is not None and explained < LOW_EXPLAINED,
             "lead": lead, "related_families": related}

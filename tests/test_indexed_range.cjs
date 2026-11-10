@@ -17,7 +17,7 @@ function uiFixture() {
     return nodes.get(key);
   }};
   const requests = [];
-  const ctx = vm.createContext({ document, console, URLSearchParams, Date, indexedQuickRange, indexedCustomRange, rowsQuickRange, gapsWithin,
+  const ctx = vm.createContext({ document, console, URLSearchParams, AbortSignal, Date, indexedQuickRange, indexedCustomRange, rowsQuickRange, gapsWithin,
     fetch(url, options) { return new Promise(resolve => requests.push({ url, options, resolve: data => resolve({ok: true, json: async () => ({ok: true, data})}) })); }
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/app.js'), 'utf8'), ctx);

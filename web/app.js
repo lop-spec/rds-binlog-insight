@@ -101,12 +101,13 @@ async function api(path, options = {}) {
     cache: "no-store",
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
+    signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(120000)]) : AbortSignal.timeout(120000),
   });
   let payload;
   try {
     payload = await response.json();
   } catch {
-    throw new Error(`本地服务返回了无效响应（HTTP ${response.status}）`);
+    throw new Error(`服务返回了无效响应（HTTP ${response.status}）`);
   }
   if (!response.ok || payload.ok === false) {
     const error = new Error(payload?.error?.message || `请求失败（HTTP ${response.status}）`);
@@ -2506,8 +2507,8 @@ async function bootstrap() {
   await Promise.allSettled([refreshStatus(), refreshSettings()]);
   setQuickRange("24h");
   await refreshQueryTasks();
-  state.statusTimer = window.setInterval(refreshStatus, 3000);
-  state.queryTaskTimer = window.setInterval(refreshQueryTasks, 1200);
+  state.statusTimer = window.setInterval(() => { if (!document.hidden) refreshStatus(); }, 3000);
+  state.queryTaskTimer = window.setInterval(() => { if (!document.hidden) refreshQueryTasks(); }, 1200);
 }
 
 document.addEventListener("DOMContentLoaded", bootstrap);

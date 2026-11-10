@@ -89,6 +89,7 @@ const rise = fs.readFileSync(path.join(root, 'web/rise.js'), 'utf8');
 function rdsContext(api, {slowlog = true, binlog = false, start = '2026-09-28T10:00', end = '2026-09-28T12:00'} = {}) {
   const nodes = {};
   const node = (selector) => (nodes[selector] ??= {innerHTML: '', textContent: '', hidden: false, value: '', className: '',
+    insertAdjacentHTML(position, html) { assert.equal(position, 'afterbegin'); this.innerHTML = html + this.innerHTML; },
     classList: {toggle() {}}, getAttribute: () => 'false', setAttribute() {}, options: [],
     selectedOptions: [{textContent: selector === '#analytics-source' ? 'RDS' : '全部实例'}]});
   const c = vm.createContext({console, URLSearchParams, Date, Promise, Number, Object, Math, JSON, Infinity, String,
@@ -413,7 +414,7 @@ test('replication lag without any statement still shows the origin; a primary-on
 test('unavailable impact analysis says why instead of an empty table', async () => {
   const {c, nodes, toasts} = rdsContext(async () => ({status: 'overlapping_baseline', nodes: []}));
   await vm.runInContext('runAnalytics()', c);
-  assert.match(nodes['#analytics-panel-rise'].innerHTML, /24 小时以内/);
+  assert.match(nodes['#analytics-panel-rise'].innerHTML, /窗口与昨日基线重叠，请缩短窗口/);
   assert.ok(toasts.some(([kind, m]) => kind === 'error' && /无法排查/.test(m)));
   const none = rdsContext(async () => impactResult);
   none.nodes['#analytics-instance'].value = '';
@@ -486,7 +487,7 @@ test('an indexed window is neither moved nor announced; a missing index names th
   assert.equal(nodes['#analytics-start'].value, '2026-09-28T10:00');
   const none = rdsContext(async () => ({status: 'incomplete_index', nodes: []}));
   await vm.runInContext('runAnalytics()', none.c);
-  assert.match(none.nodes['#analytics-panel-rise'].innerHTML, /前后 6 小时内没有索引完整/);
+  assert.match(none.nodes['#analytics-panel-rise'].innerHTML, /所选时段索引不完整；未改查其他时段/);
 });
 
 test('both sources ticked: one impact request and one Binlog request; the Binlog pages fill at once from that response', async () => {
@@ -678,7 +679,7 @@ test('an unservable window says why the ClickHouse slow-log lane is behind (10-2
   // without an ingest note the plain reason stays
   const plain = rdsContext(async () => ({status: 'incomplete_index', nodes: []}));
   await vm.runInContext('runAnalytics()', plain.c);
-  assert.match(plain.nodes['#analytics-panel-rise'].innerHTML, /前后 6 小时内没有索引完整的同长度时段<\/p>/);
+  assert.match(plain.nodes['#analytics-panel-rise'].innerHTML, /所选时段索引不完整；未改查其他时段<\/p>/);
 });
 
 // ---- 10-21: the slow log saw a sliver of the rise; the page says so, names the statement type and marks merged shard IDs ----

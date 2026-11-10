@@ -76,7 +76,7 @@ class TailEvent:
 
     __slots__ = ("event_id", "start_us", "instance_id", "node_id", "database_name", "table_name", "operation", "fingerprint",
                  "sql_id", "duration_ms", "rows_examined", "rows_sent", "lock_time_ms", "account", "client_ip", "thread_id",
-                 "sql_text")
+                 "sql_text", "sql_truncated")
 
     def __init__(self, event: dict[str, Any], extra: dict[str, Any], instance_id: str) -> None:
         profile = extra.get("statement_profile") or {}
@@ -96,12 +96,13 @@ class TailEvent:
         self.account = sys.intern(str(event.get("database_account") or ""))
         self.client_ip = sys.intern(str(event.get("connection_name") or ""))
         self.thread_id = _count(event.get("thread_id"))
+        self.sql_truncated = len(str(event.get('sql_text') or '')) > SQL_KEEP_CHARS
         self.sql_text = str(event.get("sql_text") or "")[:SQL_KEEP_CHARS]
 
     def analysis_row(self) -> dict[str, Any]:
         """The shape ``read_events`` of the rise analysis returns for a ClickHouse row (a zero cost is 'not reported')."""
         return {"event_id": self.event_id, "start_us": self.start_us, "node_id": self.node_id,
-                "database_name": self.database_name, "fingerprint": self.fingerprint, "sql_id": self.sql_id,
+                "database_name": self.database_name, "operation": self.operation, "fingerprint": self.fingerprint, "sql_id": self.sql_id,
                 "duration_ms": self.duration_ms, "rows_examined": self.rows_examined or None,
                 "lock_time_ms": self.lock_time_ms or None, "account": self.account}
 
@@ -117,7 +118,7 @@ class TailEvent:
             "server_id": 0, "thread_id": self.thread_id, "start_position": 0, "end_position": 0, "row_index": 0,
             "execution_time_ms": self.duration_ms, "query_time_ms": self.duration_ms, "error_code": 0, "row_query": "",
             "raw_event_type": "SLOW_LOG", "connection_id": "", "connection_name": self.client_ip, "client_ip": self.client_ip,
-            "database_account": self.account, "execution_status": "success", "error_message": "",
+            "database_account": self.account, "execution_status": "unknown", "sql_truncated": self.sql_truncated, "error_message": "",
             "affected_rows": self.rows_sent, "started_epoch_us": self.start_us,
             "finished_epoch_us": self.start_us + self.duration_ms * 1000, "batch_id": "", "statement_index": -1,
             "transaction_context_id": "", "locator": "", "rows_examined": self.rows_examined, "rows_sent": self.rows_sent,
@@ -211,7 +212,8 @@ class NodeTail:
                         if node:
                             record["NodeId"] = node
                         records.append(record)
-                if len(items) < PAGE_SIZE or len(records) >= int(data.get("TotalRecords") or 0):
+                total = int(data.get('TotalRecords') or 0)
+                if len(items) < PAGE_SIZE or (total > 0 and len(records) >= total):
                     return records, page, False
                 page += 1
         except Exception:

@@ -220,6 +220,7 @@ class SettingsDownloadProbeTests(unittest.TestCase):
         application = Mock()
         application.metadata.load_settings.return_value = settings()
         handler.server = SimpleNamespace(application=application)
+        handler.client_address = ('127.0.0.1', 0)
         handler.path = "/api/settings/test"
         handler._valid_host = Mock(return_value=True)
         handler._valid_origin = Mock(return_value=True)
@@ -249,7 +250,8 @@ class SettingsDownloadProbeTests(unittest.TestCase):
             handler.do_POST()
         handler._json.assert_not_called()
         self.assertEqual(handler._error.call_args.args[1], "BINLOG_DOWNLOAD_FORBIDDEN")
-        self.assertIn("fixture-request", handler._error.call_args.args[2])
+        self.assertEqual(handler._error.call_args.args[0], 500)
+        self.assertNotIn('fixture-request', handler._error.call_args.args[2])
         handler.app.sync.archive_for_settings.assert_not_called()
 
     def test_no_completed_binlog_is_unverified_not_success(self):

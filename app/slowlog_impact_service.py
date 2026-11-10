@@ -277,6 +277,8 @@ def _add_peer_health(nodes: list[dict[str, Any]], replicas: list[str], settings:
                                                [other for other in replicas if other != node["node_id"]])
     except Exception:  # noqa: BLE001 - evidence next to the lag card, never a reason to fail the analysis
         LOGGER.warning("slowlog_resource_query peer health unavailable: instance=%s", instance, exc_info=True)
+        for node in lagging:
+            node['lag_origin']['peer_health'] = {'status': 'unavailable', 'reason': 'peer_load_failed'}
 
 
 def _add_write_hotspots(nodes: list[dict[str, Any]], instance: str,
@@ -297,7 +299,7 @@ def _add_write_hotspots(nodes: list[dict[str, Any]], instance: str,
             if window not in found:
                 if len(found) >= MAX_WRITE_LOOKUPS:
                     LOGGER.warning("slowlog_resource_query write hotspots skipped for later episodes: instance=%s limit=%d", instance, MAX_WRITE_LOOKUPS)
-                    found[window] = None
+                    found[window] = {'status': 'unavailable', 'reason': 'lookup_limit_exceeded'}
                 else:
                     try:
                         found[window] = writes_lookup(instance, *window)
@@ -338,7 +340,7 @@ def tail_plan(metadata: Any, backend: Any, instance: str, start_us: int, end_us:
         return None
     pending = len(coverage.get("missing_parts") or [])
     return {"end_us": cut, "covered_from_us": covered_from, "newest_us": int(view["newest_us"]), "pending_parts": pending,
-            "coverage": {**coverage, "complete": True, "tail_parts": pending}, "baseline_coverage": baseline}
+            "coverage": {**coverage, "tail_parts": pending, "source_complete": False}, "baseline_coverage": baseline}
 
 
 def _merge_template_families(events: list[dict[str, Any]], backend: Any, instance: str, tail: Any,
@@ -359,7 +361,7 @@ def _merge_template_families(events: list[dict[str, Any]], backend: Any, instanc
         LOGGER.warning("slowlog_resource_query template families unavailable: instance=%s", instance, exc_info=True)
         for event in events:
             event.pop("family", None)
-        return {}
+        return {'_failed': 1}
 
 
 def _add_node_evidence(result: dict[str, Any], events: list[dict[str, Any]], settings: Any, instance: str, node: str,
@@ -379,12 +381,14 @@ def _add_node_evidence(result: dict[str, Any], events: list[dict[str, Any]], set
         counters = {"status": "unavailable", "nodes": {}}
     for entry in nodes:
         rows = entry.get("statements") or []
-        added = sum(max(int(row.get("runtime_delta_us") or 0), 0) for row in rows)
+        added = sum(int(row.get('runtime_delta_us') or 0) for row in rows)
         families = [{"fingerprint": row["fingerprint"],
                      "action": operation.get((entry["node_id"], row["fingerprint"]), ""),
                      "executions": (row.get("attribution") or {}).get("current_count", 0),
                      "baseline_executions": (row.get("attribution") or {}).get("baseline_count", 0)} for row in rows]
-        entry["evidence"] = node_evidence(counters["nodes"].get(entry["node_id"]), added, end_us - start_us, families)
+        entry["evidence"] = node_evidence(counters.get('nodes', {}).get(entry['node_id']), added, end_us - start_us, families)
+        entry['evidence']['counter_status'] = counters.get('status', 'unavailable')
+        entry['evidence']['failed_metrics'] = counters.get('failed_metrics', [])
 
 
 def _binlog_window(lookup: Callable[[str, int, int], dict[str, Any] | None], instance: str, start_us: int,
@@ -466,7 +470,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             coverage, baseline_coverage, end_us = tail_used["coverage"], tail_used["baseline_coverage"], tail_used["end_us"]
             if end_us < requested_end:
                 adjusted = adjusted_payload("truncated", "source_delay", start_us, requested_end, start_us, end_us)
-    if not usable(coverage) or (baseline_coverage is not None and not usable(baseline_coverage)):
+    if (not usable(coverage) and tail_used is None) or (baseline_coverage is not None and not usable(baseline_coverage)):
         reason = "incomplete_index" if not usable(coverage) else "incomplete_baseline_index"
         requested = (start_us, end_us)
         # A window that ends close to now usually misses only its tail (the newest parts are still being indexed): keep the
@@ -481,17 +485,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                                reason, adjusted["truncated_us"] // PERIOD_US, instance)
                 end_us = cut
         if adjusted is None:
-            shifted = nearest_indexed_window(metadata, backend, instance, start_us, end_us, settings.retention_days)
-            if shifted is None:
-                return unavailable(reason)
-            coverage, baseline_coverage = index_state(*shifted)
-            if not usable(coverage) or not usable(baseline_coverage):
-                LOGGER.warning("slowlog_resource_query window shift not confirmed by the manifest: %s", reason)
-                return unavailable(reason)
-            adjusted = adjusted_payload("shifted", reason, *requested, *shifted)
-            LOGGER.warning("slowlog_resource_query window shifted: reason=%s shift_min=%s instance=%s",
-                           reason, adjusted["shift_us"] // PERIOD_US, instance)
-            start_us, end_us = shifted
+            return {**unavailable(reason), 'start_us': start_us, 'end_us': end_us,
+                    'coverage': coverage, 'baseline_coverage': baseline_coverage,
+                    'window_policy': 'never_shift_incident_window'}
     def read_events(start: int, end: int) -> list[dict[str, Any]]:
         scope, parameters = backend._scope_sql(query, start, end)
         return backend._rows("SELECT scope_event_id AS event_id, "
@@ -503,6 +499,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                              "nullIf(metric_lock_time_ms,0) AS lock_time_ms, "
                              "metric_database_account AS account FROM (" + scope + ") "
                              f"LIMIT {MAX_EVENTS + 1}", parameters, None)
+    if baseline_coverage is None:
+        return unavailable('baseline_outside_retention')
     rows = read_events(start_us, end_us)
     if tail_used is not None:
         known = {row["event_id"] for row in rows}
@@ -552,7 +550,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         if unknown:
             LOGGER.warning('slowlog_cost_provenance incomplete: %s records contain legacy zero or absent costs; not treating as measured zero',unknown)
         result = rank_performance_growth(ranked_rows, ranked_baseline, points, start_us=start_us, end_us=end_us,
-                                         index_complete=True, baseline_complete=True, baseline_points=baseline_points,
+                                         index_complete=bool(coverage.get('complete') or tail_used is not None), baseline_complete=bool(baseline_coverage.get('complete')), baseline_points=baseline_points,
                                          score_points=score_points)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):
         LOGGER.exception("slowlog_resource_query metric or input validation failed")
@@ -623,7 +621,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             # Preserve exact sufficient statistics across JavaScript's 53-bit boundary.
             row["score_numerator"] = str(row["score_numerator"])
     if lag_mode:
-        peaks = {node: max((value for stamp, value in _lag_series(points, node) if start_us <= stamp <= end_us), default=0.0)
+        peaks = {node: max((value for stamp, value in _lag_series(points, node) if start_us < stamp <= end_us), default=0.0)
                  for node in replicas}
         own = defaultdict(list)
         for event in rows:
@@ -641,6 +639,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     ready = ready_through(metadata, backend, instance, end_us, time.time_ns() // 1000)
     if tail_used is not None:
         ready = max(ready or 0, tail_used["newest_us"])
+    if tail_used is not None and not coverage.get('complete'):
+        result['status'] = 'partial'
+        result['partial_reason'] = 'live_tail_not_complete_source'
     result.update(instance_id=instance, start_us=start_us, end_us=end_us,
                   ready_through_us=ready,
                   tail=None if tail_used is None else {"from_us": max(start_us, tail_used["covered_from_us"]), "through_us": end_us,
@@ -649,5 +650,9 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                   coverage=coverage, baseline_coverage=baseline_coverage, adjusted=adjusted,
                   executions=len(rows), baseline_executions=len(baseline), metric=metric_name,
                   metric_id=metric_id, metric_label=metric_label,
-                  calculation_scope="Independent read-only snapshot; all fingerprints ranked before Top 10")
+                  calculation_scope=f'Independent read-only snapshot; all fingerprints ranked before Top {top}',
+                  count_scope='collected_slow_records_not_total_executions',
+                  source_complete=False, conclusion_grade='时间相关候选',
+                  provisional=end_us > time.time_ns() // 1000 - 20 * PERIOD_US,
+                  template_grouping_complete=not bool(merged.get('_failed')))
     return result

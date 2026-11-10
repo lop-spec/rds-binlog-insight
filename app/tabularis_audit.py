@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import hmac
 import os
+import json
+import logging
+import threading
+from .audit_redaction import redact_secrets
+
+LOGGER = logging.getLogger(__name__)
 from datetime import UTC, datetime
 from typing import Any
 
@@ -79,6 +85,41 @@ class TabularisAuditIngest:
         else:
             configured = {str(item).strip() for item in allowed_instances if str(item).strip()}
         self.allowed_instances = frozenset(configured)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = None
+
+    def start(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._archive_loop, name='audit-archive', daemon=True)
+            self._thread.start()
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self._wake.set()
+
+    def status(self) -> dict[str, Any]:
+        return self.metadata.audit_delivery_status()
+
+    def _archive_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                for record in self.metadata.pending_audit_events(limit=20):
+                    if self._stop.is_set():
+                        break
+                    event = self.metadata.local_execution_event_detail(record['event_id'])
+                    if event is None:
+                        continue
+                    source_id = record['source_file_id']
+                    if not self.metadata.parts_for_file(source_id):
+                        self._store_new_event(event, source_id)
+                    self.metadata.set_tabularis_audit_state([record['event_id']], 'stored')
+                    self._archive_pending(record['event_id'], source_id)
+            except Exception:
+                LOGGER.exception('Audit background archive failed; durable index remains retryable')
+            self._wake.wait(30)
+            self._wake.clear()
 
     @staticmethod
     def _validate_prefix(value: str) -> str:
@@ -122,7 +163,7 @@ class TabularisAuditIngest:
             raise AuditIngestError("Audit event time range is invalid")
         execution_time_ms = max(int(value.get("execution_time_ms") or 0), 0)
         operation = self._text(value, "operation", 32).strip().upper() or "OTHER"
-        sql_text = self._text(value, "sql_text", _MAX_SQL_LENGTH)
+        sql_text, _ = redact_secrets(self._text(value, "sql_text", _MAX_SQL_LENGTH))
         return {
             "event_id": event_id,
             "event_epoch_us": finished_epoch_us,
@@ -132,14 +173,14 @@ class TabularisAuditIngest:
             "table_name": self._text(value, "table_name", 256),
             "transaction_id": self._text(value, "transaction_context_id", 256),
             "execution_time_ms": execution_time_ms,
-            "error_code": 1 if status == "failed" else 0,
+            "error_code": int(value.get('error_code') or (1 if status == 'failed' else 0)),
             "sql_kind": self._text(value, "sql_kind", 32) or operation,
             "sql_text": sql_text,
             "connection_id": self._text(value, "connection_id", 256),
             "connection_name": self._text(value, "connection_name", 256),
             "database_account": self._text(value, "database_account", 256),
             "execution_status": status,
-            "error_message": self._text(value, "error_message", _MAX_TEXT_LENGTH),
+            "error_message": redact_secrets(self._text(value, "error_message", _MAX_TEXT_LENGTH))[0],
             "affected_rows": max(int(value.get("affected_rows") or 0), 0),
             "started_epoch_us": started_epoch_us,
             "finished_epoch_us": finished_epoch_us,
@@ -222,60 +263,37 @@ class TabularisAuditIngest:
             raise AuditIngestError("events must be a non-empty array")
         if len(events_value) > _MAX_EVENTS:
             raise AuditIngestError("Too many audit events")
-        events = [self._validate_event(value) for value in events_value]
-        identities = [
-            (str(event["event_id"]), self._source(event)[2])
-            for event in events
-        ]
-        claimed, duplicates = self.metadata.claim_tabularis_audit_events(identities)
-        claimed_set = set(claimed)
-        by_id = {str(event["event_id"]): event for event in events}
-        rows = self.metadata.tabularis_audit_rows(
-            list(dict.fromkeys(event_id for event_id, _ in identities))
-        )
-        # 查询走这张带索引的表，Parquet 与 OSS 只作存档（见 metadata 里
-        # tabularis_audit_log 的建表注释）。这里对新旧事件一律 upsert：重投已
-        # 归档的事件不会重写 Parquet，但能把索引行补齐，这也是历史数据的回填
-        # 路径——归档后的 Parquet 本地文件会被冷数据下沉清理，读不回来。
-        self.metadata.record_tabularis_audit_log(
-            [
-                dict(
-                    event,
-                    source_file_name=f"tabularis-audit-{event['event_id']}.ndjson",
-                )
-                for event in events
-            ]
-        )
-        acknowledged: list[str] = []
-        for event_id, source_file_id in dict.fromkeys(identities):
+        events, rejected = [], []
+        for index, value in enumerate(events_value):
             try:
-                state = str(rows.get(event_id, {}).get("state") or "")
-                if event_id in claimed_set:
-                    self._store_new_event(by_id[event_id], source_file_id)
-                    self.metadata.set_tabularis_audit_state([event_id], "stored")
-                    state = "stored"
-                if state in {"accepted", "failed"}:
-                    parts = self.metadata.parts_for_file(source_file_id)
-                    if not parts:
-                        self._store_new_event(by_id[event_id], source_file_id)
-                    self.metadata.set_tabularis_audit_state([event_id], "stored")
-                    state = "stored"
-                if state == "archived" or (
-                    state == "stored" and self._archive_pending(event_id, source_file_id)
-                ):
-                    acknowledged.append(event_id)
-            except Exception as exc:  # keep the event retryable and unacknowledged
-                self.metadata.set_tabularis_audit_state(
-                    [event_id],
-                    "failed",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-        return {
-            "accepted": len(claimed),
-            "duplicates": duplicates,
-            "acknowledged": len(acknowledged) == len(set(event_id for event_id, _ in identities)),
-            "acknowledged_event_ids": acknowledged,
-        }
+                events.append(self._validate_event(value))
+            except (AuditIngestError, ValueError, TypeError, OverflowError) as exc:
+                rejected.append({'index': index, 'event_id': str(value.get('event_id') or '')[:256] if isinstance(value, dict) else '',
+                                 'code': getattr(exc, 'code', 'AUDIT_INVALID_PAYLOAD')})
+        acknowledged, accepted, duplicates = [], 0, 0
+        # Record and conflict-check under one ingest lock. The DB itself also
+        # enforces INSERT-only semantics, including backfill callers.
+        with self._lock:
+            for event in events:
+                event_id = event['event_id']
+                existing = self.metadata.local_execution_event_detail(event_id)
+                if existing is not None and any(existing.get(key) != event.get(key) for key in self.metadata.TABULARIS_AUDIT_LOG_COLUMNS if key != 'source_file_name'):
+                    rejected.append({'event_id': event_id, 'code': 'AUDIT_ID_CONFLICT'})
+                    LOGGER.warning('Audit immutable identity conflict')
+                    continue
+                if existing is None:
+                    event['source_file_name'] = f'tabularis-audit-{event_id}.ndjson'
+                    self.metadata.record_tabularis_audit_log([event])
+                    accepted += 1
+                else:
+                    duplicates += 1
+                self.metadata.claim_tabularis_audit_events([(event_id, self._source(event)[2])])
+                acknowledged.append(event_id)
+        self._wake.set()
+        return {'accepted': accepted, 'duplicates': duplicates,
+                'acknowledged': not rejected, 'acknowledged_event_ids': list(dict.fromkeys(acknowledged)),
+                'rejected': rejected, 'acknowledgement_scope': 'durable_local_index',
+                'archive_async': True}
 
     def acknowledged(self, event_ids: list[str]) -> list[str]:
         normalized = [str(value) for value in event_ids if str(value)]

@@ -120,8 +120,10 @@ class DasRpcClient(RdsRpcClient):
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RuntimeError(f"DAS 网络错误：{exc}") from exc
         result = json.loads(body.decode("utf-8"))
-        if str(result.get("Success", "true")).lower() == "false":
-            raise RuntimeError(f"DAS 调用失败：{result.get('Message')}")
+        # CMS also subclasses this client and uses Code=200, while DAS
+        # explicitly returns Success=true. Missing fields never mean success.
+        if not isinstance(result, dict) or not (str(result.get('Success', '')).lower() == 'true' or str(result.get('Code', '')) in {'200', 'Success'}):
+            raise RuntimeError(f"DAS 调用失败：{result.get('Code')} {result.get('Message')} RequestId={result.get('RequestId')}")
         return result
 
 
@@ -648,7 +650,7 @@ class SlowLogCollector:
             page_events, _observed = self._build_event_batch(records, observed_ids)
             events.extend(page_events)
             total = int(data.get("TotalRecords") or 0)
-            if len(items) < _API_PAGE_SIZE or record_count >= total:
+            if len(items) < _API_PAGE_SIZE or (total > 0 and record_count >= total):
                 break
             page += 1
 
@@ -681,6 +683,9 @@ class SlowLogCollector:
         else:
             self._set_status(lastBatchRows=0)
         self._seen_ids = observed_ids
+        self._set_status(lastWindowTruncated=truncated, lastWindowPages=page,
+                         replayCoverage='partial_page_limit' if truncated else 'bounded_replay_not_source_complete',
+                         replayOldestEpochUs=oldest_us)
         # The answer is newest first. When the page cap cut it, the oldest records are the ones missing: if the oldest one read
         # is not later than the old watermark, everything the watermark was waiting for was read and only the replay was cut.
         reached_old_watermark = not truncated or (0 < oldest_us <= int(forward_start * 1_000_000))

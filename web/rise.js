@@ -16,8 +16,17 @@ const RISE_METRICS = [
 ];
 
 const RISE_STATUS = {
-  incomplete_index: "所选时段及前后 6 小时内没有索引完整的同长度时段",
-  incomplete_baseline_index: "所选时段的昨日对照日索引不完整，前后 6 小时内也没有可用的时段",
+  incomplete_index: "所选时段索引不完整；未改查其他时段",
+  incomplete_baseline_index: "昨日对照索引不完整；未改查其他时段",
+  clickhouse_backend_required: "需要已配置的慢日志存储",
+  single_instance_required: "请选择单个实例",
+  invalid_window: "时间窗无效或超过保留期",
+  overlapping_baseline: "窗口与昨日基线重叠，请缩短窗口",
+  event_limit_exceeded: "当前慢记录超出分析上限，请缩短窗口",
+  baseline_event_limit_exceeded: "昨日慢记录超出上限，请缩短窗口",
+  baseline_outside_retention: "昨日对照超出保留期，不能判断增长",
+  invalid_metric_value: "指标含无效点，未强行计算",
+  conflicting_metric_samples: "同一分钟指标冲突，未强行合并",
   unsupported_metric: "不支持该指标",
   no_collected_executions: "该窗口没有采集到慢 SQL 执行记录",
   metric_or_input_unavailable: "云监控指标或输入校验失败，未计算（详见服务日志）",
@@ -28,6 +37,8 @@ const RISE_STATUS = {
 
 const RISE_CORRELATION_REASON = {
   insufficient_buckets: "分钟数不足",
+  constant_sql: "该 SQL 每分钟耗时恒定，无法计算",
+  constant_total: "指标在窗口内恒定，无法计算",
   constant_x: "该 SQL 每分钟耗时恒定，无法计算",
   constant_y: "指标在窗口内恒定，无法计算",
   constant_series: "序列恒定，无法计算",
@@ -283,7 +294,7 @@ function riseNodeBody(data, node) {
   const covered = shown > 0 ? `，合计占本节点增长份额 ${riseNumber(shown * 100, 0)}%` : "";
   return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${origin}${lag ? "" : riseEvidence(node)}${note}${stallNote}${slowerNote}
     <div class="table-wrap"><table class="data-table analytics-table rise-table">
-      <thead><tr><th>#</th><th>${lag ? "SQL（主库执行，按增长份额排序）" : "SQL（按增长份额排序）"}</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>执行次数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
+      <thead><tr><th>#</th><th>${lag ? "SQL（主库执行，按增长份额排序）" : "SQL（按增长份额排序）"}</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>慢记录数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
       <tbody>${rows.map((row, index) => riseStatement(node, row, index + 1)).join("")}</tbody>
     </table></div>
     <p class="analytics-note">共 ${humanCount(node.total_fingerprints)} 个 SQL 家族，显示前 ${humanCount(rows.length)} 个${covered}。灰显行的耗时和扫描都没有比昨日同窗增加。</p>`;
@@ -580,9 +591,11 @@ function normalizeAnalyticsWindow(forRise) {
 
 /* ---------------------------- 两类证据 ---------------------------- */
 
-async function runRiseSlowlog() {
+let riseRequestGeneration = 0;
+async function runRiseSlowlog(generation = ++riseRequestGeneration) {
   const requested = riseQueryString();
   const data = await api(`/api/slowlog-impact?${requested}`);
+  if (generation !== riseRequestGeneration) return null;
   const query = applyRiseAdjustment(data, requested);
   state.rise = { data, query };
   renderRise(data);
@@ -618,9 +631,10 @@ function binlogNotice(result) {
   return html;
 }
 
-async function runBinlogWrites() {
+async function runBinlogWrites(generation = ++riseRequestGeneration) {
   const query = analyticsQueryString("", "binlog");
   const result = await api(`/api/analytics?${query}`);
+  if (generation !== riseRequestGeneration) return null;
   state.analyticsRuns.binlog = { query, result };
   renderAnalytics(result);
   return result;
@@ -637,9 +651,11 @@ async function runRise() {
   state.analyticsRuns = {}; // 明细视图按新的窗口重新加载
   state.analyticsRunsQuery = "";
   const jobs = [];
-  if (useSlowlog) jobs.push(["slowlog", runRiseSlowlog()]);
-  if (useBinlog) jobs.push(["binlog", runBinlogWrites()]);
+  const generation = ++riseRequestGeneration;
+  if (useSlowlog) jobs.push(["slowlog", runRiseSlowlog(generation)]);
+  if (useBinlog) jobs.push(["binlog", runBinlogWrites(generation)]);
   const settled = await Promise.allSettled(jobs.map(([, job]) => job));
+  if (generation !== riseRequestGeneration) return;
   const failures = settled.map((outcome, index) => (outcome.status === "rejected" ? [jobs[index][0], outcome.reason] : null)).filter(Boolean);
   if (failures.length === jobs.length) throw failures[0][1]; // 勾选的来源都失败，交给提交处理器弹错
   for (const [kind, error] of failures) {
@@ -656,7 +672,7 @@ async function runRise() {
   }
   if (binlog) {
     // Binlog 页签顶部：窗口调整与入库水位。
-    $("#analytics-panel-writes").innerHTML = binlogNotice(binlog) + $("#analytics-panel-writes").innerHTML;
+    $("#analytics-panel-writes").insertAdjacentHTML('afterbegin', binlogNotice(binlog));
   }
   const data = outcome.slowlog?.status === "fulfilled" ? outcome.slowlog.value : null;
   const scope = [$("#analytics-source").selectedOptions[0].textContent, $("#analytics-instance").selectedOptions[0].textContent,
