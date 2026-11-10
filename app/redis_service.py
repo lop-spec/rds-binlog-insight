@@ -298,7 +298,7 @@ class RedisService:
                 for table in ('snapshots', 'intervals', 'topology', 'buckets', 'metrics', 'slow_events', 'samples', 'collection'):
                     col = 'end' if table == 'intervals' else 'ts'
                     # Bounded deletes. A backlog is retried hourly, never an unbounded VACUUM.
-                    c.execute(f'DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE instance=? AND {col}<? LIMIT 20000)', (e['instanceId'], now-e['retentionDays']*DAY))
+                    c.execute(f'DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE instance=? AND {col}<? LIMIT 20000)', (e['instanceId'], now-(min(e['retentionDays'], 7) if table == 'samples' else e['retentionDays'])*DAY))
                 ident = e['instanceId']
                 first = c.execute('SELECT ts FROM snapshots WHERE instance=? ORDER BY ts LIMIT 1', (ident,)).fetchone()
                 if first:
@@ -380,7 +380,7 @@ class RedisService:
         coverage = [{'node': n, 'seconds': durations.get(n, 0), 'baseline_seconds': base_durations.get(n, 0), 'expected_seconds': end-start} for n in nodes]
         return {'instance': identity, 'start': start, 'end': end, 'rows': output[:300], 'rows_truncated': len(output)>300,
                 'coverage': coverage, 'resets': resets[:100], 'baseline_resets': base_resets[:100], 'process_cpu': curve[:10000],
-                'metrics': metrics[:10000], 'metrics_truncated': len(metrics)>10000, 'rate_rows': rate_rows,
+                'metrics': metrics[:10000], 'metrics_truncated': len(metrics)>10000, 'baseline_metrics_truncated': len(base_metrics)>10000, 'rate_rows': rate_rows,
                 'buckets': {'time': bucket['ts'], 'rows': json.loads(bucket['payload']), 'scope': 'latest_observed_not_future'} if bucket else None,
                 'slow_events': events[:100], 'slow_events_truncated': len(events)>100,
                 'key_samples': samples[:100], 'key_samples_truncated': len(samples)>100,
@@ -410,6 +410,8 @@ class RedisService:
         for s in samples:
             if not isinstance(s, dict) or set(s)-allowed:
                 raise ValueError('redis_sample_contains_unapproved_fields')
+            if not isinstance(s.get('failed', False), bool):
+                raise ValueError('redis_sample_failed_must_be_boolean')
             sid = s.get('id', '')
             cmd = s.get('command', '')
             if not isinstance(sid, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{16,80}', sid) or not isinstance(cmd, str) or not re.fullmatch(r'[a-z_]{2,24}', cmd):

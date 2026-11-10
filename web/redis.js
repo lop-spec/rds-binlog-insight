@@ -33,7 +33,7 @@ function redisNodes(){
 }
 function renderRedis(data){
   $('#analytics-meta').textContent=`命令上涨排查 · ${(data.rows||[]).length}项${data.rows_truncated?'（部分）':''} · 昨日同窗对照`;
-  $('#analytics-coverage').textContent=data.warning;
+  $('#analytics-coverage').textContent=(data.metrics_truncated||data.baseline_metrics_truncated?'部分监控：达到10000点上限，仅列窗口前段；QPS均值不代表整窗。 ':'')+data.warning;
   const coverage=(data.coverage||[]).map(x=>[escapeHtml(x.node),`${redisNumber(x.seconds)} / ${redisNumber(x.expected_seconds)}秒`,`${redisNumber(x.baseline_seconds)} / ${redisNumber(x.expected_seconds)}秒`]);
   const commands=(data.rows||[]).map(x=>[escapeHtml(x.node),escapeHtml(x.command)+(x.nested?'<br><small>含嵌套，不相加</small>':''),redisNumber(x.calls),redisNumber(x.qps),redisNumber(x.service_seconds),redisNumber(x.avg_us),x.delta_service_seconds==null?'基线不足':redisNumber(x.delta_service_seconds)]);
   let output=`<section class="detail-block"><h3>记录覆盖</h3>${analyticsTable(['分片','本窗已记录','昨日已记录'],coverage,'尚无覆盖记录。')}<p>只汇总完整落在所选窗口内的差分段；边界、断采和切换缺口不外推。两窗命令覆盖均≥95%才计算增量。</p></section><section class="detail-block"><h3>命令执行成本</h3><p>优先按昨日同窗耗时增量排序；缺基线时仅列已记录耗时，不宣称上涨根因。</p>${analyticsTable(['分片','命令','调用次数','次/秒','累计执行秒','平均微秒','较昨日执行秒'],commands,'没有已记录命令；开始采集前的历史耗时无法恢复。')}</section>`;

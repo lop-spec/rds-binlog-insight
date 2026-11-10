@@ -103,6 +103,7 @@ class History(unittest.TestCase):
         with patch('app.redis_service.shutil.disk_usage',return_value=type('D',(),{'free':200*1024**3})()):
             self.s.ingest({'instance':'r-example01','samples':[sample]});self.s.ingest({'instance':'r-example01','samples':[sample]})
             with self.assertRaises(ValueError):self.s.ingest({'instance':'r-example01','samples':[dict(sample,value='secret')]})
+            with self.assertRaises(ValueError):self.s.ingest({'instance':'r-example01','samples':[dict(sample,failed={'value':'private'})]})
         r=self.query(self.now-40,self.now+1);self.assertEqual(len(r['key_samples']),1);self.assertEqual(r['key_samples'][0]['latency_scope'],'client_round_trip');self.assertIsNone(r['key_samples'][0]['server_usec'])
     def test_storage_fuse(self):
         with patch('app.redis_service.shutil.disk_usage',return_value=type('D',(),{'free':1024})()):

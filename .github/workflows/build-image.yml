@@ -26,6 +26,7 @@ on:
   push:
     tags:
       - v1.38.0-rawoss
+      - v1.38.0-rawoss-r1
 
 permissions:
   contents: read
