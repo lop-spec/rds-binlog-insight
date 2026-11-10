@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.38.1-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.38.1-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.38.2-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.38.2-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -39,16 +39,16 @@
           <svg viewBox="0 0 24 24"><path d="M4 5h6v14H4zM14 5h6v14h-6z"/><path d="M10 12h4"/></svg>
           <span>结构对比</span>
         </button>
-        <button class="nav-item" data-view="jobs" type="button">
+        <button class="nav-item" data-view="jobs" type="button" title="同步任务" aria-label="同步任务">
           <svg viewBox="0 0 24 24"><path d="M9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
           <span>同步任务</span>
           <span id="running-dot" class="nav-dot" hidden></span>
         </button>
-        <button class="nav-item" data-view="storage" type="button">
+        <button class="nav-item" data-view="storage" type="button" title="物理存储" aria-label="物理存储">
           <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></svg>
           <span>物理存储</span>
         </button>
-        <button class="nav-item" data-view="settings" type="button">
+        <button class="nav-item" data-view="settings" type="button" title="服务设置" aria-label="服务设置">
           <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21h-4v-.1A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3v-4h.1A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.1A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.38.34.73.64 1 .3.27.69.4 1.1.4h.1v4h-.1a1.7 1.7 0 0 0-1.74.6Z"/></svg>
           <span>服务设置</span>
         </button>
@@ -71,9 +71,9 @@
         </div>
         <div class="topbar-actions">
           <span class="retention-label"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span id="retention-top">OSS 保留 60 天</span></span>
-          <button id="sync-top" class="button primary compact" type="button">
+          <button id="sync-top" class="button primary compact" type="button" title="指定时间同步" aria-label="指定时间同步">
             <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66L20 8"/><path d="M20 4v4h-4"/></svg>
-            指定时间同步
+            <span class="sync-top-label">指定时间同步</span>
           </button>
         </div>
       </header>
@@ -178,11 +178,11 @@
         <div class="query-panel">
           <div class="panel-heading">
             <div><h2>分析范围</h2><p>查看趋势，定位高影响 SQL；更多条件按需展开。</p></div>
-            <label class="range-picker">时间范围<select id="analytics-range" aria-label="分析时间范围"><option value="5m">最近 5 分钟</option><option value="1h">最近 1 小时</option><option value="6h">最近 6 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></label>
+            <div class="range-picker"><label for="analytics-range">时间范围</label><select id="analytics-range" aria-label="分析时间范围"><option value="5m">最近 5 分钟</option><option value="1h">最近 1 小时</option><option value="6h">最近 6 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></div>
           </div>
 
           <form id="analytics-form" class="query-grid">
-            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="按数据库选择数据来源"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option><option value="starrocks">StarRocks</option><option value="redis">Redis</option></select></label>
+            <div class="field span-2"><label for="analytics-source">数据来源</label><select id="analytics-source" title="按数据库选择数据来源"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option><option value="starrocks">StarRocks</option><option value="redis">Redis</option></select></div>
             <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
             <fieldset id="rds-sources" class="operation-filter span-2" title="证据来源：慢日志给出真实扫描行数和耗时（上涨排查），Binlog 给出写入与事务推断（写入 SQL / 事务 / 锁争用推断）。只请求勾选的。">
               <legend>证据来源</legend>
@@ -217,8 +217,8 @@
               <div class="form-actions span-8"><button id="mongo-investigate" class="button secondary" type="button">缓存与 ticket 专项排查</button><span class="analytics-note">更新缓存指标点“开始排查”即执行；整分钟窗口最多30分钟，不挪时间、不改参数。</span></div>
             </div>
             <div id="redis-controls" class="query-grid span-8" hidden>
-              <label class="field span-4"><span>Redis实例</span><select id="redis-instance" title="已登记只读实例"></select></label>
-              <label class="field span-4"><span>分片</span><select id="redis-node" title="分片内独立对照"><option value="">全部分片</option></select></label>
+              <div class="field span-4"><label for="redis-instance">Redis实例</label><select id="redis-instance" title="已登记只读实例"></select></div>
+              <div class="field span-4"><label for="redis-node">分片</label><select id="redis-node" title="分片内独立对照"><option value="">全部分片</option></select></div>
             </div>
             <div id="starrocks-controls" class="query-grid span-8" hidden>
               <label class="field span-2"><span>StarRocks 实例</span><select id="starrocks-instance"></select></label>
@@ -235,7 +235,7 @@
               <button id="analytics-submit" class="button primary" type="submit">
                 <svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-6M22 20H2"/></svg>开始排查
               </button>
-              <details class="action-menu"><summary>更多操作</summary><div class="menu-content"><button id="analytics-reset" class="button ghost" type="button">重置条件</button></div></details>
+              <details class="action-menu"><summary>更多操作</summary><div class="menu-content"><button id="analytics-reset" class="button ghost" type="button" title="重置分析条件" aria-label="重置分析条件">重置条件</button></div></details>
             </div>
           </form>
         </div>
@@ -535,14 +535,14 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.38.1-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.38.1-rawoss" defer></script>
-  <script src="/assets/starrocks.js?v=1.38.1-rawoss" defer></script>
-  <script src="/assets/instances.js?v=1.38.1-rawoss" defer></script>
-  <script src="/assets/redis.js?v=1.38.1-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.38.1-rawoss" defer></script>
-  <script src="/assets/sessions.js?v=1.38.1-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.38.1-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.38.1-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/starrocks.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/instances.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/redis.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/sessions.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.38.2-rawoss" defer></script>
 </body>
 </html>

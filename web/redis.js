@@ -11,7 +11,7 @@ async function syncRedisMode(enabled){
   $('#analytics-panel-sql').innerHTML='';$('#analytics-empty').hidden=false;switchAnalyticsTab('sql');
   if(!redisBound){
     redisBound=true;
-    $('#analytics-form').addEventListener('change',()=>{if(!redisVisible())return;++redisRequest;$('#analytics-panel-sql').innerHTML='';$('#analytics-empty').hidden=false;$('#analytics-meta').textContent='条件已变更，请重新排查';});
+    $('#analytics-form').addEventListener('change',event=>{if(!redisVisible()||event.target.id==='analytics-source')return;++redisRequest;$('#analytics-panel-sql').innerHTML='';$('#analytics-empty').hidden=false;$('#analytics-meta').textContent='条件已变更，请重新排查';});
     $('#redis-instance').addEventListener('change',redisNodes);
   }
   const request=redisRequest;

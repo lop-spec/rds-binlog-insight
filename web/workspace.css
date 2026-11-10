@@ -8,6 +8,9 @@ summary:focus-visible { outline: 3px solid #a8c9f7; outline-offset: 3px; border-
 .nav-management > summary { padding: 7px 12px; color: var(--muted); font-size: 12px; }
 .nav-management:has(.is-active) { border-color: #adc9eb; }
 .range-picker { display: inline-flex; align-items: center; flex-shrink: 0; gap: 8px; color: var(--muted); font-size: 12px; }
+.field > label { color: #424a46; font-size: 12px; font-weight: 650; }
+#app-version, #page-eyebrow, .data-table th, .nav-item > span { font-size: 12px; }
+@media (max-width: 700px) { #sync-top .sync-top-label { display: none; } }
 .range-picker select { background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 7px 28px 7px 10px; font-size: 13px; max-width: 190px; }
 .filter-disclosure { border-top: 1px solid var(--border); padding-top: 10px; }
 .filter-disclosure > summary { display: list-item; width: fit-content; color: var(--accent); font-size: 13px; }
