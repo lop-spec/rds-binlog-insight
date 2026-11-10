@@ -19,7 +19,11 @@ class RedisAggregates:
             c.executescript('''CREATE TABLE IF NOT EXISTS redis_client_spool(instance TEXT,batch TEXT,ts REAL,digest TEXT,payload BLOB,done INTEGER DEFAULT 0,PRIMARY KEY(instance,batch));
                 CREATE INDEX IF NOT EXISTS redis_client_pending ON redis_client_spool(done,ts);
                 CREATE TABLE IF NOT EXISTS redis_profile_spool(instance TEXT,node TEXT,ts REAL,id TEXT,payload BLOB,done INTEGER DEFAULT 0,PRIMARY KEY(instance,node,ts,id));
-                CREATE TABLE IF NOT EXISTS redis_profile_imports(instance TEXT,node TEXT,source_hash TEXT,ts REAL,digest TEXT,PRIMARY KEY(instance,node,source_hash));''')
+                CREATE TABLE IF NOT EXISTS redis_profile_imports(instance TEXT,node TEXT,source_hash TEXT,ts REAL,digest TEXT,PRIMARY KEY(instance,node,source_hash));
+                CREATE TABLE IF NOT EXISTS redis_ch_dirty_hours(hour INTEGER PRIMARY KEY);''')
+            # Also recover acknowledged windows written by the preceding release.
+            c.execute('INSERT OR IGNORE INTO redis_ch_dirty_hours SELECT DISTINCT CAST(ts/3600 AS INTEGER)*3600 FROM redis_profile_spool WHERE done=1')
+            for shift in (0,120):c.execute('INSERT OR IGNORE INTO redis_ch_dirty_hours SELECT DISTINCT CAST((ts-?)/3600 AS INTEGER)*3600 FROM redis_client_spool WHERE done=1',(shift,))
 
     def _client(self):
         if self.client is not None and self.schema_ready:return self.client
@@ -145,11 +149,11 @@ class RedisAggregates:
                 cap=min(int(e.get('maxClickHouseMiB',8192)) for e in self.service.entries)*1024**2
                 if usage and int(usage[0].get('bytes') or 0)>=cap:raise RuntimeError('redis_clickhouse_storage_fuse')
                 self.last_budget=now
-            values=[];selected=[]
+            values=[];selected=[];dirty=set()
             for b in batches:
                 if len(values)>=20000:break
                 selected.append(b)
-                p=decode(b['payload']);metadata={k:p[k] for k in ('totals','dropped_calls','pipeline_count','pipeline_client_us','start','end')}
+                p=decode(b['payload']);dirty.add(int(p['start']//3600)*3600);metadata={k:p[k] for k in ('totals','dropped_calls','pipeline_count','pipeline_client_us','start','end')}
                 for index,r in enumerate(p['rows']):
                     rid=hashlib.sha256(json.dumps([r[k] for k in ('command','shape','path','script')]).encode()).hexdigest()
                     values.append({'instance':p['instance'],'process':p['process'],'batch':p['batch'],'row_id':rid,'ts':int(p['start']),'window_end':int(p['end']),'deployment':p['deployment'],'pod':p['pod'],**r,'version':1,'payload':json.dumps(metadata) if index==0 else ''})
@@ -158,29 +162,37 @@ class RedisAggregates:
                 client.insert_json_rows(database+'.redis_prefix_profiles',[{'instance':r['instance'],'node':r['node'],'ts':int(r['ts']),'id':r['id'],'payload':json.dumps(decode(r['payload'])),'version':1} for r in profiles],timeout=15)
             with self.service.db() as c:
                 for b in selected:c.execute('UPDATE redis_client_spool SET done=1 WHERE instance=? AND batch=?',(b['instance'],b['batch']))
-                for r in profiles:c.execute('UPDATE redis_profile_spool SET done=1 WHERE instance=? AND node=? AND ts=? AND id=?',(r['instance'],r['node'],r['ts'],r['id']))
+                for r in profiles:
+                    dirty.add(int(r['ts']//3600)*3600)
+                    c.execute('UPDATE redis_profile_spool SET done=1 WHERE instance=? AND node=? AND ts=? AND id=?',(r['instance'],r['node'],r['ts'],r['id']))
+                c.executemany('INSERT OR IGNORE INTO redis_ch_dirty_hours VALUES(?)',[(h,) for h in dirty])
                 c.execute('DELETE FROM redis_client_spool WHERE rowid IN (SELECT rowid FROM redis_client_spool WHERE done=1 AND ts<? LIMIT 2000)',(now-7*86400,))
                 c.execute('DELETE FROM redis_profile_spool WHERE rowid IN (SELECT rowid FROM redis_profile_spool WHERE done=1 AND ts<? LIMIT 2000)',(now-86400,))
                 c.execute('DELETE FROM redis_profile_imports WHERE ts<?',(now-90*86400,))
             with self.service.db() as c:pending=c.execute('SELECT COUNT(*) FROM redis_client_spool WHERE done=0').fetchone()[0]
             self.state.pop('error',None)
             self.state.update(status='ok',last_flushed=now,pending_batches=pending,client_connected=bool(self.state.get('last_received')))
-            if now-self.last_hour>=3600:self.rollup_hours(client,now);self.last_hour=now
+            self.rollup_hours(client,now)
         except Exception as exc:self.state.update(status='buffering_or_unavailable',error=error_code(exc),last_attempt=now)
 
     def rollup_hours(self,client,now):
-        db=client.config.database;end=int((now-120)//3600)*3600;start=end-7200
-        # Closed-hour rebuilds are idempotent by (process,hour,dimensions), FINAL removes replay duplicates.
-        client.query(f'''INSERT INTO {db}.redis_client_hours SELECT instance,process,concat('hour-',toString(toStartOfHour(ts))),
-            hex(SHA256(toJSONString(tuple(deployment,pod,command,shape,path,script)))),toStartOfHour(ts),toStartOfHour(ts)+INTERVAL 1 HOUR,
-            deployment,pod,command,shape,path,script,sum(calls),sum(errors),sum(client_us),sum(latency_known_calls),
-            sum(request_bytes),sum(response_bytes),sum(bytes_known_calls),toUInt64({int(now)}),''
-            FROM {db}.redis_client_counts FINAL WHERE ts>=toDateTime({start}) AND ts<toDateTime({end})
-            GROUP BY instance,process,toStartOfHour(ts),deployment,pod,command,shape,path,script''',timeout=15)
-        client.query(f'''INSERT INTO {db}.redis_prefix_hours SELECT instance,node,toStartOfHour(ts),
-            if(JSONExtractString(payload,'source')='offline_rdb','offline_rdb','cursor_sample'),
-            argMax(payload,ts),toUInt64({int(now)}) FROM {db}.redis_prefix_profiles FINAL
-            WHERE ts>=toDateTime({start}) AND ts<toDateTime({end}) GROUP BY instance,node,toStartOfHour(ts),if(JSONExtractString(payload,'source')='offline_rdb','offline_rdb','cursor_sample')''',timeout=15)
+        db=client.config.database;closed=int((now-120)//3600)*3600
+        with self.service.db() as c:hours=[r[0] for r in c.execute('SELECT hour FROM redis_ch_dirty_hours WHERE hour<? ORDER BY hour LIMIT 6',(closed,))]
+        # One closed hour per idempotent rebuild, including late arrivals.
+        for start in hours:
+            end=start+3600
+            client.query(f'''INSERT INTO {db}.redis_client_hours SELECT instance,process,concat('hour-',toString(toStartOfHour(ts))),
+                hex(SHA256(toJSONString(tuple(deployment,pod,command,shape,path,script)))),toStartOfHour(ts),toStartOfHour(ts)+INTERVAL 1 HOUR,
+                deployment,pod,command,shape,path,script,sum(calls),sum(errors),sum(client_us),sum(latency_known_calls),
+                sum(request_bytes),sum(response_bytes),sum(bytes_known_calls),toUInt64({int(now)}),''
+                FROM {db}.redis_client_counts FINAL WHERE ts>=toDateTime({start}) AND ts<toDateTime({end})
+                GROUP BY instance,process,toStartOfHour(ts),deployment,pod,command,shape,path,script''',timeout=15)
+            client.query(f'''INSERT INTO {db}.redis_prefix_hours SELECT instance,node,toStartOfHour(ts),
+                if(JSONExtractString(payload,'source')='offline_rdb','offline_rdb','cursor_sample'),
+                argMax(payload,ts),toUInt64({int(now)}) FROM {db}.redis_prefix_profiles FINAL
+                WHERE ts>=toDateTime({start}) AND ts<toDateTime({end}) GROUP BY instance,node,toStartOfHour(ts),if(JSONExtractString(payload,'source')='offline_rdb','offline_rdb','cursor_sample')''',timeout=15)
+            with self.service.db() as c:c.execute('DELETE FROM redis_ch_dirty_hours WHERE hour=?',(start,))
+        with self.service.db() as c:self.state['pending_closed_hours']=c.execute('SELECT count(*) FROM redis_ch_dirty_hours WHERE hour<?',(closed,)).fetchone()[0]
 
     def query(self,instance,start,end,baseline=True):
         if end-start>86400:raise ValueError('redis_aggregate_query_max_day')

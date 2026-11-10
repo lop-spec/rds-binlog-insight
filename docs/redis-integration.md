@@ -19,7 +19,7 @@
 
 物理表：原 `redis-history.sqlite3`；CH新增 `redis_client_counts`、`redis_client_hours`、`redis_prefix_profiles`、`redis_prefix_hours`。不使用OSS，不启动MONITOR、审计、实例诊断或修改慢日志阈值。
 
-分钟以差分段结束时间归桶，不按比例把段内调用拆成真实秒；边界和断采不外推。内存保存区间最小/最大/末值，分位只保留供应商累计直方图快照，不对分位相减、求均值。小时汇总与分钟各有水位，原差分未汇总前不提前删除。
+分钟以差分段结束时间归桶，不按比例把段内调用拆成真实秒；边界和断采不外推。内存保存区间最小/最大/末值，分位只保留供应商累计直方图快照，不对分位相减、求均值。小时汇总与分钟各有水位，原差分未汇总前不提前删除。CH按实际写入小时持久化脏窗口，迟到/断联补传/重启后重算；两类小时表都成功才清标记，失败保留，不局限最近两小时。
 
 配置仍在私有 `data/redis-instances.json`：`sources` 固定ACK集群、namespace及Deployment名单；`queueEnvironments` 只允许空前缀/pre/alpha；`queues` 只登记ws/order_buyer_match的确定键和长度命令；`prefixProfile` 显式开启低速画像。私有地址、账号、令牌不进入仓库。
 

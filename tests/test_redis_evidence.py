@@ -103,6 +103,29 @@ class Evidence(unittest.TestCase):
  def test_offline_import_rejects_raw_identifiers(self):
   p={'instance':'r-example01','node':'db-1','time':self.now,'rdb_sha256':'a'*64,'complete':True,'total_keys':20,'groups':{'pre:ws:binding:alice':{'keys':20,'estimated_bytes':2000,'expires':15,'types':{'string':20}}}}
   with self.assertRaises(ValueError):self.s.aggregates.import_profile(p)
+ def test_late_window_rebuilds_its_actual_hour(self):
+  class Fake:
+   config=SimpleNamespace(database='fixture');queries=[]
+   def query(self,s,**kw):self.queries.append(s);return ''
+   def json_rows(self,s,**kw):return [{'bytes':0}]
+   def insert_json_rows(self,*a,**kw):return 1
+  fake=Fake();self.s.aggregates.client_factory=lambda:fake;p=self.batch();p['start']-=5*3600;p['end']-=5*3600;self.ingest(p);self.s.aggregates.flush()
+  hour=int(p['start']//3600)*3600
+  inserts=[s for s in fake.queries if 'INSERT INTO fixture.redis_client_hours' in s]
+  self.assertTrue(any('toDateTime('+str(hour)+')' in s for s in inserts),'accepted late data was not selected for hourly rollup')
+ def test_dirty_hour_survives_restart_and_failed_rebuild(self):
+  hour=int((self.now-5*3600)//3600)*3600
+  with self.s.db() as c:c.execute('INSERT INTO redis_ch_dirty_hours VALUES(?)',(hour,))
+  other=RedisService(self.root,None,None,clock=lambda:self.now)
+  class Broken:
+   config=SimpleNamespace(database='fixture')
+   def query(self,*a,**kw):raise TimeoutError()
+  with self.assertRaises(TimeoutError):other.aggregates.rollup_hours(Broken(),self.now)
+  with other.db() as c:self.assertEqual(c.execute('SELECT hour FROM redis_ch_dirty_hours').fetchone()[0],hour)
+  class Good:
+   config=SimpleNamespace(database='fixture');calls=0
+   def query(self,*a,**kw):self.calls+=1;return ''
+  fake=Good();other.aggregates.rollup_hours(fake,self.now);self.assertEqual(fake.calls,2);other.aggregates.rollup_hours(fake,self.now);self.assertEqual(fake.calls,2);other.stop()
  def test_ch_idempotent_spool_retry(self):
   class Fake:
    config=SimpleNamespace(database='fixture');tables=[];inserts=[]

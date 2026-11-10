@@ -30,6 +30,15 @@ class RedisClickHouse(unittest.TestCase):
   self.s.aggregates.rollup_hours(self.client,self.now)
   rows=self.client.json_rows('SELECT sum(calls) calls FROM mongo_ci_fixture.redis_client_hours FINAL WHERE instance={instance:String}',parameters={'instance':self.identity})
   self.assertEqual(int(rows[0]['calls']),20)
+ def test_late_client_and_offline_hours_are_rebuilt(self):
+  p=self.batch();p['start']-=3*3600;p['end']-=3*3600
+  with patch.object(self.s,'check_storage'):self.s.aggregates.ingest(p)
+  ts=self.now-6*86400
+  offline={'instance':self.identity,'node':'db-1','time':ts,'rdb_sha256':'a'*64,'complete':True,'total_keys':20,'groups':{'pre:ws:binding:*':{'keys':20,'estimated_bytes':2000,'expires':15,'types':{'string':20}}}}
+  with patch.object(self.s,'check_storage'):self.s.aggregates.import_profile(offline)
+  self.s.aggregates.flush();self.assertEqual(self.s.aggregates.state['status'],'ok',self.s.aggregates.state)
+  rows=self.client.json_rows('SELECT sum(calls) n FROM mongo_ci_fixture.redis_client_hours FINAL WHERE instance={instance:String}',parameters={'instance':self.identity});self.assertEqual(int(rows[0]['n']),20)
+  rows=self.client.json_rows('SELECT count() n FROM mongo_ci_fixture.redis_prefix_hours FINAL WHERE instance={instance:String}',parameters={'instance':self.identity});self.assertEqual(int(rows[0]['n']),1)
  def test_cursor_and_offline_profiles_remain_distinct(self):
   ts=self.now-7200
   self.s.aggregates.profile(self.identity,'db-1',ts,{'groups':{'pre:ws:binding:*':{'observed_keys':2}},'scope':'cursor_sample'})
