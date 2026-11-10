@@ -77,6 +77,12 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(e['write_wait_us'],3000)
         self.assertNotIn('do-not-return',e['sample'])
 
+    def test_signed_transaction_dirty_bytes_do_not_reject_slow_window(self):
+        e=normalize_record(record(storage={'data':{'txnBytesDirty':{'$numberLong':'-8192'}}}),'fixture',[])
+        self.assertEqual(json.loads(e['sample'])['pressure_costs']['txn_dirty_bytes'],-8192)
+        with self.assertRaises(ValueError):
+            normalize_record(record(cpuNanos=-1),'fixture',[])
+
     def test_partial_baseline_and_missing_fields_do_not_become_growth(self):
         e=normalize_record(record(command={'find':'events'},storage={'data':{'bytesRead':10}}),'fixture',[])
         row=slow_record_evidence([e],[e],True,False)['groups'][0]
@@ -111,7 +117,9 @@ class SlsTests(unittest.TestCase):
         k=SimpleNamespace(access_key_id='fixture-id',access_key_secret='fixture-only',security_token='fixture-token')
         request=SlsReadonly('cn-example-1',SimpleNamespace(current=lambda:k)).request(self.source(),T,T+MINUTE,0)
         self.assertEqual(request.method,'GET');self.assertIsNone(request.data)
-        self.assertIn('/shards/lb?',request.full_url)
+        self.assertIn('/logstores/app-logs?',request.full_url)
+        self.assertNotIn('/shards/lb',request.full_url)
+        self.assertEqual(request.headers['X-log-bodyrawsize'],'0')
         self.assertIn('fixture-project.cn-example-1.log.aliyuncs.com',request.full_url)
         self.assertIn('LOG fixture-id:',request.headers['Authorization'])
         self.assertEqual(request.headers['X-acs-security-token'],'fixture-token')
@@ -132,6 +140,17 @@ class SlsTests(unittest.TestCase):
 
 
 class AdditionalGates(unittest.TestCase):
+    def test_sls_complete_aggregate_and_partial_raw_samples_are_separate(self):
+        c=SlsReadonly('cn-example-1',None)
+        raw={'__time__':T//1_000_000,'content':'timeout','__source__':'fixture-node'}
+        c.page=Mock(side_effect=[([{'n':'1000','nodes':'4'}],True),([{'bucket':str(T//1_000_000),'n':'1000','nodes':'4'}],True),([raw]*100,True)])
+        result=c.collect(dict(id='app',project='fixture-project',logstore='app-logs',endpointTokens=['fixture.invalid']),T,T+MINUTE,max_pages=1)
+        self.assertTrue(result['aggregation_complete'])
+        self.assertEqual(result['rows'],1000);self.assertEqual(result['sample_rows'],100)
+        self.assertFalse(result['sample_complete']);self.assertFalse(result['complete'])
+        self.assertEqual(result['node_count'],4)
+
+
     def test_http_overlap_lower_bound_and_query_data_redacted(self):
         from app.mongo_sls import summarize_http
         rows=[]

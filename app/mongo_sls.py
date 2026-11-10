@@ -9,6 +9,7 @@ import hmac
 import json
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -56,17 +57,22 @@ class SlsReadonly:
             raise ValueError('invalid_sls_region')
         self.region, self.credential = region, credential
 
-    def request(self, source, start_us, end_us, offset):
+    @staticmethod
+    def query(source):
+        return ('"' + source['pathToken'] + '"' if source.get('kind') == 'http' else
+                '(' + ' or '.join('"' + t + '"' for t in source['endpointTokens']) + ') and ("timeout" or "deadline")')
+
+    def request(self, source, start_us, end_us, offset, *, analysis=''):
         validate_sources([source])
         k = self.credential.current()
-        query = ('"' + source['pathToken'] + '"' if source.get('kind') == 'http' else
-                 '(' + ' or '.join('"' + t + '"' for t in source['endpointTokens']) + ') and ("timeout" or "deadline")')
+        # analysis is an internal, constant SQL suffix, never a caller query.
+        query = self.query(source) + analysis
         params = dict(type='log', **{'from': str(start_us // 1_000_000), 'to': str((end_us + 999999) // 1_000_000)},
                       query=query, line='100', offset=str(offset), reverse='false')
-        path = '/logstores/' + source['logstore'] + '/shards/lb'
+        path = '/logstores/' + source['logstore']
         resource = path + '?' + '&'.join(k + '=' + str(v) for k, v in sorted(params.items()))
         date = formatdate(usegmt=True)
-        headers = {'x-log-apiversion': '0.6.0', 'x-log-signaturemethod': 'hmac-sha1'}
+        headers = {'x-log-apiversion': '0.6.0', 'x-log-signaturemethod': 'hmac-sha1', 'x-log-bodyrawsize': '0'}
         if k.security_token:
             headers['x-acs-security-token'] = k.security_token
         canonical = ''.join(key + ':' + value + '\n' for key, value in sorted(headers.items()))
@@ -77,19 +83,34 @@ class SlsReadonly:
                urllib.parse.urlencode(params))
         return urllib.request.Request(url, headers=headers, method='GET')
 
-    def page(self, source, start_us, end_us, offset):
-        request = self.request(source, start_us, end_us, offset)
+    def page(self, source, start_us, end_us, offset, *, analysis=''):
+        request = self.request(source, start_us, end_us, offset, analysis=analysis)
         opener = urllib.request.build_opener(NoSlsRedirect(), urllib.request.HTTPSHandler(context=shared_ssl_context()))
         with opener.open(request, timeout=8) as response:
             body = response.read(MAX_BODY + 1)
             if len(body) > MAX_BODY:
                 raise RuntimeError('sls_response_byte_limit')
             rows = json.loads(body)
-            if not isinstance(rows, list) or len(rows) > 100:
+            if not isinstance(rows, list) or len(rows) > (400 if analysis else 100):
                 raise RuntimeError('invalid_sls_log_response')
             return rows, response.headers.get('x-log-progress', '') == 'Complete'
 
     def collect(self, source, start_us, end_us, *, max_pages=10, deadline=None):
+        aggregate = None
+        if source.get('kind','errors') == 'errors' and (deadline is None or time.monotonic() < deadline-16):
+            try:
+                totals, totals_complete = self.page(source,start_us,end_us,0,analysis=
+                    ' | select count(*) as n, count(distinct __source__) as nodes limit 1')
+                buckets, buckets_complete = self.page(source,start_us,end_us,0,analysis=
+                    ' | select __time__ - __time__ % 5 as bucket, count(*) as n, count(distinct __source__) as nodes group by bucket order by bucket limit 400')
+                if totals_complete and buckets_complete and len(totals)==1:
+                    count = int(totals[0]['n'])
+                    histogram = [dict(timestamp=int(b['bucket'])*1000,category='all_matching_timeouts',count=int(b['n']),node_count=int(b['nodes'])) for b in buckets]
+                    if sum(b['count'] for b in histogram)==count:
+                        aggregate = dict(rows=count,node_count=int(totals[0]['nodes']),buckets=histogram)
+            except (ValueError,KeyError,TypeError,RuntimeError,urllib.error.HTTPError):
+                # The raw sampling lane remains usable without SQL analysis.
+                aggregate = None
         rows, complete = [], False
         for page in range(max_pages):
             if deadline is not None and time.monotonic() >= deadline-8:
@@ -100,8 +121,13 @@ class SlsReadonly:
                 break
             if len(batch) < 100:
                 complete = True; break
-        return (summarize_http(rows, complete, source) if source.get('kind') == 'http' else
-                summarize_logs(rows, complete, source['id']))
+        result = (summarize_http(rows, complete, source) if source.get('kind') == 'http' else
+                  summarize_logs(rows, complete, source['id']))
+        result.update(sample_complete=result['complete'],sample_rows=len(rows),aggregation_complete=aggregate is not None)
+        if aggregate is not None:
+            result.update(aggregate)
+            result['warning'] += ' 总量/五秒分布来自完整系统字段聚合，原始明细仅有界抽样，两种完整性分别标注。'
+        return result
 
 
 def summarize_http(rows, complete, source):

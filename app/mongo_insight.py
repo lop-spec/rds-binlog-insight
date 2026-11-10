@@ -21,7 +21,7 @@ LOGGER = logging.getLogger(__name__)
 MINUTE = 60_000_000
 WINDOW = 5 * MINUTE
 VERSION = 2  # Existing collection fingerprints must remain comparable.
-NORMALIZATION_VERSION = 4  # Retain cache/queue costs in samples; no rollup schema change.
+NORMALIZATION_VERSION = 5  # Signed txnBytesDirty; no rollup schema change.
 DATABASE_COMMANDS = ('dbStats',)
 TOP_COUNTERS = ('read_count', 'read_us', 'write_count', 'write_us')
 TOP_NAMESPACES = 150
@@ -43,6 +43,19 @@ def number(v: Any) -> int | None:
     if not math.isfinite(n) or n < 0:
         raise ValueError('invalid_nonnegative_metric')
     return int(v) if isinstance(v, (str, int)) and '.' not in str(v) else int(n)
+
+
+def signed_number(value: Any) -> int | None:
+    """Transaction dirty bytes are a net change; freeing updates can be negative."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = value.get('$numberLong', value.get('$numberInt', value.get('$numberDouble')))
+    if value is None:
+        return None
+    if isinstance(value, bool) or not math.isfinite(float(value)):
+        raise ValueError('invalid_signed_metric')
+    return int(value)
 
 
 def canonical(v: Any) -> str:
@@ -183,7 +196,7 @@ def normalize_record(record: dict, instance: str, prefixes: list[str]) -> dict:
     sample['pressure_costs'] = dict(
         cache_wait_us=number(q.get('storage', {}).get('timeWaitingMicros', {}).get('cache')),
         execution_queue_us=number(q.get('queues', {}).get('execution', {}).get('totalTimeQueuedMicros')),
-        txn_dirty_bytes=number(data.get('txnBytesDirty')),
+        txn_dirty_bytes=signed_number(data.get('txnBytesDirty')),
         bytes_written=number(data.get('bytesWritten')),
         working_us=None if q.get('workingMillis') is None else number(q['workingMillis']) * 1000)
     sample['execution_options'] = {k: cmd[k] for k in ('limit', 'skip', 'maxTimeMS', 'batchSize')
