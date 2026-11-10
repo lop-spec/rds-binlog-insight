@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.36.1-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.36.1-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.36.2-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.36.2-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -213,7 +213,7 @@
               </div></details>
               <p id="mongo-baseline-hint" class="analytics-note span-8" role="status" aria-live="polite"></p>
               <label class="field span-2"><span>关联 SLS</span><select id="mongo-log-source"><option value="">不关联日志</option></select></label>
-              <div class="form-actions span-8"><button id="mongo-investigate" class="button secondary" type="button">缓存与 ticket 专项排查</button><span class="analytics-note">选择不超过 30 分钟的整分钟窗口；只读取五秒性能、已有慢日志与运行事件，不改参数。</span></div>
+              <div class="form-actions span-8"><button id="mongo-investigate" class="button secondary" type="button">缓存与 ticket 专项排查</button><span class="analytics-note">更新缓存指标点“开始排查”即执行；整分钟窗口最多30分钟，不挪时间、不改参数。</span></div>
             </div>
             <div id="analytics-filter-summary" class="active-filters span-8" hidden></div>
             <div class="form-actions span-8">
@@ -520,11 +520,11 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.36.1-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.36.1-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.36.1-rawoss" defer></script>
-  <script src="/assets/sessions.js?v=1.36.1-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.36.1-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.36.1-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.36.2-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.36.2-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.36.2-rawoss" defer></script>
+  <script src="/assets/sessions.js?v=1.36.2-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.36.2-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.36.2-rawoss" defer></script>
 </body>
 </html>

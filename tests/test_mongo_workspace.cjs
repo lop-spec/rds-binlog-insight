@@ -181,7 +181,7 @@ test('pressure diagnostics render evidence, missing data and escaped sources',()
  vm.runInContext('renderMongoInvestigation(data)',c);
  let html=nodes['#analytics-panel-sql'].innerHTML;
  assert.match(html,/没有可用五秒性能点/);assert.match(html,/未配置实例SLS映射/);assert.match(html,/不包含该Pod的CPU/);
- assert.match(nodes['#analytics-coverage'].textContent,/当前慢记录回读有缺口/);
+ assert.match(nodes['#analytics-coverage'].textContent,/完整业务汇总：当前有缺口/);
  c.data.sls={status:'partial',kind:'http',tenants:[{shop:'<script>',requests:2,observed_overlap_lower_bound:5,max_duration_ms:60000,exceeded:true}]};
  vm.runInContext('renderMongoInvestigation(data)',c);html=nodes['#analytics-panel-sql'].innerHTML;
  assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>/);assert.match(html,/保守并发下界/);assert.match(html,/部分结果/);
@@ -239,6 +239,34 @@ test('correlation renders signed real coefficients and missing is not zero',()=>
  const missing=vm.runInContext('mongoCorrelation({evidence:{pearson:null,metric_status:"metric_gaps"}})',c);
  assert.match(missing,/暂不可计算/);assert.doesNotMatch(missing,/r 0/);
 });
+test('cache main button uses the incident lane for the user exact whole-minute window',async()=>{
+ const {c,nodes,calls,run}=requestContext({'#analytics-start':'2026-11-10T10:16:00+08:00','#analytics-end':'2026-11-10T10:19:00+08:00','#mongo-baseline':'previous','#mongo-metric':'WtCacheUpdatesUsage','#mongo-log-source':''});
+ c.analyticsTable=(h,r)=>'<table>'+h.join('|')+r.map(x=>x.join('|')).join('\n')+'</table>';c.detailBlock=(a,b)=>a+escape(b);c.switchAnalyticsTab=()=>{};
+ c.api=async path=>{calls.push(path);return {start_us:1794276960000000,end_us:1794277140000000,baseline_start:1794276780000000,workload:{groups:[],families:[],total_groups:0},coverage:{complete:true},baseline_coverage:{complete:true},sls:{status:'not_selected'}};};
+ await run();assert.equal(calls.length,1);assert.match(calls[0],/^\/api\/mongo\/investigate\?/);
+ const q=new URL(calls[0],'http://fixture').searchParams;
+ assert.equal(q.get('startEpochUs'),'1794276960000000');assert.equal(q.get('endEpochUs'),'1794277140000000');assert.equal(q.get('baselineStart'),'1794276780000000');assert.equal(q.get('logSource'),'');
+ assert.match(nodes['#analytics-meta'].textContent,/五秒机制/);assert.doesNotMatch(nodes['#analytics-meta'].textContent,/相关度|暂无可计算/);
+ const html=nodes['#analytics-panel-sql'].innerHTML;
+ assert.match(html,/<section[^>]*><h3>业务读取与成本/);assert.match(html,/<section[^>]*><h3>应用日志关联/);assert.match(html,/未选择关联SLS/);
+ assert.doesNotMatch(html,/<details[^>]*><summary>业务工作量|<details[^>]*><summary>SLS关联/);
+});
+test('recorded-only cost differences retain coverage and do not become total changes',()=>{
+ const c=context();vm.runInContext(source,c);
+ const html=vm.runInContext('mongoPressureCost({observed:1024,baseline:512,observed_delta:512,known:1,total:2,baseline_known:1,baseline_total:1,comparison_scope:"recorded_fields_only"},1024,"KiB")',c);
+ assert.match(html,/0.5 → 1 KiB/);assert.match(html,/1\/1 → 1\/2，非总量增幅/);
+});
+test('five-second charts break at a missing five-second point',()=>{
+ const c=context();vm.runInContext(source,c);
+ const html=vm.runInContext('mongoSparkline([{timestamp:0,value:1,period:5},{timestamp:5000,value:2,period:5},{timestamp:15000,value:3,period:5}])',c);
+ assert.equal((html.match(/<polyline/g)||[]).length,2);
+});
+test('only unique observed historical bindings yield a displayed Pod name',()=>{
+ const c=context();vm.runInContext(source,c);
+ for(const status of ['historical_binding_unverified','ambiguous_ip'])assert.equal(vm.runInContext(`mongoPressurePod({pod:{status:'${status}',pods:[{name:'wrong-current-pod'}]}})`,c),null);
+ assert.equal(vm.runInContext('mongoPressurePod({pod:{status:"observed_interval",pods:[{name:"historical-pod"}]}})',c),'historical-pod');
+});
+
 test('no causal claim or fabricated full collection counts',()=>{
  assert.match(source,/相关与|因果/);assert.match(source,/尚无应用命令聚合接入/);
  assert.match(source,/不是慢日志计数/);assert.match(source,/未采集原生命令计数/);

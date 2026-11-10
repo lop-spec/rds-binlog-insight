@@ -8,8 +8,9 @@ import time
 
 from .mongo_collector import iso
 from .mongo_insight import MINUTE, epoch_us
-from .mongo_pressure import PERFORMANCE, performance_points, pressure_evidence, slow_record_evidence
+from .mongo_pressure import PERFORMANCE, performance_points, pressure_evidence
 from .mongo_sls import SlsReadonly, validate_sources
+from .mongo_workload import indexed_workload
 from .credentials import load_credential
 from .pod_lookup import inventory_path, resolve_pod
 from .resource_evidence import native_continuity
@@ -67,17 +68,17 @@ class MongoInvestigator:
         entry = collector.entry
         source_id = get('logSource')
         sources = validate_sources(entry.get('logSources', []))
-        source = next((s for s in sources if s['id'] == source_id), None)
-        if source_id and source is None:
+        selected = sources if source_id == 'auto' else [s for s in sources if s['id'] == source_id]
+        if source_id and source_id != 'auto' and not selected:
             raise ValueError('unconfigured_mongo_log_source')
-        key = (instance, start, end, base, role, json.dumps(source, sort_keys=True))
+        key = (instance, start, end, base, role, json.dumps(selected, sort_keys=True))
         saved = self.cache.get(key)
         if saved and saved[0] > time.monotonic():
             return saved[1]
         if not self.lock.acquire(blocking=False):
             raise ValueError('mongo_investigation_busy')
         try:
-            result = self._run(collector, start, end, base, role, source)
+            result = self._run(collector, start, end, base, role, selected)
             self.cache = {k: v for k, v in self.cache.items() if v[0] > time.monotonic()}
             if len(self.cache) >= 8:
                 self.cache.pop(next(iter(self.cache)))
@@ -86,7 +87,7 @@ class MongoInvestigator:
         finally:
             self.lock.release()
 
-    def _run(self, collector, start, end, base, role, source):
+    def _run(self, collector, start, end, base, role, sources):
         deadline = time.monotonic()+90
         dds = collector.rpc()
         # Interactive reads have their own short budget, never retry a failed page.
@@ -142,17 +143,20 @@ class MongoInvestigator:
             gaps['audit'] = dict(reason=type(exc).__name__)
         store = self.service.stores[collector.instance]
         prefixes = collector.entry.get('families', [])
-        current, before = [], []
+        rows, before = [], []
         coverage, baseline = dict(complete=False), dict(complete=False)
         try:
-            current, coverage = store.pressure_records(collector.instance, start, end, prefixes, role=role, deadline=deadline)
-            if time.monotonic() < deadline:
-                before, baseline = store.pressure_records(collector.instance, base, base+(end-start), prefixes, role=role, deadline=deadline)
-            else:
-                gaps['baseline'] = dict(reason='investigation_budget_exhausted')
+            rows, coverage = store.read(collector.instance, start, end, role=role, kind='command')
+            before, baseline = store.read(collector.instance, base, base+(end-start), role=role, kind='command')
         except Exception as exc:
-            gaps['slow_records'] = dict(reason=type(exc).__name__)
-        workload = slow_record_evidence(current, before, coverage['complete'], baseline['complete'])
+            gaps['indexed_workload'] = dict(reason=type(exc).__name__)
+        samples, sample_coverage = [], dict(complete=False)
+        try:
+            samples, sample_coverage = store.pressure_records(collector.instance, start, end, prefixes, role=role, deadline=deadline)
+        except Exception as exc:
+            gaps['supplemental_raw_samples'] = dict(reason=type(exc).__name__)
+        workload = indexed_workload(rows, before, coverage['complete'], baseline['complete'], samples)
+        workload['sample_coverage'] = sample_coverage
         # Bind the IP at the sample time, never use today's Pod name as historical proof.
         for g in workload['groups']:
             for sample in g['samples']:
@@ -171,16 +175,22 @@ class MongoInvestigator:
         except Exception as exc:
             gaps['native_history'] = dict(reason=type(exc).__name__)
         sls = dict(status='not_configured' if not collector.entry.get('logSources') else 'not_selected', complete=False)
-        if source:
-            try:
-                if time.monotonic() >= deadline-8:
-                    raise RuntimeError('investigation_budget_exhausted')
-                credential = load_credential(collector.settings_loader().credential_target)
-                if credential is None: raise RuntimeError('cloud_credential_unavailable')
-                sls = SlsReadonly(collector.entry['region'], credential).collect(source, start, end, max_pages=5, deadline=deadline)
-                sls['status'] = 'ok' if sls['complete'] else 'partial'
-            except Exception as exc:
-                sls = dict(status='unavailable', complete=False, reason=type(exc).__name__)
+        if sources:
+            results = []
+            for source in sources:
+                try:
+                    if time.monotonic() >= deadline-8:
+                        raise RuntimeError('investigation_budget_exhausted')
+                    credential = load_credential(collector.settings_loader().credential_target)
+                    if credential is None: raise RuntimeError('cloud_credential_unavailable')
+                    item = SlsReadonly(collector.entry['region'], credential).collect(source, start, end, max_pages=5, deadline=deadline)
+                    item['status'] = 'ok' if item['complete'] else 'partial'
+                except Exception as exc:
+                    item = dict(status='unavailable', complete=False, reason=type(exc).__name__)
+                item.update(source=source['id'],label=source.get('label',source['id']))
+                results.append(item)
+            sls = results[0] if len(results)==1 else dict(status='configured_sources',sources=results,
+                complete=all(s.get('complete') for s in results))
         if gaps:
             LOGGER.warning('mongo_investigation partial: instance=%s lanes=%s', collector.instance, ','.join(gaps))
         return dict(instance=collector.instance, start_us=start, end_us=end, baseline_start=base,

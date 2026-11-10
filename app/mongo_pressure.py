@@ -112,12 +112,15 @@ def pressure_evidence(points, start_us, end_us):
         needed = ('WtCacheUpdatesUsage', 'ApplicationEvictions', 'WriteTicketsUsed', 'WriteTicketsAvailable', 'WriteQueue')
         expected = (end_us - start_us) // (period * 1_000_000)
         coverage = {m: sum(m in f for _, f in ordered) for m in needed}
-        peaks = {}
+        peaks, troughs, initial = {}, {}, {}
         for metric in PERFORMANCE:
             values = [(t, f[metric]) for t, f in ordered if metric in f]
             if values:
                 t, value = max(values, key=lambda x: x[1])
                 peaks[metric] = dict(value=value, timestamp=t)
+                t, value = min(values, key=lambda x: x[1])
+                troughs[metric] = dict(value=value, timestamp=t)
+                initial[metric] = dict(timestamp=values[0][0],value=values[0][1])
         capacities = [dict(timestamp=t, value=f['WriteTicketsUsed'] + f['WriteTicketsAvailable'])
                       for t, f in ordered if 'WriteTicketsUsed' in f and 'WriteTicketsAvailable' in f]
         result.append(dict(role=role, node=node, epoch=epoch, period=period, status=status, causal=False,
@@ -126,8 +129,9 @@ def pressure_evidence(points, start_us, end_us):
                            complete=bool(expected) and all(n == expected for n in coverage.values()) and not conflicts,
                            conflicts=len(conflicts), first_application_eviction_ms=first_evict,
                            episodes=[dict(start_ms=r[0][0], end_ms=r[-1][0] + period * 1000,
-                                          samples=len(r), max_write_queue=max(f['WriteQueue'] for _, f in r)) for r in runs],
-                           peaks=peaks, write_capacity=capacities,
+                                          samples=len(r), max_write_queue=max(f['WriteQueue'] for _, f in r),
+                                          window_clipped=r[-1][0]+period*1000 == end_us//1000) for r in runs],
+                           peaks=peaks, troughs=troughs, initial=initial, write_capacity=capacities,
                            frames=[dict(timestamp=t, **f) for t, f in ordered]))
     return dict(nodes=result, causal=False, scope='observed_period_gauges_not_per_command_cache_ownership',
                 warning='更新缓存、脏缓存、总缓存是不同指标；ticket 为动态额度。零可用需与排队和延迟一起核对，不能直接判定根因或假定阈值为10%。')

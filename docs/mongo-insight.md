@@ -105,6 +105,18 @@ Assertions cover duplicate multiplicity, BSON types, order-sensitive sorts, comm
 
 For queries longer than 180 minutes, cost/count statistics use coarser buckets. Minute correlation is unavailable at that grain rather than interpolated. Narrow the window for minute resource overlap. The computed runtime scope is the executions represented in the fetched source windows; executions starting before those source windows cannot be inferred. Index and collection coverage are distinct from having all business requests.
 
+## Cache diagnosis workspace (1.36.2)
+
+Selecting `WtCacheUpdatesUsage` makes the existing **Start investigation** button run the incident lane directly. It does not produce the unsupported memory correlation ranking. The exact whole-minute window and disjoint equal baseline are retained (maximum 30 minutes); an episode reaching the selected end is labelled clipped, not recovered. Five-second charts preserve missing-point breaks.
+
+`mongo_workload.indexed_workload` reuses the existing complete minute rollups to show family totals, command templates, read/CPU costs, field coverage, source IPs and historical Pod bindings. Bounded raw records enrich representative samples only: exhausted raw sampling cannot erase complete indexed totals or suppress their comparison. `observed_delta` compares recorded values when both indexed windows are complete; `delta` is available only when both cost fields are fully known. Incomplete fields are expressly not total workload growth or cache ownership. The default business list is ordered by recorded read bytes, never called a per-command cache contribution score.
+
+The first result screen shows the cache/ticket mechanism, business family costs and command/source rows, application log summaries, and unresolved audit/producer scope. Clicking a command opens the existing detail drawer with redacted shape, projection/paging metadata, sample time and unique observed historical Pod binding; candidates or today's Pod are not historical proof.
+
+The SLS selector defaults to explicit **Auto-link configured logs**, querying only instance-registered sources. Choosing **No logs** performs no SLS reads. Each source retains separate coverage and population; HTTP conservative overlaps are clipped to the selected time interval, not allowed to borrow concurrency from before it. A shorter window must not inherit a later peak from a longer incident window.
+
+Acceptance must operate the actual workspace primary button with a real incident's instance, role, exact current/baseline windows and cache metric. Verify visible five-second saturation, business costs and source drilldown; separately test no-log selection and configured-log selection, and a longer window covering recovery. API responses or a menu option alone do not meet acceptance. No real incident IDs, customer literals or timestamps are baked into this algorithm.
+
 ## Rollback
 
 Disable the Mongo entry and roll back the web image to the retained previous image/container. Keep source Parquet, manifests and additive ClickHouse tables. There are no business-database rollback commands. Do not replace the existing MySQL collectors or re-create unrelated containers during this rollout.

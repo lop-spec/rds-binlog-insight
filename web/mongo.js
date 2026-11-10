@@ -61,7 +61,9 @@ async function loadMongoSources(group,role){
 function mongoMetricChanged(){
   ++mongoRequest;mongoResult=null;
   $('#analytics-panel-sql').innerHTML='';$('#analytics-empty').hidden=false;
-  $('#analytics-meta').textContent=`已选择 ${MONGO_METRICS[$('#mongo-metric').value]}；点击开始分析，${$('#mongo-analysis-mode')?.value==='correlation'?'仅比较时序相关':'核对资源成本增长证据'}`;
+  const cache=$('#mongo-metric').value==='WtCacheUpdatesUsage';
+  for(const id of ['mongo-kind','mongo-analysis-mode','mongo-command','mongo-namespace']){const element=$('#'+id);if(element)element.disabled=cache;}
+  $('#analytics-meta').textContent=cache?'更新缓存：点击开始排查，直接核对五秒缓存、ticket、业务读取量及来源':`已选择 ${MONGO_METRICS[$('#mongo-metric').value]}；点击开始分析，${$('#mongo-analysis-mode')?.value==='correlation'?'仅比较时序相关':'核对资源成本增长证据'}`;
   $('#analytics-coverage').textContent='';
 }
 function mongoAssessment(x){
@@ -156,10 +158,11 @@ async function syncMongoMode(enabled) {
     $('#mongo-investigate').addEventListener('click',()=>runMongoInvestigation().catch(e=>toast(e.message,'error')));
     $('#mongo-analysis-mode').addEventListener('change',mongoMetricChanged);
     $('#analytics-form').addEventListener('change',()=>{
-      if($('#analytics-source').value==='mongodb')syncMongoBaseline();
+      if($('#analytics-source').value==='mongodb'){syncMongoBaseline();mongoMetricChanged();}
     });
     $('#analytics-panel-sql').addEventListener('click',e=>{
       const sources=e.target.closest('[data-mongo-sources]'); if (sources) {loadMongoSources(sources.dataset.mongoSources,sources.dataset.mongoRole);return;}
+      const pressure=e.target.closest('[data-pressure-group]');if(pressure){openMongoPressureDetail(pressure.dataset.pressureGroup,pressure.dataset.mongoRole);return;}
       const button=e.target.closest('[data-mongo-group]'); if (button) openMongoDetail(button.dataset.mongoGroup,button.dataset.mongoRole);
       if(e.target.closest('[data-mongo-recent]')){setAnalyticsRange('1h');$('#mongo-baseline').value='previous';runMongoAnalytics().catch(err=>toast(err.message,'error'));}
     });
@@ -177,6 +180,7 @@ async function syncMongoMode(enabled) {
 }
 
 async function runMongoAnalytics() {
+  if($('#mongo-metric').value==='WtCacheUpdatesUsage')return runMongoInvestigation();
   const request=++mongoRequest;
   mongoResult=null;
   $('#analytics-panel-sql').innerHTML='';
@@ -219,7 +223,7 @@ function mongoSparkline(points) {
   const lo=rows[0].timestamp,hi=rows.at(-1).timestamp,max=Math.max(...rows.map(x=>Number(x.value)),1);
   // Separate segments at missing minutes instead of drawing through gaps.
   const segments=[];let current=[];
-  rows.forEach((p,i)=>{if(i&&p.timestamp-rows[i-1].timestamp>90000){segments.push(current);current=[];}current.push(`${((p.timestamp-lo)/(hi-lo)*900).toFixed(2)},${(110-Number(p.value)/max*100).toFixed(2)}`);});segments.push(current);
+  rows.forEach((p,i)=>{if(i&&p.timestamp-rows[i-1].timestamp>(rows[i-1].period||60)*1500){segments.push(current);current=[];}current.push(`${((p.timestamp-lo)/(hi-lo)*900).toFixed(2)},${(110-Number(p.value)/max*100).toFixed(2)}`);});segments.push(current);
   return `<div class="spark"><svg viewBox="0 0 920 125" role="img" aria-label="${escapeHtml(MONGO_METRICS[rows[0].metric]||rows[0].metric)}性能曲线，断点保留缺口">${segments.map(x=>`<polyline points="${x.join(' ')}" fill="none" stroke="var(--accent,#216e57)" stroke-width="2"/>`).join('')}</svg></div><p class="analytics-note">${formatTime(lo*1000)} — ${formatTime(hi*1000)} · 已有点范围 ${mongoNumber(Math.min(...rows.map(x=>Number(x.value))))} — ${mongoNumber(Math.max(...rows.map(x=>Number(x.value))))}；断线表示缺点，不补零。</p>`;
 }
 
@@ -281,7 +285,7 @@ function renderMongoAnalytics(data) {
 function syncMongoLogSources() {
   const entry=mongoStatus?.instances?.find(e=>e.id===$('#mongo-instance').value);
   const rows=entry?.logSources||[];
-  $('#mongo-log-source').innerHTML=mongoOptions([['',rows.length?'不关联日志':'未配置实例 SLS 映射'],...rows.map(s=>[s.id,s.label])]);
+  $('#mongo-log-source').innerHTML=mongoOptions([...(rows.length?[['auto','自动关联已配日志']]:[]),['',rows.length?'不关联日志':'未配置实例 SLS 映射'],...rows.map(s=>[s.id,s.label])]);
 }
 async function runMongoInvestigation() {
   const start=new Date($('#analytics-start').value).getTime()*1000,end=new Date($('#analytics-end').value).getTime()*1000;
@@ -291,38 +295,79 @@ async function runMongoInvestigation() {
   const q=new URLSearchParams({instance:$('#mongo-instance').value,startEpochUs:String(start),endEpochUs:String(end),
     baselineStart:String(base.start),role:$('#mongo-role').value,logSource:$('#mongo-log-source').value});
   const button=$('#mongo-investigate');button.disabled=true;
-  $('#analytics-meta').textContent='正在进行有界只读专项排查…';$('#analytics-panel-sql').innerHTML='';mongoResult=null;
+  $('#analytics-meta').textContent='正在核对五秒缓存、ticket与完整业务汇总…';$('#analytics-panel-sql').innerHTML='';mongoResult=null;
+  $('#analytics-empty').hidden=true;$('#analytics-coverage').textContent='分析原选时间与等长基线，不挪窗；完整索引与补充样本分别核对。';
   try {
     const data=await api('/api/mongo/investigate?'+q);
     if(request!==mongoRequest||$('#analytics-source').value!=='mongodb')return;
-    renderMongoInvestigation(data);
+    mongoResult={...data,mode:'pressure'};renderMongoInvestigation(data);
   } catch(error) {
     if(request===mongoRequest&&$('#analytics-source').value==='mongodb') {
-      $('#analytics-meta').textContent='专项排查未完成';$('#analytics-panel-sql').innerHTML='';
+      $('#analytics-meta').textContent='缓存排查未完成：'+error.message;$('#analytics-panel-sql').innerHTML='';$('#analytics-coverage').textContent='查询失败，不把缺失结果当作正常。';
     }
     const names={mongo_investigation_busy:'已有专项排查运行中，请稍后重试',pressure_requires_whole_minute_window_up_to_thirty_minutes:'请选择不超过30分钟的整分钟窗口',unconfigured_mongo_log_source:'实例SLS映射未配置，不能任意跨日志库查询'};
     throw new Error(names[error.message]||error.message);
   } finally {button.disabled=false;}
 }
+function mongoPressureCost(c,scale,unit){
+  if(!c)return '—';
+  const current=c.observed==null?'—':mongoNumber(c.observed/scale),before=c.baseline==null?'—':mongoNumber(c.baseline/scale);
+  const change=c.observed_delta==null?'不可比较':mongoDelta(c.observed_delta/scale);
+  return `<strong>${before} → ${current} ${unit}</strong><br><small>已记录变化 ${change} ${unit}；字段 ${c.baseline_known??0}/${c.baseline_total??0} → ${c.known??0}/${c.total??0}${c.comparison_scope==='recorded_fields_only'?'，非总量增幅':''}</small>`;
+}
+function mongoPressurePod(s){
+  return s?.pod?.status==='observed_interval'&&s.pod.pods?.length===1?s.pod.pods[0].name:null;
+}
+function mongoPressureSources(g){
+  return (g.clients||[]).slice(0,3).map(c=>{
+    const ip=typeof c==='string'?c:c.name,sample=(g.samples||[]).find(s=>s.client===ip);
+    const name=mongoPressurePod(sample);
+    return `${escapeHtml(ip)}${c.count?` ×${mongoNumber(c.count,0)}`:''}${name?`<br><small>${escapeHtml(name)}</small>`:''}`;
+  }).join('<br>')||'来源字段未上报';
+}
 function renderMongoInvestigation(data) {
   const statuses={cache_pressure_precedes_ticket_saturation:'先观察到缓存压力，随后写 ticket 饱和（机制候选）',write_ticket_saturation:'写 ticket 连续耗尽且有排队',eviction_observed:'观察到业务线程淘汰；未满足连续写饱和判据',insufficient_or_no_saturation:'证据不足或未观察到连续饱和'};
-  const nodes=data.performance?.nodes||[],labels=data.metric_labels||{};
-  const time=t=>t==null?'—':escapeHtml(formatTime(t*1000));
+  const time=t=>t==null||!Number.isFinite(t)?'—':escapeHtml(formatTime(t*1000)),nodes=data.performance?.nodes||[];
   const nodeBlocks=nodes.map(n=>{
-    const timeline=(n.frames||[]).map(f=>[time(f.timestamp),mongoNumber(f.WtCacheUpdatesUsage),mongoNumber(f.ApplicationEvictions),mongoNumber(f.WriteTicketsUsed),mongoNumber(f.WriteTicketsAvailable),mongoNumber(f.ReadTicketsAvailable),mongoNumber(f.WriteQueue),mongoNumber(mongoScale(f.WriteAvgRt,1000))]);
-    const rows=(n.episodes||[]).map(e=>[time(e.start_ms),time(e.end_ms),mongoNumber(e.samples,0),mongoNumber(e.max_write_queue)]);
-    const cap=(n.write_capacity||[]).map(p=>({timestamp:p.timestamp,value:p.value,metric:'动态写ticket容量'}));
-    return `<section class="detail-block"><h4>${escapeHtml(n.role)} · ${escapeHtml(n.node||'仅角色，历史节点身份未证实')}</h4><p><strong>${escapeHtml(statuses[n.status]||n.status)}</strong></p><p class="analytics-note">采样 ${mongoNumber(n.period,0)} 秒；${n.complete?'关键指标覆盖完整':'指标有缺点，不能用缺失点补零'}；实际更新缓存触发阈值未核实，不假定为10%。</p>${analyticsTable(['饱和开始','饱和结束（不含）','连续点数','最大写排队'],rows,'没有符合“连续零可用且有排队”的完整采样段。')}<details><summary>缓存、淘汰与 ticket 对齐时间线</summary>${analyticsTable(['时间','更新缓存 %','业务线程淘汰','占用写票据','可用写票据','可用读票据','写排队','写平均 ms'],timeline)}</details><details><summary>动态写 ticket 容量（占用＋可用）</summary>${mongoSparkline(cap)}</details><details><summary>完整指标与覆盖</summary>${detailBlock('指标峰值、时间与覆盖',JSON.stringify({peaks:n.peaks,coverage:n.coverage,expected:n.expected_points,conflicts:n.conflicts},null,2))}${Object.entries(labels).map(([metric,label])=>`<h5>${escapeHtml(label)}</h5>${mongoSparkline((data.metric_points||[]).filter(p=>p.role===n.role&&(p.node||'')===(n.node||'')&&p.metric===metric))}`).join('')}</details></section>`;
+    const peaks=n.peaks||{},initial=n.initial||{},low=n.troughs||{},first=n.episodes?.[0]?.start_ms;
+    const frames=n.frames||[],focus=first==null?frames.slice(-12):frames.filter(f=>f.timestamp>=first-15000&&f.timestamp<=first+15000);
+    const timeline=focus.map(f=>[time(f.timestamp),mongoNumber(f.WtCacheUpdatesUsage),mongoNumber(f.ApplicationEvictions),mongoNumber(f.WriteTicketsUsed),mongoNumber(f.WriteTicketsAvailable),mongoNumber(f.ReadTicketsAvailable),mongoNumber(f.WriteQueue)]);
+    const episodes=(n.episodes||[]).map(e=>[time(e.start_ms),`${time(e.end_ms)}${e.window_clipped?'<br><small>到达所选窗尾，非恢复时间</small>':''}`,mongoNumber(e.samples,0),mongoNumber(e.max_write_queue)]);
+    const curve=(data.metric_points||[]).filter(p=>p.role===n.role&&(p.node||'')===(n.node||'')&&p.metric==='WtCacheUpdatesUsage');
+    return `<section class="detail-block"><h4>${escapeHtml(n.role)} · ${escapeHtml(n.node||'角色维度，历史节点身份未证实')}</h4><p><strong>${escapeHtml(statuses[n.status]||n.status)}</strong></p>
+      <p>更新缓存峰值 <strong>${mongoNumber(peaks.WtCacheUpdatesUsage?.value)}%</strong>（${time(peaks.WtCacheUpdatesUsage?.timestamp)}）；业务线程首次淘汰 ${time(n.first_application_eviction_ms)}；写排队峰值 <strong>${mongoNumber(peaks.WriteQueue?.value)}</strong>。</p>
+      <p>节点请求速率：首点 ${mongoNumber(initial.RequestRate?.value)} → 窗口最低 ${mongoNumber(low.RequestRate?.value)}（${time(low.RequestRate?.timestamp)}）；写平均响应峰值 ${mongoNumber(mongoScale(peaks.WriteAvgRt?.value,1000))} ms。</p>
+      <p class="analytics-note">采样 ${mongoNumber(n.period,0)} 秒，关键点 ${Object.values(n.coverage||{})[0]??0}/${n.expected_points??0}，${n.complete?'关键指标覆盖完整':'指标有缺点，不补零'}。真实触发阈值未核实，不假定为10%；本窗未覆盖的恢复过程不外推。</p>
+      ${mongoSparkline(curve)}${analyticsTable(['饱和开始','结束边界（不含）','连续点数','最大写排队'],episodes,'未观察到连续零可用且有排队；不等于证明无压力。')}
+      <h5>关键对齐时间线</h5>${analyticsTable(['时间','更新缓存 %','业务线程淘汰','占用写票据','可用写票据','可用读票据','写排队'],timeline)}
+      <details><summary>全部指标与覆盖</summary>${detailBlock('指标峰值、时间与覆盖',JSON.stringify({peaks,coverage:n.coverage,expected:n.expected_points,frames},null,2))}</details></section>`;
   }).join('');
-  const events=(data.running_events||[]).map(e=>[time(e.timestamp),escapeHtml(e.role),e.category==='checkpoint'?'检查点':escapeHtml(e.category),e.finished===true?'已完成':e.category==='checkpoint'?'执行中':'—',mongoNumber(e.duration_seconds),mongoNumber(e.written_mb)]);
-  const workload=data.workload||{},groups=(workload.groups||[]).map(g=>[escapeHtml(g.role),escapeHtml(g.namespace)+' · '+escapeHtml(g.command),mongoNumber(g.count,0),g.clients.map(escapeHtml).join('<br>'),...['bytes_read','cpu_ns','cache_wait_us','execution_queue_us'].map(k=>mongoCost(g.costs[k],k==='bytes_read'?2**20:k==='cpu_ns'?1e9:1e6,k==='bytes_read'?'MiB':'s')),`<details><summary>${g.assessment==='workload_growth_candidate'?'观测成本增量候选（非根因）':'等待或证据不足'}</summary>${detailBlock('脱敏样本与当时Pod绑定',JSON.stringify(g.samples,null,2))}</details>`]);
-  const sls=data.sls||{},logNames={not_configured:'未配置实例SLS映射，未读取应用日志',not_selected:'未选择关联SLS',unavailable:'SLS读取失败，不能排除应用或网络问题',partial:'SLS部分结果，不是完整统计',ok:'SLS查询完成（仅配置范围）'};
-  const logRows=(sls.buckets||[]).map(p=>[time(p.timestamp),escapeHtml(p.category),mongoNumber(p.count,0)]);
-  const httpRows=(sls.tenants||[]).map(p=>[escapeHtml(p.shop),mongoNumber(p.requests,0),mongoNumber(p.observed_overlap_lower_bound,0),mongoNumber(p.expected_concurrency,0),mongoNumber(mongoScale(p.max_duration_ms,1000)),p.exceeded===true?'观察到超出配置额度':p.exceeded===false?'样本内未超出':'未配置对照额度']);
-  $('#analytics-empty').hidden=true;$('#analytics-meta').textContent='缓存与 ticket 专项排查 · 已确认机制/候选/缺口分开，未宣判唯一根因';
-  $('#analytics-coverage').textContent=`当前慢记录回读${data.coverage?.complete?'完整':'有缺口'}；基线${data.baseline_coverage?.complete?'完整':'有缺口'}；控制面请求 ${data.requests} 次。专项范围不受排名Top N与命令过滤条件裁剪。`;
-  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>缓存与 ticket 专项排查</h3><p>${escapeHtml(data.warning)}</p><p class="analytics-note">${escapeHtml(data.performance?.warning||'')}</p>${nodeBlocks||'<p>没有可用五秒性能点；不能判定缓存或ticket正常。</p>'}<details class="detail-block"><summary>检查点、角色及进程事件</summary>${analyticsTable(['时间','角色','事件','状态','已运行秒','写入 MB'],events,'没有取到匹配运行事件，不代表已排除切主或进程异常。')}${detailBlock('运行日志覆盖',JSON.stringify(data.running_log_coverage,null,2))}</details><details class="detail-block"><summary>业务工作量增量与等待受害者</summary><p>${escapeHtml(workload.warning||'')}</p>${analyticsTable(['角色','集合/命令','慢记录数','来源','读取量','CPU','缓存等待','执行队列等待','判断'],groups,'没有已保留的慢记录证据。')}</details><details class="detail-block"><summary>SLS关联</summary><p>${escapeHtml(sls.aggregation_complete?'总量与五秒分布聚合完整':logNames[sls.status]||'SLS证据不足')} · 日志 ${mongoNumber(sls.rows,0)} 条 · 节点 ${mongoNumber(sls.node_count,0)} 个；不是去重业务请求数。原始明细 ${mongoNumber(sls.sample_rows,0)} 条，${sls.sample_complete?'样本分页完成':'仅有界抽样/明细不完整'}。</p>${sls.kind==='http'?analyticsTable(['店铺','请求数','保守并发下界','配置额度','最长秒','判断'],httpRows,'无已解析HTTP样本。'):analyticsTable(['时间','错误类型','日志条数'],logRows,'无可展示日志；不当作零错误。')}<p>${escapeHtml(sls.warning||'')}</p></details><details class="detail-block"><summary>审计与归因缺口</summary><p>审计状态：${escapeHtml(data.audit?.status||'unknown')}。审计关闭、历史快照或逐集合缓存未采集时，无法由慢日志补造完整写入来源。</p>${detailBlock('缺口',JSON.stringify(data.gaps,null,2))}<p>Pod绑定只证明当时IP归属，不包含该Pod的CPU、OOM、重启和网络历史；这些证据缺失不能写成已排除。</p>${detailBlock('历史节点连续性与快照',JSON.stringify({continuity:data.native_continuity,snapshots:data.native_snapshots},null,2))}</details></section>`;
+  const workload=data.workload||{},judgments={workload_growth_candidate:'成本增量候选，非根因',recorded_cost_increased:'已记录成本增长，字段不全',latency_growth_only:'耗时增长，未证实制造负载',observed_costs_only:'仅展示已记录成本'};
+  const families=(workload.families||[]).slice(0,10).map(g=>[escapeHtml(g.namespace)+`<br><small>${escapeHtml(g.role)} · ${escapeHtml((g.commands||[]).join('/'))}</small>`,`${mongoNumber(g.baseline_count,0)} → ${mongoNumber(g.count,0)}`,mongoPressureCost(g.costs.bytes_read,2**30,'GiB'),mongoPressureCost(g.costs.cpu_ns,1e9,'s'),escapeHtml(judgments[g.assessment]||'证据待核对')]);
+  const groups=(workload.groups||[]).map(g=>[`<button type="button" class="button ghost compact" data-pressure-group="${escapeHtml(g.group_id)}" data-mongo-role="${escapeHtml(g.role)}">${escapeHtml(g.namespace)}<br><strong>${escapeHtml(g.command)} · ${escapeHtml(g.role)}</strong></button>`,mongoPressureSources(g),`${mongoNumber(g.baseline_count,0)} → ${mongoNumber(g.count,0)}`,mongoPressureCost(g.costs.bytes_read,2**30,'GiB'),mongoPressureCost(g.costs.cpu_ns,1e9,'s'),escapeHtml(judgments[g.assessment]||'证据待核对')]);
+  const sls=data.sls||{},sources=sls.sources||[sls],logNames={not_configured:'未配置实例SLS映射，未读取应用日志',not_selected:'未选择关联SLS，可选择“自动关联已配日志”再排查',unavailable:'SLS读取失败，不能排除应用或网络问题',partial:'SLS部分结果，不是完整统计',ok:'SLS查询完成（仅配置范围）'};
+  const logBlocks=sources.map(s=>{
+    const rows=(s.tenants||[]).sort((a,b)=>Number(b.exceeded)-Number(a.exceeded)||(b.observed_overlap_lower_bound||0)-(a.observed_overlap_lower_bound||0)).map(p=>[escapeHtml(p.shop),mongoNumber(p.requests,0),mongoNumber(p.observed_overlap_lower_bound,0),mongoNumber(p.expected_concurrency,0),mongoNumber(mongoScale(p.max_duration_ms,1000)),p.exceeded?'观察到超出配置额度':'样本内未超出/未配额度']);
+    const errors=(s.buckets||[]).map(p=>[time(p.timestamp),escapeHtml(p.category==='all_matching_timeouts'?'匹配的超时日志':p.category),mongoNumber(p.count,0)]);
+    return `<h4>${escapeHtml(s.label||s.source||'日志关联')}</h4><p>${escapeHtml(s.aggregation_complete?'总量与五秒分布聚合完整':logNames[s.status]||'SLS证据不足')} · 日志 ${mongoNumber(s.rows,0)} 条${s.kind==='http'?'':` · 节点 ${mongoNumber(s.node_count,0)} 个`}；不是去重业务请求数。</p><p class="analytics-note">原始明细 ${mongoNumber(s.sample_rows,0)} 条，${s.sample_complete?'样本分页完成':'仅有界抽样/明细不完整'}。${escapeHtml(s.warning||'')}</p>${s.kind==='http'?analyticsTable(['店铺','请求数','保守并发下界','配置额度','最长秒','判断'],rows,'无已解析HTTP样本。'):`<details><summary>五秒超时分布</summary>${analyticsTable(['时间','错误类型','日志条数'],errors,'无可展示日志；不当作零错误。')}</details>`}`;
+  }).join('');
+  const events=(data.running_events||[]).map(e=>[time(e.timestamp),escapeHtml(e.role),e.category==='checkpoint'?'检查点':escapeHtml(e.category),e.finished?'已完成':e.category==='checkpoint'?'执行中':'—',mongoNumber(e.duration_seconds),mongoNumber(e.written_mb)]);
+  $('#analytics-empty').hidden=true;$('#analytics-meta').textContent=`缓存压力诊断 · 五秒机制＋${workload.total_groups??0} 个业务模板 · 非缓存贡献度排名`;
+  $('#analytics-coverage').textContent=`完整业务汇总：当前${data.coverage?.complete?'完整':'有缺口'}，基线${data.baseline_coverage?.complete?'完整':'有缺口'}；补充原始样本${workload.sample_coverage?.complete?'完整':'有界抽样，不影响汇总覆盖'}。窗口不挪动，缓存诊断不使用普通相关度榜、Top N或命令筛选。`;
+  $('#analytics-panel-sql').innerHTML=`<section class="detail-block"><h3>更新缓存与 ticket</h3><p>${time(data.start_us/1000)} → ${time(data.end_us/1000)}；基线 ${time(data.baseline_start/1000)} → ${time((data.baseline_start+data.end_us-data.start_us)/1000)}。</p>${nodeBlocks||'<p>没有可用五秒性能点；不能判定缓存或ticket正常。</p>'}</section>
+    <section class="detail-block"><h3>业务读取与成本</h3><p>${escapeHtml(workload.warning||'')}</p>${analyticsTable(['集合族','基线 → 当前慢记录','已记录读取量','已记录 CPU','判断'],families,'没有完整索引业务证据；不展示空的相关度榜。')}<h4>命令与来源</h4><p class="analytics-note">按已记录读取量排列；点击命令查看脱敏命令、时间、执行参数与当时Pod绑定。当前展示 ${groups.length}/${workload.total_groups??0} 个模板，不按耗时把等待者当根因。</p>${analyticsTable(['命令 / 角色','来源 IP / 当时Pod','基线 → 当前慢记录','已记录读取量','已记录 CPU','判断'],groups,'没有已保留的慢记录证据。')}</section>
+    <section class="detail-block"><h3>应用日志关联</h3>${logBlocks}</section>
+    <section class="detail-block"><h3>结论边界</h3><p>${escapeHtml(data.warning||'')}</p><p>审计状态：${escapeHtml(data.audit?.status||'unknown')}。审计关闭、历史快照或逐集合缓存未采集时，无法由慢日志补造完整写入来源，不能宣判唯一触发源。</p><p>Pod绑定只证明当时IP归属，不包含该Pod的CPU、OOM、重启和网络历史；这些证据缺失不能写成已排除。</p></section>
+    <details class="detail-block"><summary>检查点、角色及进程事件</summary>${analyticsTable(['时间','角色','事件','状态','已运行秒','写入 MB'],events,'没有取到匹配运行事件，不代表已排除切主或进程异常。')}</details>
+    <details class="detail-block"><summary>原始覆盖与缺口</summary>${detailBlock('可复算覆盖',JSON.stringify({current:data.coverage,baseline:data.baseline_coverage,raw_samples:workload.sample_coverage,running_logs:data.running_log_coverage,gaps:data.gaps,continuity:data.native_continuity},null,2))}</details>`;
   switchAnalyticsTab('sql');
+}
+function openMongoPressureDetail(id,role){
+  const g=mongoResult?.workload?.groups?.find(x=>x.group_id===id&&x.role===role);if(!g)return;
+  $('#detail-title').textContent=`${g.namespace} · ${g.command}`;
+  const samples=(g.samples||[]).map(s=>[formatTime(s.start_us),mongoNumber(s.duration_us/1000)+' ms',escapeHtml(s.namespace),escapeHtml(s.client||'来源未上报'),escapeHtml(mongoPressurePod(s)||'历史Pod未解析'),mongoNumber(mongoScale(s.pressure_costs?.cache_wait_us,1e6)),mongoNumber(mongoScale(s.pressure_costs?.execution_queue_us,1e6))]);
+  $('#detail-body').innerHTML=`<section class="detail-block"><h3>业务证据，不是缓存贡献</h3><p>读取量来自完整分钟汇总。代表样本不是全部请求；生产写命令仅供核对，勿重放。</p>${analyticsTable(['时间','耗时','实际集合','来源IP','当时Pod','样本缓存等待 s','样本队列等待 s'],samples)}${detailBlock('脱敏命令、投影、分页与历史绑定',JSON.stringify(g.samples,null,2))}${detailBlock('分钟工作量',JSON.stringify(g.trend,null,2))}</section>`;
+  showDetailDrawer();
 }
 
 function openMongoDetail(id,role) {

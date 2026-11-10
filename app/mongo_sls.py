@@ -121,7 +121,7 @@ class SlsReadonly:
                 break
             if len(batch) < 100:
                 complete = True; break
-        result = (summarize_http(rows, complete, source) if source.get('kind') == 'http' else
+        result = (summarize_http(rows, complete, source, start_us=start_us, end_us=end_us) if source.get('kind') == 'http' else
                   summarize_logs(rows, complete, source['id']))
         result.update(sample_complete=result['complete'],sample_rows=len(rows),aggregation_complete=aggregate is not None)
         if aggregate is not None:
@@ -130,7 +130,7 @@ class SlsReadonly:
         return result
 
 
-def summarize_http(rows, complete, source):
+def summarize_http(rows, complete, source, *, start_us=None, end_us=None):
     requests, rejected, unknown = [], 0, 0
     for row in rows:
         text = str(row.get('content') or '')
@@ -155,7 +155,9 @@ def summarize_http(rows, complete, source):
             if status == 429:
                 rejected += 1; continue
             # Exclude one second at each end: SLS timestamps may be whole seconds.
-            requests.append(dict(shop=shop, page=page, start_ms=end-duration+1000, end_ms=end-1000,
+            requests.append(dict(shop=shop, page=page,
+                                 start_ms=max(end-duration+1000,start_us/1000) if start_us is not None else end-duration+1000,
+                                 end_ms=min(end-1000,end_us/1000) if end_us is not None else end-1000,
                                  duration_ms=duration, status=status))
         except (ValueError, TypeError, KeyError, OverflowError):
             unknown += 1

@@ -3,10 +3,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from app.mongo_pressure import performance_points, pressure_evidence, slow_record_evidence
-from app.mongo_insight import MINUTE, normalize_record
+from app.mongo_insight import MINUTE, normalize_record, rollup_events
+from app.mongo_workload import indexed_workload
 from app.mongo_store import MongoStore
 from app.mongo_service import MongoService
 from app.mongo_sls import SlsReadonly, summarize_logs, validate_sources
@@ -164,6 +165,13 @@ class AdditionalGates(unittest.TestCase):
         bad=summarize_http([{'content':'unparseable'}],True,dict(id='http',pathToken='getMsgList'))
         self.assertFalse(bad['complete'])
 
+    def test_http_overlap_is_clipped_to_selected_window_not_log_end_time_alone(self):
+        from app.mongo_sls import summarize_http
+        row={'__time__':T//1_000_000+1,'content':'[GIN] | 200 | 60s | 192.0.2.1 | GET "/api/getMsgList/42?page=1"'}
+        x=summarize_http([row]*5,True,dict(id='http',pathToken='getMsgList',maxConcurrent=3),start_us=T,end_us=T+MINUTE)
+        self.assertEqual(x['tenants'][0]['observed_overlap_lower_bound'],0)
+        self.assertFalse(x['tenants'][0]['exceeded'])
+
     def test_new_collector_persists_separate_pressure_kind(self):
         from app.mongo_collector import MongoCollector
         c=MongoCollector(Mock(),dict(instanceId='dds-example',region='cn-example-1'),lambda:None)
@@ -183,7 +191,8 @@ class AdditionalGates(unittest.TestCase):
 class InvestigationTests(unittest.TestCase):
     def service(self,root):
         service=MongoService(root,lambda:None,start=False)
-        store=Mock();store.pressure_records.return_value=([],dict(complete=False))
+        store=Mock();store.pressure_records.return_value=([],dict(complete=False,budget_exhausted=True))
+        store.read.return_value=([],dict(complete=True));store.read_telemetry.return_value=[]
         service.stores['dds-example']=store
         c=Mock();c.instance='dds-example';c.entry=dict(instanceId='dds-example',region='cn-example-1')
         c.rpc.return_value.call.side_effect=lambda action,params: {'PerformanceKeys':{'PerformanceKey':[]}} if action=='DescribeDBInstancePerformance' else {'TotalRecordCount':0,'Items':{'LogRecords':[]}} if action=='DescribeRunningLogRecords' else {'LogAuditStatus':'Disabled'}
@@ -215,6 +224,19 @@ class InvestigationTests(unittest.TestCase):
             self.assertTrue(result['gaps']);self.assertEqual(result['performance']['nodes'],[])
             self.assertEqual(result['root_cause'],'unresolved')
 
+    def test_auto_logs_use_only_registered_sources_and_keep_raw_coverage_separate(self):
+        with tempfile.TemporaryDirectory() as td:
+            service,c=self.service(Path(td))
+            c.entry['logSources']=[dict(id='app',project='fixture-project',logstore='app-log',endpointTokens=['fixture.invalid']),dict(id='http',project='fixture-project',logstore='http-log',kind='http',pathToken='getMsgList')]
+            with patch('app.mongo_investigation.load_credential',return_value=object()),patch('app.mongo_investigation.SlsReadonly') as sls:
+                sls.return_value.collect.side_effect=[{'rows':100,'complete':True},{'rows':2,'complete':True}]
+                x=service.investigator.run({**self.params(),'logSource':'auto'})
+                self.assertEqual(len(x['sls']['sources']),2)
+                self.assertEqual(sls.return_value.collect.call_args_list[0].args[0]['id'],'app')
+                self.assertTrue(x['coverage']['complete']);self.assertFalse(x['workload']['sample_coverage']['complete'])
+            with patch('app.mongo_investigation.SlsReadonly') as sls:
+                service.investigator.run({**self.params(),'logSource':''});sls.assert_not_called()
+
     def test_updated_cache_series_converts_dds_start_to_analysis_end(self):
         with tempfile.TemporaryDirectory() as td:
             service,c=self.service(Path(td));store=service.stores['dds-example']
@@ -223,6 +245,40 @@ class InvestigationTests(unittest.TestCase):
             store.read_telemetry.side_effect=lambda instance,kind,lo,hi,**kw: [dict(metric='WtCacheUpdatesUsage',timestamp=T//1000,period=60,source='dds',role='Primary',node='',value=9,timestamp_semantics='period_start')] if kind=='pressure' else []
             result=service.query({**self.params(),'metric':'WtCacheUpdatesUsage'})
             self.assertEqual(result['metric_points'][0]['timestamp'],(T+MINUTE)//1000)
+
+
+class IndexedWorkloadTests(unittest.TestCase):
+    def rows(self,read=100):
+        e=normalize_record(record(command={'find':'events'},storage={'data':{'bytesRead':read}},cpuNanos=20),'fixture',[])
+        return rollup_events([e])
+
+    def test_complete_index_survives_partial_raw_samples_and_preserves_deltas(self):
+        current=self.rows(500);before=self.rows(100)
+        result=indexed_workload(current,before,True,True,[])
+        c=result['groups'][0]['costs']['bytes_read']
+        self.assertEqual(c['delta'],400);self.assertTrue(result['complete'])
+        self.assertEqual(result['families'][0]['costs']['bytes_read']['observed'],500)
+
+    def test_incomplete_fields_only_compare_recorded_values_never_total_delta(self):
+        rows=self.rows(500);rows[0]['count']=2
+        c=indexed_workload(rows,self.rows(100),True,True)['groups'][0]['costs']['bytes_read']
+        self.assertIsNone(c['delta']);self.assertEqual(c['observed_delta'],400)
+        self.assertEqual(c['comparison_scope'],'recorded_fields_only');self.assertEqual(c['known'],1)
+        c=indexed_workload(rows,self.rows(100),True,False)['groups'][0]['costs']['bytes_read']
+        self.assertIsNone(c['observed_delta'])
+
+    def test_absent_template_only_is_zero_when_baseline_source_is_complete(self):
+        c=indexed_workload(self.rows(),[],True,True)['groups'][0]
+        self.assertEqual(c['baseline_count'],0);self.assertEqual(c['costs']['bytes_read']['delta'],100)
+        c=indexed_workload(self.rows(),[],True,False)['groups'][0]
+        self.assertIsNone(c['baseline_count']);self.assertIsNone(c['costs']['bytes_read']['baseline'])
+
+    def test_indexed_totals_not_double_counted_by_raw_enrichment(self):
+        sample=normalize_record(record(command={'find':'events'},storage={'data':{'bytesRead':900}}),'fixture',[])
+        result=indexed_workload(self.rows(100),[],True,True,[sample]*3)
+        g=result['groups'][0]
+        self.assertEqual(g['count'],1);self.assertEqual(g['costs']['bytes_read']['observed'],100)
+        self.assertEqual(g['samples'][0]['costs']['bytes_read'],900)
 
 
 if __name__=='__main__':unittest.main()
