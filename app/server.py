@@ -406,7 +406,8 @@ class Application:
         from .starrocks_service import StarRocksService
         self.starrocks = StarRocksService(self.data_dir, self.metadata.load_settings, credential_loader)
         from .redis_service import RedisService
-        self.redis = RedisService(self.data_dir, self.metadata.load_settings, credential_loader)
+        from .redis_context import WorkloadReader
+        self.redis = RedisService(self.data_dir, self.metadata.load_settings, credential_loader, context_reader=WorkloadReader(self.pod_inventory))
         if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
             self.redis.start()
         # Members of the MongoDB instances configured for Mongo analytics (role id, role, VPC address), for session management.
@@ -1079,6 +1080,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("workspace.css")
             elif parsed.path == "/assets/mongo.js":
                 self._serve_static("mongo.js")
+            elif parsed.path == "/assets/redis-evidence.js":
+                self._serve_static("redis-evidence.js")
             elif parsed.path == "/assets/redis.js":
                 self._serve_static("redis.js")
             elif parsed.path == "/assets/starrocks.js":
@@ -1099,6 +1102,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "data": self.app.mongo.investigator.run(query)})
             elif parsed.path == "/api/redis/status":
                 self._json({"ok": True, "data": self.app.redis.status()})
+            elif parsed.path == "/api/redis/history":
+                self._json({"ok": True, "data": self.app.redis.history_query(query)})
             elif parsed.path == "/api/redis/investigate":
                 self._json({"ok": True, "data": self.app.redis.query(query)})
             elif parsed.path == "/api/starrocks/status":
@@ -1410,6 +1415,21 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/api/ingest/redis-aggregates","/api/ingest/redis-profiles"):
+            if not self._valid_host():
+                self._error(421, "INVALID_HOST", "请求 Host 不受信任")
+                return
+            if not self.app.redis.authorized(self.headers.get("Authorization", "")) or self.app.redis.aggregates is None:
+                self._error(401, "REDIS_AUTH_REQUIRED", "Redis aggregate authentication required")
+                return
+            try:
+                receiver=self.app.redis.aggregates.import_profile if parsed.path.endswith('redis-profiles') else self.app.redis.aggregates.ingest
+                self._json({"ok": True, "data": receiver(self._body_json())},202)
+            except (ValueError, TypeError, KeyError):
+                self._error(400,"REDIS_INVALID_AGGREGATE","全量计数批次字段、时间或去重ID不符合约束")
+            except Exception:
+                self._error(503,"REDIS_AGGREGATE_UNAVAILABLE","聚合队列不可用；请用原批次ID重试")
+            return
         if parsed.path == "/api/ingest/redis-samples":
             if not self._valid_host():
                 self._error(421, "INVALID_HOST", "请求 Host 不受信任")

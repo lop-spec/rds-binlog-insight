@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.38.2-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.38.2-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.39.0-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.39.0-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -218,7 +218,8 @@
             </div>
             <div id="redis-controls" class="query-grid span-8" hidden>
               <div class="field span-4"><label for="redis-instance">Redis实例</label><select id="redis-instance" title="已登记只读实例"></select></div>
-              <div class="field span-4"><label for="redis-node">分片</label><select id="redis-node" title="分片内独立对照"><option value="">全部分片</option></select></div>
+              <div class="field span-2"><label for="redis-node">分片</label><select id="redis-node" title="分片内独立对照"><option value="">全部分片</option></select></div>
+              <div class="field span-2"><label for="redis-order">排序依据</label><select id="redis-order" title="同窗差分排序；基线不足仅列已记录成本"><option value="usec">耗时增量</option><option value="calls">调用增量</option></select></div>
             </div>
             <div id="starrocks-controls" class="query-grid span-8" hidden>
               <label class="field span-2"><span>StarRocks 实例</span><select id="starrocks-instance"></select></label>
@@ -535,14 +536,15 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.38.2-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.38.2-rawoss" defer></script>
-  <script src="/assets/starrocks.js?v=1.38.2-rawoss" defer></script>
-  <script src="/assets/instances.js?v=1.38.2-rawoss" defer></script>
-  <script src="/assets/redis.js?v=1.38.2-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.38.2-rawoss" defer></script>
-  <script src="/assets/sessions.js?v=1.38.2-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.38.2-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.38.2-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/starrocks.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/instances.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/redis-evidence.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/redis.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/sessions.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.39.0-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.39.0-rawoss" defer></script>
 </body>
 </html>

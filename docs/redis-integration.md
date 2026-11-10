@@ -1,51 +1,62 @@
-# Redis 持续记录与上涨排查
+# Redis 五层持续记录
 
-在「分析洞察 → 数据来源 → Redis」选择实例、分片和一天内窗口。主按钮读取历史记录，不重放业务命令。
+**⚠️ 风险：新增只读采集和本系统诊断表会消耗少量网络、磁盘与API配额；沿用容量与主机空间熔断。回滚主应用镜像即可停止新增记录，保留历史；不改业务Redis、ACK工作负载或云侧告警参数。**
 
-## 存在哪里
+入口仍为「分析洞察 → Redis」。一天内窗口查20秒差分与五层证据；一天以上自动查小时汇总，超过31天用日视图，最长400天。长期总量不是上涨根因。
 
-选择采集主机的数据盘：`data/redis-history.sqlite3`，WAL、独立表和索引，快照与差分压缩保存。默认20秒采样、命令/指标保留30天、键级明细保留7天、有效数据上限2GiB；采集/应用采样写入均检查容量，上限或主机可用空间低于120GiB时明确熔断，不自动删其他数据。每小时有界清理过期记录。不是逐条全量命令录制，数据量远小于MONITOR；当前不上传OSS、不修改桶生命周期或权限，也不依赖外部对象存储才能回查。
+## 持续记录
 
-## 持续采什么
+| 内容 | 频率 | 存放与保留 |
+|---|---|---|
+| 分片IINFO：server、commandstats、cpu、stats、memory、clients、persistence、keyspace、latencystats、errorstats | 约20秒 | 原SQLite，30天 |
+| 命令、CPU、网络/连接/过期淘汰计数、内存区间及最新分位快照 | 分钟/小时汇总 | SQLite，90/400天 |
+| 指定Deployment、HPA、镜像、Pod启动、worker数字/布尔白名单 | 每分钟，状态变更去重 | SQLite，长期；快照差分事件不是精确发生时刻 |
+| 云侧历史事件/任务 | 每5分钟 | SQLite，长期；只保留类型、时间、状态和标识 |
+| 热Key、大Key、重流量Key榜单 | 每分片每分钟 | SQLite，90天；仅阈值榜单，不代表全部Key |
+| 已登记outbox四阶段ZSet、payload/版本Hash长度 | 每分钟 | SQLite，90天；只读长度，不读内容 |
+| 游标前缀画像 | 每20秒轮一分片，COUNT16，最多16键×TYPE/TTL/MEMORY | SQLite短期及CH30天、小时末快照180天 |
+| 凌晨03:00–05:00基线 | 首次补最近两日，之后幂等更新 | SQLite，400天；云侧只含实际可读速率字段，不编历史耗时 |
 
-- 从云侧刷新实例拓扑，保留完整物理节点标识。每个节点经Proxy读取 `IINFO index server commandstats cpu`，保存调用和usec累计计数。账号由私有配置限定，云侧实时核验全部权限为RoleReadOnly；固定实例FQDN，私有凭据0600、拒绝符号链接。
-- 每20秒差分；首次只有基线。节点标识/run_id变化、uptime不连续、计数回退、超过2.5倍采样周期均断开，缺口不外推。Tair没有数据节点run_id时使用物理节点＋uptime，**不把proxy_run_id当节点身份**。
-- 20秒为下次采集的最短等待；云请求、故障与调度会加长实际间隔，按实际时间差计算，不把配置周期当实测周期。
-- 每分钟读取已存在的节点云监控CPU/QPS与过去10分钟最多100条慢日志，按事件去重。云侧慢日志超过页上限会标部分，API故障进入状态；不调整慢阈值。截断命令只提取脱敏键形状与来源，不保存Value/ARGV/Lua正文。
-- 每10分钟只读 `INFO KEY` 记录64个outbox桶的当前槽位与节点索引。查询只使用不晚于窗口结束的已记录快照，不把当前分配套回历史；Proxy索引是节点索引而非逻辑数据库号。
-- 不启用MONITOR、审计、诊断任务，不发送CONFIG、写命令、用户脚本或读取业务值。
+物理表：原 `redis-history.sqlite3`；CH新增 `redis_client_counts`、`redis_client_hours`、`redis_prefix_profiles`、`redis_prefix_hours`。不使用OSS，不启动MONITOR、审计、实例诊断或修改慢日志阈值。
 
-## 上涨排查口径
+分钟以差分段结束时间归桶，不按比例把段内调用拆成真实秒；边界和断采不外推。内存保存区间最小/最大/末值，分位只保留供应商累计直方图快照，不对分位相减、求均值。小时汇总与分钟各有水位，原差分未汇总前不提前删除。
 
-当前窗口与昨日同长度窗口分别汇总。完整落在窗口内的差分段才参与；两窗该命令覆盖均≥95%时显示调用量和累计执行耗时增量，否则显示“基线不足”。命令usec是服务器命令执行耗时，不是精确CPU；EVAL/EXEC与内部命令可能嵌套，严禁相加推算总CPU。进程CPU秒差分与云监控曲线是不同证据。缺基线仅展示已记录成本，不给根因分数；新启用采集不能补出旧窗口commandstats。云监控每窗最多显示10000个点，达到上限会明确标部分且仅为窗口前段，不能把此时的QPS均值当整窗均值。
+配置仍在私有 `data/redis-instances.json`：`sources` 固定ACK集群、namespace及Deployment名单；`queueEnvironments` 只允许空前缀/pre/alpha；`queues` 只登记ws/order_buyer_match的确定键和长度命令；`prefixProfile` 显式开启低速画像。私有地址、账号、令牌不进入仓库。
 
-## 私有配置
+SQLite沿用实例 `maxMiB`；CH诊断表默认8GiB总预算，可用 `maxClickHouseMiB` 设置。主机可用空间低于120GiB或命中容量预算即暂停，不提前删除证据伪装达标。保留天数是目标，受容量和实际采集覆盖制约。
 
-数据目录`redis-instances.json`（0600）为显式实例白名单：
+## 业务进程全量计数
 
-```json
-[{"instanceId":"r-example01","region":"cn-hangzhou","label":"示例缓存","enabled":true,
-  "host":"r-example01.redis.cn-hangzhou.rds.aliyuncs.com","port":6379,"username":"fixture_ro",
-  "credentialsFile":".credentials/redis.json","intervalSeconds":20,"retentionDays":30,"maxMiB":2048}]
-```
+SDK保持在 `tools/redis_sample_hook/`，已从0.1%抽样改成全部逻辑调用聚合，接收口为 `POST /api/ingest/redis-aggregates`。旧 `/redis-samples` 仅兼容原数据，不代表新接入。
 
-凭据文件只含`username`与`password`。云查询复用应用ECS角色，不回退静态AK。无配置不创建记录库、不启动线程。隔离预览设置`RDS_REDIS_COLLECT=0`，禁止与正式应用重复采集。回滚旧镜像会停止该采集，历史文件保留。
+业务正常发版时：
 
-## 键级采样接入
+1. 每进程只创建一个 `redissample.New(instance, endpoint, token, deployment, pod)`，同一个Hook注册到该目标Redis的**全部**client实例，只运行一次 `hook.Run(shutdownContext)`。统计客户端逻辑调用，不声称覆盖库内所有网络尝试或Lua内部调用。
+2. 关键worker/请求分支用 `WithPath(ctx, "静态代码路径")` 标注；跟单任务可再用 `WithCategory` 标注。没有标注就记 `unclassified`，不能假装已定位代码来源。
+3. 端点必须是受控HTTPS的 `/api/ingest/redis-aggregates`，禁止明文公网和跳转。token引用既有受控注入渠道，不写源码、日志或命令行。
+4. 每20秒上报一个不可变批次；最多499个普通形状＋1个other。ID换成星号、fo桶号保留；只保留固定词汇表命名空间，未知字段也是星号，不把随机英文ID当命名空间。
+5. 汇总同时保留逐命令总调用，形状溢出不丢调用。Pipeline逐命令计数，但只记一次Pipeline客户端耗时，不摊到每条命令。收发字节是已知参数/返回类型的RESP估算，`bytes_known_calls` 标记覆盖，不是网卡流量；不传Value、ARGV、Lua正文或错误正文。
+6. 网络发送不阻塞业务请求；一个待确认批次用同ID重试，队列有界。未保留窗口的调用进入后续 `dropped_calls`；进程崩溃/退出的未确认尾窗无法保证送达，最后水位缺口不能当零。
 
-接收入口`POST /api/ingest/redis-samples`，用私有`.credentials/redis-ingest.json`中的至少32字符令牌校验Bearer；未配置令牌默认拒绝。每批最多200条，最多120批/分钟；实例、时间、字段、采样率与耗时有限制，按实例＋样本ID去重。只接受声明字段，拒绝value/ARGV/raw等额外字段。
+接收端先落有界SQLite去重队列，成功返回202，再批量写CH。相同ID不同内容拒绝；CH `ReplacingMergeTree` 加 `FINAL` 防止重试放大。CH异常时明确显示排队/不可用，满队列返回503。上报窗口精确计数，不按比例重建窗口内真实秒或墙钟分钟。
 
-`tools/redis_sample_hook/hook.go`适用于go-redis/v8。在业务初始化时以0.1%采样率创建Hook并`client.AddHook(hook)`，用应用关闭context运行`go hook.Run(ctx)`。endpoint必须是已有受控HTTPS入口，令牌仅通过业务现有凭据机制提供，禁止改为公共明文HTTP。采样有界512条队列、每秒最多100条批量发送、2秒HTTP超时、不跟随重定向；失败丢弃并累计`Dropped()`，不阻塞或重试业务请求。Pipeline只记录一次整体客户端耗时，不复制到每条子命令。采样率不是完整性证明，Dropped必须进入原有监控。
+客户端排行比较“已收到相同形状”的昨日调用变化；缺基线、截断或已报告丢失不造增量。各Deployment/进程/Pod的接入与传输覆盖仍须核对，不把已收到批次自动称为全部业务。
 
-在领取到期与恢复超时两处分别使用`redissample.WithCategory(ctx,"claim_due")`、`redissample.WithCategory(ctx,"recover_timeout")`。EVAL只记录脚本SHA1与声明的KEYS；不保存脚本正文和ARGV。非outbox键在客户端和接收端双重脱敏，最多保留16个键形状。标记的是客户端端到端耗时，`server_usec`始终为空，无法据此计算服务端CPU占比。样本按实例展示，不猜测当前分片归属。
+## 离线画像
 
-Hook属于业务代码，需要由该业务的正常发布链路接入；SQL Insight版本上线不等于业务Hook已上线。没有样本时页面明确显示未接入，不伪造键级榜。
+`POST /api/ingest/redis-profiles` 接收预计算脱敏统计：`instance,node,time,rdb_sha256,complete,total_keys,groups`。每组仅 `keys,estimated_bytes,expires,types`，前缀必须已规范化；禁止RDB内容、原始ID、下载链接与值。完整性是提供者声明，后端校验分组计数但不假装独立认证过RDB。
 
-## 回归
+可运行入口：`python tools/import-redis-profile.py --help`。令牌只从0600文件读取，只允许受控HTTPS或本机环回HTTP，不跟随重定向。统计由离线分析器产生后交此入口；**本次不创建或启用云控制台的每日离线分析定时任务**。
 
-```text
-python -m unittest tests.test_redis_insight
-node --test tests/test_redis_workspace.cjs tests/test_starrocks_workspace.cjs tests/test_mongo_workspace.cjs tests/test_workspace.cjs
-```
+低速ISCAN不是均匀采样，可能重复、漏项和遇到键消失，不外推全库前缀数量、真实内存或增长；MEMORY USAGE使用SAMPLES5，内存是估算。在线样本与离线统计按来源分别保留，小时快照不互相覆盖。
 
-前端只扩展现有数据来源；旧RDS/Mongo/StarRocks、ClickHouse和索引worker不随Redis改动重建。生产数据、实例配置和凭据不进入源码、镜像、测试或跨工作站同步。
+## 归因与缺口
+
+- CPU差分、已处理命令数和客户端往返是不同分母；未证明Lua/EXEC计时包含关系前，不用“进程CPU减命令耗时”认定网络开销。
+- 单次成本指数按覆盖相近、至少100次的同种命令对标；Key大小/参数与节点因素都可能影响它，不单凭指数确认宿主机。
+- ConfigMap只读字面数字/布尔值，不等于运行进程已加载；Pod就绪不等于worker已执行。三段轮询模型不涵盖waiting_online等其他路径；拟合只属机制证据，不单凭比例锁定根因。
+- 服务端计数可能含Lua内部、事务控制、连接与采集器命令；客户端是逻辑调用。只列各自计数与数值差，口径未对齐时不输出伪精确的“未覆盖比例”。
+- `persistence/errorstats`及事件循环、主动过期、缓冲、命令失败/拒绝等字段由供应商实际返回决定；未返回就标缺失，不补0。Proxy的connected_clients也不自动等同真实连接数。
+- 生产业务SDK未发版、其他客户端未注册、动态队列未登记及采集前历史，必须在页面标明，不冒充覆盖或恢复。
+
+原运维巡检可直接读 `/api/redis/status` 与 `/api/redis/investigate`：CPU等已有异常自动带五层证据；新增可比单位成本抬升与持续记录缺口检查复用原5分钟状态机、模型、收件群与去重通知队列，不新建机器人，不发送探针。

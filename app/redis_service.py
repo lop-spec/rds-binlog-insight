@@ -17,7 +17,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .redis_protocol import RedisWire, delta, load_instances, parse_info, private_json, safe_key
+from .redis_protocol import RedisWire, delta, load_instances, parse_info, private_json, safe_key, error_code
+from .redis_telemetry import SECTIONS
 from .slow_log_collector import DasRpcClient
 
 LOGGER = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def iso(ts):
 
 
 class RedisService:
-    def __init__(self, root, settings_loader, credential_loader, *, wire_factory=None, cloud_factory=None, clock=time.time):
+    def __init__(self, root, settings_loader, credential_loader, *, wire_factory=None, cloud_factory=None, context_reader=None, aggregate_client_factory=None, clock=time.time):
         self.root = Path(root)
         self.clock = clock
         self.settings_loader, self.credential_loader = settings_loader, credential_loader
@@ -61,11 +62,15 @@ class RedisService:
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.thread = None
+        self.context_thread = None
+        self.context_reader = context_reader
+        self.evidence = self.context = self.aggregates = None
         self.error = ''
         self.entries = []
         self.last = {}
         self.meta = {}
         self.next_cloud = {}
+        self.next_topology = {}
         self.next_buckets = {}
         self.health = {}
         self.bounds = {}
@@ -75,10 +80,16 @@ class RedisService:
         try:
             self.entries = [e for e in load_instances(self.root) if e.get('enabled')]
         except Exception as exc:
-            self.error = type(exc).__name__
+            self.error = error_code(exc)
         self.dbpath = self.root / 'redis-history.sqlite3'
         if self.entries:
             self._init_db()
+            from .redis_history import EvidenceHistory
+            from .redis_context import RedisContext
+            from .redis_aggregate import RedisAggregates
+            self.evidence = EvidenceHistory(self)
+            self.aggregates = RedisAggregates(self,aggregate_client_factory)
+            self.context = RedisContext(self,context_reader)
             with self.db() as c:
                 for r in c.execute('SELECT instance,node,payload FROM snapshots WHERE (instance,node,ts) IN (SELECT instance,node,MAX(ts) FROM snapshots GROUP BY instance,node)'):
                     self.last[(r['instance'], r['node'])] = unpack(r['payload'])
@@ -133,11 +144,41 @@ class RedisService:
         if self.entries and self.thread is None and os.environ.get('RDS_REDIS_COLLECT', '1') == '1':
             self.thread = threading.Thread(target=self._run, name='redis-telemetry', daemon=True)
             self.thread.start()
+            self.context_thread=threading.Thread(target=self._run_context,name='redis-context',daemon=True)
+            self.context_thread.start()
+
+    @staticmethod
+    def iso_time(ts):
+        return iso(ts)
+
+    def _run_context(self):
+        while not self.stop_event.is_set():
+            for e in self.entries:
+                if self.stop_event.is_set():break
+                identity=e['instanceId'];nodes=self.meta.get(identity,[])
+                if not nodes:continue
+                try:
+                    self.housekeeping()
+                    self.check_storage(e)
+                    now=self.clock()
+                    if now>=self.next_cloud.get(identity,0):
+                        self.next_cloud[identity]=now+60
+                        try:
+                            self.cloud_poll(e,nodes,now)
+                            self.context.state['cloud_monitor']={'last_success':self.clock()}
+                        except Exception as exc:self.context.state['cloud_monitor']={'last_attempt':now,'error':error_code(exc)}
+                    self.context.run(e,nodes)
+                    self.aggregates.flush()
+                except Exception as exc:
+                    self.context.state['collector']={'last_attempt':self.clock(),'error':error_code(exc)}
+            self.stop_event.wait(5)
 
     def stop(self):
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=5)
+        if self.context_thread:
+            self.context_thread.join(timeout=5)
 
     def _run(self):
         due = {}
@@ -151,7 +192,7 @@ class RedisService:
                 try:
                     self.collect(e)
                 except Exception as exc:
-                    self.health[e['instanceId']] = {'last_error': type(exc).__name__, 'last_attempt': now}
+                    self.health[e['instanceId']] = {'last_error': error_code(exc), 'last_attempt': now}
                     LOGGER.warning('Redis telemetry failed: %s', type(exc).__name__)
                 due[e['instanceId']] = self.clock() + e['intervalSeconds']
             self.stop_event.wait(1)
@@ -212,11 +253,12 @@ class RedisService:
         identity = e['instanceId']
         now = self.clock()
         # Stop before writing/collecting if our own budget or the host safety floor is reached.
+        self.housekeeping()
         self.check_storage(e)
         nodes = self.meta.get(identity)
-        cloud_due = now >= self.next_cloud.get(identity, 0)
-        if not nodes or cloud_due:
+        if not nodes or now>=self.next_topology.get(identity,0):
             nodes = self.topology(e)  # no stale target fallback after a failed refresh
+            self.next_topology[identity]=now+60
         wire = self.wire_factory(e)
         errors = []
         try:
@@ -224,12 +266,12 @@ class RedisService:
                 if self.stop_event.is_set():
                     break
                 try:
-                    raw = wire.send('IINFO', str(node['index']), 'server', 'commandstats', 'cpu')
+                    raw = wire.send('IINFO', str(node['index']), *SECTIONS)
                     self.record(e, node, raw, self.clock())
                 except Exception as exc:
-                    errors.append(node['node']+':'+type(exc).__name__)
+                    errors.append(node['node']+':'+error_code(exc))
                     with self.db() as c:
-                        c.execute('INSERT OR REPLACE INTO collection VALUES(?,?,?,?)', (identity, node['node'], self.clock(), type(exc).__name__))
+                        c.execute('INSERT OR REPLACE INTO collection VALUES(?,?,?,?)', (identity, node['node'], self.clock(), error_code(exc)))
                     # A timed-out socket may desynchronize RESP; never continue it.
                     break
             if now >= self.next_buckets.get(identity, 0) and not errors:
@@ -245,13 +287,6 @@ class RedisService:
                 self.next_buckets[identity] = now + 600
         finally:
             wire.close()
-        if cloud_due:
-            try:
-                self.cloud_poll(e, nodes, now)
-                self.next_cloud[identity] = now + 60
-            except Exception as exc:
-                errors.append('cloud:'+type(exc).__name__)
-                self.next_cloud[identity] = now + 60
         self.health[identity] = {'last_attempt': now, 'last_success': self.clock() if not errors else None, 'errors': errors}
         self.housekeeping()
 
@@ -298,7 +333,12 @@ class RedisService:
                 for table in ('snapshots', 'intervals', 'topology', 'buckets', 'metrics', 'slow_events', 'samples', 'collection'):
                     col = 'end' if table == 'intervals' else 'ts'
                     # Bounded deletes. A backlog is retried hourly, never an unbounded VACUUM.
-                    c.execute(f'DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE instance=? AND {col}<? LIMIT 20000)', (e['instanceId'], now-(min(e['retentionDays'], 7) if table == 'samples' else e['retentionDays'])*DAY))
+                    cutoff=now-(min(e['retentionDays'], 7) if table == 'samples' else e['retentionDays'])*DAY
+                    if table=='intervals':
+                        watermark=c.execute('SELECT watermark FROM redis_maintenance WHERE instance=? AND name=?',(e['instanceId'],'minute')).fetchone()
+                        if not watermark:continue
+                        cutoff=min(cutoff,watermark[0])
+                    c.execute(f'DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE instance=? AND {col}<? LIMIT 20000)', (e['instanceId'],cutoff))
                 ident = e['instanceId']
                 first = c.execute('SELECT ts FROM snapshots WHERE instance=? ORDER BY ts LIMIT 1', (ident,)).fetchone()
                 if first:
@@ -312,11 +352,12 @@ class RedisService:
             first, latest = self.bounds.get(ident, [None, None])
             sample_time = self.last_sample.get(ident)
             recent_sample = sample_time is not None and sample_time > self.clock()-3600
-            active.append({'id': ident, 'label': e['label'], 'nodes': self.meta.get(ident, []), 'first': first, 'latest': latest,
+            active.append({'id': ident, 'label': e['label'], 'nodes': [{**n,'latest':self.last.get((ident,n['node']),{}).get('ts')} for n in self.meta.get(ident, [])], 'first': first, 'latest': latest,
                            'interval_seconds': e['intervalSeconds'], 'retention_days': e['retentionDays'], 'max_mib': e['maxMiB'], 'health': self.health.get(ident, {}),
                            'last_key_sample': sample_time, 'key_sampling': 'receiving' if recent_sample else 'not_connected'})
-        return {'status': 'unavailable' if self.error else 'ok' if active else 'not_configured', 'instances': active,
-                'storage': 'yy-ecs SQLite; 30天（实例可配置），容量上限熔断；不依赖OSS', 'warning': WARNING}
+        return {'schema':'redis-five-layer-v1','status': 'unavailable' if self.error else 'ok' if active else 'not_configured', 'instances': active,
+                'storage': 'yy-ecs：20秒30天/分钟90天/小时400天；ClickHouse：形状30天/小时180天；容量上限熔断',
+                'context': dict(self.context.state) if self.context else {}, 'aggregates': dict(self.aggregates.state) if self.aggregates else {}, 'warning': WARNING}
 
     def query(self, params):
         identity = one(params, 'instance')
@@ -347,6 +388,10 @@ class RedisService:
                     key = (row['node'], cmd)
                     g = groups.setdefault(key, {'calls': 0, 'usec': 0, 'seconds': 0})
                     g['calls'] += costs['calls']; g['usec'] += costs['usec']; g['seconds'] += sec
+                    for field in ('rejected_calls','failed_calls'):
+                        if field in costs:
+                            g[field]=g.get(field,0)+costs[field]
+                            g[field+'_known_seconds']=g.get(field+'_known_seconds',0)+sec
             return groups, durations, resets, curve
         with self.db() as c:
             current, durations, resets, curve = read_window(c, start, end)
@@ -375,16 +420,44 @@ class RedisService:
             bucket = c.execute('SELECT ts,payload FROM buckets WHERE instance=? AND ts<=? ORDER BY ts DESC LIMIT 1', (identity, end)).fetchone()
             events = [{'node': r['node'], 'time': r['ts'], **json.loads(r['payload'])} for r in c.execute('SELECT * FROM slow_events WHERE instance=? AND ts>=? AND ts<?'+node_sql+' ORDER BY ts DESC LIMIT 101', [identity, start, end]+args)]
             samples = [{**json.loads(r['payload']), 'time': r['ts']} for r in c.execute('SELECT * FROM samples WHERE instance=? AND ts>=? AND ts<? ORDER BY ts DESC LIMIT 101', (identity, start, end))]
+        limit=int(one(params,'limit','300'))
+        if not 1<=limit<=1000:raise ValueError('redis_result_limit')
+        order=one(params,'order','usec')
+        if order not in ('usec','calls'):raise ValueError('invalid_redis_cost_order')
+        field='delta_calls' if order=='calls' else 'delta_service_seconds'
+        output.sort(key=lambda x:(x[field] is not None,x[field] if x[field] is not None else x['calls' if order=='calls' else 'usec']),reverse=True)
         expected = [n['node'] for n in self.meta.get(identity, []) if not node_filter or n['node'] == node_filter]
         nodes = sorted(set(expected) | set(durations) | set(base_durations))
         coverage = [{'node': n, 'seconds': durations.get(n, 0), 'baseline_seconds': base_durations.get(n, 0), 'expected_seconds': end-start} for n in nodes]
-        return {'instance': identity, 'start': start, 'end': end, 'rows': output[:300], 'rows_truncated': len(output)>300,
+        from .redis_diagnosis import diagnosis
+        extra=diagnosis(self,e,start,end,node_filter,current,baseline)
+        return {**extra, 'instance': identity, 'first_recorded':self.bounds.get(identity,[None,None])[0], 'order':order, 'start': start, 'end': end, 'rows': output[:limit], 'rows_truncated': len(output)>limit,
                 'coverage': coverage, 'resets': resets[:100], 'baseline_resets': base_resets[:100], 'process_cpu': curve[:10000],
                 'metrics': metrics[:10000], 'metrics_truncated': len(metrics)>10000, 'baseline_metrics_truncated': len(base_metrics)>10000, 'rate_rows': rate_rows,
                 'buckets': {'time': bucket['ts'], 'rows': json.loads(bucket['payload']), 'scope': 'latest_observed_not_future'} if bucket else None,
                 'slow_events': events[:100], 'slow_events_truncated': len(events)>100,
                 'key_samples': samples[:100], 'key_samples_truncated': len(samples)>100,
                 'key_sampling': 'observed_client_samples' if samples else 'no_samples_in_window', 'key_sample_scope': 'instance_not_selected_node', 'warning': WARNING}
+
+    def history_query(self,params):
+        identity=one(params,'instance')
+        if identity not in {e['instanceId'] for e in self.entries}:raise ValueError('configured_redis_instance_required')
+        start=int(one(params,'startEpochUs'))/1e6;end=int(one(params,'endEpochUs'))/1e6
+        period=int(one(params,'period','3600'));node=one(params,'node')
+        if not math.isfinite(start+end) or start<=0 or end<=start or end>self.clock()+60 or end-start>400*DAY:raise ValueError('redis_history_window')
+        if node and not re.fullmatch(r'db-\d{1,2}',node):raise ValueError('invalid_redis_node')
+        result=self.evidence.rollups(identity,start,end,period,node)
+        if one(params,'summary')=='1':
+            totals={};points=[]
+            for r in result['rows']:
+                seconds=r['process_cpu_known_seconds'];gauges=r.get('telemetry_snapshot',{}).get('gauges',{})
+                points.append({'node':r['node'],'timestamp':r['time']*1000,'period':period,'value':r['process_cpu_seconds']/seconds*100 if seconds else None,'known_seconds':seconds,'used_memory':gauges.get('used_memory'),'rss':gauges.get('used_memory_rss')})
+                for command,cost in r['commands'].items():
+                    target=totals.setdefault((r['node'],command),{'node':r['node'],'command':command,'calls':0,'usec':0,'seconds':0})
+                    for k in ('calls','usec','seconds'):target[k]+=cost[k]
+            rows=sorted(totals.values(),key=lambda x:x['calls' if one(params,'order')=='calls' else 'usec'],reverse=True)
+            return {'points':points,'rows':rows[:300],'truncated':result['truncated'],'rows_truncated':len(rows)>300,'scope':result['scope'],'period':period,'start':start,'end':end}
+        return result
 
     def authorized(self, header):
         path = self.root / '.credentials' / 'redis-ingest.json'

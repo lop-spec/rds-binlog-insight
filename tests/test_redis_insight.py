@@ -119,7 +119,7 @@ class History(unittest.TestCase):
         class Bad:
             def send(self,*a):raise TimeoutError()
             def close(self):pass
-        self.s.wire_factory=lambda e:Bad();self.s.next_cloud['r-example01']=self.now+60
+        self.s.wire_factory=lambda e:Bad();self.s.next_topology['r-example01']=self.now+60
         with patch.object(self.s,'check_storage'):
             self.s.collect(ENTRY)
         self.assertTrue(self.s.status()['instances'][0]['health']['errors']);self.assertEqual(self.query(self.now-40,self.now)['rows'],[])
