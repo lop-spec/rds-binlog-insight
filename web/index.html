@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.36.2-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.36.2-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.37.0-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.37.0-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -177,11 +177,11 @@
         <div class="query-panel">
           <div class="panel-heading">
             <div><h2>分析范围</h2><p>查看趋势，定位高影响 SQL；更多条件按需展开。</p></div>
-            <label class="range-picker">时间范围<select id="analytics-range" aria-label="分析时间范围"><option value="1h">最近 1 小时</option><option value="6h">最近 6 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></label>
+            <label class="range-picker">时间范围<select id="analytics-range" aria-label="分析时间范围"><option value="5m">最近 5 分钟</option><option value="1h">最近 1 小时</option><option value="6h">最近 6 小时</option><option value="24h" selected>最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option><option value="custom">自定义</option></select></label>
           </div>
 
           <form id="analytics-form" class="query-grid">
-            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="RDS：下面勾选慢日志 / Binlog 写入作为证据来源，只请求勾选的；MongoDB 单独分析"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option></select></label>
+            <label class="field span-2"><span>数据来源</span><select id="analytics-source" title="按数据库选择数据来源"><option value="rds">RDS</option><option value="mongodb">MongoDB 慢日志 / 命令</option><option value="starrocks">StarRocks</option></select></label>
             <label class="field span-2"><span>实例</span><select id="analytics-instance" title="按来源实例过滤：binlog 写事件与 general log 读语句都带实例归属"><option value="">全部实例</option></select></label>
             <fieldset id="rds-sources" class="operation-filter span-2" title="证据来源：慢日志给出真实扫描行数和耗时（上涨排查），Binlog 给出写入与事务推断（写入 SQL / 事务 / 锁争用推断）。只请求勾选的。">
               <legend>证据来源</legend>
@@ -214,6 +214,16 @@
               <p id="mongo-baseline-hint" class="analytics-note span-8" role="status" aria-live="polite"></p>
               <label class="field span-2"><span>关联 SLS</span><select id="mongo-log-source"><option value="">不关联日志</option></select></label>
               <div class="form-actions span-8"><button id="mongo-investigate" class="button secondary" type="button">缓存与 ticket 专项排查</button><span class="analytics-note">更新缓存指标点“开始排查”即执行；整分钟窗口最多30分钟，不挪时间、不改参数。</span></div>
+            </div>
+            <div id="starrocks-controls" class="query-grid span-8" hidden>
+              <label class="field span-2"><span>StarRocks 实例</span><select id="starrocks-instance"></select></label>
+              <label class="field span-2"><span>查看内容</span><select id="starrocks-mode"><option value="workload">SQL 负载</option><option value="audit">SQL 审计</option><option value="slow">慢查询 ≥1秒</option><option value="loads">导入记录</option><option value="running">在途查询</option><option value="metrics">节点监控</option></select></label>
+              <label class="field span-2" data-sr-metrics><span>性能指标</span><select id="starrocks-metric"></select></label>
+              <label class="field span-2" data-sr-workload><span>排序依据</span><select id="starrocks-order"><option value="cpuCostNs">已记录 CPU</option><option value="scanBytes">已记录扫描量</option><option value="queryTime">已记录耗时</option><option value="count">已观察次数</option><option value="pendingTimeMs">已记录排队</option></select></label>
+              <label class="field span-2" data-sr-audit><span>数据库</span><input id="starrocks-database" maxlength="128" placeholder="完整库名，可留空"></label>
+              <label class="field span-2" data-sr-audit><span>账号</span><input id="starrocks-account" maxlength="128" placeholder="完整账号，可留空"></label>
+              <label class="field span-2"><span>自动刷新</span><select id="starrocks-refresh"><option value="0">手动刷新</option><option value="30">每30秒</option></select></label>
+              <p class="analytics-note span-8">审计查源端近30天，每次≤1小时，负载最多读取3万条/32MiB；超限明确标为部分。扫描不是物理IO，审计不是逐行变更。</p>
             </div>
             <div id="analytics-filter-summary" class="active-filters span-8" hidden></div>
             <div class="form-actions span-8">
@@ -520,11 +530,12 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.36.2-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.36.2-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.36.2-rawoss" defer></script>
-  <script src="/assets/sessions.js?v=1.36.2-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.36.2-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.36.2-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.37.0-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.37.0-rawoss" defer></script>
+  <script src="/assets/starrocks.js?v=1.37.0-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.37.0-rawoss" defer></script>
+  <script src="/assets/sessions.js?v=1.37.0-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.37.0-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.37.0-rawoss" defer></script>
 </body>
 </html>

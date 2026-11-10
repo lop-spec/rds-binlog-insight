@@ -403,6 +403,8 @@ class Application:
         from .mongo_collector import DdsClient
         from .mongo_service import MongoService
         self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
+        from .starrocks_service import StarRocksService
+        self.starrocks = StarRocksService(self.data_dir, self.metadata.load_settings, credential_loader)
         # Members of the MongoDB instances configured for Mongo analytics (role id, role, VPC address), for session management.
         self.mongo_nodes = MongoNodeBook(self.metadata.load_settings, credential_loader, lambda: self.mongo.entries, DdsClient)
         if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
@@ -1070,6 +1072,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("workspace.css")
             elif parsed.path == "/assets/mongo.js":
                 self._serve_static("mongo.js")
+            elif parsed.path == "/assets/starrocks.js":
+                self._serve_static("starrocks.js")
             elif parsed.path == "/assets/rise.js":
                 self._serve_static("rise.js")
             elif parsed.path == "/assets/sessions.js":
@@ -1082,6 +1086,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "data": self.app.mongo.sources(query)})
             elif parsed.path == "/api/mongo/investigate":
                 self._json({"ok": True, "data": self.app.mongo.investigator.run(query)})
+            elif parsed.path == "/api/starrocks/status":
+                self._json({"ok": True, "data": self.app.starrocks.status()})
+            elif parsed.path == "/api/starrocks/metrics":
+                self._json({"ok": True, "data": self.app.starrocks.query(query)})
+            elif parsed.path == "/api/starrocks/query":
+                self._json({"ok": True, "data": self.app.starrocks.database_query(query)})
             elif parsed.path == "/favicon.svg":
                 self._serve_static("favicon.svg")
             elif parsed.path == "/healthz":

@@ -1819,10 +1819,12 @@ function analyticsTabKind(name) {
 }
 
 function syncAnalyticsMode() {
-  const mongo = $("#analytics-source").value === "mongodb";
+  const source = $("#analytics-source").value;
+  const mongo = source === "mongodb", starrocks = source === "starrocks";
   if (typeof syncMongoMode === 'function') syncMongoMode(mongo);
-  if (typeof syncRdsControls === 'function') syncRdsControls(!mongo);
-  if (mongo) return;
+  if (typeof syncStarRocksMode === 'function') syncStarRocksMode(starrocks);
+  if (typeof syncRdsControls === 'function') syncRdsControls(!mongo && !starrocks);
+  if (mongo || starrocks) return;
   $("#analytics-tabs").hidden = false;
   switchAnalyticsTab(state.rdsTab || "rise");
   syncAnalyticsSources(); // 性能指标 / Node ID / 页签跟着勾选的证据来源走
@@ -1832,7 +1834,7 @@ function switchAnalyticsTab(name) {
   state.analyticsTab = name;
   $$("[data-analytics-tab]").forEach((button) => button.classList.toggle("is-active", button.dataset.analyticsTab === name));
   $$(".analytics-panel").forEach((panel) => panel.classList.toggle("is-active", panel.id === `analytics-panel-${name}`));
-  if ($("#analytics-source").value === "mongodb") return;
+  if ($("#analytics-source").value !== "rds") return;
   state.rdsTab = name;
   const kind = analyticsTabKind(name);
   // 锁分析口径只对事务 / 锁争用两页成立；慢日志与写入 SQL 页不需要它。
@@ -1888,8 +1890,8 @@ function renderAnalytics(result) {
 }
 
 function setAnalyticsRange(range) {
-  const units = { "1h": 60 * 60_000, "6h": 6 * 60 * 60_000, "24h": 24 * 60 * 60_000, "7d": 7 * 24 * 60 * 60_000, "30d": 30 * 24 * 60 * 60_000 };
-  const latestEpochUs = $("#analytics-source").value === "mongodb" ? 0 : Number(state.status?.summary?.latestEpochUs || 0);
+  const units = { "5m": 5 * 60_000, "1h": 60 * 60_000, "6h": 6 * 60 * 60_000, "24h": 24 * 60 * 60_000, "7d": 7 * 24 * 60 * 60_000, "30d": 30 * 24 * 60 * 60_000 };
+  const latestEpochUs = $("#analytics-source").value === "rds" ? Number(state.status?.summary?.latestEpochUs || 0) : 0;
   const end = latestEpochUs > 0 ? new Date(latestEpochUs / 1000) : new Date();
   end.setSeconds(0, 0); // 整分钟：和排查实际使用的窗口一致，起止点不带零头秒数
   $("#analytics-end").value = toLocalInput(end);
@@ -1928,6 +1930,7 @@ function analyticsQueryString(orderOverride = "", kind = "slowlog") {
 
 async function runAnalytics(orderOverride = "") {
   if ($("#analytics-source").value === "mongodb") return runMongoAnalytics();
+  if ($("#analytics-source").value === "starrocks") return runStarRocks();
   return runRise();
 }
 
@@ -1966,7 +1969,7 @@ async function loadAnalyticsDetails() {
 // 点标签：慢日志明细第一次打开时才请求；上涨排查与 Binlog 页签的数据排查时已取回。
 async function openAnalyticsTab(name) {
   switchAnalyticsTab(name);
-  if (name !== "sql" || $("#analytics-source").value === "mongodb") return;
+  if (name !== "sql" || $("#analytics-source").value !== "rds") return;
   await loadAnalyticsDetails();
 }
 

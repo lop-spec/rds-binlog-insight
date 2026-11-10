@@ -133,6 +133,20 @@ const impactResult = {status: 'ok', metric_id: 'cpu', metric: 'Cluster_CpuUsage'
                    stmt('flat', null, 60_000_000, 0, {growth_share: 0.2})]},
   ]};
 
+test('StarRocks mode dispatches separately and hides the RDS controls', async () => {
+  const {c, nodes, calls} = rdsContext(async () => { throw new Error('RDS request forbidden'); });
+  const modes = [];
+  c.syncMongoMode = value => modes.push(['mongo', value]);
+  c.syncStarRocksMode = value => modes.push(['starrocks', value]);
+  c.syncRdsControls = value => modes.push(['rds', value]);
+  c.runStarRocks = async () => 'starrocks-only';
+  nodes['#analytics-source'].value = 'starrocks';
+  vm.runInContext('syncAnalyticsMode()', c);
+  assert.deepEqual(modes, [['mongo', false], ['starrocks', true], ['rds', false]]);
+  assert.equal(await vm.runInContext('runAnalytics()', c), 'starrocks-only');
+  assert.equal(calls.length, 0);
+});
+
 test('slow log only: one growth-ordered impact analysis and nothing else', async () => {
   const {c, nodes, calls, toasts} = rdsContext(async () => impactResult);
   await vm.runInContext('runAnalytics()', c);
@@ -627,9 +641,9 @@ test('sorting a Binlog result re-renders the writes panel and keeps orders per k
   assert.match(vm.runInContext('analyticsQueryString("", "slowlog")', c), /order=executions/);
 });
 
-test('data source is exactly RDS and MongoDB; evidence sources are two ticked-by-default options; 写入 SQL is a first-level page', () => {
+test('data sources include RDS, MongoDB and StarRocks; RDS evidence and tabs stay intact', () => {
   const options = [...html.matchAll(/<select id="analytics-source"[^>]*>(.*?)<\/select>/gs)][0][1];
-  assert.deepEqual([...options.matchAll(/value="([^"]+)"/g)].map((m) => m[1]), ['rds', 'mongodb']);
+  assert.deepEqual([...options.matchAll(/value="([^"]+)"/g)].map((m) => m[1]), ['rds', 'mongodb', 'starrocks']);
   for (const id of ['analytics-use-slowlog', 'analytics-use-binlog']) {
     assert.match(html, new RegExp(`<input id="${id}" type="checkbox" checked>`), id);
   }

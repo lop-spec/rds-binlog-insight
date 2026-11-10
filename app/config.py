@@ -13,7 +13,7 @@ LOGGER = logging.getLogger(__name__)
 
 APP_NAME = "RDS SQL Insight"
 APP_ID = "rds-binlog-insight"
-APP_VERSION = "1.36.2-rawoss"
+APP_VERSION = "1.37.0-rawoss"
 DEFAULT_PORT = 8769
 MAX_PORT = 8799
 

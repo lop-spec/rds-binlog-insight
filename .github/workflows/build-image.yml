@@ -25,16 +25,16 @@ on:
         default: false
   push:
     tags:
-      - v1.36.2-rawoss
+      - v1.37.0-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.36.2-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.36.2-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.36.2-rawoss
+  VERSION: 1.37.0-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.37.0-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.37.0-rawoss
 
 jobs:
   recovery-isolation:
@@ -229,6 +229,8 @@ jobs:
             tests.test_window_align \
             tests.test_server_roles_and_windows \
             tests.test_mongo_insight \
+            tests.test_starrocks_metrics \
+            tests.test_starrocks_service \
             tests.test_mongo_pressure \
             tests.test_resource_attribution \
             tests.test_mongo_collector \
@@ -256,7 +258,7 @@ jobs:
             "$LOCAL_IMAGE" -m tools.benchmark_index_layout --raw-event-index --rows 16384
 
       - name: Verify workspace rendering and disclosure contracts
-        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs tests/test_sync_lifecycle.cjs tests/test_sync_status.cjs tests/test_indexed_range.cjs tests/test_sessions_ui.cjs
+        run: node --test tests/test_workspace.cjs tests/test_workspace_impact.cjs tests/test_mongo_workspace.cjs tests/test_starrocks_workspace.cjs tests/test_sync_lifecycle.cjs tests/test_sync_status.cjs tests/test_indexed_range.cjs tests/test_sessions_ui.cjs
 
       - name: Verify Mongo, slow-log filters and raw candidate versions against isolated ClickHouse
         shell: bash

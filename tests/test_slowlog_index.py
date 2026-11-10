@@ -1062,9 +1062,9 @@ class SlowLogRoutingTests(unittest.TestCase):
         script = (root / "web" / "app.js").read_text("utf-8")
         self.assertIn('id="analytics-source"', html)
         self.assertIn('id="analytics-node"', html)
-        # one RDS source (slow log and Binlog writes are tabs of it) besides MongoDB
+        # RDS, MongoDB and StarRocks share the workspace; RDS keeps its two evidence sources.
         select = re.search(r'<select id="analytics-source"[^>]*>(.*?)</select>', html, re.S).group(1)
-        self.assertEqual(re.findall(r'value="([^"]+)"', select), ["rds", "mongodb"])
+        self.assertEqual(re.findall(r'value="([^"]+)"', select), ["rds", "mongodb", "starrocks"])
         self.assertIn('<option value="rds">RDS</option>', html)
         self.assertIn('data-analytics-tab="writes"', html)
         self.assertIn('id="analytics-panel-writes"', html)
