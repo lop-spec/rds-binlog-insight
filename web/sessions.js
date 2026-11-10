@@ -298,6 +298,9 @@ function sessionInstances() {
   for (const item of sessionsState.mongo || []) {
     if (item.instance_id && (item.nodes || []).length && !seen.has(item.instance_id)) seen.set(item.instance_id, `${item.label || item.instance_id}（MongoDB）`);
   }
+  for (const item of state.status?.instanceRegistry || []) {
+    if (item.engine === 'starrocks') seen.set(item.id, `${item.label}（StarRocks）`);
+  }
   return [...seen.entries()];
 }
 
@@ -527,6 +530,7 @@ function setSessionsMode(mode) {
 }
 
 async function runSessions() {
+  if (typeof isStarRocksInstance === 'function' && isStarRocksInstance($('#sessions-instance').value)) return runStarRocksSessions();
   if (sessionsState.mode === "history") await loadSessionHistory(); else await loadSessions();
 }
 

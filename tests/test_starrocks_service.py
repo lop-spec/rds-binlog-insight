@@ -53,6 +53,17 @@ class StarRocksServiceTest(unittest.TestCase):
         self.assertEqual(self.connection.closed,1)
         self.assertTrue(any(s=='SET query_timeout=10' for s,a in self.connection.calls))
         self.assertFalse(any('KILL' in s or 'SET GLOBAL' in s for s,a in self.connection.calls))
+    def test_main_audit_filters_are_bound_and_status_checked(self):
+        params={**self.params,'keyword':"x' OR 1=1",'connection':'fixture-client','status':'failed'}
+        self.service.database_query(params)
+        sql,args=next((s,a) for s,a in self.connection.calls if s.startswith('SELECT `queryId`'))
+        self.assertIn('LOCATE(%s,`stmt`)',sql);self.assertIn(params['keyword'],args)
+        self.assertNotIn(params['keyword'],sql);self.assertIn("`state`='ERR'",sql)
+    def test_unsupported_main_filters_are_never_silently_ignored(self):
+        for values in [{'status':'cancelled'},{'table':'unknown'},{'operation':'INSERT'}]:
+            self.connection=Connection([])
+            with self.assertRaisesRegex(ValueError,'unsupported_starrocks'):
+                self.service.database_query({**self.params,**values})
     def test_wrong_host_refused_without_connection(self):
         self.service.db_entries[INSTANCE]={**ENTRY,'host':'evil.example'}
         with self.assertRaisesRegex(ValueError,'fixed_database_target'):self.service.database_query(self.params)

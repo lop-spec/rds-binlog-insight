@@ -25,9 +25,9 @@ async function syncStarRocksMode(enabled){
   const controls=$('#starrocks-controls');if(!controls)return;
   controls.hidden=!enabled;++starrocksRequest;srStopTimer();
   if(!enabled)return;
-  for(const id of ['analytics-instance','analytics-filters']){
-    const element=$('#'+id);if(element)(id==='analytics-instance'?element.closest('label'):element).hidden=true;
-  }
+  $('#analytics-instance').closest('label').hidden=false;
+  $('#analytics-filters').hidden=true;
+  $('#starrocks-instance').closest('label').hidden=true;
   $('#analytics-tabs').hidden=true;$('#analytics-lock-warning').hidden=true;$('#analytics-node-field').hidden=true;
   if(!starrocksBindings){
     starrocksBindings=true;
@@ -38,7 +38,7 @@ async function syncStarRocksMode(enabled){
       if($('#starrocks-refresh').value!=='0')srSchedule();
     });
     $('#analytics-form').addEventListener('change',event=>{
-      if(!srVisible()||event.target.closest('#starrocks-controls'))return;
+      if(!srVisible()||event.target.closest('#starrocks-controls')||event.target.matches('#analytics-source,#analytics-instance'))return;
       ++starrocksRequest;srStopTimer();starrocksRows=[];
       $('#analytics-panel-sql').innerHTML='';$('#analytics-empty').hidden=false;
       $('#analytics-meta').textContent='时间范围已变更，请重新排查';
@@ -63,6 +63,9 @@ async function syncStarRocksMode(enabled){
     if(request!==starrocksRequest||!srVisible())return;
     starrocksStatus=data;
     $('#starrocks-instance').innerHTML=(data.instances||[]).map(x=>`<option value="${escapeHtml(x.id)}">${escapeHtml(x.label)}</option>`).join('');
+    const chosen=$('#analytics-instance').value;
+    const selected=(data.instances||[]).find(x=>x.id===chosen)?.id||data.instances?.[0]?.id||'';
+    $('#starrocks-instance').value=selected;$('#analytics-instance').value=selected;
     $('#starrocks-metric').innerHTML=(data.metrics||[]).map(x=>`<option value="${escapeHtml(x.id)}">${escapeHtml(x.label)}</option>`).join('');
     $('#analytics-meta').textContent=data.status==='ok'?'选择内容后点击开始排查':'StarRocks 未登记或配置不可用';
   }catch(error){if(request===starrocksRequest&&srVisible())$('#analytics-meta').textContent=`StarRocks 配置读取失败：${error.message}`;}
@@ -118,7 +121,7 @@ function srRenderData(data,mode){
   $('#analytics-panel-sql').innerHTML=`<section class="detail-block">${output}</section>`;
 }
 async function runStarRocks(){
-  const instance=$('#starrocks-instance').value,mode=srMode();
+  const instance=$('#analytics-instance')?.value||$('#starrocks-instance').value,mode=srMode();
   if(!instance||starrocksStatus?.status!=='ok')throw new Error('StarRocks 实例未登记');
   const start=new Date($('#analytics-start').value).getTime()*1000,end=new Date($('#analytics-end').value).getTime()*1000;
   if(mode!=='running'&&(!Number.isFinite(start)||!Number.isFinite(end)||end<=start))throw new Error('请选择有效时间。');

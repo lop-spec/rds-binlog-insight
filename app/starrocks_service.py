@@ -220,6 +220,18 @@ class StarRocksService(StarRocksMetrics):
             value=one(params,name)
             if len(value)>128:raise ValueError('starrocks_filter_too_long')
             if value:conditions.append('`'+column+'`=%s');args.append(value)
+        keyword=one(params,'keyword')
+        if len(keyword)>500:raise ValueError('starrocks_keyword_too_long')
+        if keyword:conditions.append('LOCATE(%s,`stmt`) > 0');args.append(keyword)
+        client=one(params,'connection')
+        if len(client)>128:raise ValueError('starrocks_filter_too_long')
+        if client:conditions.append('`clientIp`=%s');args.append(client)
+        status=one(params,'status')
+        if status not in ('','success','failed'):raise ValueError('unsupported_starrocks_status')
+        if status=='failed':conditions.append("`state`='ERR'")
+        elif status=='success':conditions.append("`state` IN ('OK','EOF')")
+        if one(params,'table') or one(params,'operation') or one(params,'exact'):
+            raise ValueError('unsupported_starrocks_audit_filter')
         if one(params,'mode')=='slow':conditions.append('`queryTime` >= 1000')
         limit = MAX_SCAN_ROWS if workload else min(200,max(1,int(one(params,'limit','100'))))
         # A stable newest-first bounded snapshot, not offset pagination over changing data.

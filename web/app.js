@@ -165,6 +165,7 @@ function switchView(name) {
 }
 
 function isIndexedBinlogQuery() {
+  if (typeof isStarRocksAudit === 'function' && isStarRocksAudit()) return false;
   return $("#filter-query-mode").value !== "keyword" || ["", "binlog"].includes($("#filter-source").value);
 }
 
@@ -178,6 +179,7 @@ function gapCopy(gaps, startMs, endMs) {
 
 let indexedRangeRequest = 0;
 async function setQuickRange(range) {
+  if (typeof isStarRocksAudit === 'function' && isStarRocksAudit()) return srAuditRange(range);
   const request = ++indexedRangeRequest;
   const units = { "15m": 15 * 60_000, "1h": 60 * 60_000, "24h": 24 * 60 * 60_000, "7d": 7 * 24 * 60 * 60_000, "30d": 30 * 24 * 60 * 60_000 };
   $("#audit-range").value = range;
@@ -349,6 +351,7 @@ function eventQueryPayload() {
 }
 
 function syncQueryMode() {
+  if (typeof resetStarRocksAuditControls === 'function' && resetStarRocksAuditControls()) return;
   const mode = $("#filter-query-mode").value;
   const exact = mode === "primary-key";
   const fast = isIndexedBinlogQuery();
@@ -374,6 +377,7 @@ function syncQueryMode() {
 }
 
 function validateEventRange() {
+  if (typeof isStarRocksAudit === 'function' && isStarRocksAudit()) return;
   const startInput = $("#filter-start");
   const endInput = $("#filter-end");
   endInput.setCustomValidity("");
@@ -650,10 +654,12 @@ async function cancelQueryTask(taskId, button) {
 }
 
 async function refreshQueryTasks() {
+  if (typeof isStarRocksAudit === 'function' && isStarRocksAudit()) return;
   if (state.queryTaskRefreshInFlight) return;
   state.queryTaskRefreshInFlight = true;
   try {
     const tasks = await api("/api/query-tasks?limit=50");
+    if (typeof isStarRocksAudit === 'function' && isStarRocksAudit()) return;
     state.queryTasks = tasks;
     if (!state.activeQueryTaskId && tasks.length) state.activeQueryTaskId = tasks[0].id;
     renderQueryTasks(tasks);
@@ -681,6 +687,7 @@ async function refreshQueryTasks() {
 }
 
 async function runQuery(queryOverride = null) {
+  if (typeof isStarRocksAudit === 'function' && isStarRocksAudit()) return runStarRocksAudit();
   if (state.queryPromise) return state.queryPromise;
   if (!queryOverride) validateEventRange();
   const button = $("#query-submit");
@@ -712,6 +719,7 @@ function prettyJson(value) {
 }
 
 async function openDetail(eventId, locator = "", instance = "") {
+  if (typeof openStarRocksAuditDetail === 'function' && openStarRocksAuditDetail(eventId)) return true;
   const request = state.detailRequest = (state.detailRequest || 0) + 1;
   $("#detail-body").innerHTML = '<div class="empty-state"><strong>正在读取事件…</strong></div>';
   showDetailDrawer();
@@ -1136,11 +1144,12 @@ function instanceLabels(status) {
     ...(status.generalLogs || []),
     ...(status.slowLogs || []),
     ...(status.secondarySyncs || []),
+    ...(status.instanceRegistry || []).map(x => ({instanceId:x.id,label:x.label})),
   ];
   for (const item of sources) {
     const id = String(item.instanceId || item.instance_id || "").trim();
     const label = String(item.label || "").trim();
-    if (id && label) labels.set(id, label);
+    if (id && label && (label !== id || !labels.has(id))) labels.set(id, label);
   }
   return labels;
 }
@@ -1150,6 +1159,7 @@ function syncInstanceOptions(instances, labels = new Map()) {
   [$("#analytics-instance"), $("#filter-instance")].forEach((select) => {
     if (!select) return;
     const known = new Set(Array.from(select.options).map((item) => item.value));
+    for (const option of select.options) if (labels.has(option.value)) option.textContent = labels.get(option.value);
     instances.forEach((id) => {
       if (known.has(id)) return;
       const option = document.createElement("option");
@@ -1822,10 +1832,11 @@ function syncAnalyticsMode() {
   const source = $("#analytics-source").value;
   const mongo = source === "mongodb", starrocks = source === "starrocks", redis = source === "redis";
   if (typeof syncMongoMode === 'function') syncMongoMode(mongo);
-  if (typeof syncStarRocksMode === 'function') syncStarRocksMode(starrocks);
+  const srReady = typeof syncStarRocksMode === 'function' ? syncStarRocksMode(starrocks) : undefined;
   if (typeof syncRedisMode === 'function') syncRedisMode(redis);
   if (typeof syncRdsControls === 'function') syncRdsControls(!mongo && !starrocks && !redis);
-  if (mongo || starrocks || redis) return;
+  if (mongo || starrocks || redis) return srReady;
+  if (typeof isStarRocksInstance === 'function' && isStarRocksInstance($("#analytics-instance").value)) $("#analytics-instance").value = state.status?.primaryInstance?.instanceId || '';
   $("#analytics-tabs").hidden = false;
   switchAnalyticsTab(state.rdsTab || "rise");
   syncAnalyticsSources(); // 性能指标 / Node ID / 页签跟着勾选的证据来源走
@@ -2285,6 +2296,7 @@ function bindSchemaEvents() {
 
 function bindEvents() {
   bindSchemaEvents();
+  if (typeof bindMainInstanceControls === 'function') bindMainInstanceControls();
   $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
   $$("[data-go]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.go)));
   setupWorkspaceControls();

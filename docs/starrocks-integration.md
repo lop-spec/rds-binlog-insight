@@ -1,6 +1,8 @@
 # StarRocks 只读接入
 
-在「分析洞察 → 数据来源 → StarRocks」查看 SQL 负载、SQL 审计、慢查询、导入作业及节点监控。使用实例既有只读账号，不新增授权，不修改集群参数。数据库身份和云监控的 ECS 角色分别校验，不混为一个账号。
+StarRocks 已登记到首页共用实例目录。打开「审计查询」选择实例即可直接查询源SQL审计和详情；「分析洞察」选择同一实例自动切换为StarRocks，查看SQL负载、慢查询、导入作业和节点监控。会话页也可选择该实例；权限不足明确提示，不冒充零会话。
+
+使用实例既有只读账号，不新增授权、不修改集群参数。数据库身份和云监控ECS角色分别校验。读取模式为源端直查，不是持续归档：当前没有将SR审计复制到本地/OSS，默认保留范围由源表决定。主审计页默认15分钟，支持SQL原文片段、完整库名、账号、来源和成功/失败筛选；不支持的主键历史、表级行变更和导出控件不会误发给MySQL索引。
 
 ## 数据与范围
 
@@ -40,7 +42,7 @@
 
 ```text
 python -m unittest tests.test_starrocks_metrics tests.test_starrocks_service
-node --test tests/test_starrocks_workspace.cjs tests/test_mongo_workspace.cjs tests/test_workspace.cjs
+node --test tests/test_instances_ui.cjs tests/test_starrocks_workspace.cjs tests/test_mongo_workspace.cjs tests/test_workspace.cjs tests/test_sessions_ui.cjs
 ```
 
 发版只更新主应用容器，既有 MySQL/Mongo 采集器、ClickHouse 和索引worker不随本功能重建。保留旧主应用容器与原镜像作为回滚；回退后本功能配置保持私有但不再被旧版读取。

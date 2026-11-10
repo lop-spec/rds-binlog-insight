@@ -825,9 +825,13 @@ class Application:
             or 0
         )
         local_body_bytes = int(index_stats.get("localBodyBytes") or 0)
+        from .instance_registry import instance_registry
+        known = self.metadata.known_instances() if callable(getattr(self.metadata, 'known_instances', None)) else []
+        registry = instance_registry(known, getattr(getattr(self, 'starrocks', None), 'entries', []))
         return {
             "app": APP_ID,
             "name": APP_NAME,
+            "instanceRegistry": registry,
             "version": APP_VERSION,
             "timeUtc": utc_now_text(),
             "sync": sync_status,
@@ -874,11 +878,7 @@ class Application:
             ],
             "slowLogs": [self._slow_log_status(item) for item in getattr(self, "slow_logs", [])],
             "slowTail": getattr(self, "slow_tails", None).status() if getattr(self, "slow_tails", None) is not None else [],
-            "instances": (
-                self.metadata.known_instances()
-                if callable(getattr(self.metadata, "known_instances", None))
-                else []
-            ),
+            "instances": [item['id'] for item in registry],
             "configured": bool(settings.db_instance_id),
             "primaryInstance": {"instanceId": settings.db_instance_id},
             "secondarySyncs": [
@@ -1083,6 +1083,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._serve_static("redis.js")
             elif parsed.path == "/assets/starrocks.js":
                 self._serve_static("starrocks.js")
+            elif parsed.path == "/assets/instances.js":
+                self._serve_static("instances.js")
             elif parsed.path == "/assets/rise.js":
                 self._serve_static("rise.js")
             elif parsed.path == "/assets/sessions.js":
