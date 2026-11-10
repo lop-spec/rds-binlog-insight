@@ -861,19 +861,20 @@ class Application:
                 "structuralIndexedParts": structural_indexed_parts,
                 "indexBlocks": index_stats.get("block_count", 0),
                 "indexCoverage": (
-                    min(indexed_parts / part_count, 1.0)
-                    if part_count
+                    indexed_parts / part_count
+                    if part_count and indexed_parts <= part_count
                     else None
                 ),
                 "structuralIndexCoverage": (
-                    min(structural_indexed_parts / part_count, 1.0)
-                    if part_count
+                    structural_indexed_parts / part_count
+                    if part_count and structural_indexed_parts <= part_count
                     else None
                 ),
+                "coverageIssues": (['no_parts'] if not part_count else [name + '_count_exceeds_parts' for name, count in [('index', indexed_parts), ('structural', structural_indexed_parts), ('catalog', cataloged_parts)] if count > part_count]),
                 "catalogedParts": cataloged_parts,
                 "catalogCoverage": (
-                    min(cataloged_parts / part_count, 1.0)
-                    if part_count
+                    cataloged_parts / part_count
+                    if part_count and cataloged_parts <= part_count
                     else None
                 ),
                 "ossRetentionDays": settings.oss_retention_days,

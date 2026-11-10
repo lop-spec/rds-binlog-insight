@@ -120,10 +120,19 @@ class DasRpcClient(RdsRpcClient):
         except (urllib.error.URLError, TimeoutError) as exc:
             raise RuntimeError(f"DAS 网络错误：{exc}") from exc
         result = json.loads(body.decode("utf-8"))
-        # CMS also subclasses this client and uses Code=200, while DAS
-        # explicitly returns Success=true. Missing fields never mean success.
-        if not isinstance(result, dict) or not (str(result.get('Success', '')).lower() == 'true' or str(result.get('Code', '')) in {'200', 'Success'}):
-            raise RuntimeError(f"DAS 调用失败：{result.get('Code')} {result.get('Message')} RequestId={result.get('RequestId')}")
+        if not isinstance(result, dict):
+            raise RuntimeError('云API响应必须为对象')
+        code = str(result.get('Code', ''))
+        success = str(result.get('Success', '')).lower()
+        if self.VERSION in {'2020-01-16', '2019-01-01'}:
+            valid = success != 'false' and (success == 'true' or code in {'200', 'Success'})
+        else:
+            # Redis KV and DDS RPC successes have RequestId and product data,
+            # but no Success/Code. Their subclasses must not inherit a DAS-only
+            # response envelope assumption. Error Codes are still rejected.
+            valid = success != 'false' and (code in {'200', 'Success'} or not code and bool(result.get('RequestId')))
+        if not valid:
+            raise RuntimeError(f"云API调用失败：{result.get('Code')} {result.get('Message')} RequestId={result.get('RequestId')}")
         return result
 
 

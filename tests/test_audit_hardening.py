@@ -146,6 +146,19 @@ class AccessBoundary(unittest.TestCase):
                 server.shutdown(); server.server_close(); thread.join(3)
 
 
+class StatusTruth(unittest.TestCase):
+    def test_inconsistent_catalog_counts_are_unknown_not_full(self):
+        from app.server import Application
+        app = object.__new__(Application)
+        app.metadata = SimpleNamespace(load_settings=lambda: Settings(db_instance_id='rm-fixture'),
+            storage_metadata_stats=lambda: {'part_count': 1}, known_instances=lambda: [])
+        app.sync = SimpleNamespace(status=lambda: {'index': {'catalog': {'catalogedParts': 2}}})
+        with patch('app.server.credential_status', return_value={}):
+            result = app.public_status()['summary']
+        self.assertIsNone(result['catalogCoverage'])
+        self.assertIn('catalog_count_exceeds_parts', result['coverageIssues'])
+
+
 class CollectorSafety(unittest.TestCase):
     def test_full_page_without_total_does_not_end_tail_pagination(self):
         client = Mock()
@@ -158,6 +171,19 @@ class CollectorSafety(unittest.TestCase):
         client = DasRpcClient(Settings(db_instance_id='rm-fixture'), CloudCredential('fixture','fixture'))
         with patch.object(client, '_signed_params', return_value={}), patch('app.slow_log_collector.urllib.request.urlopen', return_value=io.BytesIO(b'{"Code":"Throttling","Message":"quota"}')):
             with self.assertRaisesRegex(RuntimeError, 'Throttling'):
+                client.call('DescribeSlowLogRecords', {})
+
+    def test_redis_rpc_success_has_request_id_but_no_das_success_flag(self):
+        from app.redis_service import KvClient
+        client = KvClient(Settings(db_instance_id='rm-fixture'), CloudCredential('fixture', 'fixture'))
+        body = b'{"RequestId":"fixture","Accounts":{"Account":[]},"PageNumber":1,"PageSize":30,"TotalCount":0}'
+        with patch.object(client, '_signed_params', return_value={}), patch('app.slow_log_collector.urllib.request.urlopen', return_value=io.BytesIO(body)):
+            self.assertEqual(client.call('DescribeAccounts', {})['RequestId'], 'fixture')
+
+    def test_explicit_failure_overrides_success_code(self):
+        client = DasRpcClient(Settings(db_instance_id='rm-fixture'), CloudCredential('fixture', 'fixture'))
+        with patch.object(client, '_signed_params', return_value={}), patch('app.slow_log_collector.urllib.request.urlopen', return_value=io.BytesIO(b'{"Success":false,"Code":"200"}')):
+            with self.assertRaises(RuntimeError):
                 client.call('DescribeSlowLogRecords', {})
 
     def test_column_suffixes_never_merge_as_shard_tables(self):
