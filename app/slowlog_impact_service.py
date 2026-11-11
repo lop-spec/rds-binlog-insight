@@ -18,6 +18,7 @@ from .rise_evidence import assign_template_families, load_counters, node_evidenc
 from .slow_log_collector import DasRpcClient
 from .slowlog_impact import DAY_US, MAX_EVENTS, PERIOD_US, family_key, order_by_correlation, rank_performance_growth
 from .window_align import adjusted_payload
+from .comparison_window import previous_window
 
 LOGGER = logging.getLogger(__name__)
 
@@ -153,18 +154,18 @@ def nearest_indexed_window(metadata: Any, backend: Any, instance: str, start_us:
     """
     length = end_us - start_us
     now_us = time.time_ns() // 1000
-    lowest = max(start_us - reach_us, now_us - (max(int(retention_days), 1) - 1) * DAY_US)
+    lowest = max(start_us - reach_us, now_us - max(int(retention_days), 1) * DAY_US + length)
     highest = min(start_us + reach_us, now_us - length)
     if highest < lowest:
         return None
     current = _index_map(metadata, backend, instance, lowest, highest + length)
-    baseline = _index_map(metadata, backend, instance, lowest - DAY_US, highest + length - DAY_US)
+    baseline = _index_map(metadata, backend, instance, lowest - length, highest)
     if current is None or baseline is None:
         return None
     for step in range(1, reach_us // PERIOD_US + 1):
         for low in (start_us - step * PERIOD_US, start_us + step * PERIOD_US):
             if (lowest <= low <= highest and _indexed(current, low, low + length)
-                    and _indexed(baseline, low - DAY_US, low + length - DAY_US)):
+                    and _indexed(baseline, low - length, low)):
                 return low, low + length
     return None
 
@@ -336,8 +337,12 @@ def tail_plan(metadata: Any, backend: Any, instance: str, start_us: int, end_us:
     if any(high >= start_us and max(low, start_us) < covered_from for low, high in zip(*index["blocked"])):
         return None
     coverage, baseline = index_state(start_us, cut)
-    if not coverage.get("total_parts") or (baseline is not None and not usable(baseline)):
-        return None
+    if not coverage.get("total_parts"):return None
+    if baseline is not None and not usable(baseline):
+        lo,hi=previous_window(start_us,cut)
+        old_index=_index_map(metadata,backend,instance,lo,hi)
+        if old_index is None or (covered_from>lo and (old_index['first'] is None or old_index['first']>lo)) or any(b>=lo and max(a,lo)<covered_from for a,b in zip(*old_index['blocked'])):return None
+        baseline={**baseline,'tail_covered':True,'tail_parts':len(baseline.get('missing_parts') or []),'source_complete':False}
     pending = len(coverage.get("missing_parts") or [])
     return {"end_us": cut, "covered_from_us": covered_from, "newest_us": int(view["newest_us"]), "pending_parts": pending,
             "coverage": {**coverage, "tail_parts": pending, "source_complete": False}, "baseline_coverage": baseline}
@@ -449,7 +454,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             return index_cache[low, high]
         found = backend._manifest_coverage(metadata.parts_in_range(start_epoch_us=low, end_epoch_us=high,
                                                                    source="slowlog", instance=instance))
-        before = (low - DAY_US, high - DAY_US)
+        before = previous_window(low,high)
         if backend._window({**query, "start_epoch_us": before[0], "end_epoch_us": before[1]}, settings.retention_days) != before:
             return found, None
         result = found, backend._manifest_coverage(metadata.parts_in_range(start_epoch_us=before[0], end_epoch_us=before[1], source='slowlog', instance=instance))
@@ -457,7 +462,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         return result
 
     def usable(found: dict[str, Any] | None) -> bool:
-        return bool(found and found.get("complete") and found.get("total_parts"))
+        return bool(found and (found.get("complete") or found.get('tail_covered')) and found.get("total_parts"))
 
     coverage, baseline_coverage = index_state(start_us, end_us)
     adjusted = None
@@ -519,10 +524,13 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     # A lag episode can be explained by the lag series and the binlog alone, so an empty slow log does not end that analysis.
     if not rows and not lag_mode:
         return unavailable("no_collected_executions")
-    baseline_start, baseline_end = start_us - DAY_US, end_us - DAY_US
+    baseline_start, baseline_end = previous_window(start_us,end_us)
     if baseline_coverage is None:
         return unavailable("baseline_outside_retention")
     baseline = read_events(baseline_start, baseline_end)
+    if tail_used is not None and baseline_coverage.get('tail_covered'):
+        known={row['event_id'] for row in baseline}
+        baseline.extend(row for row in tail.rows(instance,max(baseline_start,tail_used['covered_from_us']),baseline_end,query) if row['event_id'] not in known)
     if len(baseline) > MAX_EVENTS:
         return unavailable("baseline_event_limit_exceeded")
     node_roles = _node_roles(roles, instance)
@@ -556,8 +564,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         if unknown:
             LOGGER.warning('slowlog_cost_provenance incomplete: %s records contain legacy zero or absent costs; not treating as measured zero',unknown)
         result = rank_performance_growth(ranked_rows, ranked_baseline, points, start_us=start_us, end_us=end_us,
-                                         index_complete=bool(coverage.get('complete') or tail_used is not None), baseline_complete=bool(baseline_coverage.get('complete')), baseline_points=baseline_points,
-                                         score_points=score_points, independent_excess=True)
+                                         index_complete=bool(coverage.get('complete') or tail_used is not None), baseline_complete=bool(baseline_coverage.get('complete') or baseline_coverage.get('tail_covered')), baseline_points=baseline_points,
+                                         score_points=score_points, independent_excess=True, baseline_start_us=baseline_start)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):
         LOGGER.exception("slowlog_resource_query metric or input validation failed")
         return unavailable("metric_or_input_unavailable")
@@ -651,6 +659,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         result['status'] = 'partial'
         result['partial_reason'] = 'live_tail_not_complete_source'
     result.update(instance_id=instance, start_us=start_us, end_us=end_us,
+                  baseline_start_us=baseline_start,baseline_end_us=baseline_end,baseline_mode='previous',
                   ready_through_us=ready,
                   tail=None if tail_used is None else {"from_us": max(start_us, tail_used["covered_from_us"]), "through_us": end_us,
                                                        "newest_us": tail_used["newest_us"], "events": tail_used.get("events", 0),

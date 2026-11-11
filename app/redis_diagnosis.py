@@ -106,4 +106,4 @@ def diagnosis(service,entry,start,end,node,current,baseline):
               'keys':history.rows(identity,'keys',start,end,node,100),'queues':history.rows(identity,'queues',start,end,limit=30),
               'profiles':history.rows(identity,'profile',start,end,node,60),'night_baselines':history.rows(identity,'night',start-3*86400,end,node,30),
               'client_aggregates':aggregates,'coverage_reconciliation':reconciliation,'findings':evidence},
-            'collector_state':dict(service.context.state) if service.context else {},'aggregate_delivery_state':dict(service.aggregates.state) if service.aggregates else {},'causal':False,'workflow':['已观测节点范围','昨日与凌晨基线','命令量/成本','来源与事件','单位成本','Key/队列','内存分项','三级证据与缺口']}
+            'collector_state':dict(service.context.state) if service.context else {},'aggregate_delivery_state':dict(service.aggregates.state) if service.aggregates else {},'causal':False,'workflow':['已观测节点范围','前置等长与凌晨基线','命令量/成本','来源与事件','单位成本','Key/队列','内存分项','三级证据与缺口']}

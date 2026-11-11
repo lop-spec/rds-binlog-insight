@@ -17,14 +17,14 @@ const RISE_METRICS = [
 
 const RISE_STATUS = {
   incomplete_index: "所选时段索引不完整；未改查其他时段",
-  incomplete_baseline_index: "昨日对照索引不完整；未改查其他时段",
+  incomplete_baseline_index: "前窗对照索引不完整；未改查其他时段",
   clickhouse_backend_required: "需要已配置的慢日志存储",
   single_instance_required: "请选择单个实例",
   invalid_window: "时间窗无效或超过保留期",
-  overlapping_baseline: "窗口与昨日基线重叠，请缩短窗口",
+  overlapping_baseline: "对照窗口重叠，请缩短窗口",
   event_limit_exceeded: "当前慢记录超出分析上限，请缩短窗口",
-  baseline_event_limit_exceeded: "昨日慢记录超出上限，请缩短窗口",
-  baseline_outside_retention: "昨日对照超出保留期，不能判断增长",
+  baseline_event_limit_exceeded: "前窗慢记录超出上限，请缩短窗口",
+  baseline_outside_retention: "前窗对照超出保留期，不能判断增长",
   invalid_metric_value: "指标含无效点，未强行计算",
   conflicting_metric_samples: "同一分钟指标冲突，未强行合并",
   unsupported_metric: "不支持该指标",
@@ -161,19 +161,20 @@ function riseCorrelation(row) {
 // 增长份额：该 SQL 在本节点「超额指标 × 耗时增长」里占的比例，份额不是资源贡献率。
 function riseShare(row) {
   if (row.growth_share === null || row.growth_share === undefined) {
-    return '<span class="muted" title="没有相比昨日同窗的正向增长（只因锁等待变长的不计入）">—</span>';
+    return '<span class="muted" title="没有相比前一等长窗的正向增长（只因锁等待变长的不计入）">—</span>';
   }
   const percent = Number(row.growth_share) * 100;
   const text = percent >= 10 ? riseNumber(percent, 0) : percent >= 1 ? riseNumber(percent, 1) : riseNumber(percent, 2);
   const lock = Number(row.lock_wait_excluded_us) > 0 ? `；已扣除慢日志记录的锁等待增长 ${humanMicros(row.lock_wait_excluded_us)}` : "";
-  return `<strong title="增长份额：每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向增长比例（已扣除慢日志记录的锁等待），在本节点内的占比；不是资源贡献率${lock}">${text}%</strong>`;
+  return `<strong title="增长份额：每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比前一等长窗的正向增长比例（已扣除慢日志记录的锁等待），在本节点内的占比；不是资源贡献率${lock}">${text}%</strong>`;
 }
 
 function riseCost(row) {
   const now = Number(row.runtime_us_total || 0);
+  if(row.baseline_runtime_us_total==null)return `<span class="muted">前窗未记录，增量不可比</span><br>${humanMicros(now)}（当前已记录）`;
   const before = Number(row.baseline_runtime_us_total || 0);
   const delta = now - before;
-  const percent = before > 0 ? ` <span class="muted">${riseSigned((delta / before) * 100, (v) => `${riseNumber(v, 0)}%`)}</span>` : (now > 0 ? ' <span class="chip warn">昨日同窗无</span>' : "");
+  const percent = before > 0 ? ` <span class="muted">${riseSigned((delta / before) * 100, (v) => `${riseNumber(v, 0)}%`)}</span>` : (now > 0 ? ' <span class="chip warn">前窗未记录</span>' : "");
   return `<strong>${riseSigned(delta, humanMicros)}</strong>${percent}<br><span class="muted">${humanMicros(before)} → ${humanMicros(now)}</span>`;
 }
 
@@ -229,8 +230,8 @@ function riseNodeSummary(data, node) {
   const comparison = node.resource_comparison || {};
   const label = riseMetricLabel(data.metric_id);
   const change = comparison.delta === null || comparison.delta === undefined
-    ? "昨日同窗指标不完整，不比较"
-    : `昨日同窗 ${riseNumber(comparison.baseline_mean, 2)}，${riseSigned(comparison.delta, (v) => riseNumber(v, 2))}`;
+    ? "前窗指标不完整，不比较"
+    : `前一等长窗 ${riseNumber(comparison.baseline_mean, 2)}，${riseSigned(comparison.delta, (v) => riseNumber(v, 2))}`;
   return `<strong>${escapeHtml(node.node_id || "未知节点")}</strong> ${riseRoleChip(node)}· ${escapeHtml(label)}：窗口均值 <strong>${riseNumber(comparison.current_mean, 2)}</strong>（${change}）· 峰值 ${riseNumber(node.peak, 2)}`;
 }
 
@@ -250,8 +251,8 @@ function riseEvidence(node) {
   let verdict = "";
   if (block.explained_ratio !== null && block.explained_ratio !== undefined && threads) {
     const share = `${riseNumber(block.explained_ratio * 100, block.explained_ratio < 0.1 ? 1 : 0)}%`;
-    const growth = `活跃线程比昨日同窗多 ${riseNumber(threads.delta, 1)} 个（${riseNumber(threads.baseline, 1)} → ${riseNumber(threads.current, 1)}）`;
-    const added = `慢日志里的语句比昨日多跑的时间折合约 ${riseNumber(block.slowlog_added_concurrency, 2)} 个并发`;
+    const growth = `活跃线程比前窗多 ${riseNumber(threads.delta, 1)} 个（${riseNumber(threads.baseline, 1)} → ${riseNumber(threads.current, 1)}）`;
+    const added = `慢日志里的语句比前窗多跑的时间折合约 ${riseNumber(block.slowlog_added_concurrency, 2)} 个并发`;
     if (block.low_explained) {
       const lead = block.lead ? `变化最大的是 <strong>${escapeHtml(block.lead.operation)}：${riseNumber(block.lead.baseline, 0)} → ${riseNumber(block.lead.current, 0)} 次/秒（${riseRatioText(block.lead)}）</strong>` : "";
       const rows = (block.related_rows || []).length ? `；下表第 ${block.related_rows.join("、")} 行是慢日志里露出来的同类语句（只是其中够慢的那部分）` : "";
@@ -266,9 +267,9 @@ function riseEvidence(node) {
     return `<tr${strong ? ' class="is-lead"' : ""}><td>${escapeHtml(item.label)}</td><td>${cell(item.baseline)}</td><td>${strong ? "<strong>" : ""}${cell(item.current)}${strong ? "</strong>" : ""}</td><td>${riseRatioText(item)}</td></tr>`;
   });
   if (threads) rows.push(`<tr><td>活跃线程数</td><td>${riseNumber(threads.baseline, 1)}</td><td>${riseNumber(threads.current, 1)}</td><td>${riseSigned(threads.delta, (v) => riseNumber(v, 1))}</td></tr>`);
-  const table = rows.length ? `<details class="rise-counters"${block.low_explained ? " open" : ""}><summary>语句计数（云监控，所有语句）对照昨日同窗</summary>
-    <table class="rise-peers"><thead><tr><th>计数（窗口均值）</th><th>昨日同窗</th><th>窗口</th><th>变化</th></tr></thead><tbody>${rows.join("")}</tbody></table>
-    <p class="analytics-note">次数来自云监控 Cluster_Com* / Cluster_InnoDBRow*，含所有语句；解释率 = 慢日志里比昨日多出的执行时间（折成平均并发）÷ 活跃线程的增长，两边都含等待，只是粗略对照，不是归因。</p></details>` : "";
+  const table = rows.length ? `<details class="rise-counters"${block.low_explained ? " open" : ""}><summary>语句计数（云监控）对照前窗</summary>
+    <table class="rise-peers"><thead><tr><th>计数（窗口均值）</th><th>前窗</th><th>窗口</th><th>变化</th></tr></thead><tbody>${rows.join("")}</tbody></table>
+    <p class="analytics-note">次数来自云监控 Cluster_Com* / Cluster_InnoDBRow*，含所有语句；解释率 = 慢日志里比前窗多出的执行时间（折成平均并发）÷ 活跃线程的增长，两边都含等待，只是粗略对照，不是归因。</p></details>` : "";
   const missing = (block.failed_metrics || []).length ? `<p class="analytics-note">缺失指标：${escapeHtml(block.failed_metrics.join('；'))}</p>` : '';
   return verdict + table + missing;
 }
@@ -295,18 +296,18 @@ function riseNodeBody(data, node) {
   const covered = shown > 0 ? `，合计占本节点增长份额 ${riseNumber(shown * 100, 0)}%` : "";
   return `${riseLiveBox(node)}${riseNodeSpark(data, node)}${origin}${lag ? "" : riseEvidence(node)}${note}${stallNote}${slowerNote}
     <div class="table-wrap"><table class="data-table analytics-table rise-table">
-      <thead><tr><th>#</th><th>${lag ? "SQL（主库执行，按增长份额排序）" : "SQL（按增长份额排序）"}</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（昨日同窗 → 窗口）</th><th>慢记录数（昨日 → 窗口）</th><th>扫描 / 锁等待增量</th></tr></thead>
+      <thead><tr><th>#</th><th>${lag ? "SQL（主库执行，按增长份额排序）" : "SQL（按增长份额排序）"}</th><th>用户</th><th>增长份额</th><th>相关度 r（核对）</th><th>耗时增量（前窗→当前）</th><th>慢记录数（前窗→当前）</th><th>扫描 / 锁等待增量</th></tr></thead>
       <tbody>${rows.map((row, index) => riseStatement(node, row, index + 1)).join("")}</tbody>
     </table></div>
-    <p class="analytics-note">共 ${humanCount(node.total_fingerprints)} 个 SQL 家族，显示前 ${humanCount(rows.length)} 个${covered}。灰显行的耗时和扫描都没有比昨日同窗增加。</p>`;
+    <p class="analytics-note">共 ${humanCount(node.total_fingerprints)} 个 SQL 家族，显示前 ${humanCount(rows.length)} 个${covered}。灰显行的耗时和扫描都没有比前窗增加。</p>`;
 }
 
 /* ---------------------------- 复制延迟溯源 ---------------------------- */
 
 // 备节点的延迟不是它自己的读查询造成的：要么是主库写了什么，要么是备节点的回放线程卡在某个事件上。
 function riseLagNote(data) {
-  return `<p class="analytics-note">复制延迟：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照昨日同窗。
-    延迟出在主库写入或备节点的回放线程，不在备节点自己的读查询，所以下表列的是<strong>主库上的慢 SQL</strong>，按它们在「延迟增长的分钟」里跑了多久排序（延迟本身是累积量，只在涨的那几分钟里算重合），再乘以比昨日同窗多出来的部分。
+  return `<p class="analytics-note">复制延迟：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照前一等长窗。
+    延迟出在主库写入或备节点的回放线程，不在备节点自己的读查询，所以下表列的是<strong>主库上的慢 SQL</strong>，按它们在「延迟增长的分钟」里跑了多久排序（延迟本身是累积量，只在涨的那几分钟里算重合），再乘以比前一等长窗多出来的部分。
     表上方的「复制延迟溯源」先回答更关键的问题：延迟是从主库的哪个时刻开始的、是不是回放线程卡在同一个事件上、那一刻 binlog 里有没有 DDL。份额和相关度只是时间上的同涨同落，不是因果；
     慢日志只含已执行完且够慢的语句，一条几毫秒就执行完的 DDL 不会出现在表里，要看溯源。</p>`;
 }
@@ -480,7 +481,7 @@ function riseNotice(title, text) {
 function riseAdjustNotice(data) {
   const moved = data.adjusted;
   if (!moved) return "";
-  const why = moved.reason === "incomplete_baseline_index" ? "所选时段对应的昨日对照日索引还不完整" : "所选时段的慢日志索引还不完整";
+  const why = moved.reason === "incomplete_baseline_index" ? "所选时段之前的等长对照窗索引还不完整" : "所选时段的慢日志索引还不完整";
   const asked = `${escapeHtml(formatTime(moved.requested_start_us))} → ${escapeHtml(formatTime(moved.requested_end_us))}`;
   if (moved.reason === "source_delay") {
     return riseNotice(`已截到最近放齐的整分钟（比所选结束早 ${riseSpan(moved.truncated_us)}）`,
@@ -546,7 +547,7 @@ function renderRise(data) {
   const many = nodes.length > 3;
   const lag = data.metric_id === "replication_lag";
   panel.innerHTML = `${prefix}
-    ${lag ? riseLagNote(data) : `<p class="analytics-note">${escapeHtml(metric)}：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照昨日同窗。排序：按增长份额（该 SQL 在指标超额分钟里跑了多久，乘以比昨日同窗多出来的部分，已扣除慢日志记录的锁等待）；扫描行增量只在份额相同时决定先后，相关度 r 只是时序关联的核对列。份额不是资源贡献率，除锁等待外的等待仍算在耗时里，也不是因果；慢日志的扫描行可能远小于真实扫描（含物化子查询的语句）。SQL 只统计已采集的慢日志，看不到写入型和不够慢的查询负载，可勾选「Binlog 写入」对照；语句结束后才会进慢日志，正在跑的点节点里的「看正在跑的查询」。</p>`}
+    ${lag ? riseLagNote(data) : `<p class="analytics-note">${escapeHtml(metric)}：窗口 ${escapeHtml(formatTime(data.start_us))} → ${escapeHtml(formatTime(data.end_us))}，对照 ${escapeHtml(formatTime(data.baseline_start_us))} → ${escapeHtml(formatTime(data.baseline_end_us))}（前一等长窗）。排序：按增长份额（该 SQL 在指标超额分钟里跑了多久，乘以比前一等长窗多出来的部分，已扣除慢日志记录的锁等待）；扫描行增量只在份额相同时决定先后，相关度 r 只是时序关联的核对列。份额不是资源贡献率，除锁等待外的等待仍算在耗时里，也不是因果；慢日志的扫描行可能远小于真实扫描（含物化子查询的语句）。SQL 只统计已采集的慢日志，看不到写入型和不够慢的查询负载，可勾选「Binlog 写入」对照；语句结束后才会进慢日志，正在跑的点节点里的「看正在跑的查询」。</p>`}
     ${riseFreshness(data)}
     ${riseBinlogCoverage(data)}
     ${nodes.map((node, index) => `<details class="rise-node" ${!many || index === 0 ? "open" : ""}>
@@ -559,8 +560,8 @@ function renderRiseCoverage(data) {
     ? `${label} ${humanCount(coverage.covered_parts ?? coverage.total_parts)}/${humanCount(coverage.total_parts)} 个分区${coverage.complete ? "" : "（未完整）"}${coverage.tail_parts ? `（另 ${humanCount(coverage.tail_parts)} 个在途，由实时读取补上）` : ""}` : "";
   const complete = data.coverage?.complete !== false && data.baseline_coverage?.complete !== false;
   node.className = `notice ${complete ? "info" : "warning"} compact-notice`;
-  const text = [cover("慢日志", data.coverage), cover("对照日", data.baseline_coverage),
-    `${humanCount(data.executions)} 条执行 / 昨日 ${humanCount(data.baseline_executions)} 条`].filter(Boolean).join(" · ");
+  const text = [cover("慢日志", data.coverage), cover("前窗", data.baseline_coverage),
+    `${humanCount(data.executions)} 条执行 / 前窗 ${humanCount(data.baseline_executions)} 条`].filter(Boolean).join(" · ");
   node.innerHTML = `<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg><span>${escapeHtml(text)}</span>`;
 }
 
@@ -579,7 +580,7 @@ function normalizeAnalyticsWindow(forRise) {
   [start, end] = rounded;
   if (forRise && end - start >= RISE_MAX_WINDOW_MS + 300_000) {
     start = end - RISE_MAX_WINDOW_MS;
-    notes.push("上涨排查要和昨日同窗不重叠，窗口已压到最近 23 小时 55 分。");
+    notes.push("单次上涨排查最多23小时55分；对照紧邻之前的等长窗口。");
   }
   if (end <= start) return notes;
   if (changed || notes.length) {
@@ -768,5 +769,5 @@ async function openRiseDetail(nodeId, fingerprint) {
     <p>增长份额 ${riseShare(row)} · 相关度 ${riseCorrelation(row)} · ${escapeHtml(riseMetricLabel(data.metric_id))} · 节点 ${escapeHtml(node.node_id)} ${riseRoleChip(node)}</p>
     <p>耗时 ${humanMicros(row.baseline_runtime_us_total)} → ${humanMicros(row.runtime_us_total)}；执行 ${humanCount(row.attribution?.baseline_count)} → ${humanCount(row.executions)} 次${members > 1 ? `；合并 ${members} 个物理指纹（分表族）` : ""}。</p>
     ${analyticsTable(["分钟结束", `${riseMetricLabel(data.metric_id)}`, "该 SQL 当分钟执行耗时"], riseDetailSeries(data, node, row))}
-    <p class="analytics-note">增长份额 = 每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比昨日同窗的正向增长比例（扣除慢日志记录的锁等待），在本节点内的占比，不是资源贡献率；相关度是上表两列的皮尔逊系数，只说明时间上同涨同落，不证明因果，也不衡量该 SQL 消耗了多少资源。</p></section>`);
+    <p class="analytics-note">增长份额 = 每分钟「执行耗时 × 高于窗口 P20 基线的指标超额」乘以相比前一等长窗的正向增长比例（扣除慢日志记录的锁等待），在本节点内的占比，不是资源贡献率；相关度是上表两列的皮尔逊系数，只说明时间上同涨同落，不证明因果，也不衡量该 SQL 消耗了多少资源。</p></section>`);
 }

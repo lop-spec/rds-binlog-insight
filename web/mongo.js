@@ -85,7 +85,8 @@ function mongoBaselineWindow(start,end,mode,custom) {
   if (mode==='yesterday'&&span>day) {
     mode='previous';adjustment='分析范围超过 24 小时，昨日同窗会重叠，已改为前一个等长窗口；分析时间不变。';
   }
-  const baseline=mode==='custom'?custom:mode==='previous'?start-span:start-day;
+  if(!['previous','yesterday','custom'].includes(mode))mode='previous';
+  const baseline=mode==='custom'?custom:mode==='yesterday'?start-day:start-span;
   if (!Number.isFinite(baseline)) throw new Error('请选择有效的基线开始时间');
   if (baseline+span>start) throw new Error('基线与分析时间重叠：请选择更早的基线开始时间，或改选“前一个等长窗口”');
   return {start:baseline,end:baseline+span,mode,adjustment};

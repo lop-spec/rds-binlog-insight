@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .redis_protocol import RedisWire, delta, load_instances, parse_info, private_json, safe_key, error_code
 from .redis_telemetry import SECTIONS
+from .comparison_window import previous_window
 from .slow_log_collector import DasRpcClient
 
 LOGGER = logging.getLogger(__name__)
@@ -373,6 +374,7 @@ class RedisService:
         start, end = int(one(params, 'startEpochUs'))/1e6, int(one(params, 'endEpochUs'))/1e6
         if not math.isfinite(start+end) or start <= 0 or end <= start or end-start > DAY or end > self.clock()+60:
             raise ValueError('redis_window_max_one_day')
+        base_start,base_end=previous_window(start,end)
         node_filter = one(params, 'node')
         if node_filter and not re.fullmatch(r'db-\d{1,2}', node_filter):
             raise ValueError('invalid_redis_node')
@@ -398,10 +400,10 @@ class RedisService:
                         if field in costs:
                             g[field]=g.get(field,0)+costs[field]
                             g[field+'_known_seconds']=g.get(field+'_known_seconds',0)+sec
-            return groups, durations, resets, curve
+            return groups, durations, resets, curve, rows
         with self.db() as c:
-            current, durations, resets, curve = read_window(c, start, end)
-            baseline, base_durations, base_resets, _ = read_window(c, start-DAY, end-DAY)
+            current, durations, resets, curve, records = read_window(c, start, end)
+            baseline, base_durations, base_resets, _, before_records = read_window(c, base_start, base_end)
             output = []
             for (node, cmd), costs in current.items():
                 before = baseline.get((node, cmd))
@@ -414,22 +416,22 @@ class RedisService:
             output.sort(key=lambda x: (x['delta_service_seconds'] is not None, x['delta_service_seconds'] or 0, x['usec']), reverse=True)
             metrics = [{'node': r['node'], 'timestamp': r['ts']*1000, **json.loads(r['payload'])} for r in c.execute('SELECT * FROM metrics WHERE instance=? AND ts>=? AND ts<?'+node_sql+' ORDER BY ts LIMIT 10001', [identity, start, end]+args)]
             rate_groups = {}
-            base_metrics = c.execute('SELECT node,ts,payload FROM metrics WHERE instance=? AND ts>=? AND ts<?'+node_sql+' ORDER BY ts LIMIT 10001', [identity, start-DAY, end-DAY]+args).fetchall()
-            for window, points in [('current', metrics), ('yesterday', [{'node':r['node'], **json.loads(r['payload'])} for r in base_metrics])]:
+            base_metrics = c.execute('SELECT node,ts,payload FROM metrics WHERE instance=? AND ts>=? AND ts<?'+node_sql+' ORDER BY ts LIMIT 10001', [identity, base_start, base_end]+args).fetchall()
+            for window, points in [('current', metrics), ('previous', [{'node':r['node'], **json.loads(r['payload'])} for r in base_metrics])]:
                 for point in points:
                     for command in ('del', 'zrangebyscore', 'eval', 'evalsha'):
                         if command in point:
                             rate_groups.setdefault((point['node'], command), {}).setdefault(window, []).append(point[command])
             rate_rows = [{'node':n, 'command':cmd, 'qps':sum(v['current'])/len(v['current']) if v.get('current') else None,
-                          'baseline_qps':sum(v['yesterday'])/len(v['yesterday']) if v.get('yesterday') else None,
-                          'samples':len(v.get('current', [])), 'baseline_samples':len(v.get('yesterday', [])), 'source':'cloud_rates_no_duration'} for (n,cmd),v in sorted(rate_groups.items())]
+                          'baseline_qps':sum(v['previous'])/len(v['previous']) if v.get('previous') else None,
+                          'samples':len(v.get('current', [])), 'baseline_samples':len(v.get('previous', [])), 'source':'cloud_rates_no_duration'} for (n,cmd),v in sorted(rate_groups.items())]
             bucket = c.execute('SELECT ts,payload FROM buckets WHERE instance=? AND ts<=? ORDER BY ts DESC LIMIT 1', (identity, end)).fetchone()
             events = [{'node': r['node'], 'time': r['ts'], **json.loads(r['payload'])} for r in c.execute('SELECT * FROM slow_events WHERE instance=? AND ts>=? AND ts<?'+node_sql+' ORDER BY ts DESC LIMIT 101', [identity, start, end]+args)]
             samples = [{**json.loads(r['payload']), 'time': r['ts']} for r in c.execute('SELECT * FROM samples WHERE instance=? AND ts>=? AND ts<? ORDER BY ts DESC LIMIT 101', (identity, start, end))]
         limit=int(one(params,'limit','300'))
         if not 1<=limit<=1000:raise ValueError('redis_result_limit')
-        order=one(params,'order','usec')
-        if order not in ('usec','calls'):raise ValueError('invalid_redis_cost_order')
+        order=one(params,'order','correlation')
+        if order not in ('correlation','usec','calls'):raise ValueError('invalid_redis_cost_order')
         field='delta_calls' if order=='calls' else 'delta_service_seconds'
         output.sort(key=lambda x:(x[field] is not None,x[field] if x[field] is not None else x['calls' if order=='calls' else 'usec']),reverse=True)
         expected = [n['node'] for n in self.meta.get(identity, []) if not node_filter or n['node'] == node_filter]
@@ -437,7 +439,10 @@ class RedisService:
         coverage = [{'node': n, 'seconds': durations.get(n, 0), 'baseline_seconds': base_durations.get(n, 0), 'expected_seconds': end-start} for n in nodes]
         from .redis_diagnosis import diagnosis
         extra=diagnosis(self,e,start,end,node_filter,current,baseline)
-        return {**extra, 'instance': identity, 'first_recorded':self.bounds.get(identity,[None,None])[0], 'order':order, 'start': start, 'end': end, 'rows': output[:limit], 'rows_truncated': len(output)>limit,
+        from .redis_ranking import ranked_evidence
+        related=ranked_evidence(self,identity,start,end,base_start,base_end,records,before_records,output,node_filter)
+        if order=='correlation':output.sort(key=lambda r:(r['correlation']['r'] is not None,r['correlation']['r'] if r['correlation']['r'] is not None else -2),reverse=True)
+        return {**extra, 'related':related, 'baseline_start':base_start,'baseline_end':base_end,'baseline_mode':'previous', 'instance': identity, 'first_recorded':self.bounds.get(identity,[None,None])[0], 'order':order, 'start': start, 'end': end, 'rows': output[:limit], 'rows_truncated': len(output)>limit,
                 'coverage': coverage, 'resets': resets[:100], 'baseline_resets': base_resets[:100], 'process_cpu': curve[:10000],
                 'metrics': metrics[:10000], 'metrics_truncated': len(metrics)>10000, 'baseline_metrics_truncated': len(base_metrics)>10000, 'rate_rows': rate_rows,
                 'buckets': {'time': bucket['ts'], 'rows': json.loads(bucket['payload']), 'scope': 'latest_observed_not_future'} if bucket else None,

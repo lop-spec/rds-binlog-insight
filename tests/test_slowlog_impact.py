@@ -94,9 +94,9 @@ class ImpactTests(unittest.TestCase):
 
 class GrowthTests(unittest.TestCase):
     def rank(self, current, before):
-        previous = [{**e, 'start_us': e['start_us'] - DAY_US} for e in before]
+        previous = [{**e, 'start_us': e['start_us'] - DAY_US} for e in before]  # explicit custom historical baseline exercises non-default comparisons
         return rank_performance_growth(current, previous, points([10, 10, 10, 90, 90, 90]),
-                                       start_us=0, end_us=6*W-1, index_complete=True, baseline_complete=True)
+                                       start_us=0, end_us=6*W-1, index_complete=True, baseline_complete=True, baseline_start_us=-DAY_US)
 
     def test_large_unchanged_load_does_not_outrank_growing_load(self):
         steady = event('steady', 3*W, 180000)
@@ -212,8 +212,9 @@ class ServiceTests(unittest.TestCase):
             return dict(event_id=f"{sql_id}-{i}", start_us=3 * W + i * 1000, node_id="a", database_name="d", fingerprint=sql_id,
                         sql_id=sql_id, duration_ms=30000, rows_examined=1, lock_time_ms=None, account=account)
         current = [make(i, "mixed", "analyst") for i in range(3)] + [make(3, "mixed", "root")] + [make(i, "plain", "") for i in range(2)]
+        backend._window.side_effect=lambda q,retention:(q.get('start_epoch_us',0),q.get('end_epoch_us',6*W))
         backend._rows.side_effect = lambda sql, params, _: (
-            [dict(e, start_us=e["start_us"] - DAY_US) for e in current[:1]] if params["low"] < 0 else current)
+            [dict(e, start_us=e["start_us"] - 6*W) for e in current[:1]] if params["low"] < 0 else current)
         loader = Mock(return_value=points([10, 10, 10, 90, 90, 90]))
         result = query_resource_overlap(metadata, backend, {"source": "slowlog", "instance": "x"}, Settings(), loader)
         rows = {row["sql_id"]: row for row in result["nodes"][0]["statements"]}
@@ -237,13 +238,14 @@ class ServiceTests(unittest.TestCase):
         def make(fp, sql_id, start, duration, op):
             return dict(event_id=f"{fp}-{start}", start_us=start, node_id="a", database_name="d", fingerprint=fp, sql_id=sql_id,
                         duration_ms=duration, rows_examined=1, lock_time_ms=None, account="root", operation=op)
+        backend._window.side_effect=lambda q,retention:(q.get('start_epoch_us',0),q.get('end_epoch_us',6*W))
         steady_now = [make("steady", "T", 3 * W + 1, 170000, "SELECT")]
-        steady_before = [make("steady", "T", 3 * W + 1 - DAY_US, 100000, "SELECT")]
+        steady_before = [make("steady", "T", 3 * W + 1 - 6*W, 100000, "SELECT")]
         shards = [make("s38", "A", 3 * W + i * 1000, 40000, "INSERT") for i in range(1, 3)] + \
                  [make("s563", "B", 4 * W + i * 1000, 40000, "INSERT") for i in range(1, 3)]
-        baseline_shards = [dict(e, event_id='before-'+e['event_id'], start_us=e['start_us']-DAY_US, duration_ms=0, rows_examined=0) for e in shards[::2]]
+        baseline_shards = [dict(e, event_id='before-'+e['event_id'], start_us=e['start_us']-6*W, duration_ms=0, rows_examined=0) for e in shards[::2]]
         backend._rows.side_effect = lambda sql, params, _: steady_before + baseline_shards if params['low'] < 0 else steady_now + shards
-        loader = Mock(side_effect=lambda _settings,lo,_hi,*args,**kwargs: [dict(p,timestamp=p['timestamp']-(DAY_US//1000 if lo<0 else 0)) for p in points([10,10,10,90,90,90])])
+        loader = Mock(side_effect=lambda _settings,lo,_hi,*args,**kwargs: [dict(p,timestamp=p['timestamp']-(6*W//1000 if lo<0 else 0)) for p in points([10,10,10,90,90,90])])
 
         def counters(settings, start, end, instance, node, metric_name):
             now = start >= 0
@@ -290,7 +292,7 @@ class CorrelationOrderTests(unittest.TestCase):
     def ranked(self, current, before, values):
         previous = [{**e, "start_us": e["start_us"] - DAY_US} for e in before]
         return rank_performance_growth(current, previous, points(values), start_us=0, end_us=6 * W - 1,
-                                       index_complete=True, baseline_complete=True)
+                                       index_complete=True, baseline_complete=True,baseline_start_us=-DAY_US)
 
     def test_orders_by_signed_r_descending_not_by_cost_or_evidence(self):
         # metric rises 10 -> 60. "ramp" runs longer each minute (r = +1), "inverse" shorter (r = -1),
@@ -440,10 +442,10 @@ class IndexedWindowTests(unittest.TestCase):
 
     def test_incomplete_baseline_day_moves_to_the_nearer_side_of_the_hole(self):
         start, end = self.NOW - 5 * 3600 * 1_000_000, self.NOW - 4 * 3600 * 1_000_000
-        hole = self.overlapping(self.NOW - DAY_US - 290 * MIN, self.NOW - DAY_US - 265 * MIN)
+        hole = self.overlapping(start - (end-start) + 5*MIN, start - 5*MIN)
         metadata, backend = self.fixture({p["path"] for p in hole})
-        early = min(p["min_event_epoch_us"] for p in hole) + DAY_US - end - MIN
-        late = max(p["max_event_epoch_us"] for p in hole) + DAY_US - start + MIN
+        early = min(p["min_event_epoch_us"] for p in hole) + (end-start) - end - MIN
+        late = max(p["max_event_epoch_us"] for p in hole) + (end-start) - start + MIN
         shift = early if abs(early) <= abs(late) else late
         self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 60), (start + shift, end + shift))
         # served through the analysis, the move is reported with its reason and the baseline stays a day behind
@@ -483,7 +485,7 @@ class IndexedWindowTests(unittest.TestCase):
                                                   requested_end_us=end, truncated_us=end - cut))
         self.assertEqual((result["start_us"], result["end_us"]), (start, cut))
         self.assertEqual(loader.call_args_list[0].args[1:3], (start, cut))
-        self.assertEqual(loader.call_args_list[1].args[1:3], (start - DAY_US, cut - DAY_US))  # the baseline day is cut the same
+        self.assertEqual(loader.call_args_list[1].args[1:3], (start - (cut-start), start))  # previous window is resized with the actual current window
         self.assertTrue(result["coverage"]["complete"] and result["baseline_coverage"]["complete"])
         self.assertEqual(result["ready_through_us"], ready_until)  # how far behind the index is, for the page
 
@@ -543,7 +545,7 @@ class IndexedWindowTests(unittest.TestCase):
         # plenty of retention: the neighbouring minute is already indexed
         self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 60), (start - MIN, end - MIN))
         # two days of retention: an earlier window's baseline day would be expired, so only the far later side qualifies
-        self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 2), (self.NOW - DAY_US, self.NOW - DAY_US + 3600 * 1_000_000))
+        self.assertEqual(nearest_indexed_window(metadata, backend, "x", start, end, 2), (start-MIN,end-MIN))
 
     # --- the live tail (slowlog_tail): a window ending now takes the part ClickHouse does not have yet from it ---
 
@@ -574,7 +576,7 @@ class IndexedWindowTests(unittest.TestCase):
                                                   requested_end_us=end, truncated_us=end - cut))
         self.assertEqual((result["start_us"], result["end_us"]), (start, cut))
         self.assertEqual(loader.call_args_list[0].args[1:3], (start, cut))
-        self.assertEqual(loader.call_args_list[1].args[1:3], (start - DAY_US, cut - DAY_US))  # the baseline day is read from ClickHouse
+        self.assertEqual(loader.call_args_list[1].args[1:3], (start - (cut-start), start))  # immediately preceding equal-length window
         self.assertFalse(result['coverage']['complete'])
         self.assertEqual(result['status'], 'partial')
         self.assertFalse(result['source_complete'])
@@ -609,7 +611,7 @@ class IndexedWindowTests(unittest.TestCase):
         backend._rows.side_effect = lambda sql, params, _: window if params["low"] == start else []
         values = [10, 10, 10, 10, 10, 10, 90, 90, 90, 90]
         loader = Mock(side_effect=[[dict(timestamp=(start + (i + 1) * MIN) // 1000, nodeId="a", Average=v) for i, v in enumerate(values)],
-                                   [dict(timestamp=(start - DAY_US + (i + 1) * MIN) // 1000, nodeId="a", Average=10) for i in range(10)]])
+                                   [dict(timestamp=(start - (cut-start) + (i + 1) * MIN) // 1000, nodeId="a", Average=10) for i in range(10)]])
         profile = {"action": "SELECT", "normalized_sql": "select ? from fresh_table", "sample_sql": "SELECT 1 FROM fresh_table",
                    "sql_id": "fz", "instance_id": "x", "fingerprint": "fz", "first_seen_us": 1, "last_seen_us": 2}
         tail = FakeTail(self.tail_view(), [self.live("live-1", start + 8 * MIN, fingerprint="fz")], {("x", "fz"): profile})
@@ -747,8 +749,9 @@ class LagMetricTests(unittest.TestCase):
         current = [make("w1", "p", "bulk-write", 4 * W, 180000, "batch"),                       # the primary's write, in the growth minutes
                    make("w2", "p", "steady-write", 0, 360000),
                    make("v1", "r", "queued-read", 4 * W, 180000)]                               # the replica's own reader: a victim
+        backend._window.side_effect=lambda q,retention:(q.get('start_epoch_us',0),q.get('end_epoch_us',6*W))
         backend._rows.side_effect = lambda sql, params, _: (
-            [dict(e, start_us=e["start_us"] - DAY_US) for e in current[1:2]] if params["low"] < 0 else current)
+            [dict(e, start_us=e["start_us"] - 6*W) for e in current[1:2]] if params["low"] < 0 else current)
         return metadata, backend
 
     def run_lag(self, **kw):
@@ -771,7 +774,7 @@ class LagMetricTests(unittest.TestCase):
         self.assertEqual(result["primary_nodes"], ["p"])
         self.assertIn("lag_origin", node)
         # one extra minute is requested ahead of the window (and of its baseline day) so the first growth can be told
-        self.assertEqual([c.args[1] for c in loader.call_args_list], [-W, -W - DAY_US])
+        self.assertEqual([c.args[1] for c in loader.call_args_list], [-W, -7*W])
 
     def test_active_minutes_come_with_the_growth_order_too(self):
         # the page prints "n / total minutes with executions" next to every statement; only the correlation order used to set n

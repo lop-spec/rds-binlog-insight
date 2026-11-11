@@ -27,6 +27,7 @@ class AttributionGates(unittest.TestCase):
                 for i in range(1,11)]
 
     def run_case(self, now, before, **kwargs):
+        kwargs.setdefault('baseline_start',T-DAY_US)
         return analyze(rollup_events(now),rollup_events(before),self.points(),T,T+10*MINUTE,
                        coverage=True,baseline_coverage=True,order='attribution',
                        baseline_metrics=self.points(baseline=True,value=5),**kwargs)
@@ -64,7 +65,7 @@ class AttributionGates(unittest.TestCase):
 
     def test_resource_not_up_is_retained_as_counterevidence(self):
         r=analyze(rollup_events(self.events(cpu=10000)),rollup_events(self.events(baseline=True)),self.points(value=5),
-                  T,T+10*MINUTE,coverage=True,baseline_coverage=True,baseline_metrics=self.points(baseline=True,value=50))
+                  T,T+10*MINUTE,coverage=True,baseline_coverage=True,baseline_metrics=self.points(baseline=True,value=50),baseline_start=T-DAY_US)
         self.assertIn('resource_window_mean_not_increased',r['statements'][0]['attribution']['reasons'])
 
     def test_metric_node_change_blocks_attribution_not_just_correlation(self):
@@ -113,7 +114,7 @@ class AttributionGates(unittest.TestCase):
                                        lock_time_ms=0 if baseline or fp=='reader' else 9000))
             return result
         p=[dict(timestamp=(T+i*MINUTE)//1000,nodeId='n',Average=i*5) for i in range(1,7)]
-        r=rank_performance_growth(events(False),events(True),p,start_us=T,end_us=T+6*MINUTE-1,index_complete=True,baseline_complete=True)
+        r=rank_performance_growth(events(False),events(True),p,start_us=T,end_us=T+6*MINUTE-1,index_complete=True,baseline_complete=True,baseline_start_us=T-DAY_US)
         rows=r['nodes'][0]['statements']
         self.assertEqual(rows[0]['sql_id'],'reader')
         self.assertEqual(rows[0]['attribution']['status'],'scan_growth_related_evidence')
@@ -132,7 +133,7 @@ class AttributionGates(unittest.TestCase):
                   start_us=T+i*MINUTE,duration_ms=1000,rows_examined=100) for i in range(6)]
         old=[dict(e,start_us=e['start_us']-DAY_US,rows_examined=None) for e in now]
         p=[dict(timestamp=(T+i*MINUTE)//1000,nodeId='n',Average=i*5) for i in range(1,7)]
-        r=rank_performance_growth(now,old,p,start_us=T,end_us=T+6*MINUTE-1,index_complete=True,baseline_complete=True)
+        r=rank_performance_growth(now,old,p,start_us=T,end_us=T+6*MINUTE-1,index_complete=True,baseline_complete=True,baseline_start_us=T-DAY_US)
         a=r['nodes'][0]['statements'][0]['attribution']
         self.assertIsNone(a['rows_examined']['baseline'])
         self.assertIsNone(a['rows_examined']['delta'])
@@ -161,6 +162,8 @@ class AttributionGates(unittest.TestCase):
         self.assertEqual(r['statements'][0]['attribution']['status'],'no_resource_cost_growth')
         self.assertFalse(r['ranking']['available'])
 
-    def test_mysql_overlapping_yesterday_is_rejected(self):
+    def test_mysql_default_long_window_is_previous_not_yesterday(self):
         r=rank_performance_growth([],[],[],start_us=T,end_us=T+2*DAY_US,index_complete=True,baseline_complete=True)
-        self.assertEqual(r['status'],'overlapping_baseline')
+        self.assertEqual((r['baseline_start_us'],r['baseline_end_us']),(T-2*DAY_US,T))
+        with self.assertRaisesRegex(ValueError,'overlap'):
+            rank_performance_growth([],[],[],start_us=T,end_us=T+2*DAY_US,index_complete=True,baseline_complete=True,baseline_start_us=T-DAY_US)

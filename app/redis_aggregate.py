@@ -216,7 +216,7 @@ class RedisAggregates:
             for r in reports[:10000]:
                 m=json.loads(r['metadata']);dropped+=m['dropped_calls'];pipeline_count+=m.get('pipeline_count',0);pipeline_us+=m.get('pipeline_client_us',0)
                 for cmd,n in m['totals'].items():reported[cmd]=reported.get(cmd,0)+n
-            previous=self.query(instance,start-86400,end-86400,False) if baseline else {}
+            previous=self.query(instance,start-(end-start),start,False) if baseline else {}
             dims=('deployment','command','shape','path','script')
             old={tuple(r[k] for k in dims):r for r in previous.get('rows',[])}
             for row in rows:

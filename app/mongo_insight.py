@@ -462,7 +462,7 @@ def analyze(rows: list[dict], baseline: list[dict], metrics: list[dict], start: 
     now, previous = summarize(rows), summarize(baseline)
     statements = []
     metric_series, expected = metric_windows(metrics, metric, start, end)
-    base_start = baseline_start if baseline_start is not None else start - 86400 * 1_000_000
+    base_start = baseline_start if baseline_start is not None else start - (end - start)
     baseline_series, baseline_expected = metric_windows(baseline_metrics or [], metric, base_start, base_start + end - start)
     comparable_minutes = len(expected) == len(baseline_expected) and bool(expected)
     if not comparable_minutes:

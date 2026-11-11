@@ -174,7 +174,7 @@ test('the hottest node comes first; SQL keep the API order and show share, r and
   assert.match(htmlOut, /<strong title="增长份额[^"]*">20%<\/strong>/);
   assert.match(htmlOut, /\+0\.97/);                       // signed correlation stays as a check column
   assert.match(htmlOut, /\+2 分/);                         // ramp: 60 s -> 180 s = +120 s
-  assert.match(htmlOut, /昨日同窗无/);                       // flat: no baseline executions
+  assert.match(htmlOut, /前窗未记录/);                       // flat: no baseline executions
   assert.match(htmlOut, /title="constant_x|每分钟耗时恒定/);  // uncomputable r explained, not shown as 0
   assert.match(htmlOut, /窗口均值 <strong>60<\/strong>/);
   assert.match(htmlOut, /class="is-flat"/);                // steady/quiet rows: neither runtime nor scans grew -> dimmed
@@ -414,7 +414,7 @@ test('replication lag without any statement still shows the origin; a primary-on
 test('unavailable impact analysis says why instead of an empty table', async () => {
   const {c, nodes, toasts} = rdsContext(async () => ({status: 'overlapping_baseline', nodes: []}));
   await vm.runInContext('runAnalytics()', c);
-  assert.match(nodes['#analytics-panel-rise'].innerHTML, /窗口与昨日基线重叠，请缩短窗口/);
+  assert.match(nodes['#analytics-panel-rise'].innerHTML, /对照窗口重叠，请缩短窗口/);
   assert.ok(toasts.some(([kind, m]) => kind === 'error' && /无法排查/.test(m)));
   const none = rdsContext(async () => impactResult);
   none.nodes['#analytics-instance'].value = '';
@@ -441,7 +441,7 @@ test('a window the server moved to the nearest indexed period is applied to the 
   // the baseline-day reason is named as such
   moved.adjusted.reason = 'incomplete_baseline_index';
   vm.runInContext('renderRise(state.rise.data)', c);
-  assert.match(nodes['#analytics-panel-rise'].innerHTML, /昨日对照日索引还不完整/);
+  assert.match(nodes['#analytics-panel-rise'].innerHTML, /等长对照窗索引还不完整/);
 });
 
 test('a window cut back to the indexed edge keeps its start, says where it ends and how far behind the index is', async () => {
@@ -606,7 +606,7 @@ test('the 24-hour default is clamped to 23 h 55 m before it can be rejected, and
   assert.equal(end - start, (24 * 60 - 5) * 60_000_000);
   assert.equal(nodes['#analytics-start'].value, local(c, start));
   assert.equal(nodes['#analytics-range'].value, 'custom');
-  assert.match(nodes['#analytics-panel-rise'].innerHTML, /时间框已调整[\s\S]*23 小时 55 分/);
+  assert.match(nodes['#analytics-panel-rise'].innerHTML, /时间框已调整[\s\S]*23小时55分/);
 });
 
 test('start rounds down and end rounds up to cover the selected window, then writes back', async () => {

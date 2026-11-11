@@ -96,7 +96,7 @@ class MongoService:
         if instance not in self.stores:raise ValueError('configured_mongo_instance_required')
         start=int(get('startEpochUs'));end=int(get('endEpochUs'))
         if end<=start or end-start>7*86400*1_000_000:raise ValueError('mongo_window_exceeds_seven_days')
-        base=int(get('baselineStart',start-86400*1_000_000))
+        base=int(get('baselineStart',start-(end-start)))
         base_end=base+(end-start)
         if base_end>start:raise ValueError('baseline_must_not_overlap_current_window')
         role=get('role');kind=get('kind','command');command=get('command');namespace=get('namespace')

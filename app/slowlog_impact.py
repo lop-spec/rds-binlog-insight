@@ -24,6 +24,7 @@ from typing import Any
 
 from .slowlog_correlation import pearson
 from .resource_evidence import metric_windows, metric_comparison
+from .comparison_window import comparison_window
 
 LOGGER = logging.getLogger(__name__)
 PERIOD_US = 60_000_000
@@ -78,7 +79,7 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
                             index_complete: bool, baseline_complete: bool,
                             baseline_points: list[dict[str, Any]] | None = None,
                             score_points: list[dict[str, Any]] | None = None,
-                            independent_excess: bool = False) -> dict[str, Any]:
+                            independent_excess: bool = False, baseline_start_us: int | None = None) -> dict[str, Any]:
     """Resource overlap discounted by the non-growing fraction of execution time.
 
     Identical full-minute windows exactly 24 hours apart. All SQL families are
@@ -87,9 +88,8 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
     recorded, so a statement that only waits longer scores nothing. Fraction
     preserves the exact ordering before conversion to display shares.
     """
-    if end_us - start_us >= DAY_US:
-        LOGGER.warning('slowlog_performance_growth unavailable: overlapping_baseline')
-        return {'status':'overlapping_baseline','nodes':[]}
+    baseline_start, baseline_end = comparison_window(start_us,end_us,baseline_start_us)
+    shift_us=start_us-baseline_start
     if not baseline_complete or len(baseline_events) > MAX_EVENTS:
         reason = "incomplete_baseline_index" if not baseline_complete else "baseline_event_limit_exceeded"
         LOGGER.warning("slowlog_performance_growth unavailable: %s", reason)
@@ -103,15 +103,15 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
     if independent_excess and score_points is None:
         first = ((start_us+PERIOD_US-1)//PERIOD_US)*PERIOD_US
         stop = ((end_us+1)//PERIOD_US)*PERIOD_US
-        expected = {t-86_400_000_000 for t in range(first+PERIOD_US,stop+1,PERIOD_US)}
+        expected = {t-shift_us for t in range(first+PERIOD_US,stop+1,PERIOD_US)}
         samples, _reason = _node_metrics(baseline_points or [],expected)
         references = {node: sorted(values.values())[(len(values)-1)//5] for node,values in (samples or {}).items() if len(values)==len(expected) and len(values)>=6}
     result = rank_resource_overlap(families, points, start_us=start_us, end_us=end_us,
                                    index_complete=index_complete, score_points=score_points, metric_baselines=references)
     result['excess_reference'] = 'previous_window' if independent_excess and score_points is None else 'selected_window_descriptive'
-    previous_series = execution_series(previous, start_us - DAY_US, end_us - DAY_US)
+    previous_series = execution_series(previous, baseline_start, baseline_end)
     net_now = clipped_runtime_net_of_lock(families, start_us, end_us)
-    net_before = clipped_runtime_net_of_lock(previous, start_us - DAY_US, end_us - DAY_US)
+    net_before = clipped_runtime_net_of_lock(previous, baseline_start, baseline_end)
     members: dict[tuple[str, str], set[str]] = defaultdict(set)
     ids = {}
     for event in events:
@@ -133,7 +133,7 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
     def metric_input(source):
         return [dict(p, role=p.get('nodeId',''), node=p.get('nodeId',''), metric='IOPS', value=p['Average']) for p in source]
     current_metrics, _ = metric_windows(metric_input(points),'IOPS',start_us,end_us+1)
-    previous_metrics, _ = metric_windows(metric_input(baseline_points or []),'IOPS',start_us-DAY_US,end_us-DAY_US+1)
+    previous_metrics, _ = metric_windows(metric_input(baseline_points or []),'IOPS',baseline_start,baseline_end+1)
     for node in result.get("nodes", []):
         rows = node.get("statements", [])
         node['resource_comparison'] = metric_comparison(current_metrics.get(node['node_id']),previous_metrics.get(node['node_id']))
@@ -195,7 +195,7 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
     result.update(method="growth_overlap_net_of_lock_v4", rank_unit="database_and_cloud_sql_id",
                   ranking_warning='Growth share is overlap with the metric excess, not physical IOPS contribution; '
                                   'recorded lock wait is excluded, other waits are not; DAS scan counts can be far below the real scan.',
-                  baseline_start_us=start_us - DAY_US, baseline_end_us=end_us - DAY_US)
+                  baseline_start_us=baseline_start, baseline_end_us=baseline_end, baseline_mode='previous' if baseline_end==start_us else 'custom')
     return result
 
 

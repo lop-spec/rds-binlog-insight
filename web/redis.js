@@ -32,13 +32,13 @@ function redisNodes(){
   $('#redis-node').innerHTML='<option value="">全部分片</option>'+(item?.nodes||[]).map(x=>`<option value="${escapeHtml(x.node)}">${escapeHtml(x.node)}</option>`).join('');
 }
 function renderRedis(data){
-  $('#analytics-meta').textContent=`命令上涨排查 · ${(data.rows||[]).length}项${data.rows_truncated?'（部分）':''} · 昨日同窗对照`;
+  $('#analytics-meta').textContent=`命令上涨排查 · ${(data.rows||[]).length}项${data.rows_truncated?'（部分）':''} · 前一等长窗对照`;
   $('#analytics-coverage').textContent=(data.metrics_truncated||data.baseline_metrics_truncated?'部分监控：达到10000点上限，仅列窗口前段；QPS均值不代表整窗。 ':'')+data.warning;
   const coverage=(data.coverage||[]).map(x=>[escapeHtml(x.node),`${redisNumber(x.seconds)} / ${redisNumber(x.expected_seconds)}秒`,`${redisNumber(x.baseline_seconds)} / ${redisNumber(x.expected_seconds)}秒`]);
   const commands=(data.rows||[]).map(x=>[escapeHtml(x.node),escapeHtml(x.command)+(x.nested?'<br><small>含嵌套，不相加</small>':''),redisNumber(x.calls),redisNumber(x.delta_calls),redisNumber(x.qps),redisNumber(x.service_seconds),redisNumber(x.avg_us),x.delta_service_seconds==null?'基线不足':redisNumber(x.delta_service_seconds)]);
-  let output=`<section class="detail-block"><h3>记录覆盖</h3>${analyticsTable(['分片','本窗已记录','昨日已记录'],coverage,'尚无覆盖记录。')}<p>只汇总完整落在所选窗口内的差分段；边界、断采和切换缺口不外推。两窗命令覆盖均≥95%才计算增量。</p></section><section class="detail-block"><h3>命令执行成本</h3><p>优先按昨日同窗${data.order==='calls'?'调用增量':'耗时增量'}排序；缺基线时仅列已记录耗时，不宣称上涨根因。</p>${analyticsTable(['分片','命令','调用次数','较昨日调用','次/秒','累计执行秒','平均微秒','较昨日执行秒'],commands,'没有已记录命令；开始采集前的历史耗时无法恢复。')}</section>`;
+  let output=`<section class="detail-block"><h3>记录覆盖</h3>${analyticsTable(['分片','本窗已记录','前窗已记录'],coverage,'尚无覆盖记录。')}<p>只汇总完整落在所选窗口内的差分段；边界、断采和切换缺口不外推。两窗命令覆盖均≥95%才计算增量。</p></section><section class="detail-block"><h3>命令执行成本</h3><p>按${data.order==='calls'?'调用增量':data.order==='correlation'?'相关度':'耗时增量'}排序，对照前一等长窗；缺基线时仅列已记录耗时，不宣称上涨根因。</p>${analyticsTable(['分片','命令','调用次数','较前窗调用','次/秒','累计执行秒','平均微秒','较前窗执行秒'],commands,'没有已记录命令；开始采集前的历史耗时无法恢复。')}</section>`;
   const rates=(data.rate_rows||[]).map(x=>[escapeHtml(x.node),escapeHtml(x.command),redisNumber(x.qps),redisNumber(x.baseline_qps),`${x.samples} / ${x.baseline_samples}`]);
-  output+=`<section class="detail-block"><h3>云监控命令QPS</h3><p>各自已返回采样点的速率均值，不是逐次调用记录；不含命令执行耗时，采样不足不外推。</p>${analyticsTable(['分片','命令','本窗次/秒','昨日次/秒','本窗/昨日点数'],rates,'尚无命令速率记录。')}</section>`;
+  output+=`<section class="detail-block"><h3>云监控命令QPS</h3><p>各自已返回采样点的速率均值，不是逐次调用记录；不含命令执行耗时，采样不足不外推。</p>${analyticsTable(['分片','命令','本窗次/秒','前窗次/秒','本窗/前窗点数'],rates,'尚无命令速率记录。')}</section>`;
   const points=(data.metrics||[]).filter(x=>x.CpuUsage!=null);
   const nodes=[...new Set(points.map(x=>x.node))];
   output+=nodes.map(node=>`<section class="detail-block"><h3>${escapeHtml(node)} · CPU %</h3>${starrocksGraph(points.filter(x=>x.node===node).map(x=>({timestamp:x.timestamp,value:x.CpuUsage,period:5})),'cpu','云监控CPU','%')}</section>`).join('');
@@ -53,7 +53,12 @@ function renderRedis(data){
   if(samples.length||!data.five_layers)output+=`<section class="detail-block"><h3>键级采样（实例）</h3><p>${samples.length?'实例级客户端采样，未自动归属到选中分片；不外推服务端CPU，不与Lua内部命令重复累加。':'未接入或本窗无样本，无法归因到具体Key/新增Pod；需业务Hook发版。'}${data.key_samples_truncated?' 显示达到100条上限。':''}</p>${analyticsTable(['命令','Key形状','脚本/任务','Pod','采样率','客户端微秒'],samples,'没有键级样本。')}</section>`;
   if(data.resets?.length)output+=`<section class="detail-block"><h3>采集断点</h3>${analyticsTable(['分片','时间','原因'],data.resets.map(x=>[escapeHtml(x.node),escapeHtml(formatTime(x.time*1e6)),escapeHtml(x.reason)]))}</section>`;
   if(typeof redisEvidence==='function')output=redisEvidence(data)+output;
-  $('#analytics-panel-sql').innerHTML=output;
+  if(data.related&&typeof redisFocus==='function'){
+    const focus=redisFocus(data);
+    $('#analytics-panel-sql').innerHTML=focus+`<details class="detail-block"><summary>原始证据与明细</summary>${output}</details>`;
+    $('#analytics-meta').textContent=`Redis上涨排查 · ${data.related.command_groups?.length||0}类高相关增量命令 · 前一等长窗`;
+    $('#analytics-coverage').textContent=`对照 ${formatTime(data.baseline_start*1e6)} → ${formatTime(data.baseline_end*1e6)}；当前 ${formatTime(data.start*1e6)} → ${formatTime(data.end*1e6)}。相关不等于因果，缺失不补零。`;
+  }else $('#analytics-panel-sql').innerHTML=output;
 }
 async function runRedis(){
   const instance=$('#redis-instance').value;
@@ -62,7 +67,7 @@ async function runRedis(){
   if(!Number.isFinite(start)||!Number.isFinite(end)||end<=start||end-start>400*86400e6)throw new Error('Redis请选择400天以内的有效窗口；一天以上自动走汇总趋势');
   const request=++redisRequest;$('#analytics-panel-sql').innerHTML='';$('#analytics-empty').hidden=true;$('#analytics-meta').textContent='正在读取Redis记录…';
   try{
-    const query=new URLSearchParams({instance,node:$('#redis-node').value,order:$('#redis-order')?.value||'usec',startEpochUs:String(start),endEpochUs:String(end)});
+    const query=new URLSearchParams({instance,node:$('#redis-node').value,order:$('#redis-order')?.value||'correlation',startEpochUs:String(start),endEpochUs:String(end)});
     const rawDays=redisStatus?.instances?.find(x=>x.id===instance)?.retention_days||30;
     const history=end-start>86400e6||start<(Date.now()-rawDays*86400e3)*1000;
     if(history){query.set('period',end-start>31*86400e6?'86400':'3600');query.set('summary','1');}

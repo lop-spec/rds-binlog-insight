@@ -63,8 +63,12 @@ class History(unittest.TestCase):
     def test_record_and_unknown_baseline(self):
         self.seed(self.now-40);r=self.query(self.now-40,self.now);g=next(x for x in r['rows'] if x['command']=='get')
         self.assertEqual(g['calls'],20);self.assertEqual(g['usec'],2000);self.assertIsNone(g['delta_service_seconds']);self.assertEqual(r['coverage'][0]['seconds'],40)
-    def test_yesterday_direct_cost_delta(self):
-        self.seed(self.now-86440,calls=5);self.seed(self.now-40,calls=10)
+    def test_previous_equal_window_direct_cost_delta(self):
+        self.seed(self.now-86440,calls=99);self.seed(self.now-80,calls=5)
+        boundary=self.s.last[('r-example01','db-1')]
+        for offset in (20,40):
+            raw=INFO.replace('uptime_in_seconds:100','uptime_in_seconds:'+str(140+offset)).replace('calls=100,usec=1000','calls='+str(110+offset//2)+',usec='+str(2000+offset*50))
+            self.s.record(ENTRY,self.node,raw,self.now-40+offset)
         r=self.query(self.now-40,self.now);g=next(x for x in r['rows'] if x['command']=='get');self.assertEqual(g['delta_calls'],10);self.assertEqual(g['delta_service_seconds'],.001)
     def test_partial_window_not_extrapolated(self):
         self.seed(self.now-40);r=self.query(self.now-35,self.now);g=next(x for x in r['rows'] if x['command']=='get');self.assertEqual(g['calls'],10);self.assertEqual(g['seconds'],20)
@@ -72,7 +76,7 @@ class History(unittest.TestCase):
         self.seed(self.now-40);r=self.query(self.now-40,self.now,'db-3');self.assertEqual(r['rows'],[])
     def test_old_cloud_rate_does_not_invent_command_duration(self):
         with self.s.db() as c:
-            for shift, rate in [(0, 10), (-86400, 5)]:
+            for shift, rate in [(0, 10), (-40, 5), (-86400,99)]:
                 c.execute('INSERT INTO metrics VALUES(?,?,?,?)', ('r-example01','db-1',self.now-20+shift,json.dumps({'CpuUsage':80,'del':rate})))
         r=self.query(self.now-40,self.now)
         self.assertEqual(r['rows'],[])

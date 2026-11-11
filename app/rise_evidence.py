@@ -128,7 +128,8 @@ def load_counters(loader: Callable[..., list[dict[str, Any]]], settings: Any, in
     wanted = [(key, name) for key, name, _label, _op in COUNTER_METRICS]
     if threads_points is None:
         wanted.append(("threads", THREADS_METRIC))
-    jobs = [(key, name, offset) for key, name in wanted for offset in (0, DAY_US)]
+    shift_us=end_us-start_us
+    jobs = [(key, name, offset) for key, name in wanted for offset in (0, shift_us)]
 
     def fetch(job: tuple[str, str, int]) -> tuple[str, int, list[dict[str, Any]] | Exception]:
         key, name, offset = job
@@ -143,17 +144,17 @@ def load_counters(loader: Callable[..., list[dict[str, Any]]], settings: Any, in
     failed = []
     for key, offset, points in fetched:
         if isinstance(points, Exception):
-            failed.append(f"{key}{'@-1d' if offset else ''}: {str(points)[:120]}")
+            failed.append(f"{key}{'@previous' if offset else ''}: {str(points)[:120]}")
         else:
             series.setdefault(key, {})[offset] = points
     if failed:
         LOGGER.warning("rise_counters unavailable for instance=%s: %s", instance, "; ".join(failed))
     if threads_points is not None:
-        series["threads"] = {0: threads_points[0], DAY_US: threads_points[1]}
+        series["threads"] = {0: threads_points[0], shift_us: threads_points[1]}
     nodes: dict[str, dict[str, tuple[float | None, float | None]]] = {}
     for key, by_offset in series.items():
         now = _means(by_offset.get(0, []), start_us, end_us)
-        before = _means(by_offset.get(DAY_US, []), start_us - DAY_US, end_us - DAY_US)
+        before = _means(by_offset.get(shift_us, []), start_us - shift_us, start_us)
         for node_id in set(now) | set(before):
             nodes.setdefault(node_id, {})[key] = (now.get(node_id), before.get(node_id))
     if not nodes:

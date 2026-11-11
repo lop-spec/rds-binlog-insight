@@ -79,7 +79,7 @@ class CounterTests(unittest.TestCase):
             return points(start, value)
         return load
 
-    def test_counters_compare_the_window_with_the_same_window_yesterday(self):
+    def test_counters_compare_the_previous_equal_length_window(self):
         load = self.loader({"Cluster_ComInsert": 13000, "Cluster_ThreadsRunning": 20, "Cluster_ComSelect": 500},
                            {"Cluster_ComInsert": 4000, "Cluster_ThreadsRunning": 11, "Cluster_ComSelect": 480},
                            fail={"Cluster_ComReplace"})
@@ -98,7 +98,7 @@ class CounterTests(unittest.TestCase):
             calls.append(metric_name)
             return points(start, 1)
         found = load_counters(load, None, "i", "", self.START, self.END,
-                              threads_points=(points(self.START, 20), points(self.START - DAY_US, 10)))
+                              threads_points=(points(self.START, 20), points(self.START - (self.END-self.START), 10)))
         self.assertNotIn("Cluster_ThreadsRunning", calls)
         self.assertEqual(len(calls), 2 * len(COUNTER_METRICS))
         self.assertEqual(found["nodes"]["n1"]["threads"], (20, 10))
