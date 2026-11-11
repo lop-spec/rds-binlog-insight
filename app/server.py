@@ -1244,7 +1244,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/index-coverage" and self.app.storage.binlog_rows is not None:
                 settings = self.app.metadata.load_settings()
-                identity = _query_value(query, 'instance')
+                identity = _query_value(query, 'instance') or settings.db_instance_id
                 known = {settings.db_instance_id, *(m.scope_instance_id for m in getattr(self.app, 'secondary_syncs', []))}
                 if identity not in known:
                     raise ValueError('只能查询已登记的Binlog实例覆盖度')
@@ -1254,9 +1254,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 from .maintenance_status import read_json_status
                 coverage['worker'] = read_json_status(self.app.storage.paths['index'] / STATUS_NAME)
                 coverage['gaps'] = coverage.get('gaps', [])[-500:]
+                coverage['scope_instance_id'] = identity
                 self._json({'ok': True, 'data': coverage})
             elif parsed.path == "/api/index-coverage":
+                settings = self.app.metadata.load_settings()
                 scope = {key: _query_value(query, key) for key in ('instance', 'database', 'table')}
+                scope['instance'] = scope['instance'] or settings.db_instance_id
+                known = {settings.db_instance_id, *(m.scope_instance_id for m in getattr(self.app, 'secondary_syncs', []))}
+                if scope['instance'] not in known:
+                    raise ValueError('只能查询已登记的Binlog实例覆盖度')
                 scope['exact'] = {'kind': 'SCOPE'}
                 coverage = self.app.storage.raw_event_index.coverage(scope)
                 coverage.pop('_valid_files', None)

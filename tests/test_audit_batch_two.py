@@ -167,6 +167,24 @@ class ResourceAndReadiness(unittest.TestCase):
         health=collector_health(SimpleNamespace(general_logs=[collector]))
         self.assertFalse(health['ok']);self.assertEqual(health['lanes'][0]['state'],'thread_stopped')
 
+    def test_default_index_scope_allowed_and_unknown_identity_rejected(self):
+        import threading,urllib.request,urllib.error
+        from app.server import AppHTTPServer
+        from app.config import Settings
+        with tempfile.TemporaryDirectory() as root:
+            rows=Mock();rows.coverage.return_value={'gaps':[]}
+            app=SimpleNamespace(data_dir=Path(root),secondary_syncs=[],metadata=SimpleNamespace(load_settings=lambda:Settings(db_instance_id='rm-fixture')),
+                storage=SimpleNamespace(binlog_rows=rows,_query_window=lambda q,r:(1,2),paths={'index':Path(root)}))
+            server=AppHTTPServer(('127.0.0.1',0),app);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            try:
+                base='http://127.0.0.1:'+str(server.server_port)
+                with urllib.request.urlopen(base+'/api/index-coverage?instance=&database=&table=',timeout=3) as response:
+                    self.assertEqual(json.load(response)['data']['scope_instance_id'],'rm-fixture')
+                rows.coverage.assert_called_once_with('rm-fixture',1,2)
+                with self.assertRaises(urllib.error.HTTPError) as raised:urllib.request.urlopen(base+'/api/index-coverage?instance=unknown',timeout=3)
+                self.assertEqual(raised.exception.code,400);raised.exception.close()
+            finally:server.shutdown();server.server_close();thread.join(3)
+
     def test_missing_io_pressure_is_not_zero(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaises(IoPressurePaused):read_full_avg10(Path(root)/'missing')

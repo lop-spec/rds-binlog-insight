@@ -516,6 +516,28 @@ test('status answered while another page is open: the lists are ready and the fi
   assert.equal(history.reads().length, 0);
 });
 
+test('switching scope clears old snapshots and rejects a slow answer for the old instance', async () => {
+  let finish;
+  const {run,c,nodes} = context({api: () => new Promise(resolve => { finish = resolve; })});
+  nodes['#sessions-instance'] = {value:'rm-x'}; nodes['#sessions-node'] = {value:''};
+  c.data=payload(); run('sessionsState.data=data; sessionsState.selected=new Set(["rn-primary00000001:44"])');
+  const pending=run('loadSessions()');
+  nodes['#sessions-node'].value='rn-secondary0000b';
+  run('sessionsChange({target:{id:"sessions-node"}})');
+  assert.equal(run('sessionsState.data'),null);
+  assert.equal(run('sessionsState.selected.size'),0);
+  assert.equal(nodes['#sessions-summary'].innerHTML,'');
+  finish(payload()); await pending;
+  assert.equal(run('sessionsState.data'),null);
+  assert.match(nodes['#sessions-meta'].textContent,/旧快照与勾选已清除/);
+});
+
+test('mobile session tabs and actions wrap instead of collapsing or clipping', () => {
+  const css=web('app.css');
+  assert.match(css,/\.session-list-head > #sessions-tabs\s*\{[^}]*flex:\s*1 0 100%[^}]*flex-wrap:\s*wrap/);
+  assert.match(css,/\.session-list-head \.session-actions\s*\{[^}]*flex-wrap:\s*wrap/);
+});
+
 /* ---------------------------- MongoDB ---------------------------- */
 
 const MONGO = 'dds-example0000000';

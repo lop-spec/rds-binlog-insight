@@ -407,7 +407,10 @@ function renderSessionsList() {
 
 async function loadSessions() {
   const query = sessionsQueryString();
-  sessionsState.data = await api(`/api/sessions?${query}`);
+  const generation = sessionsState.requestGeneration = (sessionsState.requestGeneration || 0) + 1;
+  const data = await api(`/api/sessions?${query}`);
+  if (generation !== sessionsState.requestGeneration || query !== sessionsQueryString()) return;
+  sessionsState.data = data;
   // picks are trimmed to the rows on screen when the list is drawn (sessionListHtml)
   sessionsState.page = 0;
   renderSessionsLive();
@@ -708,7 +711,15 @@ function sessionsChange(event) {
     return;
   }
   if (target.id === "sessions-sort") { sessionsState.sort = target.value; sessionsState.page = 0; renderSessionsList(); return; }
-  if (target.id === "sessions-instance") { syncSessionControls(); return; }
+  if (target.id === 'sessions-instance' || target.id === 'sessions-node') {
+    if (target.id === 'sessions-instance') syncSessionControls();
+    sessionsState.requestGeneration = (sessionsState.requestGeneration || 0) + 1;
+    sessionsState.data = null; sessionsState.history = null; sessionsState.kill = null;
+    sessionsState.selected.clear(); sessionsState.page = 0;
+    for (const selector of ['#sessions-summary','#sessions-holders','#sessions-stats','#sessions-list','#sessions-history']) $(selector).innerHTML = '';
+    $('#sessions-meta').textContent = '选择已改变，请点击读取；旧快照与勾选已清除';
+    return;
+  }
   if (target.id === "sessions-window" && target.value !== "custom") applySessionWindow(Number(target.value));
 }
 

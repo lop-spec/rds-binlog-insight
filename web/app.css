@@ -576,6 +576,11 @@ h2 { margin: 0; font-size: 17px; line-height: 1.3; }
   .sync-controls .toolbar-actions { grid-column: 1 / -1; justify-content: flex-end; }
   .panel-heading { display: grid; }
   .segmented { max-width: 100%; overflow-x: auto; }
+  .session-list-head { flex-wrap: wrap; align-items: stretch; gap: 10px; padding-block: 10px; }
+  .session-list-head > #sessions-tabs { flex: 1 0 100%; flex-wrap: wrap; align-items: center; gap: 0; }
+  #sessions-tabs button { flex: 1 1 auto; white-space: nowrap; }
+  .session-list-head .session-actions { width: 100%; flex-wrap: wrap; gap: 8px; }
+  .session-list-head .session-inline { flex: none; white-space: nowrap; }
   .query-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .query-task-list { grid-template-columns: 1fr; }
   .query-task:nth-child(odd) { border-right: 0; }
