@@ -41,6 +41,7 @@ summary:focus-visible { outline: 3px solid #a8c9f7; outline-offset: 3px; border-
 .sql-aggregate .analytics-more .table-wrap { max-height: 300px; overflow: auto; }
 .sql-aggregate .analytics-table td, .sql-aggregate .analytics-table th { white-space: nowrap; }
 .detail-meta strong { overflow-wrap: anywhere; }
+#analytics-panel-sql .detail-block small { font-size: 12px; }
 .compact-kpis .stat-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .compact-kpis > .stat-tiles > .stat-tile { padding: 14px 16px; }
 .compact-kpis .analytics-more { margin-top: 6px; border-top: 0; padding-top: 0; }

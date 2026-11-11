@@ -2,10 +2,10 @@
 function redisEvidence(data){
  const f=data.five_layers;if(!f)return '';
  const table=(headers,rows,empty='尚未记录该层证据，不能当作零。')=>analyticsTable(headers,rows,empty);
- const section=(title,body,open=false)=>`<details class="detail-block"${open?' open':''}><summary>${escapeHtml(title)}</summary>${body}</details>`;
+ const section=(title,body,open=false)=>`<details class="detail-block"${open?' open':''}><summary aria-label="${escapeHtml(title)}">${escapeHtml(title)}</summary>${body}</details>`;
  const scopes=new Map((f.nodes||[]).map(n=>[n.node,n]));
  const ranges=(data.coverage||[]).map(c=>{const n=scopes.get(c.node)||{},v=n.counter_deltas?.total_commands_processed;return [escapeHtml(c.node),redisNumber(n.average_process_cpu_percent),redisNumber(v?.seconds?v.value/v.seconds:null),`${redisNumber(n.process_cpu_known_seconds)}秒`,`${redisNumber(c.seconds)} / ${redisNumber(c.expected_seconds)}`,`${redisNumber(c.baseline_seconds)} / ${redisNumber(c.expected_seconds)}`];});
- let output=section('分片范围',table(['分片','已观察CPU%','处理命令/秒','CPU覆盖','本窗覆盖秒','前窗覆盖秒'],ranges)+`<p>先分清六片同涨还是单片偏高；未记录的历史不补零，部分CPU覆盖不冒充整窗平均。</p>`,true);
+ let output=section('分片范围',table(['分片','已观察CPU%','处理命令/秒','CPU覆盖','本窗覆盖秒','前窗覆盖秒'],ranges)+`<p>先分清各分片同涨还是单片偏高；未记录的历史不补零，部分CPU覆盖不冒充整窗平均。</p>`,true);
  const findings=(f.findings||[]).map(x=>[escapeHtml(x.grade),escapeHtml(x.message)]);
  output+=section('证据结论',table(['等级','事实与缺口'],findings),true);
  const source=f.sources?.data;
@@ -51,7 +51,7 @@ function redisFocus(data){
  const summary=!valid.length?'两窗CPU证据不足，不能判断均值上涨。':!risen.length?'有可比数据的分片CPU均值没有上涨，不能把相关命令当作上涨根因。':`${risen.length}个分片CPU均值高于前窗${falling.length?`，${falling.length}个未升`:''}；以下为时序候选，不是已确认根因。`;
  const groups=[...(r.command_groups||[])];if(data.order==='calls')groups.sort((a,b)=>b.delta_calls-a.delta_calls);
  const grouped=groups.map(g=>[escapeHtml(g.command),`${g.nodes.length}个相关分片`,`${redisNumber(g.r_min)}～${redisNumber(g.r_max)}`,`${redisNumber(g.baseline_calls)} → ${redisNumber(g.calls)}`,delta(g.delta_calls),delta(g.delta_service_seconds),g.nested?'含嵌套，不相加':'命令执行耗时，非CPU']);
- let html=`<section class="detail-block"><h3>高相关命令</h3><p>${escapeHtml(summary)}</p><p>相关度在同分片独立计算，至少${r.minimum_points}个有效分钟，r≥${r.high_r}；合并同名命令，只合计相关且有增量的分片，按${data.order==='calls'?'调用':'执行耗时'}增量排序。不按相关系数分摊CPU。</p>${analyticsTable(['命令','覆盖','分片r范围','前窗→本窗次数','调用增量','执行增秒','口径'],grouped,'未找到同时满足高相关且有已证实增量的命令；不使用大总量或常量命令填榜。')}<details><summary>逐分片关联</summary>${analyticsTable(headers,commandRows(growing))}</details></section>`;
+ let html=`<section class="detail-block"><h3>高相关命令</h3><p>${escapeHtml(summary)}</p><p>相关度在同分片独立计算，至少${r.minimum_points}个有效分钟，r≥${r.high_r}；合并同名命令，只合计相关且有增量的分片，按${data.order==='calls'?'调用':'执行耗时'}增量排序。不按相关系数分摊CPU。</p>${analyticsTable(['命令','覆盖','分片r范围','前窗→本窗次数','调用增量','执行增秒','口径'],grouped.slice(0,6),'未找到同时满足高相关且有已证实增量的命令；不使用大总量或常量命令填榜。')}${grouped.length>6?`<details><summary>更多候选（${grouped.length-6}）</summary>${analyticsTable(['命令','覆盖','分片r范围','前窗→本窗次数','调用增量','执行增秒','口径'],grouped.slice(6))}</details>`:''}<details><summary>逐分片关联</summary>${analyticsTable(headers,commandRows(growing))}</details></section>`;
  if(other.length)html+=`<details class="detail-block"><summary>其他相关命令（${other.length}）</summary><p>未增长或前窗覆盖不足，不能用来解释上涨。</p>${analyticsTable(headers,commandRows(other))}</details>`;
  const keys=(r.keys||[]).map(k=>[escapeHtml(k.node||'实例范围'),escapeHtml(k.key)+(k.deployment?`<br><small>${escapeHtml(k.deployment)} · ${escapeHtml(k.path||'未标注路径')}</small>`:''),escapeHtml(k.command||'热点QPS'),corr(k.correlation),redisNumber(k.qps_observed),delta(k.delta_qps_observed),escapeHtml(k.source==='connected_client_counts'?'已接入业务计数':'阈值热点快照')]);
  html+=`<section class="detail-block"><h3>高相关Key</h3>${analyticsTable(['分片','Key形状','命令/指标','相关度r','已观察次/秒','前窗变化','证据来源'],keys,'本窗没有可计算的高相关Key；业务全量计数未接入或热点快照不足，不编Key归因。')}<p>热榜只覆盖超阈值Key，消失不记零；大小或队列长度不是Key调用量。Key已脱敏保留形状与稳定摘要。</p></section>`;
