@@ -173,7 +173,7 @@ class ResourceAndReadiness(unittest.TestCase):
         from app.config import Settings
         with tempfile.TemporaryDirectory() as root:
             rows=Mock();rows.coverage.return_value={'gaps':[]}
-            app=SimpleNamespace(data_dir=Path(root),secondary_syncs=[],metadata=SimpleNamespace(load_settings=lambda:Settings(db_instance_id='rm-fixture')),
+            app=SimpleNamespace(data_dir=Path(root),secondary_syncs=[],metadata=SimpleNamespace(load_settings=lambda:Settings(db_instance_id='rm-fixture'),has_known_instance=lambda identity:identity=='rm-archived'),
                 storage=SimpleNamespace(binlog_rows=rows,_query_window=lambda q,r:(1,2),paths={'index':Path(root)}))
             server=AppHTTPServer(('127.0.0.1',0),app);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
             try:
@@ -181,6 +181,8 @@ class ResourceAndReadiness(unittest.TestCase):
                 with urllib.request.urlopen(base+'/api/index-coverage?instance=&database=&table=',timeout=3) as response:
                     self.assertEqual(json.load(response)['data']['scope_instance_id'],'rm-fixture')
                 rows.coverage.assert_called_once_with('rm-fixture',1,2)
+                with urllib.request.urlopen(base+'/api/index-coverage?instance=rm-archived',timeout=3) as response:
+                    self.assertEqual(json.load(response)['data']['scope_instance_id'],'rm-archived')
                 with self.assertRaises(urllib.error.HTTPError) as raised:urllib.request.urlopen(base+'/api/index-coverage?instance=unknown',timeout=3)
                 self.assertEqual(raised.exception.code,400);raised.exception.close()
             finally:server.shutdown();server.server_close();thread.join(3)

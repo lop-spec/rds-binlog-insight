@@ -1246,7 +1246,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 settings = self.app.metadata.load_settings()
                 identity = _query_value(query, 'instance') or settings.db_instance_id
                 known = {settings.db_instance_id, *(m.scope_instance_id for m in getattr(self.app, 'secondary_syncs', []))}
-                if identity not in known:
+                if identity not in known and not self.app.metadata.has_known_instance(identity):
                     raise ValueError('只能查询已登记的Binlog实例覆盖度')
                 floor, ceiling = self.app.storage._query_window({}, settings.retention_days)
                 coverage = self.app.storage.binlog_rows.coverage(identity, floor, ceiling)
@@ -1261,7 +1261,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 scope = {key: _query_value(query, key) for key in ('instance', 'database', 'table')}
                 scope['instance'] = scope['instance'] or settings.db_instance_id
                 known = {settings.db_instance_id, *(m.scope_instance_id for m in getattr(self.app, 'secondary_syncs', []))}
-                if scope['instance'] not in known:
+                if scope['instance'] not in known and not self.app.metadata.has_known_instance(scope['instance']):
                     raise ValueError('只能查询已登记的Binlog实例覆盖度')
                 scope['exact'] = {'kind': 'SCOPE'}
                 coverage = self.app.storage.raw_event_index.coverage(scope)

@@ -4797,6 +4797,10 @@ class MetadataStore:
             now=now,
         )
 
+    def has_known_instance(self, instance: str) -> bool:
+        with self.connection() as conn:
+            return conn.execute('SELECT 1 FROM binlog_files WHERE instance_id=? LIMIT 1',(instance,)).fetchone() is not None
+
     def known_instances(self) -> list[str]:
         with self.connection() as conn:
             rows = conn.execute(
