@@ -8,6 +8,25 @@ test('Mongo source is inside existing workspace, not a second application',()=>{
  assert.match(html,/value="mongodb"/);assert.match(html,/id="mongo-kind"/);assert.match(html,/id="mongo-baseline"/);
  assert.match(app,/return runMongoAnalytics\(\)/);assert.match(html,/assets\/mongo.js/);
 });
+test('async Mongo options refresh the empty label but never overwrite another engine',async()=>{
+ for(const leave of [false,true]){
+  const c=context(),nodes={};let finish;
+  c.$=s=>nodes[s]??={value:'',textContent:'',innerHTML:'',hidden:false,addEventListener(){},closest(){return this;}};
+  c.state={};c.switchAnalyticsTab=()=>{};c.api=()=>new Promise(resolve=>{finish=resolve;});
+  c.$('#analytics-source').value='mongodb';
+  const metric=c.$('#mongo-metric');let markup='';
+  Object.defineProperty(metric,'innerHTML',{get:()=>markup,set:value=>{markup=value;metric.value=/value="([^"]+)"/.exec(value)?.[1]||'';}});
+  vm.runInContext(source,c);vm.runInContext('syncMongoBaseline=()=>{};syncMongoLogSources=()=>{};mongoMetricChanged()',c);
+  assert.match(c.$('#analytics-meta').textContent,/指标加载中/);
+  assert.doesNotMatch(c.$('#analytics-meta').textContent,/undefined/);
+  const pending=vm.runInContext('syncMongoMode(true)',c);
+  if(leave){c.$('#analytics-source').value='redis';c.$('#analytics-meta').textContent='Redis';}
+  finish({status:'ok',instances:[]});await pending;
+  assert.equal(metric.value,'CPUUtilization');
+  if(leave)assert.equal(c.$('#analytics-meta').textContent,'Redis');
+  else assert.match(c.$('#analytics-meta').textContent,/已选择 CPU 使用率 %/);
+ }
+});
 test('missing values are not rendered as zero',()=>{
  const c=context();vm.runInContext(source,c);assert.equal(vm.runInContext('mongoNumber(null)',c),'—');
 });

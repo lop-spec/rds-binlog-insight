@@ -63,7 +63,7 @@ function mongoMetricChanged(){
   $('#analytics-panel-sql').innerHTML='';$('#analytics-empty').hidden=false;
   const cache=$('#mongo-metric').value==='WtCacheUpdatesUsage';
   for(const id of ['mongo-kind','mongo-analysis-mode','mongo-command','mongo-namespace']){const element=$('#'+id);if(element)element.disabled=cache;}
-  $('#analytics-meta').textContent=cache?'更新缓存：点击开始排查，直接核对五秒缓存、ticket、业务读取量及来源':`已选择 ${MONGO_METRICS[$('#mongo-metric').value]}；点击开始分析，${$('#mongo-analysis-mode')?.value==='correlation'?'仅比较时序相关':'核对资源成本增长证据'}`;
+  $('#analytics-meta').textContent=cache?'更新缓存：点击开始排查，直接核对五秒缓存、ticket、业务读取量及来源':`已选择 ${MONGO_METRICS[$('#mongo-metric').value] || '指标加载中'}；点击开始分析，${$('#mongo-analysis-mode')?.value==='correlation'?'仅比较时序相关':'核对资源成本增长证据'}`;
   $('#analytics-coverage').textContent='';
 }
 function mongoAssessment(x){
@@ -168,7 +168,10 @@ async function syncMongoMode(enabled) {
     });
   }
   syncMongoBaseline();
-  if (mongoStatus) return;
+  if (mongoStatus) {
+    if (!mongoResult && mongoStatus.status==='ok') mongoMetricChanged();
+    return;
+  }
   try {
     mongoStatus=await api('/api/mongo/status');
     $('#mongo-instance').innerHTML=mongoOptions((mongoStatus.instances||[]).map(x=>[x.id,x.label]));
@@ -176,6 +179,7 @@ async function syncMongoMode(enabled) {
     syncMongoLogSources();
     $('#mongo-replay').innerHTML=mongoOptions([['','选择已固定的异常与基线'],...(mongoStatus.replays||[]).map(x=>[x.id,x.label])]);
     if (mongoStatus.status!=='ok') $('#analytics-meta').textContent=`MongoDB ${mongoStatus.reason||mongoStatus.status}`;
+    else if (!mongoResult && $('#analytics-source').value==='mongodb') mongoMetricChanged();
   } catch(e) { $('#analytics-meta').textContent=`MongoDB 配置读取失败：${e.message}`; }
 }
 
