@@ -609,14 +609,14 @@ test('the 24-hour default is clamped to 23 h 55 m before it can be rejected, and
   assert.match(nodes['#analytics-panel-rise'].innerHTML, /时间框已调整[\s\S]*23 小时 55 分/);
 });
 
-test('start and end are rounded down to whole minutes (5 minutes when only Binlog is asked) and written back', async () => {
+test('start rounds down and end rounds up to cover the selected window, then writes back', async () => {
   const slow = rdsContext(async () => impactResult, {start: '2026-09-28T10:00:40', end: '2026-09-28T12:07:59'});
   await vm.runInContext('runAnalytics()', slow.c);
   const query = new URL(slow.calls[0], 'http://fixture').searchParams;
   assert.equal(Number(query.get('startEpochUs')) % 60_000_000, 0);
   assert.equal(Number(query.get('endEpochUs')) % 60_000_000, 0);
   assert.equal(slow.nodes['#analytics-start'].value, '2026-09-28T10:00:00');
-  assert.equal(slow.nodes['#analytics-end'].value, '2026-09-28T12:07:00');
+  assert.equal(slow.nodes['#analytics-end'].value, '2026-09-28T12:08:00');
   assert.equal(slow.nodes['#analytics-range'].value, '24h', 'rounding alone does not turn the preset into a custom range');
   const only = rdsContext(async () => binlogResult, {slowlog: false, binlog: true, start: '2026-09-28T10:03:00', end: '2026-09-28T12:07:59'});
   await vm.runInContext('runAnalytics()', only.c);
@@ -624,7 +624,7 @@ test('start and end are rounded down to whole minutes (5 minutes when only Binlo
   assert.equal(Number(binlog.get('startEpochUs')) % 300_000_000, 0);
   assert.equal(Number(binlog.get('endEpochUs')) % 300_000_000, 0);
   assert.equal(only.nodes['#analytics-start'].value, '2026-09-28T10:00:00');
-  assert.equal(only.nodes['#analytics-end'].value, '2026-09-28T12:05:00');
+  assert.equal(only.nodes['#analytics-end'].value, '2026-09-28T12:10:00');
   // a window that is already whole minutes is left exactly as typed (no write-back while the user is editing)
   const same = rdsContext(async () => impactResult);
   await vm.runInContext('runAnalytics()', same.c);

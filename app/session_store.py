@@ -90,15 +90,21 @@ class SessionStore:
             "max_trx_seconds=MAX(max_trx_seconds,?), kinds=?, holder=MAX(holder,?), holder_basis=?, sql=? WHERE id=?",
             (ts_us, row["database"] or previous["db"], row["command"], row["state"], row["seconds"], row["trx_seconds"],
              json.dumps(merged), int(bool(row.get("holder"))), str(row.get("holder_basis") or previous["holder_basis"]),
-             sql or previous["sql"], previous["id"]))
+             previous['sql'] or sql, previous["id"]))
 
-    def history(self, instance: str, node: str, start_us: int, end_us: int, limit: int = MAX_HISTORY_ROWS) -> dict[str, Any]:
+    def history(self, instance: str, node: str, start_us: int, end_us: int, limit: int = MAX_HISTORY_ROWS, cursor: str = '') -> dict[str, Any]:
         """Abnormal sessions seen between two instants (one node, or every node with ``node=""``), lock-holder candidates first and then newest first, and how
         many snapshots were taken in that window per node (so a gap in collection is visible, not read as "all quiet")."""
         limit = max(1, min(int(limit), MAX_HISTORY_ROWS))
         where, args = "instance=? AND first_us<=? AND last_us>=?", [instance, end_us, start_us]
         if node:
             where, args = where + " AND node=?", args + [node]
+        if cursor:
+            key = json.loads(cursor)
+            if not isinstance(key, list) or len(key) != 3 or any(type(x) is not int for x in key):
+                raise ValueError('invalid_history_cursor')
+            where += ' AND (holder,first_us,id) < (?,?,?)'
+            args += key
         with closing(self._connect()) as conn:
             rows = conn.execute(f"SELECT * FROM abnormal WHERE {where} ORDER BY holder DESC, first_us DESC, id DESC LIMIT ?", args + [limit + 1]).fetchall()
             cover_where, cover_args = "instance=? AND ts_us BETWEEN ? AND ?", [instance, start_us, end_us]
@@ -116,6 +122,7 @@ class SessionStore:
                 "kinds": json.loads(row["kinds"]), "holder": bool(row["holder"]), "holder_basis": row["holder_basis"], "sql": row["sql"],
             } for row in shown],
             "truncated": len(rows) > limit,
+            'next_cursor': json.dumps([shown[-1]['holder'], shown[-1]['first_us'], shown[-1]['id']]) if len(rows) > limit else None,
             "coverage": [{"node_id": row["node"], "snapshots": row["snapshots"], "first_us": row["first_us"], "last_us": row["last_us"],
                           "most_abnormal": row["most_abnormal"]} for row in coverage],
         }

@@ -159,7 +159,7 @@ class TabularisAuditIngest:
             raise AuditIngestError("execution_status is not allowed")
         started_epoch_us = int(value.get("started_epoch_us") or 0)
         finished_epoch_us = int(value.get("finished_epoch_us") or 0)
-        if started_epoch_us <= 0 or finished_epoch_us < started_epoch_us:
+        if started_epoch_us <= 0 or finished_epoch_us < started_epoch_us or finished_epoch_us > int(datetime.now(UTC).timestamp()*1_000_000)+300_000_000:
             raise AuditIngestError("Audit event time range is invalid")
         execution_time_ms = max(int(value.get("execution_time_ms") or 0), 0)
         operation = self._text(value, "operation", 32).strip().upper() or "OTHER"

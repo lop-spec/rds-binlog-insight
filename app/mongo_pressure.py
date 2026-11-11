@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import math
+import json
 
 # DDS names are provider-defined; field order is always taken from ValueFormat.
 PERFORMANCE = {
@@ -57,7 +58,7 @@ def performance_points(payload, role, start_us, end_us, period, metrics=PRESSURE
             values = str(row.get('Value') or '').split('&')
             for metric, spec, ix in wanted:
                 value = finite(values[ix]) if ix < len(values) else None
-                if value is None or (value < 0 and metric != 'ReplicationLag') or (spec[3] == '%' and value > 100):
+                if value is None or (value < 0 and metric != 'ReplicationLag') or (metric in {'WtCacheUsage','WtCacheDirtyUsage','WtCacheUpdatesUsage','CPUUtilization'} and value > 100):
                     continue
                 out.append(dict(timestamp=t // 1000, role=role, node='', metric=metric,
                                 value=value, period=period, source='dds', unit=spec[3],
@@ -150,8 +151,10 @@ def slow_record_evidence(events, before, complete, baseline_complete):
             g['count'] += 1
             if e.get('client'):
                 g['clients'].add(e['client'])
-            import json
-            sample = json.loads(e['sample'])
+            try:
+                sample = json.loads(e['sample'])
+            except (ValueError,TypeError):
+                sample = {'parse_error': True}
             for field in ('cpu_ns', 'bytes_read', 'duration_us', 'cache_wait_us', 'execution_queue_us', 'txn_dirty_bytes'):
                 value = (sample.get('pressure_costs') or {}).get(field) if field in {'cache_wait_us','execution_queue_us','txn_dirty_bytes'} else e.get(field)
                 cost = g['costs'].setdefault(field, dict(observed=0, known=0))
@@ -177,7 +180,7 @@ def slow_record_evidence(events, before, complete, baseline_complete):
         g['baseline_count'] = previous['count'] if previous and baseline_complete else None
         g['causal'] = False
         g['assessment'] = ('workload_growth_candidate' if any((g['costs'][f]['delta'] or 0) > 0 for f in ('cpu_ns','bytes_read'))
-                           else 'waiting_or_incomplete_evidence')
+                           else 'no_observed_cost_growth' if complete and baseline_complete and previous and all(g['costs'][f]['delta'] is not None for f in ('cpu_ns','bytes_read')) else 'waiting_or_incomplete_evidence')
         out.append(g)
     return dict(groups=sorted(out, key=lambda g: -(g['costs']['bytes_read']['delta'] or 0))[:50],
                 complete=complete, baseline_complete=baseline_complete, population='command_slow_records_only',

@@ -23,12 +23,15 @@ import re
 import threading
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
+from collections import Counter
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .config import utc_now_text
 from .rds_api import RemoteBinlog
+from .sql_lex import statement_verb
 
 if TYPE_CHECKING:
     from .metadata import MetadataStore
@@ -53,7 +56,7 @@ _READ_STATEMENT_PREFIXES = ("select", "show", "with", "desc", "describe", "expla
 _EXECUTION_COMMAND_TYPES = ("Query", "Execute")
 # 只用于维护 thread_id → 当前库 的会话轨迹，不产出事件：
 # Init DB 的 argument 是库名；Connect 的 argument 形如 "user@host on <db> using TCP/IP"。
-_SESSION_DB_COMMAND_TYPES = ("Init DB", "Connect")
+_SESSION_DB_COMMAND_TYPES = ("Init DB", "Connect", "Quit")
 _CONNECT_DB_RE = re.compile(r" on (\S+) using ")
 # 会话轨迹上限：超过后整体清空重建（线程断开不会发事件，靠自然淘汰）。
 _THREAD_DB_LIMIT = 50_000
@@ -207,17 +210,11 @@ class GeneralLogConfig:
 def _read_operation(sql: str) -> str:
     """读语句的操作分类：SELECT / SHOW / QUERY(其他只读)。"""
 
-    text = sql.lstrip().lower()
-    while text.startswith("/*"):
-        closing = text.find("*/")
-        if closing < 0:
-            return "QUERY"
-        text = text[closing + 2 :].lstrip()
-    if text.startswith(("select", "with")):
-        return "SELECT"
-    if text.startswith("show"):
-        return "SHOW"
-    return "QUERY"
+    try:
+        verb = statement_verb(sql)
+    except ValueError:
+        return 'QUERY'
+    return verb if verb in {'SELECT','SHOW'} else 'QUERY'
 
 
 def _is_read_statement(sql: str) -> bool:
@@ -238,7 +235,10 @@ def _is_read_statement(sql: str) -> bool:
             continue
         break
     lowered = text.lower()
-    return lowered.startswith(_READ_STATEMENT_PREFIXES)
+    try:
+        return statement_verb(sql) in {'SELECT','SHOW','DESC','DESCRIBE','EXPLAIN','TABLE'}
+    except ValueError:
+        return False
 
 
 class GeneralLogCollector:
@@ -264,6 +264,9 @@ class GeneralLogCollector:
         self._state_path = storage.paths["root"] / (
             f"general_log_state-{suffix}.json" if suffix else "general_log_state.json"
         )
+        self._boundary_seen = {}
+        self._sample_started_epoch = 0.0
+        self._failure_count = 0
         self._started_monotonic = 0.0
         self._last_truncate_monotonic = 0.0
         self._status_lock = threading.Lock()
@@ -321,6 +324,9 @@ class GeneralLogCollector:
     def _load_watermark(self) -> tuple[int, str]:
         try:
             raw = json.loads(self._state_path.read_text("utf-8"))
+            self._boundary_seen = raw.get('boundary_seen') or {}
+            self._sample_started_epoch = float(raw.get('sample_started_epoch') or 0)
+            self._status['incompleteIntervals'] = raw.get('incomplete_intervals') or []
             return int(raw.get("watermark_epoch_us") or 0), str(
                 raw.get("last_truncate_date") or ""
             )
@@ -331,6 +337,9 @@ class GeneralLogCollector:
         payload = json.dumps(
             {
                 "watermark_epoch_us": int(epoch_us),
+                'boundary_seen': self._boundary_seen,
+                'sample_started_epoch': self._sample_started_epoch,
+                'incomplete_intervals': self._status.get('incompleteIntervals', []),
                 "last_truncate_date": last_truncate_date,
                 "updated_utc": utc_now_text(),
             }
@@ -352,6 +361,9 @@ class GeneralLogCollector:
         watermark, last_truncate_date = self._load_watermark()
         self._set_status(watermarkEpochUs=watermark)
         self._started_monotonic = time.monotonic()
+        if not self._sample_started_epoch:
+            self._sample_started_epoch = time.time()
+        self._save_watermark(watermark, last_truncate_date)
         self._last_truncate_monotonic = self._started_monotonic
         while not self._stop.is_set():
             started = time.monotonic()
@@ -372,8 +384,8 @@ class GeneralLogCollector:
                 return
             try:
                 watermark, ingested, raw_count = self._poll_once(watermark)
-                if ingested:
-                    self._save_watermark(watermark, last_truncate_date)
+                self._failure_count = 0
+                self._save_watermark(watermark, last_truncate_date)
                 # 满批说明源端还有积压，立即连续拉取直到追平，
                 # 否则积压增长速度可能永远超过固定节拍的消费速度。
                 backlog = raw_count >= _BATCH_ROW_LIMIT
@@ -389,17 +401,17 @@ class GeneralLogCollector:
                 )
             except Exception as exc:  # noqa: BLE001 - 驻留线程必须自愈
                 LOGGER.exception("general log 采集循环失败")
-                self._set_status(lastError=f"{type(exc).__name__}: {exc}")
+                self._failure_count += 1
+                self._set_status(lastError=f'{type(exc).__name__}: {exc}', failures=self._failure_count)
             elapsed = time.monotonic() - started
-            self._stop.wait(
-                1.0 if backlog else max(self.config.poll_seconds - elapsed, 5.0)
-            )
+            delay = min(1800, self.config.poll_seconds * 2**min(self._failure_count, 4)) if self._failure_count else self.config.poll_seconds
+            self._stop.wait(1.0 if backlog and not self._failure_count else max(delay - elapsed, 5.0))
 
     def _sample_window_expired(self, now_monotonic: float) -> bool:
         limit = self.config.sample_max_minutes
         if limit <= 0:
             return False
-        return now_monotonic - self._started_monotonic >= limit * 60
+        return (time.time()-self._sample_started_epoch >= limit*60) if self._sample_started_epoch else now_monotonic-self._started_monotonic >= limit*60
 
     # ---------------- 采集 ----------------
 
@@ -420,12 +432,26 @@ class GeneralLogCollector:
         )
 
     def _poll_once(self, watermark_epoch_us: int) -> tuple[int, int, int]:
+        if sum(self._boundary_seen.values()) > 150000:
+            raise RuntimeError('general_log_timestamp_boundary_exceeds_budget; watermark retained')
         rows = self._fetch_rows(watermark_epoch_us)
         if not rows:
             self._set_status(lastBatchRows=0)
             return watermark_epoch_us, 0, 0
-        events, max_epoch_us = self._build_events(rows)
         raw_count = len(rows)
+        counts = Counter()
+        fresh = []
+        for row in rows:
+            key = self._row_identity(row)
+            counts[key] += 1
+            if int(row.get('epoch_us') or 0) == watermark_epoch_us and counts[key] <= self._boundary_seen.get(key, 0):
+                continue
+            fresh.append(dict(row, _occurrence=counts[key]))
+        events, max_epoch_us = self._build_events(fresh)
+        max_epoch_us = max(max_epoch_us, watermark_epoch_us)
+        boundary = Counter(self._row_identity(r) for r in rows if int(r.get('epoch_us') or 0) == max_epoch_us)
+        if raw_count >= _BATCH_ROW_LIMIT + sum(self._boundary_seen.values()) and not fresh:
+            raise RuntimeError('general_log_timestamp_boundary_budget_exhausted; watermark retained')
         del rows
         if events:
             self._ingest_batch(events)
@@ -436,7 +462,10 @@ class GeneralLogCollector:
             self._set_status(lastBatchRows=0)
         # 水位线推进到本批最大 event_time，无论是否有可入库语句，
         # 否则被过滤的批会导致重复扫描同一段。
-        return max(max_epoch_us, watermark_epoch_us), len(events), raw_count
+        if max_epoch_us == watermark_epoch_us:
+            boundary = Counter({key:max(boundary.get(key,0),count) for key,count in self._boundary_seen.items()}) | boundary
+        self._boundary_seen = dict(boundary)
+        return max(max_epoch_us, watermark_epoch_us), len(events), len(fresh)
 
     def _fetch_rows(self, watermark_epoch_us: int) -> list[dict[str, Any]]:
         import pymysql.cursors
@@ -458,6 +487,8 @@ class GeneralLogCollector:
                 )
                 probe = cursor.fetchall()[0][0]  # 无缓冲游标：读完结果再发下一条
                 tz_offset_s = 0
+                if probe is None:
+                    raise RuntimeError('general_log_clock_probe_missing; no UTC offset assumed')
                 if probe is not None:
                     drift = time.time() - float(probe)
                     tz_offset_s = int(round(drift / 1800.0) * 1800)
@@ -470,22 +501,22 @@ class GeneralLogCollector:
                     "  FROM mysql.general_log"
                     # GREATEST 钳位：水位线为 0 时减去时区偏移会变负数，
                     # FROM_UNIXTIME(负数) 返回 NULL 导致 WHERE 恒假。
-                    " WHERE event_time >"
+                    " WHERE event_time >="
                     "       FROM_UNIXTIME(GREATEST(%s / 1000000.0 - %s, 0))"
                     # command_type 下推到 SQL：Prepare/Close stmt/Quit 占源表
                     # 约 59%，在库侧丢弃可省掉这部分传输与解码。Init DB 与
                     # Connect 不产出事件，只用于还原各连接的当前库（general
                     # log 的语句行不带库名，定库只能靠会话轨迹）。
-                    "   AND command_type IN (%s, %s, %s, %s)"
+                    "   AND command_type IN (%s, %s, %s, %s, %s)"
                     " ORDER BY event_time"
                     " LIMIT %s",
                     (
                         tz_offset_s,
-                        watermark_epoch_us,
+                        Decimal(watermark_epoch_us),
                         tz_offset_s,
                         *_EXECUTION_COMMAND_TYPES,
                         *_SESSION_DB_COMMAND_TYPES,
-                        _BATCH_ROW_LIMIT,
+                        min(200000, _BATCH_ROW_LIMIT + sum(self._boundary_seen.values())),
                     ),
                 )
                 columns = [item[0] for item in cursor.description]
@@ -498,11 +529,16 @@ class GeneralLogCollector:
         finally:
             connection.close()
 
+    @staticmethod
+    def _row_identity(row):
+        return hashlib.sha256(json.dumps([str(row.get(k) or '') for k in ('epoch_us','thread_id','server_id','command_type','user_host','sql_text')], ensure_ascii=False).encode()).hexdigest()
+
     def _build_events(
         self, rows: list[dict[str, Any]]
     ) -> tuple[list[dict[str, Any]], int]:
         events: list[dict[str, Any]] = []
         max_epoch_us = 0
+        occurrences = Counter()
         for index, row in enumerate(rows):
             epoch_us = int(row.get("epoch_us") or 0)
             max_epoch_us = max(max_epoch_us, epoch_us)
@@ -514,6 +550,11 @@ class GeneralLogCollector:
             # event_time 序，所以同线程后续语句一定拿到最新的库。
             if command_type in _SESSION_DB_COMMAND_TYPES:
                 thread_id = int(row.get("thread_id") or 0)
+                if command_type == 'Quit':
+                    self._thread_db.pop(thread_id, None)
+                    continue
+                if command_type == 'Connect':
+                    self._thread_db.pop(thread_id, None)
                 if command_type == "Init DB":
                     database = sql_text.strip().strip("`")
                 else:
@@ -521,25 +562,31 @@ class GeneralLogCollector:
                     database = matched.group(1) if matched else ""
                 if thread_id and database:
                     if len(self._thread_db) >= _THREAD_DB_LIMIT:
-                        self._thread_db.clear()
+                        self._thread_db.pop(next(iter(self._thread_db)))
                     self._thread_db[thread_id] = database
                 continue
             if command_type not in _EXECUTION_COMMAND_TYPES:
                 continue
             user_host = str(row.get("user_host") or "")
-            lowered_user = user_host.lower()
-            if any(item in lowered_user for item in self.config.exclude_users):
+            lowered_user = user_host.split('[', 1)[0].split('@', 1)[0].strip().lower()
+            if lowered_user in {*self.config.exclude_users, self.config.user.lower()}:
+                continue
+            use = re.match(r'^\s*USE\s+`?([A-Za-z0-9_$]+)`?\s*;?\s*$', sql_text, re.I)
+            if use:
+                self._thread_db[int(row.get('thread_id') or 0)] = use[1]
                 continue
             if not _is_read_statement(sql_text):
                 continue
+            identity = self._row_identity(row)
+            occurrences[identity] += 1
             digest = hashlib.sha256(
                 "\x1f".join(
                     (
                         self.config.instance_id,
                         str(epoch_us),
                         str(row.get("thread_id") or 0),
-                        str(index),
-                        sql_text[:512],
+                        identity,
+                        str(row.get('_occurrence') or occurrences[identity]),
                     )
                 ).encode("utf-8", "replace")
             ).hexdigest()
@@ -607,7 +654,8 @@ class GeneralLogCollector:
 
         # 文件名由批次时间区间确定性生成：宕机后重跑同一批会命中同一条
         # 文件记录(stable_id 相同)，state=done 直接跳过，天然幂等去重。
-        stamp = f"{begin_us}-{end_us}"
+        content_id = hashlib.sha256('\x1f'.join(sorted(e['event_id'] for e in events)).encode()).hexdigest()[:16]
+        stamp = f'{begin_us}-{end_us}-{content_id}'
         log_file_name = f"general-log/{self.config.instance_id}/{stamp}"
         staging = self.storage.paths["staging"]
         staging.mkdir(parents=True, exist_ok=True)
@@ -662,7 +710,7 @@ class GeneralLogCollector:
                     archived = self.archiver.archive_parts_now(
                         parts, self.config.oss_prefix
                     )
-                    self._set_status(lastArchivedParts=archived)
+                    self._set_status(lastArchivedParts=archived, lastArchiveError='')
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning("general log 分区归档失败: %s", exc)
                     self._set_status(lastArchiveError=f"{type(exc).__name__}: {exc}")
@@ -710,7 +758,7 @@ class GeneralLogCollector:
             if not self._force_truncate_due():
                 return last_slot, watermark_epoch_us
             forced = True
-        now_local = datetime.now()
+        now_local = datetime.now(timezone(timedelta(hours=8)))
         if self.config.truncate_min_interval_s <= 0 and (
             now_local.hour != self.config.truncate_hour
         ):
@@ -733,6 +781,8 @@ class GeneralLogCollector:
         finally:
             connection.close()
         self._last_truncate_monotonic = time.monotonic()
+        gap = {'start_us': watermark_epoch_us, 'end_us': time.time_ns()//1000, 'reason': 'forced_truncate' if forced else 'truncate_tail_race_possible'}
+        self._status['incompleteIntervals'] = (self._status.get('incompleteIntervals', []) + [gap])[-1000:]
         if forced:
             LOGGER.warning(
                 "mysql.general_log 强制 TRUNCATE(超过 %s 秒未清、采集未追平)："

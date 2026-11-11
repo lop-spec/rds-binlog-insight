@@ -64,7 +64,7 @@ def diagnosis(service,entry,start,end,node,current,baseline):
             last=c.execute('SELECT ts,payload FROM snapshots WHERE instance=? AND node=? AND ts>=? AND ts<=? ORDER BY ts DESC LIMIT 1',(identity,n['node'],start,end)).fetchone()
             first=c.execute('SELECT ts,payload FROM snapshots WHERE instance=? AND node=? AND ts>=? AND ts<=? ORDER BY ts LIMIT 1',(identity,n['node'],start,end)).fetchone()
             if last:
-                raw=decode(last['payload']);tel=raw.get('telemetry',{});latest[n['node']]={'time':last['ts'],'telemetry':tel,'run_id':raw['run_id'],'physical_node':raw['node_id']}
+                raw=decode(last['payload']);tel=raw.get('telemetry',{});latest[n['node']]={'time':last['ts'],'telemetry':tel,'run_id':raw.get('run_id'),'physical_node':raw.get('node_id'),'identity_verified':bool(raw.get('node_id'))}
                 for cmd,p in tel.get('percentiles',{}).items():latencies.append({'node':n['node'],'command':cmd,**p,'scope':'cumulative_histogram_snapshot'})
             if first:initial[n['node']]={'time':first['ts'],'telemetry':decode(first['payload']).get('telemetry',{})}
     for n,value in nodes.items():
@@ -98,7 +98,7 @@ def diagnosis(service,entry,start,end,node,current,baseline):
         old=initial.get(n,{}).get('telemetry',{}).get('gauges',{});new=last['telemetry'].get('gauges',{})
         memory.append({'node':n,'fields':{k:{'first':old.get(k),'last':new.get(k),'delta':new[k]-old[k] if k in old and k in new else None} for k in sorted(set(old)|set(new)) if k.startswith(('used_memory','mem_','allocator_','rss_','lazyfree','aof_','rdb_'))},'scope':'overlapping_components_not_additive'})
     if source and events['rows']:evidence.append({'grade':'时间相关候选','kind':'workload_or_configuration_change','message':'窗口附近有副本、镜像、HPA或Pod变化；需与命令阶跃和运行计数核对。'})
-    if any(n['median_command_index']>1.2 and n['comparable_commands']>=5 for n in peers['nodes']):evidence.append({'grade':'机制支持的贡献因素','kind':'higher_observed_unit_cost','message':'同窗多个相同命令单次成本偏高；不能据此排除Key参数差异或确认宿主机争抢。'})
+    if any(n['median_command_index']>1.2 and n['comparable_commands']>=5 for n in peers['nodes']):evidence.append({'grade':'时间相关候选','kind':'higher_observed_unit_cost','message':'同窗多个相同命令单次成本偏高；不能据此排除Key参数差异或确认宿主机争抢。'})
     evidence.append({'grade':'未覆盖','kind':'unattributed','message':'未接入的客户端、内部命令口径差异、未记录历史均不默认为零；不自动关闭其他候选。'})
     return {'five_layers':{'nodes':[{'node':n,**v} for n,v in sorted(nodes.items())], 'unit_costs':peers,'latency_snapshots':latencies[:300],
               'memory':memory,'sources':source,'worker_configs':configs,'polling_model':poll_model(source,configs),
@@ -106,4 +106,4 @@ def diagnosis(service,entry,start,end,node,current,baseline):
               'keys':history.rows(identity,'keys',start,end,node,100),'queues':history.rows(identity,'queues',start,end,limit=30),
               'profiles':history.rows(identity,'profile',start,end,node,60),'night_baselines':history.rows(identity,'night',start-3*86400,end,node,30),
               'client_aggregates':aggregates,'coverage_reconciliation':reconciliation,'findings':evidence},
-            'collector_state':dict(service.context.state) if service.context else {},'aggregate_delivery_state':dict(service.aggregates.state) if service.aggregates else {},'causal':False,'workflow':['六分片范围','昨日与凌晨基线','命令量/成本','来源与事件','单位成本','Key/队列','内存分项','三级证据与缺口']}
+            'collector_state':dict(service.context.state) if service.context else {},'aggregate_delivery_state':dict(service.aggregates.state) if service.aggregates else {},'causal':False,'workflow':['已观测节点范围','昨日与凌晨基线','命令量/成本','来源与事件','单位成本','Key/队列','内存分项','三级证据与缺口']}

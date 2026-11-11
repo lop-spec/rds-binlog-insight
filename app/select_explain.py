@@ -23,6 +23,7 @@ import re
 import sqlite3
 import time
 from typing import Any
+from .sql_lex import explain_safe
 
 LOGGER = logging.getLogger(__name__)
 
@@ -125,9 +126,9 @@ def estimate_examined_rows(plan_rows: list[dict[str, Any]]) -> int:
         prefix = 1.0
         for row in rows:
             est = float(row.get("rows") or 0)
-            filtered = float(row.get("filtered") or 100.0) / 100.0
+            filtered = float(row['filtered'] if row.get('filtered') is not None else 100.0) / 100.0
             total += prefix * est
-            prefix *= max(est * filtered, 1.0)
+            prefix *= max(est * filtered, 0.0)
             if total > _EST_CAP:
                 return _EST_CAP
     return int(min(total, _EST_CAP))
@@ -176,13 +177,12 @@ class SelectExplainWorker:
             cache: dict[str, list[str]] = {}
             with self._mysql().cursor() as cursor:
                 cursor.execute(
-                    "SELECT TABLE_NAME, TABLE_SCHEMA FROM information_schema.TABLES"
-                    " WHERE TABLE_SCHEMA NOT IN"
-                    " ('mysql','sys','information_schema','performance_schema')"
+                    'SELECT TABLE_NAME, TABLE_SCHEMA FROM information_schema.TABLES WHERE TABLE_NAME=%s'
+                    " AND TABLE_SCHEMA NOT IN ('mysql','sys','information_schema','performance_schema')", (table,)
                 )
                 for name, schema in cursor.fetchall():
                     cache.setdefault(str(name).lower(), []).append(str(schema))
-            self._table_db_cache = cache
+            return cache.get(table.lower(), [])
         return self._table_db_cache.get(table.lower(), [])
 
     # ---------------- 定库 ----------------
@@ -211,9 +211,7 @@ class SelectExplainWorker:
         if len(dbs) == 1:
             return [dbs[0]], "unique_table"
         if len(dbs) > 1:
-            ordered = [db for db in self.config.db_priority if db in dbs]
-            ordered += [db for db in dbs if db not in ordered]
-            return ordered[:3], "priority"
+            return [], 'ambiguous_database_not_guessed'
         return [], "none"
 
     # ---------------- EXPLAIN ----------------
@@ -223,8 +221,12 @@ class SelectExplainWorker:
         lowered = body.lower()
         if not lowered.startswith(("select", "with")):
             return {"status": "skip", "error": "非 SELECT 主体"}
-        if ";" in body:
-            return {"status": "skip", "error": "疑似多语句"}
+        try:
+            safe = explain_safe(body)
+        except ValueError:
+            safe = False
+        if not safe or body.endswith(' …'):
+            return {'status':'skip','error':'样本含危险函数/执行注释、多语句或不完整文本；未在源库重放'}
         candidates, source = self.resolve_databases(sample_sql, body)
         if source == "no_table":
             return {
@@ -237,6 +239,11 @@ class SelectExplainWorker:
             }
         if not candidates:
             return {"status": "error", "error": "无法定库", "db_source": source}
+        with self._mysql().cursor() as cursor:
+            cursor.execute('SELECT @@version')
+            version = str(cursor.fetchone()[0])
+        if not re.match(r'^8\.', version):
+            return {'status':'skip','error':'未核实非MySQL8的EXPLAIN不执行边界'}
         last_error = ""
         for database in candidates:
             try:
@@ -304,8 +311,9 @@ class SelectExplainWorker:
                 WHERE st.action = 'SELECT'
                   AND (
                         se.fingerprint IS NULL
-                        OR (se.status = 'error' AND se.updated_utc < :cutoff)
+                        OR se.updated_utc < :cutoff
                   )
+                ORDER BY COALESCE(se.updated_utc, ''), st.last_seen_us DESC, st.fingerprint
                 LIMIT :limit
                 """,
                 {"cutoff": retry_cutoff, "limit": self.config.batch},

@@ -100,6 +100,7 @@ class LiveSessions:
         self._clock, self._sleep, self._wall_us = clock, sleep, wall_us
         self._cache_seconds, self._poll_seconds, self._deadline_seconds = cache_seconds, poll_seconds, deadline_seconds
         self._cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+        self._failures = {}
         self._locks: dict[tuple[str, str], threading.Lock] = {}
         self._guard = threading.Lock()
         self._gate = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
@@ -116,13 +117,21 @@ class LiveSessions:
         """One node's snapshot shaped by ``build(data, now_us)``; the read and the cache are shared by every view."""
         key = (instance_id, node_id)
         with self._node_lock(key):
+            failed = self._failures.get(key)
+            if failed and self._clock() < failed[0]:
+                raise LiveSessionsError(failed[1], failed[2])
             hit = self._cache.get(key)
             cached = bool(hit and self._clock() < hit[0])
             if cached:
                 data = hit[1]
             else:
-                with self._gate:
-                    data = self._read(instance_id, node_id)
+                try:
+                    with self._gate:
+                        data = self._read(instance_id, node_id)
+                except LiveSessionsError as exc:
+                    self._failures[key] = (self._clock()+10, exc.code, str(exc))
+                    raise
+                self._failures.pop(key, None)
                 self._cache[key] = (self._clock() + self._cache_seconds, data)
         payload = build(data, self._wall_us())
         payload.update(instance_id=instance_id, node_id=node_id)

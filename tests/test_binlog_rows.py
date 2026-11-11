@@ -965,7 +965,8 @@ class Release12916Tests(unittest.TestCase):
                     "requested_us": 10, "covered_us": 5}
         out = self._analytics(coverage, responder).summarize(
             {"instance": "i", "limit": 10, "order": "executions", "operation": "update"}, 0, 3_600_000_000)
-        self.assertEqual(set(out), {"mode", "window", "sql", "transactions", "locks", "coverage", "evidence"})
+        self.assertEqual(set(out), {'count_scope',"mode", "window", "sql", "transactions", "locks", "coverage", "evidence"})
+        self.assertEqual(out['count_scope'],'rows_event_records_not_sql_executions')
         self.assertEqual(set(out["sql"]["orders"]), set(SQL_ORDERS))
         real, synthetic = out["sql"]["statements"]
         self.assertEqual((real["source_kind"], real["normalized_sql"]), ("rows-query", "UPDATE t SET a = ?"))

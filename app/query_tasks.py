@@ -174,11 +174,11 @@ class QueryTaskManager:
         # Table-row queries carry their own ClickHouse deadline; keep the task
         # bound just above it and below the two-minute interactive budget.
         indexed_budget = QUERY_DEADLINE_SECONDS + 18 if serving_enabled() else 55
-        deadline = time.monotonic()+indexed_budget if query.get('indexed_only') else None
+        deadline = time.monotonic()+(indexed_budget if query.get('indexed_only') else 120)
         with self._lock:
             if self._closing:
                 raise RuntimeError("查询任务管理器正在停止")
-            if query.get('indexed_only') and len(self._controls) >= self.max_workers:
+            if len(self._controls) >= self.max_workers:
                 raise QueryBusy('查询执行槽已满，请稍后重试；索引查询不会排队等待原档扫描')
             task_id = self.metadata.create_query_task(dict(query))
             control = QueryControl(task_id, self.metadata, deadline=deadline)
@@ -192,6 +192,11 @@ class QueryTaskManager:
         return task_id
 
     def _prune_history(self) -> None:
+        for path in self.result_dir.glob('*.json.gz'):
+            try:
+                if time.time()-path.stat().st_mtime>86400:path.unlink()
+            except OSError:
+                LOGGER.warning('Expired query result removal failed')
         for name in self.metadata.prune_query_tasks(keep=100):
             if not name or Path(name).name != name:
                 continue
@@ -246,7 +251,8 @@ class QueryTaskManager:
                 "查询已取消",
                 error_code=QueryCancelled.code,
             )
-        except BaseException as exc:
+        except Exception as exc:
+            LOGGER.exception('Query task failed id=%s', task_id)
             control.flush()
             self.metadata.finish_query_task(
                 task_id,
@@ -309,6 +315,9 @@ class QueryTaskManager:
             return None
         path = self.result_dir / name
         try:
+            if time.time()-path.stat().st_mtime > 86400:
+                path.unlink(missing_ok=True)
+                return None
             return json.loads(gzip.decompress(path.read_bytes()).decode("utf-8"))
         except (OSError, ValueError, json.JSONDecodeError):
             return None

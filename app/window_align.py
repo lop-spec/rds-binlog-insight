@@ -59,7 +59,11 @@ def align_to_intervals(start_us: int, end_us: int, intervals: Iterable[Iterable[
     that length exists within reach (the caller then runs the requested window and reports its own coverage).
     Repaired edges sit on ``step_us`` boundaries; a truncated window keeps at least ``min_span_us`` (one step by default).
     """
-    covered = sorted((int(a), int(b)) for a, b in intervals if int(b) >= int(a))
+    covered = []
+    for a,b in sorted((int(a),int(b)) for a,b in intervals if int(b)>=int(a)):
+        if covered and a <= covered[-1][1]+1:
+            covered[-1] = (covered[-1][0],max(covered[-1][1],b))
+        else:covered.append((a,b))
     if _inside(covered, start_us, end_us):
         return None
     length = end_us - start_us
@@ -70,12 +74,6 @@ def align_to_intervals(start_us: int, end_us: int, intervals: Iterable[Iterable[
             if cut - start_us >= minimum:
                 return {"kind": "truncated", "start_us": start_us, "end_us": cut}
             break
-    base = floor_to(start_us, step_us)
-    for step in range(1, reach_us // step_us + 1):
-        for low in (base - step * step_us, base + step * step_us):
-            high = low + length
-            if low >= floor_us and high <= now_us and _inside(covered, low, high):
-                return {"kind": "shifted", "start_us": low, "end_us": high}
     return {"kind": "none"}
 
 
@@ -102,7 +100,7 @@ def align_binlog_query(binlog_rows: Any, query: dict[str, Any], retention_days: 
     except Exception:  # noqa: BLE001 - a coverage hiccup must not take the analysis down
         LOGGER.warning("BINLOG_WINDOW_ALIGN_SKIPPED instance=%s: coverage unavailable; running the requested window",
                        instance, exc_info=True)
-        return None, None
+        raise RuntimeError('binlog_coverage_unavailable; analysis not performed') from None
     intervals = coverage.get("intervals") or []
     edge = ready_edge(intervals, now_us)
     fixed = align_to_intervals(start_us, end_us, intervals, now_us=now_us, floor_us=floor_us)

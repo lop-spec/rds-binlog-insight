@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import faulthandler
 import gzip
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -386,7 +387,7 @@ class Application:
         self.slow_tails = SlowLogTails(self.slow_logs)
         if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
             self.slow_tails.start()
-        # Primary / secondary label of each collected node. Refreshed off the request path (the server is single-threaded
+        # Primary / secondary label of each collected node. Refreshed off the request path (the server is multi-threaded
         # and the page polls /api/status); skipped in the mock-API test mode, which has no cloud to ask.
         self.node_roles = NodeRoleBook(
             self.metadata.load_settings, credential_loader,
@@ -413,10 +414,19 @@ class Application:
         from .mongo_service import MongoService
         self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
         from .starrocks_service import StarRocksService
-        self.starrocks = StarRocksService(self.data_dir, self.metadata.load_settings, credential_loader)
+        from .collector_health import UnavailableEngine
+        try:
+            self.starrocks = StarRocksService(self.data_dir, self.metadata.load_settings, credential_loader)
+        except Exception:
+            LOGGER.exception('Optional StarRocks initialization failed')
+            self.starrocks = UnavailableEngine('starrocks')
         from .redis_service import RedisService
         from .redis_context import WorkloadReader
-        self.redis = RedisService(self.data_dir, self.metadata.load_settings, credential_loader, context_reader=WorkloadReader(self.pod_inventory))
+        try:
+            self.redis = RedisService(self.data_dir, self.metadata.load_settings, credential_loader, context_reader=WorkloadReader(self.pod_inventory))
+        except Exception:
+            LOGGER.exception('Optional Redis initialization failed')
+            self.redis = UnavailableEngine('redis')
         if os.environ.get("RDS_BINLOG_TEST_MODE") != "1":
             self.redis.start()
         # Members of the MongoDB instances configured for Mongo analytics (role id, role, VPC address), for session management.
@@ -448,6 +458,10 @@ class Application:
     def _live_status_sections(self) -> dict[str, Any]:
         """The parts of the status that cost nothing to compute: collector and live-tail state, always read at request time."""
         return {
+            'sync': self.sync.status() if getattr(self, 'sync', None) is not None else {},
+            'secondarySyncs': [{'instanceId': m.scope_instance_id, 'label': m.display_name, 'sync': m.status()} for m in getattr(self, 'secondary_syncs', [])],
+            'auditIngest': self.audit_ingest.status() if getattr(self, 'audit_ingest', None) is not None else {},
+            'nodeRoleHealth': self.node_roles.status() if getattr(self,'node_roles',None) is not None else {},
             "redis": self.redis.status() if getattr(self, "redis", None) is not None else {},
             "generalLog": (self.general_log.status() if getattr(self, "general_log", None) is not None else {}),
             "generalLogs": [item.status() for item in getattr(self, "general_logs", [])],
@@ -581,7 +595,13 @@ class Application:
             issues.append(f"无法读取入库清单：{exc}")
         for instance, guard in zip(instances, guards):
             newest = str(guard.get("newestCollectedEnd") or "")
-            if ingested is None or not newest or instance not in ingested:
+            if ingested is None:
+                continue
+            if newest and instance not in ingested:
+                issues.append(f'{instance} 尚无按表入库记录，不能判为健康')
+                result['instances'][instance] = {'state': 'not_ingested', 'behindSeconds': None}
+                continue
+            if not newest:
                 continue
             try:
                 collected_us = int(datetime.fromisoformat(newest.replace("Z", "+00:00")).timestamp() * 1_000_000)
@@ -595,13 +615,19 @@ class Application:
         if stuck:
             issues.append(f"按表存储有 {len(stuck)} 个文件反复失败")
         updated = [lane.get("updatedAt") for lane in (worker.get("lanes") or {}).values() if lane.get("updatedAt")]
+        if not updated:
+            issues.append('按表写入进程没有可用状态时间')
         if updated:
             newest_update = max(updated)
             try:
-                age = (datetime.now(UTC) - datetime.fromisoformat(newest_update)).total_seconds()
-            except ValueError:
-                age = 0
-            if age > 900:
+                observed = datetime.fromisoformat(newest_update.replace('Z', '+00:00'))
+                if observed.tzinfo is None:
+                    raise ValueError('timezone missing')
+                age = (datetime.now(UTC) - observed).total_seconds()
+            except (ValueError, TypeError):
+                age = None
+                issues.append('按表写入进程状态时间无效或缺少时区')
+            if age is not None and age > 900:
                 issues.append(f"按表存储写入进程 {age / 60:.0f} 分钟没有更新状态")
         result["stuckFiles"] = stuck[:20]
         if issues:
@@ -766,6 +792,10 @@ class Application:
 
         取不到时返回 None，由 SchemaDiffService 回退到配置里的名字。
         """
+        cache = getattr(self, '_instance_name_cache', {})
+        hit = cache.get(instance_id)
+        if hit and time.monotonic() < hit[0]:
+            return hit[1]
         settings = self.metadata.load_settings()
         credential = load_credential(settings.credential_target)
         if credential is None:
@@ -778,14 +808,17 @@ class Application:
             items = [items]
         if not items:
             return None
-        return str(items[0].get("DBInstanceDescription") or "").strip() or None
+        name = str(items[0].get('DBInstanceDescription') or '').strip() or None
+        cache[instance_id] = (time.monotonic()+300, name)
+        self._instance_name_cache = cache
+        return name
 
     def _configure_logging(self) -> None:
         log_path = self.paths["logs"] / "app.log"
         handler = logging.handlers.RotatingFileHandler(
             log_path,
-            maxBytes=5 * 1024 * 1024,
-            backupCount=3,
+            maxBytes=20 * 1024 * 1024,
+            backupCount=5,
             encoding="utf-8",
         )
         handler.setFormatter(
@@ -1016,7 +1049,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
             "base-uri 'none'; frame-ancestors 'none'",
         )
-        self.send_header("Cache-Control", "no-store")
+        static = urllib.parse.urlsplit(getattr(self,'path','')).path.startswith('/assets/')
+        self.send_header('Cache-Control', 'private, no-cache' if static else 'no-store')
 
     def _json(self, value: Any, status: int = 200) -> None:
         self._json_body(_encode_json(value), status)
@@ -1092,8 +1126,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._error(404, "NOT_FOUND", "资源不存在")
             return
         body = path.read_bytes()
+        etag = '"'+hashlib.sha256(body).hexdigest()+'"'
+        if self.headers.get('If-None-Match') == etag:
+            self.send_response(304)
+            self.send_header('ETag', etag)
+            self._security_headers()
+            self.end_headers()
+            return
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         self.send_response(200)
+        self.send_header('ETag', etag)
         self.send_header(
             "Content-Type",
             content_type + ("; charset=utf-8" if content_type.startswith("text/") else ""),
@@ -1202,8 +1244,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/index-coverage" and self.app.storage.binlog_rows is not None:
                 settings = self.app.metadata.load_settings()
+                identity = _query_value(query, 'instance')
+                known = {settings.db_instance_id, *(m.scope_instance_id for m in getattr(self.app, 'secondary_syncs', []))}
+                if identity not in known:
+                    raise ValueError('只能查询已登记的Binlog实例覆盖度')
                 floor, ceiling = self.app.storage._query_window({}, settings.retention_days)
-                coverage = self.app.storage.binlog_rows.coverage(_query_value(query, 'instance'), floor, ceiling)
+                coverage = self.app.storage.binlog_rows.coverage(identity, floor, ceiling)
                 from .binlog_rows_worker import STATUS_NAME
                 from .maintenance_status import read_json_status
                 coverage['worker'] = read_json_status(self.app.storage.paths['index'] / STATUS_NAME)
@@ -1224,6 +1270,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not coverage['intervals'] and not coverage['reason']:
                     coverage['reason'] = '保留窗口内尚无连续完整的索引区间'
                 self._json({'ok': True, 'data': coverage})
+            elif parsed.path == '/api/health':
+                from .collector_health import collector_health
+                health = collector_health(self.app)
+                self._json({'ok': health['ok'], 'data': health}, 200 if health['ok'] else 503)
             elif parsed.path == "/api/status":
                 snapshot = getattr(self.app, "status_snapshot", None)
                 self._json({"ok": True, "data": snapshot() if snapshot is not None else self.app.public_status()})
@@ -1378,7 +1428,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 end_us = int(_query_value(query, "endEpochUs") or time.time_ns() // 1000)
                 start_us = int(_query_value(query, "startEpochUs") or end_us - 3600 * 1_000_000)
                 self._json({"ok": True, "data": self.app.sessions.history(_query_value(query, "instance").strip(), node_id, start_us, end_us,
-                                                                          int(_query_value(query, "limit") or 200))})
+                                                                          int(_query_value(query, "limit") or 200), **({'cursor': _query_value(query, 'cursor')} if _query_value(query, 'cursor') else {}))})
             elif parsed.path == "/api/ip-names":
                 # Pod (at that moment) or ECS name of each client IP; IPs with neither are left out.
                 ips = [value for value in _query_value(query, "ips").split(",") if value.strip()][:500]
@@ -1431,7 +1481,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                         raise
                     raise PipelineError('导出区间未完整覆盖；请通过采集管理显式回补后重试',
                                         'TIER_COVERAGE_MISSING') from exc
-                self._send_file(path, f"binlog-events-{count}.csv")
+                self._send_file(path, f"{event_query.get('source') or 'all'}-events-{count}.csv")
             elif parsed.path == "/api/schema/instances":
                 self._json(
                     {
@@ -1465,11 +1515,17 @@ class RequestHandler(BaseHTTPRequestHandler):
         except SessionRequestError as exc:
             self._error(400, exc.code, str(exc))
         except ValueError as exc:
+            if str(exc).endswith('_busy') or str(exc).endswith('_rate_limit'):
+                self._error(429, 'RESOURCE_BUSY', '当前查询资源忙，请稍后重试')
+                return
             LOGGER.warning('Invalid GET path=%s', parsed.path, exc_info=True)
             self._error(400, "INVALID_REQUEST", str(exc))
         except Exception as exc:
             LOGGER.exception("GET request failed")
             code = getattr(exc, "code", "INTERNAL_ERROR")
+            if str(exc).endswith('_busy'):
+                self._error(429, 'RESOURCE_BUSY', '当前查询资源忙，请稍后重试')
+                return
             status = (
                 404
                 if code == "BINLOG_RANGE_NOT_FOUND"
@@ -1512,8 +1568,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 self._json({"ok": True, "data": self.app.redis.ingest(self._body_json())}, 202)
-            except (ValueError, TypeError, KeyError):
-                self._error(400, "REDIS_INVALID_SAMPLE", "采样字段、窗口或速率不符合约束")
+            except (ValueError, TypeError, KeyError) as exc:
+                self._error(429 if str(exc).endswith('_rate_limit') else 400, 'REDIS_RATE_LIMIT' if str(exc).endswith('_rate_limit') else 'REDIS_INVALID_SAMPLE', '采样限流，请退避重试' if str(exc).endswith('_rate_limit') else '采样字段或窗口不符合约束')
             except Exception:
                 LOGGER.exception('Redis sample ingestion failed')
                 self._error(503, "REDIS_INGEST_FAILED", "采样写入不可用；原ID可去重重试")

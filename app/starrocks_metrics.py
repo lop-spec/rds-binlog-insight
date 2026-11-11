@@ -144,6 +144,7 @@ class StarRocksMetrics:
             'StartTime': str(start_ms), 'EndTime': str(end_ms), 'Period': str(period), 'Length': '1000',
         }
         points, seen_tokens, token = [], set(), None
+        invalid_points = 0
         for _ in range(32):
             if token:
                 params['NextToken'] = token
@@ -164,7 +165,8 @@ class StarRocksMetrics:
                         or isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
                         or isinstance(timestamp, bool) or not isinstance(timestamp, int)
                         or not start_ms < timestamp <= end_ms):
-                    raise RuntimeError('starrocks_invalid_metric_point')
+                    invalid_points += 1
+                    continue
                 points.append({'timestamp': timestamp, 'node': node, 'value': value, 'period': period})
             token = response.get('NextToken')
             if not token:
@@ -174,16 +176,23 @@ class StarRocksMetrics:
             seen_tokens.add(token)
         else:
             raise RuntimeError('starrocks_metric_page_limit')
-        point_keys = [(p['node'], p['timestamp']) for p in points]
-        if len(set(point_keys)) != len(point_keys):
-            raise RuntimeError('starrocks_conflicting_metric_points')
+        unique = {}
+        conflicts = set()
+        for point in points:
+            key = point['node'], point['timestamp']
+            if key in unique and unique[key]['value'] != point['value']:
+                conflicts.add(key)
+            unique[key] = point
+        points = [p for k,p in unique.items() if k not in conflicts]
+        invalid_points += len(conflicts)
         points.sort(key=lambda p: (p['node'], p['timestamp']))
         return {
             'instance': identity, 'metric': metric_id, 'label': METRICS[metric_id]['label'],
             'unit': METRICS[metric_id]['unit'], 'kind': METRICS[metric_id]['kind'],
             'start_ms': start_ms, 'end_ms': end_ms, 'period': period, 'points': points,
             'nodes': sorted({point['node'] for point in points}), 'source': 'aliyun_cms',
-            'complete': False,
+            'complete': False, 'invalid_points': invalid_points, 'read_complete': not invalid_points,
             'warning': '仅列云监控返回的节点和采样点；无法仅凭返回结果确认节点全覆盖，缺失不当作零。',
-            'audit_status': 'not_connected', 'running_queries_status': 'not_connected',
+            'audit_status': self.status().get('audit',{}).get('status','unknown'),
+            'running_queries_status': self.status().get('running_queries',{}).get('status','unknown'),
         }

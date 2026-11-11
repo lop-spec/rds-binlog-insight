@@ -104,6 +104,7 @@ class ServiceTests(unittest.TestCase):
         return {"instance": "rm-x", "node_id": "rn-b", "mode": "connection", "snapshot_us": T0, "sessions": rows, **extra}
 
     def test_kill_statements_are_written_never_run_and_leave_a_log_line(self):
+        self.service._wall_us = lambda: T0+10*SEC
         with self.assertLogs("app.session_service", "INFO") as logs:
             out = self.service.kill_statements(self.payload())
         self.assertEqual(out["statements"], ["/*FORCE_NODE='rn-b'*/ KILL 2;"])
@@ -112,24 +113,28 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("schema_table_lock_waits", self.service.kill_statements(self.payload(lock_waiters=3))["text"])
         self.assertIn("nothing was executed", logs.output[0])
         self.assertIn("nodes=rn-b mode=connection sessions=1", logs.output[0])
-        self.assertEqual(self.live.calls, [])      # no DAS call, and the service has no database connection at all
+        self.assertEqual(self.live.calls, [('rm-x','rn-b'),('rm-x','rn-b')])  # authoritative snapshots only; no KILL execution
 
     def test_sessions_on_several_nodes_are_one_request_and_one_text_every_check_first_primary_first(self):
+        self.service._wall_us = lambda: T0+10*SEC
+        self.answers['rm-x','rn-b'] = das(idle_trx(2),idle_trx(3))
+        self.answers['rm-x','rn-p'] = das(idle_trx(2))
+        self.answers['rm-x','rn-p']['SessionData']['TimeStamp'] = (T0+SEC)//1000
         rows = lambda *ids: [dict(session_id=i, user="app", client="10.0.0.1", database="shop", command="Sleep", seconds=90) for i in ids]
         out = self.service.kill_statements({"instance": "rm-x", "mode": "query", "nodes": [
             {"node_id": "rn-b", "snapshot_us": T0, "lock_waiters": 1, "sessions": rows(2, 3)},
             {"node_id": "rn-p", "snapshot_us": T0 + SEC, "sessions": rows(2)}]})
         check = "SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN "
         self.assertEqual(out["text"].splitlines(), [
-            "/*FORCE_MASTER*/ " + check + "(2);",
+            "/*FORCE_NODE='rn-p'*/ " + check + "(2);",
             "/*FORCE_NODE='rn-b'*/ " + check + "(2, 3);",
             "/*FORCE_NODE='rn-b'*/ SELECT * FROM sys.schema_table_lock_waits;",
-            "/*FORCE_MASTER*/ KILL QUERY 2;", "/*FORCE_NODE='rn-b'*/ KILL QUERY 2;", "/*FORCE_NODE='rn-b'*/ KILL QUERY 3;"])
+            "/*FORCE_NODE='rn-p'*/ KILL QUERY 2;", "/*FORCE_NODE='rn-b'*/ KILL QUERY 2;", "/*FORCE_NODE='rn-b'*/ KILL QUERY 3;"])
         self.assertEqual(out["statements"], out["text"].splitlines()[3:])
         self.assertEqual(out["session_ids"], [2, 2, 3])                                # the same id on two nodes is two sessions
         self.assertEqual([(node["node_id"], node["role"], node["snapshot_us"], node["session_ids"]) for node in out["nodes"]],
                          [("rn-p", "primary", T0 + SEC, [2]), ("rn-b", "secondary", T0, [2, 3])])
-        self.assertEqual((out["mode"], out["generated_us"], out["skipped"]), ("query", T0 + 60 * SEC, []))
+        self.assertEqual((out["mode"], out["generated_us"], out["skipped"]), ("query", T0 + 10 * SEC, []))
         one = {"node_id": "rn-b", "snapshot_us": T0, "sessions": rows(1)}
         for bad in ({"instance": "rm-x", "nodes": []}, {"instance": "rm-x", "nodes": "x"}, {"instance": "rm-x", "nodes": [1]},
                     {"instance": "rm-x", "nodes": [one, dict(one, sessions=rows(2))]}, {"instance": "rm-x", "nodes": [one, dict(one, node_id="rn-p", sessions=[])]},

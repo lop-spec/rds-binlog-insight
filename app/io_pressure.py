@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -33,10 +34,10 @@ def read_full_avg10(path: Path = DEFAULT_PRESSURE_PATH) -> float:
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        return 0.0
+        raise IoPressurePaused('host_io_pressure_unavailable') from None
     except OSError as exc:
         LOGGER.warning("Unable to read host I/O pressure from %s: %s", path, exc)
-        return 0.0
+        raise IoPressurePaused('host_io_pressure_unavailable') from None
     for line in lines:
         fields = line.split()
         if not fields or fields[0] != "full":
@@ -48,11 +49,13 @@ def read_full_avg10(path: Path = DEFAULT_PRESSURE_PATH) -> float:
             for key, value in (field.split("=", 1),)
         }
         try:
-            return float(values["avg10"])
+            value=float(values['avg10'])
+            if not math.isfinite(value) or not 0<=value<=100:break
+            return value
         except (KeyError, ValueError):
             break
     LOGGER.warning("Host I/O pressure file has no full avg10 value: %s", path)
-    return 0.0
+    raise IoPressurePaused('host_io_pressure_invalid')
 
 
 def probe_io_pressure(

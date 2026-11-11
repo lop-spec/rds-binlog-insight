@@ -101,6 +101,11 @@ class MongoInvestigator:
                 raise RuntimeError('investigation_budget_exhausted')
             calls += 1
             return dds.call(action, params)
+        def failure(exc):
+            LOGGER.exception('Mongo investigation lane failed')
+            message = str(exc).lower()
+            kind = 'throttled' if 'thrott' in message else 'permission_denied' if any(k in message for k in ('forbidden','permission','unauthor')) else 'budget_exhausted' if 'budget' in message else 'unavailable'
+            return {'reason': kind, 'exception_type': type(exc).__name__}
         points, events, logs = [], [], []
         roles = [role] if role else ['Primary', 'Secondary']
         for r in roles:
@@ -113,7 +118,7 @@ class MongoInvestigator:
                 absent = sorted(set(PERFORMANCE)-{p['metric'] for p in batch})
                 if absent: gaps['performance:'+r] = dict(missing_metrics=absent)
             except Exception as exc:
-                gaps['performance:'+r] = dict(reason=type(exc).__name__)
+                gaps['performance:'+r] = failure(exc)
             got, total, complete = 0, None, False
             try:
                 for page in range(1, 4):
@@ -122,6 +127,7 @@ class MongoInvestigator:
                         QueryKeywords='checkpoint election stepdown shutdown', LogicalOperator='or', OrderType='asc'))
                     count = int(payload['TotalRecordCount'])
                     if total is not None and count != total:
+                        gaps['running_logs:'+r] = {'reason': 'source_changed_during_pagination'}
                         break
                     total = count
                     batch = payload.get('Items', {}).get('LogRecords', [])
@@ -133,14 +139,14 @@ class MongoInvestigator:
                         complete = True; break
                     if not batch: break
             except Exception as exc:
-                gaps['running_logs:'+r] = dict(reason=type(exc).__name__)
-            logs.append(dict(role=r, total=total, fetched=got, complete=complete,
+                gaps['running_logs:'+r] = failure(exc)
+            logs.append(dict(role=r, total=total, fetched=got, complete=complete, remaining=max(total-got,0) if total is not None else None,
                              filter='checkpoint/election/stepdown/shutdown'))
         audit = dict(status='unknown')
         try:
             audit['status'] = call('DescribeAuditPolicy', {'DBInstanceId': collector.instance}).get('LogAuditStatus', 'unknown')
         except Exception as exc:
-            gaps['audit'] = dict(reason=type(exc).__name__)
+            gaps['audit'] = failure(exc)
         store = self.service.stores[collector.instance]
         prefixes = collector.entry.get('families', [])
         rows, before = [], []
@@ -149,12 +155,12 @@ class MongoInvestigator:
             rows, coverage = store.read(collector.instance, start, end, role=role, kind='command')
             before, baseline = store.read(collector.instance, base, base+(end-start), role=role, kind='command')
         except Exception as exc:
-            gaps['indexed_workload'] = dict(reason=type(exc).__name__)
+            gaps['indexed_workload'] = failure(exc)
         samples, sample_coverage = [], dict(complete=False)
         try:
             samples, sample_coverage = store.pressure_records(collector.instance, start, end, prefixes, role=role, deadline=deadline)
         except Exception as exc:
-            gaps['supplemental_raw_samples'] = dict(reason=type(exc).__name__)
+            gaps['supplemental_raw_samples'] = failure(exc)
         workload = indexed_workload(rows, before, coverage['complete'], baseline['complete'], samples)
         workload['sample_coverage'] = sample_coverage
         # Bind the IP at the sample time, never use today's Pod name as historical proof.
@@ -173,7 +179,7 @@ class MongoInvestigator:
                                'cache':{k:cache[k] for k in ('maximum bytes configured','bytes currently in the cache',
                                    'tracked dirty bytes in the cache','bytes allocated for updates') if k in cache}})
         except Exception as exc:
-            gaps['native_history'] = dict(reason=type(exc).__name__)
+            gaps['native_history'] = failure(exc)
         sls = dict(status='not_configured' if not collector.entry.get('logSources') else 'not_selected', complete=False)
         if sources:
             results = []
@@ -186,7 +192,7 @@ class MongoInvestigator:
                     item = SlsReadonly(collector.entry['region'], credential).collect(source, start, end, max_pages=5, deadline=deadline)
                     item['status'] = 'ok' if item['complete'] else 'partial'
                 except Exception as exc:
-                    item = dict(status='unavailable', complete=False, reason=type(exc).__name__)
+                    item = dict(status='unavailable', complete=False, **failure(exc))
                 item.update(source=source['id'],label=source.get('label',source['id']))
                 results.append(item)
             sls = results[0] if len(results)==1 else dict(status='configured_sources',sources=results,

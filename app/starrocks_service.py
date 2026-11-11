@@ -127,7 +127,7 @@ def aggregate(rows, truncated=False):
             if not c['known']:c['value'] = None
     return {'groups':values, 'observed_executions':len(unique),'source_records':len(rows),
             'duplicate_records':len(rows)-len(unique),'duplicate_cost_conflicts':conflicts,
-            'complete':False,'truncated':truncated,'source_scope':'observed_audit_executions',
+            'read_complete':not truncated, 'source_complete':False, 'complete':False,'truncated':truncated,'source_scope':'observed_audit_executions',
             'warning':'只统计已读到的完成审计；长查询与插件晚到可能补入，不保证源端全量。内存取峰值，不相加。'}
 
 
@@ -142,9 +142,13 @@ class StarRocksService(StarRocksMetrics):
         self.db_entries = {}
         path = self.root/'starrocks-instances.json'
         if path.exists() and not self.error:
-            value = json.loads(path.read_text(encoding='utf-8'))
-            entries = value.get('instances') if isinstance(value,dict) else value
-            self.db_entries = {e['instanceId']:e for e in entries if e.get('credentialsFile')}
+            try:
+                value = json.loads(path.read_text(encoding='utf-8'))
+                entries = value.get('instances') if isinstance(value,dict) else value
+                self.db_entries = {e['instanceId']:e for e in entries if e.get('credentialsFile')}
+            except (OSError,ValueError,TypeError,KeyError):
+                LOGGER.exception('StarRocks optional database configuration invalid')
+                self.error = 'database_config_invalid'
 
     def status(self):
         state = super().status()

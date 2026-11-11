@@ -29,23 +29,24 @@ class PodLookupTests(unittest.TestCase):
         self.assertIn("polling", result["note"])
 
     def test_current_ip_is_not_past_identity(self):
-        with self.assertLogs("app.pod_lookup", "WARNING"):
+        with self.assertLogs('app.pod_lookup','DEBUG') as logs:
             before = self.lookup(15)
             recycled = self.lookup(5)
             stale = self.lookup(35)
+        self.assertFalse(any('WARNING' in line for line in logs.output))
         self.assertEqual(before["status"], "historical_binding_unverified")
         self.assertEqual(recycled["status"], "ip_not_observed")
         self.assertEqual(stale["status"], "historical_binding_unverified")
 
     def test_host_network_ambiguity_not_arbitrarily_chosen(self):
         self.save([self.binding, dict(self.binding, uid="other", name="other")])
-        with self.assertLogs("app.pod_lookup", "WARNING"):
+        with self.assertLogs('app.pod_lookup','DEBUG'):
             result = self.lookup()
         self.assertEqual(result["status"], "ambiguous_ip")
         self.assertEqual(len(result["pods"]), 2)
 
     def test_instance_scope_prevents_cross_cluster_guess(self):
-        with self.assertLogs("app.pod_lookup", "WARNING"):
+        with self.assertLogs('app.pod_lookup','DEBUG'):
             result = resolve_pod("192.0.2.1", 25, self.path, "other-database")
         self.assertEqual(result["status"], "instance_unconfigured")
 
@@ -55,7 +56,7 @@ class PodLookupTests(unittest.TestCase):
                 self.path.unlink()
             else:
                 self.path.write_text(content)
-            with self.assertLogs("app.pod_lookup", "WARNING"):
+            with self.assertLogs('app.pod_lookup','DEBUG'):
                 self.assertEqual(self.lookup()["status"], expected)
 
     def test_binlog_details_unchanged(self):

@@ -243,7 +243,7 @@ class ServiceTests(unittest.TestCase):
                  [make("s563", "B", 4 * W + i * 1000, 40000, "INSERT") for i in range(1, 3)]
         baseline_shards = [dict(e, event_id='before-'+e['event_id'], start_us=e['start_us']-DAY_US, duration_ms=0, rows_examined=0) for e in shards[::2]]
         backend._rows.side_effect = lambda sql, params, _: steady_before + baseline_shards if params['low'] < 0 else steady_now + shards
-        loader = Mock(return_value=points([10, 10, 10, 90, 90, 90]))
+        loader = Mock(side_effect=lambda _settings,lo,_hi,*args,**kwargs: [dict(p,timestamp=p['timestamp']-(DAY_US//1000 if lo<0 else 0)) for p in points([10,10,10,90,90,90])])
 
         def counters(settings, start, end, instance, node, metric_name):
             now = start >= 0

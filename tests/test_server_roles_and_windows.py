@@ -87,7 +87,7 @@ class StatusRoleTests(unittest.TestCase):
         application = Application.__new__(Application)
         application.metadata, application.storage, application.sync = Metadata(), SimpleNamespace(), Sync()
         application.slow_logs = [collector("rn-1"), collector("rn-2"), collector("")]
-        application.node_roles = SimpleNamespace(lookup=lambda instance: (
+        application.node_roles = SimpleNamespace(status=lambda: {}, lookup=lambda instance: (
             {"rn-1": {"role": "primary", "zone": "cn-chengdu-a", "status": "active"}} if instance == "rm-prod" else {}))
         with patch("app.server.credential_status", return_value={"configured": True}):
             slow = application.public_status()["slowLogs"]
@@ -203,7 +203,7 @@ class LiveTailEndpointTests(unittest.TestCase):
         application = Application.__new__(Application)
         application.metadata, application.storage, application.sync = Metadata(), SimpleNamespace(), Sync()
         application.slow_logs = []
-        application.node_roles = SimpleNamespace(lookup=lambda instance: {})
+        application.node_roles = SimpleNamespace(lookup=lambda instance: {}, status=lambda: {})
         with patch("app.server.credential_status", return_value={"configured": True}):
             self.assertEqual(application.public_status()["slowTail"], [])
             application.slow_tails = SimpleNamespace(status=lambda: [{"nodeId": "rn-1", "scans": 3}])
@@ -317,7 +317,7 @@ class StatusSnapshotTests(unittest.TestCase):
         states = iter(range(1, 100))
         application = self.application(lambda: {"slowLogs": ["old"], "slowTail": ["old"], "generalLog": {}, "generalLogs": [], "n": 1})
         application.slow_logs = [SimpleNamespace(status=lambda: {"instanceId": "rm-prod", "nodeId": "rn-1", "poll": next(states)})]
-        application.node_roles = SimpleNamespace(lookup=lambda instance: {})
+        application.node_roles = SimpleNamespace(lookup=lambda instance: {}, status=lambda: {})
         application.slow_tails = SimpleNamespace(status=lambda: [{"nodeId": "rn-1", "scans": next(states)}])
         first, second = application.status_snapshot(), application.status_snapshot()
         wait_idle(application)

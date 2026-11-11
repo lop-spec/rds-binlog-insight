@@ -25,16 +25,16 @@ on:
         default: false
   push:
     tags:
-      - v1.39.3-rawoss
+      - v1.39.4-rawoss
 
 permissions:
   contents: read
   packages: write
 
 env:
-  VERSION: 1.39.3-rawoss
-  LOCAL_IMAGE: local/rds-binlog-insight:1.39.3-rawoss
-  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.39.3-rawoss
+  VERSION: 1.39.4-rawoss
+  LOCAL_IMAGE: local/rds-binlog-insight:1.39.4-rawoss
+  LOCAL_CLICKHOUSE_IMAGE: local/rds-binlog-insight-clickhouse:1.39.4-rawoss
 
 jobs:
   recovery-isolation:
@@ -249,7 +249,8 @@ jobs:
             tests.test_host_load_1030 \
             tests.test_binlog_gap_hardening \
             tests.test_public_config \
-            tests.test_audit_hardening
+            tests.test_audit_hardening \
+            tests.test_audit_batch_two
           test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$LOCAL_IMAGE")" = "$VERSION"
           docker run --rm --entrypoint python "$LOCAL_IMAGE" -c \
             "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"

@@ -167,14 +167,20 @@ class StarRocksMetricsTest(unittest.TestCase):
 
     def test_missing_node_nan_bool_and_time_outside_window_rejected(self):
         for row in [point(node=''), point(value=float('nan')), point(value=True), point(timestamp=NOW-900_000)]:
-            self.client.pages = [page([row])]
-            with self.assertRaisesRegex(RuntimeError, 'invalid_metric_point'):
-                self.service().query(self.query())
+            self.client.pages = [page([row,point(node='good-node')])]
+            result = self.service().query(self.query())
+            self.assertEqual(result['invalid_points'],1)
+            self.assertFalse(result['read_complete'])
+            self.assertEqual(result['nodes'],['good-node'])
 
     def test_duplicate_points_rejected(self):
         self.client.pages = [page([point(), point(value=99)])]
-        with self.assertRaisesRegex(RuntimeError, 'conflicting_metric_points'):
-            self.service().query(self.query())
+        result = self.service().query(self.query())
+        self.assertEqual(result['invalid_points'],1)
+        self.assertEqual(result['points'],[])
+        self.assertFalse(result['read_complete'])
+        self.client.pages = [page([point(),point()])]
+        self.assertEqual(len(self.service().query(self.query())['points']),1)
 
     def test_pagination_cycle_rejected(self):
         self.client.pages = [page([], 'repeat'), page([], 'repeat')]

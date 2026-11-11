@@ -245,7 +245,7 @@ function riseRatioText(item) {
 function riseEvidence(node) {
   const block = node.evidence;
   if (!block) return "";
-  if (block.status !== "ok") return '<p class="analytics-note muted">语句计数（云监控）读不到，没能核对慢日志之外的负载（详见服务日志）。</p>';
+  if (block.status !== 'ok') return `<p class="analytics-note muted">语句计数（云监控）读不到，不能核对慢日志之外的负载。${escapeHtml((block.failed_metrics || []).join('；') || '云指标未返回完整证据')}</p>`;
   const threads = block.threads;
   let verdict = "";
   if (block.explained_ratio !== null && block.explained_ratio !== undefined && threads) {
@@ -269,7 +269,8 @@ function riseEvidence(node) {
   const table = rows.length ? `<details class="rise-counters"${block.low_explained ? " open" : ""}><summary>语句计数（云监控，所有语句）对照昨日同窗</summary>
     <table class="rise-peers"><thead><tr><th>计数（窗口均值）</th><th>昨日同窗</th><th>窗口</th><th>变化</th></tr></thead><tbody>${rows.join("")}</tbody></table>
     <p class="analytics-note">次数来自云监控 Cluster_Com* / Cluster_InnoDBRow*，含所有语句；解释率 = 慢日志里比昨日多出的执行时间（折成平均并发）÷ 活跃线程的增长，两边都含等待，只是粗略对照，不是归因。</p></details>` : "";
-  return verdict + table;
+  const missing = (block.failed_metrics || []).length ? `<p class="analytics-note">缺失指标：${escapeHtml(block.failed_metrics.join('；'))}</p>` : '';
+  return verdict + table + missing;
 }
 
 function riseNodeBody(data, node) {
@@ -501,12 +502,12 @@ function riseBinlogCoverage(data) {
   if (!cover || cover.status !== "ok" || cover.covered_ratio === null || cover.covered_ratio === undefined || cover.covered_ratio >= 0.999) return "";
   const pending = Number(cover.pending_files) > 0 ? `，还有 ${humanCount(cover.pending_files)} 个 binlog 文件等着展开` : "";
   return riseNotice(`Binlog 行存储只覆盖了这个窗口的 ${riseNumber(cover.covered_ratio * 100, 0)}%`,
-    `原始 binlog 已全部归档，按表 / 按语句展开写入 ClickHouse 的步骤还没追上${pending}；勾选「Binlog 写入」时，写入 SQL 页会改查最近已展开的时段，这段时间的写入要等展开追上后再看。`);
+    `原始 binlog 已全部归档，按表 / 按语句展开写入 ClickHouse 的步骤还没追上${pending}；勾选「Binlog 写入」时，写入 SQL 页会明确显示未覆盖或同起点截尾，不改查其他时段，这段时间的写入要等展开追上后再看。`);
 }
 
 function riseFreshness(data) {
   if (!data.ready_through_us) return "";
-  const behindMs = Math.max(0, Date.now() - Number(data.ready_through_us) / 1000);
+  const behindMs = Math.max(0, Number(data.generated_us ? data.generated_us / 1000 : Date.now()) - Number(data.ready_through_us) / 1000);
   // With the live tail the label can honestly be a matter of seconds; without it the index is minutes behind, as before.
   const behind = data.tail && behindMs < 120_000 ? `约 ${Math.round(behindMs / 1000)} 秒` : `约 ${Math.round(behindMs / 60_000)} 分钟`;
   const what = data.tail ? `最新一条慢日志，其中最近的 ${humanCount(data.tail.events)} 条是直接从阿里云实时读到的、还没进入库` : "最新已入库的慢日志";
@@ -573,7 +574,7 @@ function normalizeAnalyticsWindow(forRise) {
   let end = new Date($("#analytics-end").value).getTime();
   if (!Number.isFinite(start) || !Number.isFinite(end)) return [];
   const notes = [];
-  const rounded = [Math.floor(start / step) * step, Math.floor(end / step) * step];
+  const rounded = [Math.floor(start / step) * step, Math.ceil(end / step) * step];
   const changed = rounded[0] !== start || rounded[1] !== end;
   [start, end] = rounded;
   if (forRise && end - start >= RISE_MAX_WINDOW_MS + 300_000) {
@@ -586,6 +587,7 @@ function normalizeAnalyticsWindow(forRise) {
     $("#analytics-end").value = toLocalInput(new Date(end));
     if (notes.length) $("#analytics-range").value = "custom";
   }
+  if (changed) notes.push('开始向下、结束向上取整以覆盖原选范围，表单已显示实际查询起止。');
   return notes;
 }
 

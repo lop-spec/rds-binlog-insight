@@ -132,6 +132,11 @@ class TailEvent:
 
 def scope_matches(event: TailEvent, query: dict[str, Any]) -> bool:
     """The filters of ``ClickHouseSlowLogBackend._scope_sql`` (node, database, table, operation), applied in memory."""
+    if query.get('connection') or query.get('status'):
+        raise ValueError('slowlog_connection_or_status_filter_unavailable')
+    account = str(query.get('account') or '').strip()
+    if account and event.account != account:
+        return False
     node = str(query.get("node_id") or "").strip()
     if node and event.node_id != node:
         return False

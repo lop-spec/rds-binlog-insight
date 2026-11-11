@@ -1,5 +1,7 @@
 """Full client counters with bounded spool, immutable batch IDs and explicit gaps."""
 import hashlib
+import logging
+LOGGER = logging.getLogger(__name__)
 import json
 import math
 import re
@@ -173,7 +175,9 @@ class RedisAggregates:
             self.state.pop('error',None)
             self.state.update(status='ok',last_flushed=now,pending_batches=pending,client_connected=bool(self.state.get('last_received')))
             self.rollup_hours(client,now)
-        except Exception as exc:self.state.update(status='buffering_or_unavailable',error=error_code(exc),last_attempt=now)
+        except Exception as exc:
+            LOGGER.exception('Redis durable aggregate flush failed; pending batches retained')
+            self.state.update(status='buffering_or_unavailable',error=error_code(exc),last_attempt=now)
 
     def rollup_hours(self,client,now):
         db=client.config.database;closed=int((now-120)//3600)*3600

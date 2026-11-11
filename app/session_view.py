@@ -36,8 +36,8 @@ MAX_KILL_SESSIONS = 200
 # What a node id must look like to be written inside a hint (they come from the node registry; this is the second lock).
 NODE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 # Waits that are about a lock held by somebody else's transaction or statement (the victims of a stuck DDL).
-LOCK_WAIT_WORDS = ("metadata lock", "global read lock", "backup lock", "commit lock", "table flush")
-INTERNAL_USERS = frozenset({"system user", "event_scheduler", "aliyun_root"})
+LOCK_WAIT_WORDS = ("metadata lock", "global read lock", "backup lock", "commit lock", "table flush", "row lock", "record lock", "innodb lock")
+INTERNAL_USERS = frozenset({'system user','event_scheduler','aliyun_root','rdsinternal','rdsadmin','rdsrepl'})
 KIND_LABELS = {
     "long_running": "语句运行过久",
     "lock_wait": "等待锁",
@@ -201,6 +201,7 @@ def build_session_view(data: dict[str, Any], now_us: int, thresholds: dict[str, 
                   "database": _stats(sessions, "database")[:STATS_LIMIT],
                   "more": {name: max(len({row[field] for row in sessions}) - STATS_LIMIT, 0)
                            for name, field in (("user", "user"), ("client", "client"), ("database", "database"))}},
+        'holder_scope': 'unverified_candidates_not_proven_blockers',
         "sessions": chosen, "truncated": len(chosen) < len(sessions),
     }
 
@@ -210,8 +211,8 @@ def route_hint(node: dict[str, Any]) -> tuple[str, str]:
 
     Empty when the node id cannot be written inside a hint safely: the text then asks for a connection to the node itself.
     """
-    if str(node.get("role") or "") == "primary":
-        return "FORCE_MASTER", "/*FORCE_MASTER*/ "
+    if str(node.get('role') or '') == 'primary' and not node.get('route_by_identity'):
+        return 'FORCE_MASTER', '/*FORCE_MASTER*/ '
     node_id = str(node.get("node_id") or "")
     if NODE_ID_PATTERN.fullmatch(node_id):
         return f"FORCE_NODE='{node_id}'", f"/*FORCE_NODE='{node_id}'*/ "

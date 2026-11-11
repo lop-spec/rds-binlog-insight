@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 from .config import NODE_ID_RE, Settings, utc_now_text
 from .rds_api import RemoteBinlog, RdsRpcClient, shared_ssl_context
 from .sql_fingerprint import FINGERPRINT_FORMAT_VERSION, statement_profile
+from .sql_lex import statement_verb
 
 if TYPE_CHECKING:
     from .metadata import MetadataStore
@@ -142,8 +143,11 @@ def _operation_of(sql_text: str) -> str:
         end = head.find("*/")
         if end >= 0:
             head = head[end + 2 :].lstrip()
-    word = head.split(None, 1)[0].lower() if head.split(None, 1) else ""
-    return _OPERATIONS.get(word, "OTHER")
+    try:
+        word = statement_verb(sql_text)
+    except ValueError:
+        return 'OTHER'
+    return _OPERATIONS.get(word.lower(), word if word in {'SHOW','EXPLAIN','DESC','SET','CALL','LOAD','OPTIMIZE'} else 'OTHER')
 
 
 def _epoch_us(record: dict[str, Any]) -> int:
@@ -297,9 +301,9 @@ def build_slow_events(
                 "connection_id": "",
                 "connection_name": client_ip,
                 "database_account": account,
-                "execution_status": "success",
+                "execution_status": "unknown",
                 "error_message": "",
-                "affected_rows": int(record.get("RowsSent") or 0),
+                "affected_rows": 0,
                 "started_epoch_us": epoch_us,
                 "finished_epoch_us": epoch_us
                 + int(float(record.get("QueryTime") or 0)) * 1000,

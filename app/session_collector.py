@@ -70,6 +70,8 @@ class SessionCollector:
         self._lock = threading.Lock()
         self._last_purge_us = 0
         self._last_config: dict[str, Any] = dict(DEFAULT_CONFIG)
+        self._loop_error = ''
+        self._last_pass_at = None
 
     # -- what to read ---------------------------------------------------------
     def targets(self, config: dict[str, Any]) -> list[tuple[str, str]]:
@@ -132,9 +134,17 @@ class SessionCollector:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            config = self._config_loader()
-            self._last_config = config
-            targets = self.targets(config) if config["enabled"] else []
+            try:
+                config = self._config_loader()
+                targets = self.targets(config) if config['enabled'] else []
+                self._last_config = config
+                self._last_pass_at = time.time()
+                self._loop_error = ''
+            except Exception as exc:
+                LOGGER.exception('Session retention target/config discovery failed; retrying')
+                self._loop_error = type(exc).__name__
+                self._stop.wait(IDLE_WAIT_SECONDS)
+                continue
             if not targets:
                 self._stop.wait(IDLE_WAIT_SECONDS)
                 continue
@@ -164,4 +174,4 @@ class SessionCollector:
                       "consecutive_failures": state["failures"], "reads": state["reads"], "abnormal_now": state.get("abnormal")}
                      for (instance, node), state in sorted(self._state.items())]
         return {"enabled": bool(config["enabled"]), "interval_seconds": config["intervalSeconds"], "retention_days": config["retentionDays"],
-                "running": self._thread is not None and not self._stop.is_set(), "nodes": nodes, "store": self.store.stats()}
+                "running": self._thread is not None and self._thread.is_alive() and not self._stop.is_set(), 'loop_error': self._loop_error, "nodes": nodes, "store": self.store.stats()}

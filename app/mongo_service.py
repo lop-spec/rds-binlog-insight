@@ -23,27 +23,44 @@ class MongoService:
     def __init__(self,root,settings_loader,archive_loader=None,*,start=True):
         self.root=Path(root);self.collectors=[];self.stores={};self.tails={};self.error='';self.entries=[]
         self.investigator = MongoInvestigator(self)
+        self.initialization_errors = {}
         try:
             self.entries=load_instances(self.root)
-            for entry in self.entries:
+        except Exception as exc:
+            self.error=type(exc).__name__
+            LOGGER.exception('Mongo configuration unavailable; other engines unchanged')
+        for entry in self.entries:
+            collector = tail = None
+            identity = entry['instanceId']
+            try:
                 store=MongoStore(self.root,backend=entry.get('backend','clickhouse'))
                 store.check()
-                self.stores[entry['instanceId']]=store
                 collector=MongoCollector(store,entry,settings_loader,archive_loader)
-                self.collectors.append(collector)
                 if entry.get('slowlogSource','das')=='das':
-                    self.tails[entry['instanceId']]=MongoSlowTail(collector,collector.slow_next)
+                    tail=MongoSlowTail(collector,collector.slow_next)
                 if start:
                     collector.start()
-                    if entry.get('enabled') and entry['instanceId'] in self.tails:self.tails[entry['instanceId']].start()
-        except Exception as exc:
-            self.error=type(exc).__name__+':'+str(exc)[:160]
-            LOGGER.warning('mongo_service unavailable: %s; MySQL unchanged',self.error)
+                    if entry.get('enabled') and tail is not None:tail.start()
+                self.stores[identity]=store
+                self.collectors.append(collector)
+                if tail is not None:self.tails[identity]=tail
+            except Exception as exc:
+                for resource in (tail,collector):
+                    if resource is not None:
+                        try:resource.shutdown()
+                        except Exception:LOGGER.exception('Mongo failed-instance cleanup')
+                self.initialization_errors[identity]=type(exc).__name__
+                LOGGER.exception('Mongo instance initialization failed: %s',identity)
 
     def status(self):
         path=self.root/'mongo-replays.json'
-        cases=json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
-        return dict(status='unavailable' if self.error else 'ok' if self.entries else 'not_configured',reason=self.error,
+        try:
+            cases=json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
+        except (OSError, ValueError):
+            LOGGER.exception('Mongo replay config unreadable')
+            cases=[]
+        return dict(status='unavailable' if self.error or self.initialization_errors and not self.stores else 'partial' if self.initialization_errors else 'ok' if self.entries else 'not_configured',reason=self.error,
+                    initialization_errors=dict(self.initialization_errors),
                     instances=[{'id':e['instanceId'],'label':e.get('label',e['instanceId']),
                                 'logSources':[{'id':s['id'],'label':s.get('label',s['id'])} for s in e.get('logSources',[])]} for e in self.entries],
                     collectors=[self.collector_status(c) for c in self.collectors],metrics=list(ANALYSIS_METRICS),replays=cases,
@@ -60,6 +77,8 @@ class MongoService:
         return state
 
     def shutdown(self):
+        for tail in self.tails.values():
+            tail.shutdown()
         for c in self.collectors:c.shutdown()
 
     def tail_rows(self, store, instance, start, end):
@@ -85,6 +104,10 @@ class MongoService:
         if kind not in ('command','suboperation',''):raise ValueError('invalid_record_kind')
         metric=get('metric','CPUUtilization')
         if metric not in (*METRICS, 'LockWaits', 'WtCacheUpdatesUsage'):raise ValueError('unsupported_mongo_metric')
+        limit=int(get('limit','50'))
+        if not 1<=limit<=500:raise ValueError('mongo_limit_1_to_500')
+        if get('order','attribution') not in {'attribution','performance','count','count_growth','duration_total','duration_growth','cpu_total','cpu_growth','scan_total','scan_growth','read_total','read_growth','max_latency','correlation'}:
+            raise ValueError('invalid_mongo_order')
         store=self.stores[instance]
         adjusted=None;tail=None;base_tail=None
         if not store.windows_complete(instance,start,end):
@@ -99,7 +122,7 @@ class MongoService:
                     end=through;base_end=base+(end-start)
                 LOGGER.info('mongo_query live tail: instance=%s windows=%s end=%s',instance,len(tail),end)
         if adjusted is None and tail is None and not store.windows_complete(instance,start,end):
-            found=store.nearest_complete(instance,start,end,base)
+            found=None  # An incident window must never move to a different incident.
             if found is None:
                 LOGGER.warning('mongo_query no complete window within 6h of the request: instance=%s start=%s end=%s',instance,start,end)
             else:
@@ -164,6 +187,8 @@ class MongoService:
                       metric_points=points,native_counters=counter_rows,native_gaps=counter_gaps[:20],native_baseline_gaps=baseline_gaps[:20],
                       native_latest=latest,client_aggregates=clients,namespace_top=namespaces,optional_unavailable=optional,
                       collection_status=next((c.status() for c in self.collectors if c.instance==instance),{}))
+        result['source_complete'] = False
+        result['tail_source_scope'] = 'bounded_recent_completed_slow_records_not_all_long_running' if tail is not None else 'persisted_slow_records_not_all_operations'
         result['client_count_scope']='connected_services_only' if clients else 'not_connected'
         return result
 
@@ -211,7 +236,7 @@ class MongoService:
                             start_us=lo,end_us=hi,count=count,failed=failed,duration_us=duration,
                             lost=int(payload.get('lost',0)),scope='connected_service_command_attempts',
                             timestamp=hi//1000,role='Client',node=service+':'+epoch)
-            normalized['identity']=digest([instance,service,epoch,batch,namespace,command,fingerprint])
+            normalized['identity']=digest([instance,service,epoch,batch,namespace,command,fingerprint,lo,hi])
             rows.append(normalized)
         self.stores[instance].telemetry(instance,'client',rows)
         return dict(accepted=len(rows),scope='connected_services_only',batch_id=batch)

@@ -32,27 +32,23 @@ class AlignTests(unittest.TestCase):
         found = self.align(start, NOW + HOUR_US, [(start - HOUR_US, NOW + 30 * MINUTE_US)])
         self.assertEqual(found, {"kind": "truncated", "start_us": start, "end_us": floor_to(NOW, STEP)})
 
-    def test_a_prefix_shorter_than_one_step_falls_back_to_a_covered_window(self):
+    def test_a_prefix_shorter_than_one_step_does_not_move_the_incident(self):
         start = NOW - 30 * MINUTE_US
         covered = [(start - 5 * HOUR_US, start + 2 * MINUTE_US)]  # only 2 minutes of the window survive
         found = self.align(start, NOW, covered)
-        self.assertEqual(found["kind"], "shifted")
-        self.assertEqual(found["end_us"] - found["start_us"], NOW - start)
-        self.assertLessEqual(found["end_us"], start + 2 * MINUTE_US)
-        self.assertEqual(found["start_us"] % STEP, 0)
+        self.assertEqual(found, {'kind':'none'})
 
     def test_a_hole_at_the_start_shifts_to_the_nearer_side(self):
         start = NOW - 4 * HOUR_US
         hole = (start - 10 * MINUTE_US, start + 20 * MINUTE_US)
         found = self.align(start, start + 30 * MINUTE_US, [(start - 3 * HOUR_US, hole[0]), (hole[1], NOW)])
-        self.assertEqual(found, {"kind": "shifted", "start_us": ceil_to(hole[1], STEP),
-                                 "end_us": ceil_to(hole[1], STEP) + 30 * MINUTE_US})
+        self.assertEqual(found, {'kind':'none'})
 
     def test_equal_distance_prefers_the_earlier_window(self):
         start = floor_to(NOW, STEP) - 4 * HOUR_US
         covered = [(start - 35 * MINUTE_US, start - 5 * MINUTE_US), (start + 35 * MINUTE_US, start + 65 * MINUTE_US)]
         found = self.align(start, start + 30 * MINUTE_US, covered)
-        self.assertEqual(found, {"kind": "shifted", "start_us": start - 35 * MINUTE_US, "end_us": start - 5 * MINUTE_US})
+        self.assertEqual(found, {'kind':'none'})
 
     def test_nothing_covered_within_reach_is_reported_not_guessed(self):
         start = NOW - 20 * HOUR_US
@@ -63,9 +59,7 @@ class AlignTests(unittest.TestCase):
         covered = [(NOW - 40 * MINUTE_US, NOW + HOUR_US)]
         self.assertIsNone(self.align(NOW - 30 * MINUTE_US, NOW, covered))
         found = self.align(NOW - 120 * MINUTE_US, NOW - 90 * MINUTE_US, covered, floor_us=NOW - 40 * MINUTE_US)
-        self.assertEqual(found["kind"], "shifted")
-        self.assertGreaterEqual(found["start_us"], NOW - 40 * MINUTE_US)
-        self.assertLessEqual(found["end_us"], NOW)
+        self.assertEqual(found, {'kind':'none'})
         below = self.align(NOW - 120 * MINUTE_US, NOW - 90 * MINUTE_US, covered, floor_us=NOW)
         self.assertEqual(below, {"kind": "none"})
 
@@ -126,7 +120,8 @@ class BinlogQueryTests(unittest.TestCase):
         rows.coverage.side_effect = RuntimeError("clickhouse down")
         query = {"instance": "rm-x", "start_epoch_us": NOW - HOUR_US, "end_epoch_us": NOW}
         with self.assertLogs("app.window_align", "WARNING") as logs:
-            self.assertEqual(align_binlog_query(rows, query, 60, now_us=NOW), (None, None))
+            with self.assertRaisesRegex(RuntimeError,'coverage_unavailable'):
+                align_binlog_query(rows, query, 60, now_us=NOW)
         self.assertIn("BINLOG_WINDOW_ALIGN_SKIPPED", logs.output[0])
         self.assertEqual((query["start_epoch_us"], query["end_epoch_us"]), (NOW - HOUR_US, NOW))
 

@@ -1565,7 +1565,8 @@ class MetadataStore:
                 params.extend(['%' + term.lower().replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'] * 6)
             clauses.append("(" + joiner.join(term_clauses) + ")")
         where = " AND ".join(clauses) if clauses else "1 = 1"
-        columns = ",".join(self.TABULARIS_AUDIT_LOG_COLUMNS)
+        columns = ','.join('substr(sql_text,1,4096) AS sql_text' if c == 'sql_text' else c for c in self.TABULARIS_AUDIT_LOG_COLUMNS)
+        columns += ',length(sql_text)>4096 AS sql_truncated'
         with self.connection() as conn:
             rows = conn.execute(
                 f"SELECT {columns} FROM tabularis_audit_log WHERE {where} "
@@ -1589,6 +1590,8 @@ class MetadataStore:
     def _audit_log_row(row: Any) -> dict[str, Any]:
         item = dict(row)
         item["raw_event_type"] = "TABULARIS_AUDIT"
+        item['source_tool'] = 'dbx' if str(item.get('event_id','')).startswith('dbx-') else 'compass' if str(item.get('event_id','')).startswith('compass-') else 'tabularis'
+        item['redaction_scope'] = 'credential_patterns_server_side'
         epoch_us = int(item.get("event_epoch_us") or 0)
         item["event_time_utc"] = (
             datetime.fromtimestamp(epoch_us / 1_000_000, UTC).strftime(

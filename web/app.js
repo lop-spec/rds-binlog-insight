@@ -775,6 +775,7 @@ async function openDetail(eventId, locator = "", instance = "") {
       </div>
       ${auditDetails}
       ${slowDetails}
+      ${row.sql_truncated ? '<p class="analytics-note">SQL为截断预览，不可直接回放。</p>' : ''}
       ${detailBlock(`SQL · ${sqlKind}`, row.sql_text || row.row_query || "—")}
       ${auditEvent || slowEvent ? "" : detailBlock("变更前 BEFORE", prettyJson(row.before_json))}
       ${auditEvent || slowEvent ? "" : detailBlock("变更后 AFTER", prettyJson(row.after_json))}
@@ -1461,13 +1462,14 @@ function renderAnalyticsSlowlogSql(data) {
 
 function renderAnalyticsSql(data) {
   if (data.mode === "slowlog") return renderAnalyticsSlowlogSql(data);
+  const countLabel = data.mode === 'binlog-rows' ? '行事件数' : '执行次数';
   const totals = data.totals || {};
   const order = data.order || "executions";
   const estCoverage = Number(totals.executions) > 0
     ? ((Number(totals.est_covered_executions) / Number(totals.executions)) * 100).toFixed(0)
     : "0";
   const tiles = statTiles([
-    { label: "执行次数", value: humanCount(totals.executions), hint: "语句被执行的次数" },
+    { label: countLabel, value: humanCount(totals.executions), hint: data.mode === 'binlog-rows' ? 'RowsEvent边界数，不等于SQL次数' : '语句被执行的次数' },
     { label: "影响行数", value: humanCount(totals.row_events), hint: "被修改的行，非扫描行数" },
     { label: "扫描行数(估)", value: humanCount(totals.est_scan_rows), hint: `EXPLAIN 估算×执行次数，已覆盖 ${estCoverage}% 的执行` },
     { label: "语句指纹", value: humanCount(totals.fingerprints), hint: "参数已归一" },
@@ -1488,7 +1490,7 @@ function renderAnalyticsSql(data) {
     return `<span title="${escapeHtml(tip)}">${humanCount(item.est_scan_total)}</span>${mark}`;
   };
   const statements = analyticsTable(
-    ["语句", "动作", "执行次数", "次数占比", "影响行数", "行数占比", "每次行数", "扫描行数(估)", "慢语句", "最近出现"],
+    ["语句", "动作", countLabel, "次数占比", "影响行数", "行数占比", "每次行数", "扫描行数(估)", "慢语句", "最近出现"],
     (data.statements || []).map((item) => [
       `<code class="sql-cell" title="${escapeHtml(item.sample_sql || "")}">${sourceMark(item.source_kind)}${escapeHtml(item.normalized_sql || "—")}</code>`,
       `<span class="operation-chip ${escapeHtml(operationClass(item.action))}">${escapeHtml(item.action || "—")}</span>`,
@@ -1524,7 +1526,7 @@ function renderAnalyticsSql(data) {
     <div class="analytics-block"><h3>写入趋势</h3>${sparkline(data.trend || [])}</div>
     <div class="analytics-block">
       <div class="block-head"><h3>Top 语句</h3>${sorter}</div>
-      <p class="analytics-note"><strong>执行次数</strong>按 RowsEvent 边界统计（同一次语句执行产生的多行算一次），<strong>影响行数</strong>是被实际修改的行数——binlog 不记录扫描行数。<strong>扫描行数(估)</strong>是对 SELECT 指纹用真实参数样本跑 <code>EXPLAIN</code> 得到的优化器估算 × 窗口内执行次数：量级与相对排序可用，不是精确值；带「全扫」标记的执行计划含全表/全索引扫描。「慢语句」来自 QueryEvent 的 <code>exec_time</code>（秒级，仅 QueryEvent 有值）。</p>
+      <p class="analytics-note"><strong>${countLabel}</strong>按当前来源口径统计；RowsEvent边界数量不等于SQL执行次数，<strong>影响行数</strong>是被实际修改的行数——binlog 不记录扫描行数。<strong>扫描行数(估)</strong>是对 SELECT 指纹用真实参数样本跑 <code>EXPLAIN</code> 得到的优化器估算 × 窗口内执行次数：量级与相对排序可用，不是精确值；带「全扫」标记的执行计划含全表/全索引扫描。「慢语句」来自 QueryEvent 的 <code>exec_time</code>（秒级，仅 QueryEvent 有值）。</p>
       ${statements}
     </div>
     <div class="analytics-split">

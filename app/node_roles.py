@@ -6,7 +6,7 @@ Cloud Monitor and DAS identify a cluster node by an ``rn-…`` id that carries n
 (``DescribeDBInstanceHAConfig`` is not usable for this: it names the same nodes with numeric ids.)
 
 Roles are the *current* ones: a failover swaps them. They are refreshed by a background thread and only ever read
-from memory on a request path, because the HTTP server is single-threaded and ``/api/status`` is polled every few
+from memory on a request path, under explicit thread-safe locks while the multi-threaded HTTP server and ``/api/status`` is polled every few
 seconds. A refresh that fails keeps the last known roles and is logged once per failure streak.
 """
 from __future__ import annotations
@@ -70,13 +70,21 @@ class NodeRoleBook:
         self._lock = threading.Lock()
         self._roles: dict[str, dict[str, dict[str, str]]] = {}
         self._failing: set[str] = set()
+        self._observed = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def lookup(self, instance_id: str) -> dict[str, dict[str, str]]:
         """Last known roles of one instance; never touches the network."""
         with self._lock:
-            return {node: dict(info) for node, info in self._roles.get(str(instance_id or ""), {}).items()}
+            observed = self._observed.get(instance_id)
+            stale = observed is not None and time.monotonic()-observed > self._refresh_seconds*2
+            return {node: {**info, 'role': '', 'stale': True} if stale else dict(info) for node, info in self._roles.get(str(instance_id or ''), {}).items()}
+
+    def status(self):
+        with self._lock:
+            return {identity: {'age_seconds': time.monotonic()-stamp, 'refresh_failed': identity in self._failing,
+                    'stale': time.monotonic()-stamp > self._refresh_seconds*2} for identity,stamp in self._observed.items()}
 
     def refresh(self) -> None:
         for instance in sorted(set(self._instances())):
@@ -94,6 +102,7 @@ class NodeRoleBook:
             with self._lock:
                 previous = self._roles.get(instance)
                 self._roles[instance] = nodes
+                self._observed[instance] = time.monotonic()
             if previous is None:
                 LOGGER.info("node roles loaded for %s: %s", instance,
                             ", ".join(f"{node}={info['role']}" for node, info in sorted(nodes.items())) or "(none)")

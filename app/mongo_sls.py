@@ -60,7 +60,7 @@ class SlsReadonly:
     @staticmethod
     def query(source):
         return ('"' + source['pathToken'] + '"' if source.get('kind') == 'http' else
-                '(' + ' or '.join('"' + t + '"' for t in source['endpointTokens']) + ') and ("timeout" or "deadline")')
+                '(' + ' or '.join('"' + t + '"' for t in source['endpointTokens']) + ') and ("timeout" or "deadline" or "connection refused" or "connection reset" or "connection pool" or "checkout" or "no route to host")')
 
     def request(self, source, start_us, end_us, offset, *, analysis=''):
         validate_sources([source])

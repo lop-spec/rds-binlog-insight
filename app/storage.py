@@ -4542,6 +4542,10 @@ class EventStorage:
             archive,
         )
 
+    @staticmethod
+    def _csv_safe_row(row):
+        return {key: "'"+value if isinstance(value,str) and value.lstrip(' \t\r\n').startswith(('=','+','-','@')) else value for key,value in row.items()}
+
     def export_csv(
         self, query: dict[str, Any], retention_days: int, max_rows: int = 100_000
     ) -> tuple[Path, int]:
@@ -4570,7 +4574,7 @@ class EventStorage:
                 if writer is None:
                     writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
                     writer.writeheader()
-                writer.writerows(rows)
+                writer.writerows(self._csv_safe_row(row) for row in rows)
                 count += len(rows)
                 offset += len(rows)
                 if not page["has_more"]:
@@ -4615,7 +4619,7 @@ class EventStorage:
             if rows:
                 writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
                 writer.writeheader()
-                writer.writerows(rows)
+                writer.writerows(self._csv_safe_row(row) for row in rows)
         return path, len(rows)
 
     def query_cache_stats(self) -> dict[str, int]:

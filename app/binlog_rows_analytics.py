@@ -19,6 +19,9 @@ columns first so its output can keep the Parquet contract's names.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import threading
+
+_QUERY_GATE = threading.BoundedSemaphore(2)
 from datetime import UTC, datetime
 from typing import Any
 
@@ -54,7 +57,12 @@ class BinlogRowsAnalytics:
         self.ch = rows.ch
 
     def _q(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-        return self.ch.rows(sql, params=params, settings=QUERY_SETTINGS, timeout=75)
+        if not _QUERY_GATE.acquire(timeout=10):
+            raise RuntimeError('binlog_analytics_busy')
+        try:
+            return self.ch.rows(sql, params=params, settings=QUERY_SETTINGS, timeout=75)
+        finally:
+            _QUERY_GATE.release()
 
     def summarize(self, query: dict[str, Any], start_us: int, end_us: int, *, control: Any | None = None
                   ) -> dict[str, Any] | None:
@@ -117,6 +125,7 @@ class BinlogRowsAnalytics:
         for item in hotspots:
             item["txn_count"] = counts.get((item["database_name"], item["table_name"]), 0)
         return {
+            'count_scope': 'rows_event_records_not_sql_executions',
             "mode": MODE,
             "window": {"start_epoch_us": start_us, "end_epoch_us": end_us, "bucket_us": AGG_BUCKET_US,
                        "trend_bucket_us": width, "rollup_width_us": 0},

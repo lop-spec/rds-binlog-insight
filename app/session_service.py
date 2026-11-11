@@ -84,11 +84,15 @@ class SessionService:
         return {"instance_id": instance, "engine": engine, "thresholds": dict(thresholds), "nodes": results,
                 "partial": any(item["status"] != "ok" for item in results), "generated_us": self._wall_us()}
 
-    def history(self, instance: str, node_id: str, start_us: int, end_us: int, limit: int) -> dict[str, Any]:
+    def history(self, instance: str, node_id: str, start_us: int, end_us: int, limit: int, cursor: str = '') -> dict[str, Any]:
         self._resolve(instance, node_id)
         if not 0 < end_us - start_us <= MAX_HISTORY_DAYS * 86400 * 1_000_000:
             raise SessionRequestError("SESSIONS_INVALID_WINDOW", f"时间窗必须大于 0 且不超过 {MAX_HISTORY_DAYS} 天")
-        result = self.store.history(instance, node_id, start_us, end_us, limit)
+        result = self.store.history(instance, node_id, start_us, end_us, limit, cursor=cursor) if cursor else self.store.history(instance, node_id, start_us, end_us, limit)
+        retention = self.collector.status()
+        floor = self._wall_us() - int(retention.get('retention_days', 7)) * 86400 * 1_000_000
+        result['outside_retention'] = start_us < floor
+        result['retention_floor_us'] = floor
         labels = {node: self._role(instance, node) for node in self._known(instance)}
         result.update(instance_id=instance, start_us=start_us, end_us=end_us,
                       nodes=[{"node_id": node, **label} for node, label in sorted(labels.items())], retention=self.collector.status())
@@ -128,11 +132,23 @@ class SessionService:
             snapshot_us = item.get("snapshot_us")
             if isinstance(snapshot_us, bool) or not isinstance(snapshot_us, int) or snapshot_us <= 0:
                 raise ValueError("snapshot_us 必须是快照时间（微秒）")
+            if generated_us - snapshot_us > 30_000_000 or snapshot_us > generated_us + 5_000_000:
+                raise SessionRequestError('SESSIONS_STALE_SNAPSHOT', '快照已过期，请刷新并重新核对；未生成KILL')
+            builder = build_mongo_session_view if mongo else build_session_view
+            trusted = self.live.view(instance, node, lambda data, stamp: builder(data, stamp))
+            observed = int(trusted['observed_at_us'])
+            if generated_us-observed > 30_000_000 or observed != snapshot_us:
+                raise SessionRequestError('SESSIONS_STALE_SNAPSHOT', '快照已变化，请刷新重新选择；未生成KILL')
+            wanted = {row.get('session_id') for row in sessions}
+            verified = [row for row in trusted['sessions'] if row['session_id'] in wanted]
+            if len({row['session_id'] for row in verified}) != len(wanted):
+                raise SessionRequestError('SESSIONS_CHANGED', '所选会话已不存在，请刷新；未生成KILL')
+            sessions = verified
             if mongo:
                 parts.append(build_mongo_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, snapshot_us=snapshot_us,
                                                          generated_us=generated_us))
                 continue
-            parts.append(build_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, mode=mode, snapshot_us=snapshot_us,
+            parts.append(build_kill_statements({'route_by_identity': True, "node_id": node, **self._role(instance, node)}, sessions, mode=mode, snapshot_us=snapshot_us,
                                                generated_us=generated_us, lock_waiters=item.get("lock_waiters", 0)))
         parts.sort(key=lambda part: (ROLE_ORDER.get(part["role"], 3), part["node_id"]))
         if mongo:

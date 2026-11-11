@@ -81,6 +81,7 @@ class MongoSlowTail:
         self.complete_through = None  # µs, whole minute
         self.last_scan = 0.0  # wall clock of the last successful scan start
         self.failures = 0
+        self.total_failures = 0
         self.last_error = ''
         self.stop_event = collector.stop_event
         self.thread = None
@@ -92,6 +93,11 @@ class MongoSlowTail:
         self.thread = threading.Thread(target=self._loop, daemon=True, name='mongo-slowlog-tail')
         self.thread.start()
 
+    def shutdown(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+
     def _loop(self):
         while not self.stop_event.is_set():
             begin = time.monotonic()
@@ -101,6 +107,7 @@ class MongoSlowTail:
                 self.last_error = ''
             except Exception as exc:  # noqa: BLE001 - a failed scan only ages the tail; the analysis then ignores it
                 self.failures += 1
+                self.total_failures += 1
                 self.last_error = (type(exc).__name__ + ':' + str(exc))[:160]
                 if self.failures == 1 or self.failures % FAILURE_LOG_EVERY == 0:
                     LOGGER.warning('mongo_slowlog_tail unavailable: instance=%s failures=%s reason=%s',
@@ -167,6 +174,6 @@ class MongoSlowTail:
         with self.lock:
             records = sum(n for _, n in self.minutes.values())
             minutes = len(self.minutes)
-        return dict(enabled=enabled(), fresh=self.fresh(now), complete_through_us=self.complete_through,
+        return dict(total_failures=self.total_failures, enabled=enabled(), fresh=self.fresh(now), complete_through_us=self.complete_through,
                     covered_from_us=self.covered_from, last_scan_age_seconds=round(now - self.last_scan, 1) if self.last_scan else None,
                     minutes=minutes, records=records, failures=self.failures, last_error=self.last_error)

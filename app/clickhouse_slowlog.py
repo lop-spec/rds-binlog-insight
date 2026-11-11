@@ -772,6 +772,8 @@ class ClickHouseSlowLogQueryBackend:
         start_us: int,
         end_us: int,
     ) -> tuple[str, dict[str, str | int]]:
+        if query.get('connection') or query.get('status'):
+            raise ValueError('慢日志成本索引尚无连接/执行状态维度；请清除该筛选，未忽略条件')
         parameters = _Parameters()
         clauses = [
             "event_epoch_us >= " + parameters.add(start_us, "Int64"),
@@ -783,6 +785,7 @@ class ClickHouseSlowLogQueryBackend:
             ("database", "database_name"),
             ("table", "table_name"),
             ("operation", "operation"),
+            ('account', 'database_account'),
         ):
             value = str(query.get(key) or "").strip()
             if not value:

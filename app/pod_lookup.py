@@ -44,7 +44,7 @@ def load_inventory(path: Path) -> dict[str, Any]:
 
 def resolve_pod(client: str, event_us: int, path: Path, instance: str) -> dict[str, Any]:
     def unknown(reason: str, candidates: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        LOGGER.warning("slowlog_pod_lookup unavailable: reason=%s", reason)
+        LOGGER.debug("slowlog_pod_lookup unavailable: reason=%s", reason)
         return {"status": reason, "pods": candidates or []}
 
     try:

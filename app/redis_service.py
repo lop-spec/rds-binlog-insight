@@ -272,15 +272,21 @@ class RedisService:
                     errors.append(node['node']+':'+error_code(exc))
                     with self.db() as c:
                         c.execute('INSERT OR REPLACE INTO collection VALUES(?,?,?,?)', (identity, node['node'], self.clock(), error_code(exc)))
-                    # A timed-out socket may desynchronize RESP; never continue it.
-                    break
+                    # Never reuse a desynchronized RESP socket; reconnect for
+                    # the NEXT shard so one slow shard cannot hide every peer.
+                    wire.close()
+                    wire = self.wire_factory(e)
+                    continue
             if now >= self.next_buckets.get(identity, 0) and not errors:
+                self.next_buckets[identity] = now + 600
                 rows = []
                 for b in range(64):
                     reply = wire.send('INFO', 'KEY', f'pre:follow_order:outbox:zset:{{fo:{b}}}')
                     m = re.fullmatch(r'slot:(\d+)\s+node_index:(\d+)', str(reply).strip())
                     if not m or int(m[2]) not in {n['index'] for n in nodes}:
-                        raise RuntimeError('redis_bucket_mapping_invalid')
+                        self.health[identity] = {'last_attempt': now, 'last_success': self.clock(), 'errors': [], 'bucket_error': 'redis_bucket_mapping_invalid'}
+                        LOGGER.warning('Redis bucket mapping unavailable; node snapshots remain valid')
+                        return
                     rows.append({'bucket': b, 'slot': int(m[1]), 'node_index': int(m[2])})
                 with self.db() as c:
                     c.execute('INSERT OR REPLACE INTO buckets VALUES(?,?,?)', (identity, self.clock(), json.dumps(rows)))
@@ -307,7 +313,7 @@ class RedisService:
                 for row in logs:
                     raw = str(row.get('Command', ''))
                     cmd = raw.split(None, 1)[0].lower() if raw else 'unknown'
-                    keys = re.findall(r'(?:pre:)?[a-z_][a-z0-9_:{}.-]{3,250}', raw)
+                    keys = re.findall(r'[A-Za-z0-9_][A-Za-z0-9_:{}.-]{3,250}', raw)
                     keys = [safe_key(k) for k in keys if ':' in k][:8]
                     ts = datetime.fromisoformat(row['ExecuteTime'].replace('Z', '+00:00')).timestamp()
                     if not now-900 <= ts <= now:
@@ -356,7 +362,7 @@ class RedisService:
                            'interval_seconds': e['intervalSeconds'], 'retention_days': e['retentionDays'], 'max_mib': e['maxMiB'], 'health': self.health.get(ident, {}),
                            'last_key_sample': sample_time, 'key_sampling': 'receiving' if recent_sample else 'not_connected'})
         return {'schema':'redis-five-layer-v1','status': 'unavailable' if self.error else 'ok' if active else 'not_configured', 'instances': active,
-                'storage': 'yy-ecs：20秒30天/分钟90天/小时400天；ClickHouse：形状30天/小时180天；容量上限熔断',
+                'storage': '保留期为配置上限，不代表已有完整历史；实际起止见实例first/latest；容量不足停止采集',
                 'context': dict(self.context.state) if self.context else {}, 'aggregates': dict(self.aggregates.state) if self.aggregates else {}, 'warning': WARNING}
 
     def query(self, params):
@@ -465,6 +471,7 @@ class RedisService:
             token = private_json(path).get('token', '')
             return len(token)>=32 and hmac.compare_digest(str(header), 'Bearer '+token)
         except Exception:
+            LOGGER.exception('Redis ingest token configuration unreadable; authorization denied')
             return False
 
     def ingest(self, payload):
@@ -501,7 +508,7 @@ class RedisService:
             validated.append((identity, ts, sid, json.dumps({**s, 'keys':[safe_key(k) for k in keys], 'latency_scope':'client_round_trip', 'server_usec':None})))
         with self.lock:
             self.ingest_times = [t for t in self.ingest_times if now-t<60]
-            if len(self.ingest_times)>=120:
+            if len(self.ingest_times)>=600:
                 raise ValueError('redis_sample_ingest_rate_limit')
             with self.db() as c:
                 c.executemany('INSERT OR IGNORE INTO samples VALUES(?,?,?,?)', validated)

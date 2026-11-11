@@ -62,13 +62,13 @@ def clipped_runtime_net_of_lock(events: list[dict[str, Any]], start_us: int, end
     totals: dict[tuple[str, str], Fraction] = defaultdict(Fraction)
     for event in events:
         begin = int(event["start_us"])
-        duration = int(event["duration_ms"]) * 1000
+        duration = int(Decimal(str(event['duration_ms'])) * 1000)
         clipped = max(0, min(begin + duration, stop) - max(begin, first))
         if not clipped or duration <= 0:
             continue
         lock = event.get("lock_time_ms")
         known = isinstance(lock, (int, float)) and not isinstance(lock, bool) and math.isfinite(lock) and lock > 0
-        waited = min(int(lock) * 1000, duration) if known else 0
+        waited = min(int(Decimal(str(lock)) * 1000), duration) if known else 0
         totals[str(event.get("node_id") or ""), str(event["fingerprint"])] += Fraction(clipped * (duration - waited), duration)
     return dict(totals)
 
@@ -77,7 +77,8 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
                             points: list[dict[str, Any]], *, start_us: int, end_us: int,
                             index_complete: bool, baseline_complete: bool,
                             baseline_points: list[dict[str, Any]] | None = None,
-                            score_points: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                            score_points: list[dict[str, Any]] | None = None,
+                            independent_excess: bool = False) -> dict[str, Any]:
     """Resource overlap discounted by the non-growing fraction of execution time.
 
     Identical full-minute windows exactly 24 hours apart. All SQL families are
@@ -98,8 +99,16 @@ def rank_performance_growth(events: list[dict[str, Any]], baseline_events: list[
     missing_ids = sum(not e.get("sql_id") for e in events + baseline_events)
     if missing_ids:
         LOGGER.warning("slowlog_performance_growth missing SQL IDs: %s events use physical fingerprint", missing_ids)
+    references = None
+    if independent_excess and score_points is None:
+        first = ((start_us+PERIOD_US-1)//PERIOD_US)*PERIOD_US
+        stop = ((end_us+1)//PERIOD_US)*PERIOD_US
+        expected = {t-86_400_000_000 for t in range(first+PERIOD_US,stop+1,PERIOD_US)}
+        samples, _reason = _node_metrics(baseline_points or [],expected)
+        references = {node: sorted(values.values())[(len(values)-1)//5] for node,values in (samples or {}).items() if len(values)==len(expected) and len(values)>=6}
     result = rank_resource_overlap(families, points, start_us=start_us, end_us=end_us,
-                                   index_complete=index_complete, score_points=score_points)
+                                   index_complete=index_complete, score_points=score_points, metric_baselines=references)
+    result['excess_reference'] = 'previous_window' if independent_excess and score_points is None else 'selected_window_descriptive'
     previous_series = execution_series(previous, start_us - DAY_US, end_us - DAY_US)
     net_now = clipped_runtime_net_of_lock(families, start_us, end_us)
     net_before = clipped_runtime_net_of_lock(previous, start_us - DAY_US, end_us - DAY_US)
@@ -228,7 +237,7 @@ def execution_series(events: list[dict[str, Any]], start_us: int, end_us: int,
                 raise ValueError("duplicate event: canonicalize the input before ranking")
             seen.add(identity)
         begin = int(event["start_us"])
-        duration = int(event["duration_ms"]) * 1000
+        duration = int(Decimal(str(event['duration_ms'])) * 1000)
         if duration < 0:
             raise ValueError("negative execution duration")
         if not start_us <= begin <= end_us:
@@ -267,11 +276,12 @@ def _scaled(samples: dict[int, Decimal], times: list[int]) -> tuple[int, list[in
 def rank_resource_overlap(events: list[dict[str, Any]], points: list[dict[str, Any]], *,
                           start_us: int, end_us: int, index_complete: bool,
                           period_us: int = PERIOD_US,
-                          score_points: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                          score_points: list[dict[str, Any]] | None = None,
+                          metric_baselines: dict[str, Decimal] | None = None) -> dict[str, Any]:
     """Rank each node independently by sum(runtime_us * positive metric excess).
 
-    Baseline is the lower empirical 20th percentile of the SAME selected node
-    window, not a fitted quiet-period detector. Shares sum to 1 within a node;
+    The production caller supplies an independent previous-window baseline.
+    With no metric_baselines, the legacy helper uses the selected-window 20th percentile only descriptively. Shares sum to 1 within a node;
     they are overlap shares, NOT shares of IOPS caused by a SQL statement.
 
     ``score_points`` (replication lag) replaces the series the excess and the coefficient are taken from; the node
@@ -313,8 +323,14 @@ def rank_resource_overlap(events: list[dict[str, Any]], points: list[dict[str, A
             continue
         scale, y = _scaled(samples, times)
         score_scale, ys = (scale, y) if scored is samples else _scaled(scored, times)
-        baseline = sorted(ys)[(len(ys) - 1) // 5]
-        excess = [max(v - baseline, 0) for v in ys]
+        reference = metric_baselines.get(node) if metric_baselines is not None else None
+        if reference is not None:
+            ref_scale=10**max(0,-reference.as_tuple().exponent)
+            if ref_scale>score_scale:
+                ys=[value*(ref_scale//score_scale) for value in ys]
+                score_scale=ref_scale
+        baseline = int(reference * score_scale) if reference is not None else sorted(ys)[(len(ys) - 1) // 5]
+        excess = [max(v - baseline, 0) for v in ys] if metric_baselines is None or reference is not None else [0]*len(ys)
         statements = []
         for (event_node, fingerprint), sparse in series.items():
             if event_node != node:
@@ -330,10 +346,10 @@ def rank_resource_overlap(events: list[dict[str, Any]], points: list[dict[str, A
         for rank, row in enumerate(statements, 1):
             row["rank"] = rank if total else None
             row["overlap_share"] = row["score_numerator"] / total if total else None
-        status = "ok" if total else "no_excess_overlap"
+        status = 'metric_baseline_unavailable' if metric_baselines is not None and reference is None else 'ok' if total else 'no_excess_overlap'
         if status != "ok":
             LOGGER.warning("slowlog_resource_overlap unavailable: node=%s reason=%s", node, status)
-        entry = {"node_id": node, "status": status, "baseline": sorted(y)[(len(y) - 1) // 5] / scale,
+        entry = {"node_id": node, "status": status, "baseline": float(reference) if reference is not None else None if metric_baselines is not None else sorted(y)[(len(y) - 1) // 5] / scale,
                  "peak": max(y) / scale, "metric_scale": scale,
                  "metric_values": y, "statements": statements}
         if scored is not samples:

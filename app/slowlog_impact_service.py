@@ -442,15 +442,19 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
     start_us, end_us = window
     if end_us - start_us >= DAY_US:
         return unavailable("overlapping_baseline")
+    index_cache = {}
     def index_state(low: int, high: int) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Coverage of the window and of its day-before baseline (None when the baseline is outside retention)."""
+        if (low, high) in index_cache:
+            return index_cache[low, high]
         found = backend._manifest_coverage(metadata.parts_in_range(start_epoch_us=low, end_epoch_us=high,
                                                                    source="slowlog", instance=instance))
         before = (low - DAY_US, high - DAY_US)
         if backend._window({**query, "start_epoch_us": before[0], "end_epoch_us": before[1]}, settings.retention_days) != before:
             return found, None
-        return found, backend._manifest_coverage(metadata.parts_in_range(start_epoch_us=before[0], end_epoch_us=before[1],
-                                                                         source="slowlog", instance=instance))
+        result = found, backend._manifest_coverage(metadata.parts_in_range(start_epoch_us=before[0], end_epoch_us=before[1], source='slowlog', instance=instance))
+        index_cache[low, high] = result
+        return result
 
     def usable(found: dict[str, Any] | None) -> bool:
         return bool(found and found.get("complete") and found.get("total_parts"))
@@ -541,6 +545,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             if not primaries:
                 LOGGER.warning("slowlog_resource_query lag candidates unavailable: primary node unknown for %s", instance)
             replicas = [node for node in with_lag if node not in primaries]
+            if len(replicas)*max(sum(e.get('node_id') in primaries for e in rows),sum(e.get('node_id') in primaries for e in baseline)) > MAX_EVENTS:
+                return unavailable('event_limit_exceeded')
             ranked_rows = lag_candidates(rows, primaries, replicas)
             ranked_baseline = lag_candidates(baseline, primaries, replicas)
             if len(ranked_rows) > MAX_EVENTS or len(ranked_baseline) > MAX_EVENTS:
@@ -551,7 +557,7 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
             LOGGER.warning('slowlog_cost_provenance incomplete: %s records contain legacy zero or absent costs; not treating as measured zero',unknown)
         result = rank_performance_growth(ranked_rows, ranked_baseline, points, start_us=start_us, end_us=end_us,
                                          index_complete=bool(coverage.get('complete') or tail_used is not None), baseline_complete=bool(baseline_coverage.get('complete')), baseline_points=baseline_points,
-                                         score_points=score_points)
+                                         score_points=score_points, independent_excess=True)
     except (RuntimeError, ValueError, KeyError, TypeError, OSError):
         LOGGER.exception("slowlog_resource_query metric or input validation failed")
         return unavailable("metric_or_input_unavailable")
@@ -591,8 +597,10 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
         # A fingerprint first seen in the last minutes is not in the SQLite statement table yet; the tail kept its text.
         profiles.update(tail.profiles(unasked - set(profiles)))
     for node in result.get("nodes", []):
-        node["total_fingerprints"] = len(node.get("statements", []))
-        node["statements"] = node.get("statements", [])[:top]
+        node['total_fingerprints'] = len(node.get('statements', []))
+        node['shown_growth_share'] = sum(r.get('growth_share') or 0 for r in node.get('statements', [])[:top])
+        node['omitted_fingerprints'] = max(node['total_fingerprints']-top,0)
+        node['statements'] = node.get('statements', [])[:top]
         evidence = node.get("evidence") or {}
         if evidence.get("related_families") is not None:
             # Family keys mean nothing to the page: point at the shown rows instead (1-based), dropping families not shown.
@@ -654,5 +662,8 @@ def query_resource_overlap(metadata: Any, backend: Any, query: dict[str, Any],
                   count_scope='collected_slow_records_not_total_executions',
                   source_complete=False, conclusion_grade='时间相关候选',
                   provisional=end_us > time.time_ns() // 1000 - 20 * PERIOD_US,
-                  template_grouping_complete=not bool(merged.get('_failed')))
+                  template_grouping_complete=not bool(merged.get('_failed')),
+                  role_scope='current_roles_not_historical_proof',
+                  primary_role_unavailable=lag_mode and not any(i.get('role')=='primary' for i in node_roles.values()),
+                  generated_us=time.time_ns()//1000)
     return result

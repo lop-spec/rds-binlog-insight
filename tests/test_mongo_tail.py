@@ -328,7 +328,7 @@ class ServiceUsesTheTail(unittest.TestCase):
         self.assertEqual(status['slowlog_data_through'], T + 8 * MINUTE)
         self.assertTrue(status['slowlog_tail']['fresh'])
 
-    def test_without_a_fresh_tail_the_old_nearest_window_search_runs(self):
+    def test_without_a_fresh_tail_the_selected_window_is_not_shifted(self):
         with tempfile.TemporaryDirectory() as td:
             service, tail = self.service(td, [])
             store = service.stores['dds-example']
@@ -336,7 +336,7 @@ class ServiceUsesTheTail(unittest.TestCase):
             with self.assertLogs('app.mongo_service', 'WARNING'):
                 result = service.query(dict(instance='dds-example', startEpochUs=T, endEpochUs=T + 5 * MINUTE,
                                             baselineStart=T - 5 * MINUTE))
-        store.nearest_complete.assert_called_once()
+        store.nearest_complete.assert_not_called()
         self.assertIsNone(result['adjusted'])
 
 
