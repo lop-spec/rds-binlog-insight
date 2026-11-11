@@ -106,6 +106,43 @@ class AccessBoundary(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_networks(Path(root))
 
+    def test_public_access_requires_explicit_owner_boolean(self):
+        with tempfile.TemporaryDirectory() as root:
+            policy=Path(root,'http-access.json')
+            for value in ['true','false',1,0,None]:
+                policy.write_text(json.dumps({'allowPublic':value}))
+                with self.subTest(value=value),self.assertRaises(ValueError):load_networks(Path(root))
+            policy.write_text(json.dumps({'allowPublic':True,'trustedNetworks':['172.18.0.0/16']}))
+            networks=load_networks(Path(root))
+            for peer in ['203.0.113.10','2001:db8::1','::ffff:203.0.113.10']:
+                self.assertTrue(peer_allowed(peer,networks),peer)
+            self.assertFalse(peer_allowed('not-an-address',networks))
+            policy.write_text(json.dumps({'allowPublic':False}))
+            self.assertFalse(peer_allowed('203.0.113.10',load_networks(Path(root))))
+
+    def test_public_mode_serves_api_but_keeps_ingest_token_and_origin_checks(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root,'http-access.json').write_text('{"allowPublic":true}')
+            ingest=Mock()
+            app=SimpleNamespace(data_dir=Path(root),public_status=lambda:{'available':True},audit_ingest=ingest)
+            server=AppHTTPServer(('127.0.0.1',0),app)
+            thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+            try:
+                self.assertTrue(peer_allowed('203.0.113.10',server.trusted_networks))
+                base=f'http://127.0.0.1:{server.server_port}'
+                with urllib.request.urlopen(base+'/api/status',timeout=3) as response:
+                    self.assertTrue(json.load(response)['data']['available'])
+                probes=[('/api/ingest/tabularis-audit',{},401,'AUDIT_AUTH_REQUIRED'),
+                        ('/api/settings',{'Origin':'https://untrusted.invalid'},403,'LOCAL_ORIGIN_REQUIRED')]
+                for route,headers,status,code in probes:
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(urllib.request.Request(base+route,data=b'{}',headers=headers),timeout=3)
+                    self.assertEqual(raised.exception.code,status)
+                    value=json.load(raised.exception);raised.exception.close()
+                    self.assertEqual(value['error']['code'],code)
+                ingest.ingest.assert_not_called()
+            finally:server.shutdown();server.server_close();thread.join(3)
+
     def test_get_query_validation_matches_post_bounds(self):
         for query in [{'limit': ['-1']}, {'limit': ['999999']}, {'offset': ['-1']}, {'keywordMode': ['oops']}, {'source': ['typo']}]:
             with self.subTest(query=query), self.assertRaises(ValueError):

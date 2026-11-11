@@ -1,8 +1,8 @@
-"""Network containment until an authenticated public entry is explicitly configured.
+"""Owner-controlled HTTP exposure; missing policy means loopback only.
 
-Host/Origin are NOT identities. Only the TCP peer is checked; forwarding headers
-never confer trust. Deployments may list their isolated worker network in the
-owner-controlled data/http-access.json. Missing policy means loopback only.
+Host/Origin are NOT identities. TCP peer containment can be explicitly disabled
+by allowPublic=true in data/http-access.json. Ingest tokens, origin validation,
+query budgets and database read-only accounts remain independent protections.
 """
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ from typing import Any
 def load_networks(root: Path) -> tuple[Any, ...]:
     path = Path(root) / 'http-access.json'
     raw = json.loads(path.read_text('utf-8')) if path.exists() else {}
+    allow_public = raw.get('allowPublic', False)
+    if type(allow_public) is not bool:
+        raise ValueError('http-access allowPublic must be a boolean')
     entries = raw.get('trustedNetworks', [])
     if not isinstance(entries, list) or len(entries) > 32:
         raise ValueError('http-access trustedNetworks must be a bounded array')
@@ -25,6 +28,8 @@ def load_networks(root: Path) -> tuple[Any, ...]:
         if not network.is_private or network.prefixlen == 0:
             raise ValueError('http-access accepts explicit private networks only')
         networks.append(network)
+    if allow_public:
+        return (ipaddress.ip_network('0.0.0.0/0'), ipaddress.ip_network('::/0'))
     return tuple(networks)
 
 
