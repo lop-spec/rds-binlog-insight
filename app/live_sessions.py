@@ -9,6 +9,9 @@ Two sources give the same ``Data`` shape: the database itself (``direct_sessions
 tens of milliseconds, used for the instances ``data/session-direct.json`` lists) and DAS (asynchronous, 2-3 s a node, two
 reads at once at most). A direct read that cannot be trusted falls back to DAS for that node and is not tried again for
 30 s (doubling up to 10 minutes while it keeps failing); ``source="das"`` asks for DAS on purpose.
+
+A node that has no direct path (a MongoDB hidden member) in an instance that is read directly would make the page wait for DAS
+(about 1 s) for one operation; its caller can accept the snapshot the retention loop took up to ``max_age`` seconds ago instead.
 """
 from __future__ import annotations
 
@@ -109,7 +112,7 @@ class LiveSessions:
         self._clock, self._sleep, self._wall_us = clock, sleep, wall_us
         self._cache_seconds, self._poll_seconds, self._deadline_seconds = cache_seconds, poll_seconds, deadline_seconds
         self._direct = direct
-        self._cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+        self._cache: dict[tuple[str, str, str], tuple[float, dict[str, Any], float]] = {}   # expires at, data, read at
         self._failures = {}
         self._direct_down: dict[tuple[str, str], tuple[float, str, int]] = {}
         self._locks: dict[tuple[str, str], threading.Lock] = {}
@@ -127,6 +130,13 @@ class LiveSessions:
                      for (instance, node), (until, code, streak) in sorted(self._direct_down.items()) if until > now]
         return {"enabled": bool(config["enabled"]), "instances": sorted(config["instances"]) if config["enabled"] else [], "fallbacks": fallbacks}
 
+    def direct_enabled(self, instance_id: str) -> bool:
+        return self._direct is not None and self._direct.enabled_for(instance_id)
+
+    def direct_supports(self, instance_id: str, node_id: str) -> bool:
+        """Whether this node would be read directly (the instance is switched on and the node has a direct path)."""
+        return self.direct_enabled(instance_id) and self._direct.supports(instance_id, node_id)
+
     def _node_lock(self, key: tuple[str, str]) -> threading.Lock:
         with self._guard:
             return self._locks.setdefault(key, threading.Lock())
@@ -135,10 +145,13 @@ class LiveSessions:
         """The statements running on one node (the "看正在跑的查询" view)."""
         return self.view(instance_id, node_id, normalize_sessions)
 
-    def view(self, instance_id: str, node_id: str, build: Callable[[dict[str, Any], int], dict[str, Any]], source: str = "auto") -> dict[str, Any]:
+    def view(self, instance_id: str, node_id: str, build: Callable[[dict[str, Any], int], dict[str, Any]], source: str = "auto",
+             max_age: float = 0.0) -> dict[str, Any]:
         """One node's snapshot shaped by ``build(data, now_us)``; the read and the cache are shared by every view.
 
-        ``source`` is ``"auto"`` (the database when it is switched on for the instance, else DAS) or ``"das"``."""
+        ``source`` is ``"auto"`` (the database when it is switched on for the instance, else DAS) or ``"das"``. With ``max_age`` a
+        stored snapshot that is not older than that many seconds is used even when its short cache time is over (the payload then
+        says ``stale_seconds``)."""
         mode = "das" if source == "das" else "auto"
         key = (instance_id, node_id, mode)
         with self._node_lock((instance_id, node_id)):
@@ -146,7 +159,10 @@ class LiveSessions:
             if failed and self._clock() < failed[0]:
                 raise LiveSessionsError(failed[1], failed[2])
             hit = self._cache.get(key)
-            cached = bool(hit and self._clock() < hit[0])
+            now = self._clock()
+            fresh = bool(hit and now < hit[0])
+            stale_seconds = round(now - hit[2]) if hit and not fresh and max_age and now - hit[2] <= max_age else None
+            cached = fresh or stale_seconds is not None
             if cached:
                 data = hit[1]
             else:
@@ -156,18 +172,20 @@ class LiveSessions:
                     self._failures[key] = (self._clock()+10, exc.code, str(exc))
                     raise
                 self._failures.pop(key, None)
-                self._cache[key] = (self._clock() + ttl, data)
+                self._cache[key] = (self._clock() + ttl, data, self._clock())
         payload = build(data, self._wall_us())
         payload.update(instance_id=instance_id, node_id=node_id)
         payload["source"] = str(data.get("Source") or "das")
         if data.get("DirectFallback"):
             payload["fallback"] = data["DirectFallback"]
+        if stale_seconds is not None:
+            payload["stale_seconds"] = stale_seconds
         return {**payload, "cached": cached}
 
     def _fetch(self, instance_id: str, node_id: str, mode: str) -> tuple[dict[str, Any], float]:
         """The node's ``Data`` and how long to keep it: from the database when that is switched on and trustworthy, else DAS."""
         fallback = ""
-        if mode == "auto" and self._direct is not None and not instance_id.startswith("dds-") and self._direct.enabled_for(instance_id):
+        if mode == "auto" and self._direct is not None and self._direct.enabled_for(instance_id) and self._direct.supports(instance_id, node_id):
             down = self._direct_down.get((instance_id, node_id))
             if down and self._clock() < down[0]:
                 fallback = down[1]

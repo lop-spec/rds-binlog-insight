@@ -68,6 +68,7 @@ from .query_tasks import QueryTaskManager
 from .rds_api import RdsApiError, RdsRpcClient
 from .schema_diff import SchemaDiffError, SchemaDiffService, load_instances
 from .direct_sessions import DirectSessionReader
+from .direct_mongo_sessions import DirectMongoReader
 from .storage import EventStorage
 from .tabularis_audit import AuditIngestError, TabularisAuditIngest
 from .http_access import load_networks, peer_allowed, validate_event_query
@@ -413,6 +414,10 @@ class Application:
         # Sessions are read from the database itself where data/session-direct.json switches that on (the read-only account of schema-instances.json),
         # and from DAS otherwise or when a direct read cannot be trusted.
         self.direct_sessions = DirectSessionReader(self.data_dir, instances=load_instances, roles=lambda instance: self.node_roles.lookup(instance))
+        # MongoDB members are read by their own reader ($currentOp with the collector's read-only identity); the lambdas run later,
+        # when self.mongo and self.mongo_nodes exist.
+        self.direct_sessions.attach_mongo(DirectMongoReader(self.data_dir, entries=lambda: self.mongo.entries,
+                                                            roles=lambda instance: self.mongo_nodes.lookup(instance), config=self.direct_sessions.config))
         self.live_sessions = LiveSessions(das_client, direct=self.direct_sessions)
         from .mongo_collector import DdsClient
         from .mongo_service import MongoService

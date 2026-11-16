@@ -2,10 +2,10 @@
 
 /* 会话管理（RDS）：对齐阿里云 DAS 的会话管理——实例会话（异常 / 运行中 / 总数 / 最长运行）、会话统计（按用户 / 来源 / 数据库）、
    会话列表、三类异常会话（语句运行超过 30 秒、事务超过 30 秒、事务开启后 10 秒没再执行语句）；另加一项 DAS 没有的：有会话在等锁时，
-   按快照推断「疑似持锁」的会话。实时部分每次点刷新才读（RDS 直连库读 information_schema，失败回落 DAS）；历史部分是服务后台每分钟留存的异常会话。
+   按快照推断「疑似持锁」的会话。实时部分每次点刷新才读（RDS 直连库读 information_schema、MongoDB 直连成员读 $currentOp，失败回落 DAS）；历史部分是服务后台每分钟留存的异常会话。
    「结束会话」换成 KILL 语句：服务没有能 kill 的账号，所以本页只生成 KILL 语句（每条带路由 Hint，没有别的 SQL）让你执行，自己不执行任何 kill。
-   MongoDB（dds- 实例）共用这一页：DAS GetMongoDBCurrentOp 每个成员一份，一行是一个操作（opid），异常只有「操作运行过久」；
-   结束会话换成每个成员一段 mongosh 文本（核对 + 按 opid 与连接号双重匹配才 killOp），要直连该成员执行。 */
+   MongoDB（dds- 实例）共用这一页：每个成员一份（直连成员的 $currentOp；隐藏成员没有地址，读 DAS GetMongoDBCurrentOp），一行是一个操作（opid），
+   异常只有「操作运行过久」；结束会话换成每个成员一段只有 killOp 语句的 mongosh 文本，要直连该成员执行。 */
 
 const SESSION_KIND_LABEL = { long_running: "语句运行过久", lock_wait: "等待锁", long_trx: "事务过长", idle_trx: "未提交事务" };
 const MONGO_KIND_LABEL = { long_running: "操作运行过久" };
@@ -427,11 +427,13 @@ function sessionsQueryString() {
 
 function sessionSourceText(data) {
   const ok = data.nodes.filter((node) => node.status === "ok");
-  const direct = ok.filter((node) => node.source === "mysql").length;
+  const direct = ok.filter((node) => node.source === "mysql" || node.source === "mongo").length;
   const fallback = ok.filter((node) => node.fallback).length;
+  const stale = ok.filter((node) => node.stale_seconds != null);
   const parts = [];
-  if (direct) parts.push(`${humanCount(direct)} 个节点直连库读取`);
+  if (direct) parts.push(`${humanCount(direct)} 个节点直连读取`);
   if (fallback) parts.push(`${humanCount(fallback)} 个节点直连失败，已回落 DAS`);
+  if (stale.length) parts.push(`${humanCount(stale.length)} 个节点没有直连通道，沿用 ${humanCount(Math.max(...stale.map((node) => Number(node.stale_seconds) || 0)))} 秒前的快照`);
   return parts.length ? ` · ${parts.join("，")}` : "";
 }
 
@@ -440,7 +442,8 @@ function renderSessionsLive() {
   $("#sessions-live").hidden = false;
   $("#sessions-history").hidden = true;
   if (!data) return;
-  const when = Math.min(...data.nodes.filter((node) => node.status === "ok").map((node) => Number(node.observed_at_us) || Infinity));
+  const current = data.nodes.filter((node) => node.status === "ok" && node.stale_seconds == null);
+  const when = Math.min(...(current.length ? current : data.nodes.filter((node) => node.status === "ok")).map((node) => Number(node.observed_at_us) || Infinity));
   $("#sessions-meta").textContent = Number.isFinite(when) ? `快照时间 ${formatTime(when)}${sessionSourceText(data)}${data.partial ? " · 有节点读取失败" : ""}` : "没有读到任何节点";
   $("#sessions-summary").innerHTML = sessionSummaryHtml(data);
   $("#sessions-holders").innerHTML = sessionHolderHtml(data);
@@ -618,13 +621,13 @@ async function generateSessionKill() {
 // MongoDB：每个成员一段，各自直连该成员执行（opid 只在本成员有效），每段一个复制按钮
 function mongoKillHtml(item) {
   const nodes = item.nodes || [];
-  const warn = nodes.some((node) => node.role === "primary" && node.text) ? '<p class="session-kill-warn">含<strong>主节点</strong>的操作：结束写入操作会直接影响线上，务必先跑核对。</p>' : "";
+  const warn = nodes.some((node) => node.role === "primary" && node.text) ? '<p class="session-kill-warn">含<strong>主节点</strong>的操作：结束写入操作会直接影响线上，执行前请再核对一遍 opid。</p>' : "";
   const skipped = (item.skipped || []).length ? `<p class="analytics-note">跳过 ${humanCount(item.skipped.length)} 个：${escapeHtml(item.skipped.map((row) => `${row.session_id}（${row.reason}）`).join("、"))}。</p>` : "";
   const blocks = nodes.filter((node) => node.text).map((node, index) => `<section class="detail-block"><div class="session-kill-nodes"><span class="session-kill-node">${sessionNodeChip(node)}<span class="muted">${humanCount(node.session_ids.length)} 个操作 · 快照 ${escapeHtml(sessionTimeText(node.snapshot_us))}</span></span></div>
       <p class="analytics-note">连接：<code>${escapeHtml(node.connect)}</code></p>
       <textarea class="session-kill-text" readonly rows="${Math.min(16, Math.max(4, String(node.text).split("\n").length + 2))}" spellcheck="false" aria-label="killOp 语句">${escapeHtml(node.text)}</textarea>
       <div class="session-kill-actions"><button type="button" class="button primary compact" data-session-copy="${index}">复制这一段</button></div></section>`).join("");
-  return `<p class="analytics-note">只生成语句，不执行。opid 只在它所在的成员上有效，每段要用 mongosh <strong>直连该成员</strong>（directConnection=true）执行：第一行核对（opid、连接号、命名空间、已运行秒数对得上再往下），第二行逐个按「opid + 连接号」在本成员的 currentOp 里重新找到才 killOp，连错成员或操作已结束只打印「未执行」。需要有 killop 权限的账号；killOp 只结束操作，连接保留。</p>
+  return `<p class="analytics-note">只生成 killOp 语句，不执行，没有别的命令。opid 只在它所在的成员上有效，每段要用 mongosh <strong>直连该成员</strong>（directConnection=true）执行；连错成员会结束别人的操作。需要有 killop 权限的账号；killOp 只结束操作，连接保留。</p>
     ${warn}${blocks || '<p class="analytics-empty">没有可生成的语句。</p>'}${skipped}`;
 }
 

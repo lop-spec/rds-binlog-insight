@@ -20,9 +20,13 @@ another node of the instance already owns), a refused or timed out connection.
 
 Switched on per instance by ``data/session-direct.json`` (read again whenever its modification time changes, no restart)::
 
-    {"enabled": true, "instances": {"<instance id>": {"primaryHost": "<the instance's own address>"}}, "excludeUsers": ["<extra platform account>"]}
+    {"enabled": true, "instances": {"<instance id>": {"primaryHost": "<the instance's own address>"}, "dds-<id>": {}},
+     "excludeUsers": ["<extra platform account>"]}
 
-Without the file nothing is read directly.
+Without the file nothing is read directly. A ``dds-`` instance (MongoDB) needs no address here: its members are read by
+``direct_mongo_sessions`` (this reader hands the call over). An instance whose proxy does not know node ids says
+``"standbyHint": "FORCE_SLAVE"`` (only valid while it has exactly one standby). The read-only account needs the ``PROCESS``
+privilege to see other sessions; without it the read says so (``direct_no_process_privilege``) and DAS is read instead.
 """
 from __future__ import annotations
 
@@ -84,9 +88,15 @@ def load_config(data_dir: Path) -> dict[str, Any]:
         if not isinstance(instances, dict):
             raise ValueError("instances 必须是对象")
         for instance_id, item in instances.items():
-            primary = (item or {}).get("primaryHost") if isinstance(item, dict) else None
+            if not isinstance(item, dict):
+                raise ValueError(f"{instance_id} 的配置必须是对象")
+            if _is_mongo(instance_id):
+                continue                                           # members and the account come from the MongoDB registry
+            primary = item.get("primaryHost")
             if not isinstance(primary, str) or not HOST_PATTERN.fullmatch(primary):
                 raise ValueError(f"{instance_id} 缺少合法的 primaryHost")
+            if item.get("standbyHint", "FORCE_NODE") not in ("FORCE_NODE", "FORCE_SLAVE"):
+                raise ValueError(f"{instance_id} 的 standbyHint 只能是 FORCE_NODE 或 FORCE_SLAVE")
         excluded = config["excludeUsers"]
         if not (isinstance(excluded, list) and len(excluded) <= MAX_EXCLUDED and all(isinstance(name, str) and 0 < len(name) <= 64 for name in excluded)):
             raise ValueError("excludeUsers 必须是不超过 50 个、每个 1 到 64 字符的账号名数组")
@@ -98,6 +108,10 @@ def load_config(data_dir: Path) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         LOGGER.warning("会话直连配置 %s 无法使用，按关闭处理（读取走 DAS）：%s", path, exc)
         return dict(DEFAULT_CONFIG)
+
+
+def _is_mongo(instance_id: str) -> bool:
+    return str(instance_id or "").startswith("dds-")
 
 
 def _seconds(value: Any) -> int:
@@ -142,6 +156,11 @@ class DirectSessionReader:
         self._lock = threading.Lock()
         self._owner: dict[tuple[str, int], str] = {}          # (instance, server_id) -> the node that answered with it
         self._answered: dict[tuple[str, str], int] = {}       # (instance, node) -> its server_id
+        self._mongo: Any = None                               # direct_mongo_sessions.DirectMongoReader, attached by the server
+
+    def attach_mongo(self, reader: Any) -> None:
+        """MongoDB members are read by ``reader`` (it needs this reader's ``config``, so it is made second)."""
+        self._mongo = reader
 
     # -- settings -------------------------------------------------------------
     def config(self) -> dict[str, Any]:
@@ -152,16 +171,24 @@ class DirectSessionReader:
         except OSError:
             stamp = None
         with self._lock:
-            if stamp != self._config_stamp:
+            changed = stamp != self._config_stamp
+            if changed:
                 self._config, self._config_stamp = load_config(self._data_dir), stamp
-            return self._config
+            config = self._config
+        if changed and not config["enabled"] and self._mongo is not None:
+            self._mongo.close()                                  # no idle connections to the members while direct reads are off
+        return config
 
     def cache_seconds(self) -> float:
         return float(self.config()["cacheSeconds"])
 
     def enabled_for(self, instance_id: str) -> bool:
         config = self.config()
-        return bool(config["enabled"] and instance_id in config["instances"])
+        return bool(config["enabled"] and instance_id in config["instances"] and (self._mongo is not None or not _is_mongo(instance_id)))
+
+    def supports(self, instance_id: str, node_id: str) -> bool:
+        """Whether this node has a direct path at all (a MongoDB hidden member has no address: it stays on DAS, without a warning)."""
+        return self._mongo.supports(instance_id, node_id) if _is_mongo(instance_id) else True
 
     # -- one node -------------------------------------------------------------
     def _endpoint(self, instance_id: str, node_id: str) -> tuple[str, str, int, str, str]:
@@ -174,15 +201,26 @@ class DirectSessionReader:
             raise DirectSessionError("direct_no_credential", f"schema-instances.json 无法读取：{type(exc).__name__}: {str(exc)[:160]}") from exc
         if item is None or not getattr(item, "user", "") or not getattr(item, "host", ""):
             raise DirectSessionError("direct_no_credential", "schema-instances.json 里没有这个实例的只读账号")
-        role = str((self._roles(instance_id).get(node_id) or {}).get("role") or "")
+        members = self._roles(instance_id)
+        role = str((members.get(node_id) or {}).get("role") or "")
+        settings = self.config()["instances"][instance_id]
         if role == "primary":
-            return "", self.config()["instances"][instance_id]["primaryHost"], int(item.port), str(item.user), str(item.password)
+            return "", settings["primaryHost"], int(item.port), str(item.user), str(item.password)
         if role == "secondary":
+            if settings.get("standbyHint", "FORCE_NODE") == "FORCE_SLAVE":
+                # a proxy that does not know node ids: the hint picks "the" standby, which is only a node while there is exactly one
+                if sum(1 for info in members.values() if info.get("role") == "secondary") != 1:
+                    raise DirectSessionError("direct_ambiguous_standby", "FORCE_SLAVE 只在实例恰好一个备节点时才能指定节点")
+                return "/*FORCE_SLAVE*/ ", str(item.host), int(item.port), str(item.user), str(item.password)
             return f"/*FORCE_NODE='{node_id}'*/ ", str(item.host), int(item.port), str(item.user), str(item.password)
         raise DirectSessionError("direct_role_unknown", f"节点角色未知（{role or '空'}），不能决定走哪个地址")
 
     def read(self, instance_id: str, node_id: str) -> dict[str, Any]:
         """The DAS-shaped ``Data`` of one node, read now; ``DirectSessionError`` when it cannot be trusted."""
+        if _is_mongo(instance_id):
+            if self._mongo is None:
+                raise DirectSessionError("direct_not_configured", "没有 MongoDB 直连读取器")
+            return self._mongo.read(instance_id, node_id)
         config = self.config()
         hint, host, port, user, password = self._endpoint(instance_id, node_id)
         expected_read_only = 0 if not hint else 1
@@ -204,6 +242,8 @@ class DirectSessionReader:
                 cursor.execute(sql, users)                       # the account names are bound parameters, never part of the text
                 rows = list(cursor.fetchall())
         except Exception as exc:  # noqa: BLE001
+            if tuple(getattr(exc, "args", ())[:1]) == (1227,):           # ER_SPECIFIC_ACCESS_DENIED_ERROR: no PROCESS privilege
+                raise DirectSessionError("direct_no_process_privilege", "只读账号缺少 PROCESS 权限，看不到其他会话（需 DBA 执行 GRANT PROCESS）") from exc
             raise DirectSessionError("direct_query_failed", f"{type(exc).__name__}: {str(exc)[:200]}") from exc
         finally:
             try:

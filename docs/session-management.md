@@ -63,7 +63,7 @@
 
 **成员**：后台线程每 5 分钟用 DDS 只读接口 `DescribeRoleZoneInfo`（角色 ID、主 / 备 / 隐藏、可用区）和 `DescribeReplicaSetRole`（每个角色 ID 的 VPC 地址）刷新，查到之前下拉框里没有这个实例；成员列表经 `GET /api/sessions/status` 的 `mongo` 字段给页面。隐藏节点没有连接地址。
 
-**读取**：每个成员一次同步的 DAS `GetMongoDBCurrentOp`（`InstanceId` + `NodeId`=角色 ID，不带过滤条件，与 DAS 控制台一致：每个客户端连接一行（生产主节点约 1300、备节点约 1200，空闲连接没有 opid）加后台线程）。2026-10-22 实测：`NodeId` 写一个不存在的号时接口**不报错、直接返回主节点的操作**，所以服务只发成员表里的角色 ID（其他一律 400 `SESSIONS_UNKNOWN_NODE`）；隐藏节点的角色 ID 可用。缓存、并发、失败码与 RDS 共用。
+**读取**：1.42.0 起生产实例直连成员读 `$currentOp`（见下「读取方式」）；隐藏成员没有地址，读 DAS。DAS 的 `GetMongoDBCurrentOp`（`InstanceId` + `NodeId`=角色 ID，不带过滤条件，与 DAS 控制台一致：每个客户端连接一行（生产主节点约 1300、备节点约 1200，空闲连接没有 opid）加后台线程）。2026-10-22 实测：`NodeId` 写一个不存在的号时接口**不报错、直接返回主节点的操作**，所以服务只发成员表里的角色 ID（其他一律 400 `SESSIONS_UNKNOWN_NODE`）；隐藏节点的角色 ID 可用。缓存、并发、失败码与 RDS 共用。
 
 **一行是一个操作**，按 RDS 行的字段放，页面换了列名：
 
@@ -80,23 +80,25 @@
 
 **受保护（不生成语句）**：空闲连接 / 没有 opid（没有在跑的操作，killOp 无对象）；`Desc` 不是 `connNNN`（`TTLMonitor` 等内部线程）；集合在 `local.`（oplog 读取）或驱动是 `NetworkInterfaceTL` / `MongoDB Internal Client`（副本集内部连接）；`hello` / `isMaster` / `ping` / 认证命令（驱动探活，长轮询的 `hello` 也不算异常）。
 
-**killOp 语句**：opid 是每个成员各自的计数器，同一个数在别的成员上是别人的操作，所以每个成员单独一段，用 mongosh **直连该成员**（`mongosh "mongodb://<成员 VPC 地址>:3717/admin?directConnection=true" -u <账号> -p`，页面写在每段上方，有单独的复制按钮）：
+**killOp 语句**（1.42.0 起只有 killOp，没有核对脚本）：opid 是每个成员各自的计数器，同一个数在别的成员上是别人的操作，所以每个成员单独一段，用 mongosh **直连该成员**（`mongosh "mongodb://<成员 VPC 地址>:3717/admin?directConnection=true" -u <账号> -p`，页面写在每段上方，有单独的复制按钮）；每个操作一行：`db.adminCommand({killOp: 1, op: <opid>});`。连错成员会结束别人的操作，所以服务端在写这些行之前先重新读成员，确认每个 opid 仍在跑、仍是你选中时的那条连接（`connNNN`），不是就拒绝（`SESSIONS_CHANGED`）。
 
-1. 核对：`db.getSiblingDB("admin").aggregate([{$currentOp: {allUsers: true}}, {$match: {opid: {$in: […]}}}, {$project: …}])`，看 opid、连接号、集合、已运行秒数对得上；
-2. 结束：`[[opid, "connNNN"], …].forEach(…)`，每个 opid 在本成员的 `$currentOp` 里按 **opid + 连接号**重新找到才 `killOp`，找不到（连错成员、操作已结束号被复用）只打印「未执行」。
 
-文本里只有整数 opid 和匹配 `connNNN` 的连接号，客户端发来的内容进不了代码。killOp 只结束操作、连接保留，没有 KILL / KILL QUERY 两种模式；执行账号要有 `killop` 权限（只读账号不行）。隐藏节点没有地址，不生成，提示到 DAS 控制台的会话管理里结束。
+文本里只有整数 opid，客户端发来的内容进不了代码。killOp 只结束操作、连接保留，没有 KILL / KILL QUERY 两种模式；执行账号要有 `killop` 权限（只读账号不行）。隐藏节点没有地址，不生成，提示到 DAS 控制台的会话管理里结束。
 
-## 读取方式：直连库（1.41.3 起）
+## 读取方式：直连（RDS MySQL 1.41.3 起，MongoDB 1.42.0 起）
 
-DAS 的 `GetMySQLAllSessionAsync` 是异步接口（先发起、再每 1.5 秒轮询），一个节点 2–3 秒，六个节点并发只开 2 路，冷读一次约 7 秒。同样的事实一条 `information_schema` 语句就能查到，所以 RDS MySQL 节点改为**直连数据库读取**，DAS 只做回落。线上实测（生产实例，6 节点、每节点约 2100 个会话）：一次查询 20–60 ms，6 节点并行约 0.2 秒。
+DAS 的 `GetMySQLAllSessionAsync` 是异步接口（先发起、再每 1.5 秒轮询），一个节点 2–3 秒，六个节点并发只开 2 路，冷读一次约 7 秒。同样的事实一条 `information_schema` 语句就能查到，所以 RDS MySQL 节点改为**直连数据库读取**，DAS 只做回落。线上实测（生产实例，6 节点、每节点约 2100 个会话）：一次查询 20–60 ms，6 节点并行约 0.2 秒。MongoDB 成员同理：DAS 每个成员 1.5–2.2 s，直连 `$currentOp` 20–70 ms。
 
 - **语句**：每个节点一条 `SELECT`（没有 KILL、DDL、SET）：`information_schema.PROCESSLIST` 左连 `INNODB_TRX`（`trx_mysql_thread_id = ID` 且 `trx_is_read_only = 0`：InnoDB 的事务一开始都是只读，第一次写或加锁读才升级成读写；只读事务（单条自动提交 SELECT、BEGIN 后只查询就空闲的连接池连接）什么都没占，不算事务，DAS 也不报（在生产实例上对过：备节点上约十个这样的空闲只读事务，DAS 一个都没有）），带 `@@server_id`、`@@read_only`，去掉本连接和 RDS 平台账号（`system user` / `event_scheduler` / `aliyun_root` / `replicator` / `rdsadmin` / `rdsinternal` / `rdsrepl`，再加配置文件 `excludeUsers` 里登记的本部署专有账号——DAS 也不列它们，在生产实例上对过；账号名作为绑定参数传入，不拼进语句），加 `MAX_EXECUTION_TIME(5000)`。结果整理成和 DAS 快照一样的 `Data`（`SessionList` 的 `SessionId / User / Client / DbName / Command / State / Time / SqlText`，在事务里才有 `TrxId / TrxDuration`），实时视图、会话管理、留存、KILL 文本都不用改。
 - **账号和地址**：复用 `schema-instances.json`（`RDS_BINLOG_SCHEMA_CONFIG`）里该实例的只读账号（权限 `SELECT, PROCESS, SHOW VIEW`）和读写分离地址；备节点走该地址并带 `/*FORCE_NODE='<节点 ID>'*/`，主节点不在这个只读代理的节点列表里（`FORCE_NODE` 报 `force hint server node is not found`），改连实例自己的地址 `primaryHost`。不新增凭据、不存任何新口令。
-- **开关**：`data/session-direct.json`，没有这个文件就不直连。每次改动后自动重读，不用重启：`{"enabled": true, "instances": {"<实例 ID>": {"primaryHost": "<实例主地址>"}}, "excludeUsers": ["<本部署专有的平台账号>"], "cacheSeconds": 3, "connectTimeoutSeconds": 3, "readTimeoutSeconds": 8, "maxExecutionMs": 5000}`（`excludeUsers` 和后四项可省，范围见 `app/direct_sessions.py`）。`{"enabled": false}` 或删文件立即回到 DAS；只列出的实例才直连，MongoDB 成员不适用。
+- **开关**：`data/session-direct.json`，没有这个文件就不直连。每次改动后自动重读，不用重启：`{"enabled": true, "instances": {"<实例 ID>": {"primaryHost": "<实例主地址>"}}, "excludeUsers": ["<本部署专有的平台账号>"], "cacheSeconds": 3, "connectTimeoutSeconds": 3, "readTimeoutSeconds": 8, "maxExecutionMs": 5000}`（`excludeUsers` 和后四项可省，范围见 `app/direct_sessions.py`）。`{"enabled": false}` 或删文件立即回到 DAS；只列出的实例才直连。MongoDB 实例写 `"dds-…": {}` 即可（成员和账号来自 MongoDB 登记）；代理不认节点 ID 的实例可加 `"standbyHint": "FORCE_SLAVE"`（只在它恰好一个备节点时有效）。
 - **读不到就回落**：没有凭据 / 角色未知 / 连不上 / 查询失败 / 落点不对（`@@read_only` 与角色不符，或同实例另一个节点已用过这个 `@@server_id`——说明 Hint 没送到）都读 DAS，节点的 `fallback` 写原因码，页面快照行写「N 个节点直连失败，已回落 DAS」。该节点之后 30 秒内不再试直连（连续失败翻倍，最长 10 分钟），日志只在失败那一刻写一条 WARNING（`direct read failed, reading DAS instead`）。
 - **缓存**：直连结果缓存 3 秒（DAS 仍是 10 秒），页面、实时视图、留存循环和 KILL 核对共用。
+- **没有直连通道的成员**（MongoDB 隐藏成员，没有地址）：实例按直连读取时，页面不为它等 DAS（约 1 秒），而是沿用留存循环每分钟取的快照（最多 90 秒前），快照行写「N 个节点没有直连通道，沿用 X 秒前的快照」，头部时间只算当次读到的节点；留存循环停了或快照更旧就照常读 DAS。
+- **MongoDB 直连**（`app/direct_mongo_sessions.py`）：账号是 MongoDB 采集器已在用的只读账号（`mongo-instances.json` 的 `credentialsFile` / `readonlyUsername`，角色 `read` / `readAnyDatabase` / `clusterMonitor`，含 `$currentOp` 要的 `inprog`）；建连后和采集器一样核对认证身份与角色，不符就拒绝并回落；一次读 = `hello`（核对角色：登记为主的必须是 `isWritablePrimary`、登记为备的必须是 `secondary`，同一个成员名也不能被两个节点认领）+ 一条 `$currentOp`（`allUsers`、`idleConnections`，后接 `$project` 只留页面用的字段，`maxTimeMS` 5000）。只读，不发写命令。每成员保持一个客户端（认证一次），读失败就丢弃重建，关直连时关闭。
+- **MongoDB 与 DAS 的差别**：直连列出成员自己的全部 `connNNN` 连接（和 `serverStatus.connections.current` 一致，DAS 少约 20%）；驱动的监控流（`hello` / `isMaster`，每个客户端一条长连接，生产上每成员约 230 条）算连接不算「运行中」操作（DAS 也只显示 1–8 个运行中）；成员内部线程和本服务自己的操作不列。
 - **和 DAS 的差别**：事务字段来自 `INNODB_TRX`，只有真正在事务里的会话才有 `TrxId`；DAS 和库内读取不在同一时刻，时长 0–1 秒的瞬时事务两边可能不一致，不影响三类异常的判定。`performance_schema` 在 6 个节点都是关的，所以仍然没有精确的元数据锁持有者。
+- **测试实例**：测试实例的只读账号只有 `SELECT, SHOW VIEW`，没有 `PROCESS`，直连只看得到自己的线程（`INNODB_TRX` 直接拒绝），所以该实例的直连读取会报 `direct_no_process_privilege` 并回落 DAS。DBA 在测试实例的主节点执行 `GRANT PROCESS ON *.* TO '<只读账号>'@'%';` 之后，在 `session-direct.json` 的 `instances` 里加上该实例（`primaryHost` 是实例自己的地址；测试实例的代理不认节点 ID，加 `"standbyHint": "FORCE_SLAVE"`）即可，不用重启。
 
 ## 留存
 

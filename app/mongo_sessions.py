@@ -14,9 +14,10 @@ The page, the retention loop and the history are the ones RDS uses (``session_se
   abnormal kind is an operation running longer than the threshold;
 * the text. ``killOp`` works on the node the operation runs on, and an opid is a per-node counter: the same number on
   another member is somebody else's operation. Each node therefore gets its own block for a direct connection to that
-  member, and the kill line only kills an opid whose ``desc`` (the connection, ``connNNN``) still matches the snapshot.
+  member: one ``killOp`` line per operation and nothing else. (The page checks that an operation is still the same connection
+  before it writes the line; the line itself carries no check.)
 
-Nothing here talks to a database; the service has a read-only cloud identity and no MongoDB account that may kill.
+Nothing here talks to a database; the service has a read-only identity and no MongoDB account that may kill.
 """
 from __future__ import annotations
 
@@ -245,11 +246,11 @@ def connect_command(host: str) -> str:
 
 def build_mongo_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], *, snapshot_us: int,
                                 generated_us: int) -> dict[str, Any]:
-    """The mongosh lines that end the given operations on one member: one check of all of them, then one guarded kill line.
+    """The mongosh lines that end the given operations on one member: one ``killOp`` per operation, no check, no comment.
 
-    Only integers (opids) and ``connNNN`` names reach the text, so nothing a client sent can become code. The kill line looks
-    every pair up in ``$currentOp`` on the member it is run on and calls ``killOp`` only for an opid whose connection still
-    matches: run on the wrong member, or after the operation ended and the number was reused, it kills nothing and says so.
+    Only integers (opids) reach the text, so nothing a client sent can become code. The member's own connection address is
+    shown beside the block by the page (``connect``): an opid means another operation on another member, so the block must be run
+    on a direct connection to the member it was written for.
     """
     if not sessions:
         raise ValueError("没有选中会话")
@@ -275,18 +276,8 @@ def build_mongo_kill_statements(node: dict[str, Any], sessions: list[dict[str, A
         skipped.extend({"session_id": opid, "reason": reason} for opid in sorted(keep))
         keep = {}
     ids = sorted(keep)
-    checks: list[str] = []
-    statements: list[str] = []
-    if ids:
-        listing = ", ".join(str(opid) for opid in ids)
-        pairs = ", ".join(f'[{opid}, "{keep[opid]}"]' for opid in ids)
-        checks.append('db.getSiblingDB("admin").aggregate([{$currentOp: {allUsers: true}}, {$match: {opid: {$in: [' + listing + ']}}}, '
-                      '{$project: {_id: 0, opid: 1, desc: 1, op: 1, ns: 1, secs_running: 1, client: 1, planSummary: 1}}])')
-        statements.append('[' + pairs + '].forEach(([op, desc]) => { const admin = db.getSiblingDB("admin"); '
-                          'if (admin.aggregate([{$currentOp: {allUsers: true}}, {$match: {opid: op, desc: desc}}]).toArray().length) '
-                          'printjson({opid: op, result: admin.killOp(op)}); else print("opid " + op + " 不在本节点（或已结束），未执行"); })')
-    lines = checks + statements
-    return {"text": ("\n".join(lines) + "\n") if lines else "", "checks": checks, "statements": statements, "skipped": skipped,
+    statements = [f"db.adminCommand({{killOp: 1, op: {opid}}});" for opid in ids]
+    return {"text": ("\n".join(statements) + "\n") if statements else "", "checks": [], "statements": statements, "skipped": skipped,
             "mode": "killop", "session_ids": ids, "snapshot_us": snapshot_us, "generated_us": generated_us, "hint": "",
             "host": host if ids else "", "connect": connect_command(host) if ids else "",
             "node_id": str(node.get("node_id") or ""), "role": str(node.get("role") or ""), "zone": str(node.get("zone") or "")}

@@ -406,13 +406,30 @@ test('the snapshot line says which nodes were read from the database and which f
   data.nodes[1].fallback = 'direct_connect_failed';
   c.data = data;
   run('sessionsState.data = data; renderSessionsLive()');
-  assert.match(nodes['#sessions-meta'].textContent, /^快照时间 .* · 1 个节点直连库读取，1 个节点直连失败，已回落 DAS$/);
+  assert.match(nodes['#sessions-meta'].textContent, /^快照时间 .* · 1 个节点直连读取，1 个节点直连失败，已回落 DAS$/);
   data.nodes[1].fallback = undefined;
   run('renderSessionsLive()');
-  assert.match(nodes['#sessions-meta'].textContent, /^快照时间 .* · 1 个节点直连库读取$/);
+  assert.match(nodes['#sessions-meta'].textContent, /^快照时间 .* · 1 个节点直连读取$/);
   data.nodes.forEach((node) => { delete node.source; });
   run('renderSessionsLive()');
   assert.doesNotMatch(nodes['#sessions-meta'].textContent, /直连/);
+});
+
+test('MongoDB members read directly count as direct, and a member served from the stored snapshot is named and left out of the headline time', () => {
+  const {run, c, nodes} = context();
+  const data = payload();
+  data.nodes[0].source = 'mongo';
+  data.nodes[1].source = 'das';
+  data.nodes[1].stale_seconds = 47;
+  data.nodes[1].observed_at_us = SNAP - 47_000_000;                                        // older than the node read just now
+  c.data = data;
+  run('sessionsState.data = data; renderSessionsLive()');
+  const text = nodes['#sessions-meta'].textContent;
+  assert.match(text, /· 1 个节点直连读取，1 个节点没有直连通道，沿用 47 秒前的快照$/);
+  assert.ok(text.includes(run('formatTime(' + SNAP + ')')), 'the headline is the time of the node read now, not the stored one');
+  data.nodes[0].status = 'error';                                                            // when only the stored one is left it is the headline
+  run('renderSessionsLive()');
+  assert.ok(nodes['#sessions-meta'].textContent.includes(run('formatTime(' + (SNAP - 47_000_000) + ')')));
 });
 
 test('nothing selected is a message, not a request', async () => {
@@ -756,7 +773,7 @@ test('MongoDB killOp: the request carries connection and command name; one block
   const answer = {engine: 'mongo', mode: 'killop', kills: 1, generated_us: SNAP, text: 'all', checks: [], statements: [], session_ids: [503368306],
     skipped: [{node_id: '100000001', session_id: 7, reason: '驱动探活 / 认证'}],
     nodes: [{node_id: '100000001', role: 'primary', zone: 'cn-example-a', host: HOST1, connect: `mongosh "mongodb://${HOST1}:3717/admin?directConnection=true" -u <账号> -p`,
-      text: 'db.getSiblingDB("admin").aggregate([])\n[[503368306, "conn503368306"]].forEach(<x>)\n', snapshot_us: SNAP, session_ids: [503368306], statements: ['k'], checks: ['c'], skipped: []}]};
+      text: 'db.adminCommand({killOp: 1, op: 503368306});\n', snapshot_us: SNAP, session_ids: [503368306], statements: ['k'], checks: [], skipped: []}]};
   const {run, c, calls, nodes} = context({api: async () => answer});
   c.data = mongoPayload();
   run('sessionsState.data = data; sessionsState.tab = "all"; sessionsState.selected = new Set(["100000001:503368306", "100000001:7"])');
@@ -769,9 +786,11 @@ test('MongoDB killOp: the request carries connection and command name; one block
   assert.equal(nodes['#detail-title'].textContent, 'killOp 语句（MongoDB）');
   const html = nodes['#detail-body'].innerHTML;
   assert.match(html, /直连该成员/);
+  assert.match(html, /只生成 killOp 语句，不执行，没有别的命令/);
+  assert.doesNotMatch(html, /第一行核对|currentOp|forEach|务必先跑核对/);                 // killOp lines only: no check script is announced
   assert.doesNotMatch(html, /data-session-killmode/);                                    // one mode only: killOp
   assert.match(html, /mongosh &quot;mongodb:\/\/dds-example00000001\.mongodb/);
-  assert.match(html, /forEach\(&lt;x&gt;\)/);
+  assert.match(html, /db.adminCommand\(\{killOp: 1, op: 503368306}\);/);
   assert.equal(html.match(/data-session-copy="0"/g).length, 1);
   assert.match(html, /跳过 1 个：7（驱动探活 \/ 认证）/);
   let copied = '';

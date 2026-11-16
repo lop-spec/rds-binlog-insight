@@ -1,4 +1,4 @@
-"""MongoDB session management: members from the cloud, one view per GetMongoDBCurrentOp answer, the guarded killOp text, and
+"""MongoDB session management: members from the cloud, one view per GetMongoDBCurrentOp answer, the killOp text, and
 the RDS service / reader / retention loop routing a dds- instance to them. Payloads follow real DAS / DDS answers (2026-10-22)."""
 import json
 import tempfile
@@ -149,17 +149,14 @@ class KillTextTests(unittest.TestCase):
         return [{"session_id": opid, "connection": desc, "database": "appdb.x", "user": "mongo-go-driver", "command_name": "find"}
                 for opid, desc in pairs]
 
-    def test_one_check_and_one_guarded_kill_line_per_member(self):
+    def test_one_killop_line_per_operation_and_nothing_else(self):
         result = build_mongo_kill_statements(self.node("100000002"), self.rows((-1177661433, "conn2224778"), (5, "conn9"), (5, "conn9")),
                                              snapshot_us=T0, generated_us=T0 + SEC)
         self.assertEqual(result["session_ids"], [-1177661433, 5])
-        self.assertEqual(len(result["checks"]), 1)
-        self.assertIn("{$match: {opid: {$in: [-1177661433, 5]}}}", result["checks"][0])
-        self.assertEqual(len(result["statements"]), 1)
-        kill = result["statements"][0]
-        self.assertTrue(kill.startswith('[[-1177661433, "conn2224778"], [5, "conn9"]].forEach('))
-        self.assertIn("{$match: {opid: op, desc: desc}}", kill)
-        self.assertIn("admin.killOp(op)", kill)
+        self.assertEqual(result["checks"], [])                                  # no check script either
+        self.assertEqual(result["statements"], ["db.adminCommand({killOp: 1, op: -1177661433});", "db.adminCommand({killOp: 1, op: 5});"])
+        self.assertEqual(result["text"], "\n".join(result["statements"]) + "\n")
+        self.assertNotRegex(result["text"], r"currentOp|aggregate|forEach|print|//")
         self.assertEqual(result["host"], HOST2)
         self.assertIn(f"mongodb://{HOST2}:3717/admin?directConnection=true", result["connect"])
 
@@ -245,7 +242,24 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual((result["engine"], result["mode"], result["kills"]), ("mongo", "killop", 2))
         self.assertEqual([(n["node_id"], n["host"]) for n in result["nodes"]], [("100000001", HOST1), ("100000002", HOST2)])
         self.assertTrue(result["text"].startswith(f"// primary 100000001: mongosh \"mongodb://{HOST1}"))
-        self.assertTrue(all("forEach" in n["text"] and "$currentOp" in n["text"] for n in result["nodes"]))
+        self.assertEqual([n["text"] for n in result["nodes"]], ["db.adminCommand({killOp: 1, op: 11});\n", "db.adminCommand({killOp: 1, op: 12});\n"])
+        self.assertEqual(result["checks"], [])
+
+    def test_an_operation_that_moved_to_another_connection_is_not_killed_and_an_older_snapshot_still_works(self):
+        request = {"instance": INSTANCE, "mode": "connection", "nodes": [
+            {"node_id": "100000002", "snapshot_us": T0 - 20 * SEC, "sessions": [{"session_id": 12, "connection": "conn2224778", "database": "appdb.a"}]}]}
+        self.service._wall_us = lambda: T0                                   # the node was read again since the page's snapshot: still the same operation
+        self.assertEqual(self.service.kill_statements(request)["kills"], 1)
+        self.client.answers["100000002"] = {"Data": das(op(12, 218, desc="conn999")), "Success": True}   # the opid is somebody else's now
+        self.live._cache.clear()
+        with self.assertRaises(SessionRequestError) as caught:
+            self.service.kill_statements(request)
+        self.assertEqual(caught.exception.code, "SESSIONS_CHANGED")
+        self.client.answers["100000002"] = {"Data": das(), "Success": True}                                # and one that ended is gone
+        self.live._cache.clear()
+        with self.assertRaises(SessionRequestError) as caught:
+            self.service.kill_statements(request)
+        self.assertEqual(caught.exception.code, "SESSIONS_CHANGED")
 
     def test_status_lists_the_mongo_instances(self):
         self.assertEqual(self.service.status()["mongo"], [{"instance_id": INSTANCE, "nodes": []}])

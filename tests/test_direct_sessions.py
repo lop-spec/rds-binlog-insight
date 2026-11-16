@@ -36,7 +36,7 @@ class FakeCursor:
         self.connection.statements.append(sql)
         self.connection.arguments.append(args)
         if self.connection.fail_query:
-            raise OSError("lost connection")
+            raise self.connection.fail_query if isinstance(self.connection.fail_query, BaseException) else OSError("lost connection")
 
     def fetchall(self):
         return self.connection.rows
@@ -132,6 +132,27 @@ class StatementTests(DirectReaderCase):
         self.assertEqual(connection.arguments[0], [*INTERNAL_USERS, "platform-agent", "x'); DROP TABLE t; --"])   # once each, as parameters
         self.assertNotIn("DROP", connection.statements[0])
 
+    def test_a_proxy_that_does_not_know_node_ids_is_asked_for_the_standby_when_there_is_exactly_one(self):
+        config = {"enabled": True, "instances": {"rm-x": {"primaryHost": PRIMARY_HOST, "standbyHint": "FORCE_SLAVE"}}}
+        one_standby = {"rn-p": ROLES["rn-p"], "rn-a": ROLES["rn-a"]}
+        server = FakeServer({(PROXY_HOST, ""): [row(1, sid=21, ro=1)]})
+        reader(self.tmp.name, server, config=config, roles=one_standby).read("rm-x", "rn-a")
+        statement = server.connections[0].statements[0]
+        self.assertTrue(statement.startswith("/*FORCE_SLAVE*/ SELECT "))
+        self.assertNotIn("FORCE_NODE", statement)
+        with self.assertRaises(DirectSessionError) as caught:                         # two standbys: the hint could mean either
+            reader(self.tmp.name, FakeServer({}), config=config, roles=ROLES).read("rm-x", "rn-a")
+        self.assertEqual(caught.exception.code, "direct_ambiguous_standby")
+
+    def test_a_read_only_account_without_the_process_privilege_is_told_apart(self):
+        denied = type("OperationalError", (Exception,), {})(1227, "Access denied; you need (at least one of) the PROCESS privilege(s) for this operation")
+        server = FakeServer({(PROXY_HOST, "rn-a"): []}, fail_query=denied)
+        with self.assertRaises(DirectSessionError) as caught:
+            reader(self.tmp.name, server).read("rm-x", "rn-a")
+        self.assertEqual(caught.exception.code, "direct_no_process_privilege")
+        self.assertIn("GRANT PROCESS", str(caught.exception))
+        self.assertTrue(server.connections[0].closed)
+
     def test_the_primary_is_read_through_its_own_address_without_a_hint(self):
         server = self.standby_server()
         data = reader(self.tmp.name, server).read("rm-x", "rn-p")
@@ -225,6 +246,7 @@ class ConfigTests(DirectReaderCase):
         for bad in ("not json", "[]", json.dumps({"enabled": "yes", "instances": {}}), json.dumps({"enabled": True, "instances": []}),
                     json.dumps({"enabled": True, "instances": {"rm-x": {}}}), json.dumps({"enabled": True, "instances": {"rm-x": {"primaryHost": "a b;c"}}}),
                     json.dumps({"enabled": True, "instances": {"rm-x": {"primaryHost": PRIMARY_HOST}}, "cacheSeconds": 999}),
+                    json.dumps({"enabled": True, "instances": {"rm-x": {"primaryHost": PRIMARY_HOST, "standbyHint": "FORCE_ANY"}}}),
                     json.dumps({**CONFIG, "excludeUsers": "root"}), json.dumps({**CONFIG, "excludeUsers": [""]}), json.dumps({**CONFIG, "excludeUsers": [1]}),
                     json.dumps({**CONFIG, "excludeUsers": ["x"] * 51})):
             (Path(self.tmp.name) / CONFIG_NAME).write_text(bad, encoding="utf-8")

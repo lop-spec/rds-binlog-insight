@@ -22,6 +22,7 @@ LOGGER = logging.getLogger(__name__)
 
 MAX_HISTORY_DAYS = 31
 MAX_PARALLEL_NODES = 3
+STALE_MAX_SECONDS = 90.0     # a node without a direct path (MongoDB hidden member) in a directly read instance: the retention loop's snapshot will do
 ROLE_ORDER = {"primary": 0, "secondary": 1, "hidden": 2}
 
 
@@ -75,8 +76,10 @@ class SessionService:
 
         def one(node: str) -> dict[str, Any]:
             label = {"node_id": node, **self._role(instance, node)}
+            # the page must not wait ~1 s for DAS on the one member that has no direct path while the others answer in milliseconds
+            max_age = STALE_MAX_SECONDS if source != "das" and self.live.direct_enabled(instance) and not self.live.direct_supports(instance, node) else 0.0
             try:
-                return {**self.live.view(instance, node, build, source), **label}
+                return {**self.live.view(instance, node, build, source, max_age), **label}
             except LiveSessionsError as exc:
                 return {**label, "status": "error", "code": exc.code.upper(), "message": str(exc)}
 
@@ -117,7 +120,7 @@ class SessionService:
         The page's snapshot must be at most 30 s old. What is written comes from a fresh read of the node, not from the rows the
         page sent: every picked session must still be on the node, and a MySQL session must still belong to the same user and
         client address it had when the person picked it (a thread id is not reused while the server runs, so that is the same
-        connection)."""
+        connection); a MongoDB operation must still run on the same connection (``connNNN``)."""
         instance, mode = str(payload.get("instance") or "").strip(), str(payload.get("mode") or "connection")
         nodes = payload.get("nodes")
         if nodes is None:
@@ -144,20 +147,23 @@ class SessionService:
             builder = build_mongo_session_view if mongo else build_session_view
             trusted = self.live.view(instance, node, lambda data, stamp: builder(data, stamp))
             observed = int(trusted['observed_at_us'])
-            if generated_us-observed > 30_000_000 or (mongo and observed != snapshot_us):
+            if generated_us-observed > 30_000_000:
                 raise SessionRequestError('SESSIONS_STALE_SNAPSHOT', '快照已变化，请刷新重新选择；未生成KILL')
             wanted = {row.get('session_id') for row in sessions}
             verified = [row for row in trusted['sessions'] if row['session_id'] in wanted]
             if len({row['session_id'] for row in verified}) != len(wanted):
                 raise SessionRequestError('SESSIONS_CHANGED', '所选会话已不存在，请刷新；未生成KILL')
-            if not mongo:
-                shown = {row.get('session_id'): row for row in sessions}
-                for row in verified:
-                    seen = shown[row['session_id']]
-                    if row['protected']:
-                        continue                                       # skipped below whatever the page said this session was
-                    if str(seen.get('user', row['user'])) != row['user'] or str(seen.get('client', row['client'])) != row['client']:
-                        raise SessionRequestError('SESSIONS_CHANGED', f"会话 {row['session_id']} 已不是你选中的那个连接，请刷新；未生成KILL")
+            shown = {row.get('session_id'): row for row in sessions}
+            for row in verified:
+                seen = shown[row['session_id']]
+                if row['protected']:
+                    continue                                       # skipped below whatever the page said this session was
+                if mongo:
+                    same = str(seen.get('connection', row['connection'])) == row['connection']
+                else:
+                    same = str(seen.get('user', row['user'])) == row['user'] and str(seen.get('client', row['client'])) == row['client']
+                if not same:
+                    raise SessionRequestError('SESSIONS_CHANGED', f"会话 {row['session_id']} 已不是你选中的那个连接，请刷新；未生成KILL")
             sessions = verified
             if mongo:
                 parts.append(build_mongo_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, snapshot_us=snapshot_us,

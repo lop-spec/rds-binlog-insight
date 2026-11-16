@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app.live_sessions import LiveSessionsError
 from app.session_collector import DEFAULT_CONFIG, SessionCollector
-from app.session_service import MAX_HISTORY_DAYS, SessionRequestError, SessionService
+from app.session_service import MAX_HISTORY_DAYS, STALE_MAX_SECONDS, SessionRequestError, SessionService
 from app.session_store import SessionStore
 
 SEC = 1_000_000
@@ -26,9 +26,19 @@ class FakeLive:
     def __init__(self, answers):
         self.answers, self.calls = answers, []
 
-    def view(self, instance, node, build, source="auto"):
+    direct_instances = frozenset()      # instances read directly
+    unsupported = frozenset()           # (instance, node) pairs without a direct path
+
+    def direct_enabled(self, instance):
+        return instance in self.direct_instances
+
+    def direct_supports(self, instance, node):
+        return instance in self.direct_instances and (instance, node) not in self.unsupported
+
+    def view(self, instance, node, build, source="auto", max_age=0.0):
         self.calls.append((instance, node))
         self.sources = getattr(self, "sources", []) + [source]
+        self.max_ages = getattr(self, "max_ages", {}) | {node: max_age}
         answer = self.answers[instance, node]
         if isinstance(answer, BaseException):
             raise answer
@@ -112,6 +122,16 @@ class ServiceTests(unittest.TestCase):
         self.service.overview("rm-x", "rn-b", {"blocking_s": 30, "trx_s": 30, "idle_trx_s": 10}, "das")
         self.assertEqual(self.live.sources, ["auto", "das"])
         self.assertEqual(self.service.status()["direct"], {"enabled": False, "instances": [], "fallbacks": []})
+
+    def test_a_node_without_a_direct_path_may_use_the_retention_snapshot_but_only_when_the_instance_is_read_directly(self):
+        thresholds = {"blocking_s": 30, "trx_s": 30, "idle_trx_s": 10}
+        self.service.overview("rm-x", "", thresholds)
+        self.assertEqual(self.live.max_ages, {"rn-p": 0.0, "rn-a": 0.0, "rn-b": 0.0})            # DAS everywhere: every read is fresh
+        self.live.direct_instances, self.live.unsupported = frozenset({"rm-x"}), frozenset({("rm-x", "rn-a")})
+        self.service.overview("rm-x", "", thresholds)
+        self.assertEqual(self.live.max_ages, {"rn-p": 0.0, "rn-a": STALE_MAX_SECONDS, "rn-b": 0.0})
+        self.service.overview("rm-x", "", thresholds, "das")                                       # DAS asked for on purpose: always fresh
+        self.assertEqual(self.live.max_ages["rn-a"], 0.0)
 
     def test_kill_statements_are_written_never_run_and_leave_a_log_line(self):
         self.service._wall_us = lambda: T0+10*SEC
