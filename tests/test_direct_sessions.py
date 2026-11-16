@@ -111,7 +111,7 @@ class StatementTests(DirectReaderCase):
         self.assertEqual(len(connection.statements), 1)                       # one statement, one round trip
         sql = connection.statements[0]
         self.assertTrue(sql.startswith("/*FORCE_NODE='rn-a'*/ SELECT /*+ MAX_EXECUTION_TIME(5000) */ "))
-        for part in ("information_schema.PROCESSLIST", "information_schema.INNODB_TRX", "trx_autocommit_non_locking = 0", "p.ID <> CONNECTION_ID()", "@@read_only", "@@server_id"):
+        for part in ("information_schema.PROCESSLIST", "information_schema.INNODB_TRX", "t.trx_is_read_only = 0", "p.ID <> CONNECTION_ID()", "@@read_only", "@@server_id"):
             self.assertIn(part, sql)
         arguments = connection.arguments[0]
         self.assertEqual(arguments, list(INTERNAL_USERS))                       # the platform accounts are bound parameters

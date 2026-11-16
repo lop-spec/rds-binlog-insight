@@ -47,14 +47,16 @@ INTERNAL_USERS = ("system user", "event_scheduler", "aliyun_root", "replicator",
 NODE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 HOST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
 # One statement, one round trip: the thread list of the node, each thread's InnoDB transaction (if any), and who answered.
-# Our own thread is left out. An autocommit single SELECT is an InnoDB "transaction" too (trx_autocommit_non_locking = 1);
-# it is a statement, not a transaction somebody forgot to commit, so it carries no transaction fields.
+# Our own thread is left out. Only a read-write transaction counts as one: InnoDB starts every transaction read only and
+# upgrades it on the first write or locking read, so a single autocommit SELECT, or a pooled application connection that ran
+# a SELECT after BEGIN and sits idle, holds nothing and is no transaction somebody forgot to commit. DAS does not report those
+# either (checked against it on a production instance: about ten such idle read-only transactions on the standbys, none in DAS).
 SESSION_SQL = (
     "SELECT /*+ MAX_EXECUTION_TIME({max_ms}) */ @@server_id AS sid, @@read_only AS ro, "
     "p.ID, p.USER, p.HOST, p.DB, p.COMMAND, p.TIME, p.STATE, p.INFO, t.trx_id, "
     "TIMESTAMPDIFF(SECOND, t.trx_started, NOW()) AS trx_s "
     "FROM information_schema.PROCESSLIST p "
-    "LEFT JOIN information_schema.INNODB_TRX t ON t.trx_mysql_thread_id = p.ID AND t.trx_autocommit_non_locking = 0 "
+    "LEFT JOIN information_schema.INNODB_TRX t ON t.trx_mysql_thread_id = p.ID AND t.trx_is_read_only = 0 "
     "WHERE p.ID <> CONNECTION_ID() AND p.USER NOT IN ({users})"
 )
 MAX_EXCLUDED = 50
