@@ -2,7 +2,7 @@
 import threading
 import unittest
 
-from app.live_sessions import (ACTION, DEADLINE_SECONDS, MAX_SESSIONS, POLL_SECONDS, SQL_LIMIT, LiveSessions,
+from app.live_sessions import (ACTION, DEADLINE_SECONDS, MAX_SESSIONS, POLL_SECONDS, LiveSessions,
                                LiveSessionsError, classify_failure, normalize_sessions)
 
 
@@ -61,11 +61,12 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(result["observed_at_us"], 1_790_000_000_000_000)   # the snapshot's own time, not ours
         self.assertFalse(result["truncated"])
 
-    def test_statement_text_is_cut_and_its_length_kept(self):
-        long_sql = "SELECT " + "x" * 5000
+    def test_statement_text_is_kept_without_a_local_cut(self):
+        long_sql = "SELECT '" + "商品🧪" * 5000 + "' LIMIT 50;"
         row = normalize_sessions(finished([session("a", "Query", 1, long_sql)])["Data"], 0)["sessions"][0]
-        self.assertEqual(len(row["sql"]), SQL_LIMIT)
+        self.assertEqual(row["sql"], long_sql)
         self.assertEqual(row["sql_chars"], len(long_sql))
+        self.assertFalse(row["sql_truncated"])
 
     def test_a_long_list_is_capped_and_says_so(self):
         many = [session("a", "Query", i, session_id=i) for i in range(MAX_SESSIONS + 5)]

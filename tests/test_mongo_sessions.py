@@ -49,6 +49,16 @@ def das(*ops):
             "SessionList": list(ops)}
 
 
+class FullCommandTests(unittest.TestCase):
+    def test_full_command_is_retained_and_upstream_truncation_is_explicit(self):
+        command = {"find": "orders", "filter": {"name": "商品🧪" * 5000}}
+        row = build_mongo_session_view(das(op(1, 99, command=command)), T0)["sessions"][0]
+        self.assertEqual(json.loads(row["sql"]), command)
+        self.assertFalse(row["sql_truncated"])
+        row = build_mongo_session_view(das(op(2, 99, command={"$truncated": "{find: orders, filter: ..."})), T0)["sessions"][0]
+        self.assertTrue(row["sql_truncated"])
+
+
 class MembersTests(unittest.TestCase):
     def test_roles_zones_and_only_the_vpc_address(self):
         self.assertEqual(MEMBERS, {

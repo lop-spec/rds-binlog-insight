@@ -1,9 +1,11 @@
 """History of abnormal sessions: merged across snapshots, bounded, and honest about gaps in collection."""
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import closing
 
-from app.session_store import MAX_HISTORY_ROWS, SessionStore
+from app.session_store import MAX_HISTORY_ROWS, SCHEMA, SessionStore
 from app.session_view import build_session_view
 
 SEC = 1_000_000
@@ -112,6 +114,40 @@ class StoreTests(unittest.TestCase):
         history = self.store.history("rm-x", "rn-1", T0, T0)
         self.assertEqual(len(history["sessions"]), 1)
         self.assertEqual(history["coverage"][0]["snapshots"], 1)
+
+    def test_full_unicode_sql_survives_insert_merge_and_reopen(self):
+        sql = "SELECT '" + "商品🧪" * 25000 + "' AS title GROUP BY c_id LIMIT 50;"
+        self.store.record("rm-x", "rn-1", view_at(T0, item(1, "Query", 99, sql=sql)))
+        self.store.record("rm-x", "rn-1", view_at(T0 + 60 * SEC, item(1, "Query", 159, sql=sql)))
+        again = SessionStore(self.store.path)
+        row = again.history("rm-x", "rn-1", T0, T0 + 60 * SEC)["sessions"][0]
+        self.assertEqual((row["sql"], row["sql_chars"], row["sql_truncated"], row["seen"]), (sql, len(sql), False, 2))
+        self.store.record("rm-x", "rn-1", view_at(T0 + 120 * SEC, item(1, "Query", 99, sql="SELECT a_different_statement")))
+        self.assertEqual(self.store.history("rm-x", "rn-1", T0, T0 + 120 * SEC)["sessions"][0]["sql"], sql)
+
+    def test_old_schema_is_migrated_without_inventing_missing_text(self):
+        path = Path(self.tmp.name) / "legacy.sqlite3"
+        with closing(sqlite3.connect(path)) as conn, conn:
+            conn.executescript(SCHEMA)
+            conn.execute("INSERT INTO abnormal (instance,node,session_id,first_us,last_us,seen,user,client,db,command,state,max_seconds,"
+                         "max_trx_seconds,kinds,holder,holder_basis,sql) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         ("rm-x", "rn-1", 1, T0, T0, 1, "app", "10.0.0.1", "shop", "Query", "", 99, 0, '["long_running"]', 0, "", "x" * 2000))
+        store = SessionStore(path)
+        row = store.history("rm-x", "rn-1", T0, T0)["sessions"][0]
+        self.assertEqual(row["sql"], "x" * 2000)
+        self.assertIsNone(row["sql_chars"])
+        self.assertIsNone(row["sql_truncated"])
+        sql = "x" * 2000 + " original tail"
+        store.record("rm-x", "rn-1", view_at(T0 + 60 * SEC, item(1, "Query", 159, sql=sql)))
+        row = SessionStore(path).history("rm-x", "rn-1", T0, T0 + 60 * SEC)["sessions"][0]
+        self.assertEqual((row["sql"], row["sql_chars"], row["sql_truncated"]), (sql, len(sql), False))
+
+    def test_upstream_truncation_metadata_is_retained(self):
+        view = view_at(T0, item(1, "Query", 99, sql="upstream prefix"))
+        view["sessions"][0]["sql_truncated"] = True
+        self.store.record("rm-x", "rn-1", view)
+        row = self.store.history("rm-x", "rn-1", T0, T0)["sessions"][0]
+        self.assertTrue(row["sql_truncated"])
 
     def test_a_reopened_store_keeps_its_rows(self):
         self.store.record("rm-x", "rn-1", view_at(T0, item(1, "Query", 99, sql="kept")))

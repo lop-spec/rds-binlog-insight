@@ -142,12 +142,14 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(result["overview"]["listed_total"], LIST_ACTIVE_LIMIT + 52)
         self.assertEqual([row["session_id"] for row in result["sessions"][:2]], [2, 1])    # abnormal first, longest first
 
-    def test_a_short_list_is_complete_and_sql_is_cut(self):
-        long_sql = "SELECT " + "x" * 5000
+    def test_a_short_list_keeps_the_entire_upstream_statement(self):
+        long_sql = "SELECT '" + "商品🧪" * 5000 + "' AS title LIMIT 50;"
         result = view(item(1, "Query", 1, sql=long_sql))
         row = result["sessions"][0]
         self.assertFalse(result["truncated"])
-        self.assertEqual((len(row["sql"]), row["sql_chars"]), (2000, len(long_sql)))
+        self.assertEqual(row["sql"], long_sql)
+        self.assertEqual(row["sql_chars"], len(long_sql))
+        self.assertFalse(row["sql_truncated"])
 
     def test_the_snapshot_time_is_the_snapshots_own(self):
         self.assertEqual(view(item(1))["observed_at_us"], 1_790_000_000_000_000)

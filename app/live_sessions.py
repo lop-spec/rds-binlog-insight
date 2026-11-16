@@ -22,7 +22,6 @@ DEADLINE_SECONDS = 25.0
 CACHE_SECONDS = 10.0
 MAX_CONCURRENT_READS = 2
 MAX_SESSIONS = 50
-SQL_LIMIT = 2000
 # Commands of sessions that are not running a statement: idle clients, replication and background threads.
 IDLE_COMMANDS = frozenset({"sleep", "daemon", "connect", "binlog dump", "binlog dump gtid"})
 _PERMISSION_WORDS = ("forbidden", "nopermission", "not authorized", "unauthorized", "accessdenied", "http 403")
@@ -71,8 +70,9 @@ def normalize_sessions(data: dict[str, Any], now_us: int) -> dict[str, Any]:
             "command": command,
             "state": str(item.get("State") or ""),
             "seconds": _seconds(item.get("Time")),
-            "sql": sql[:SQL_LIMIT],
+            "sql": sql,
             "sql_chars": len(sql),
+            "sql_truncated": False,
         })
     running.sort(key=lambda row: (-row["seconds"], str(row["session_id"])))
     observed_ms = snapshot.get("TimeStamp") or data.get("Timestamp")

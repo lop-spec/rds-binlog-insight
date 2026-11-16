@@ -19,7 +19,6 @@ from .session_view import KIND_LABELS
 
 LOGGER = logging.getLogger(__name__)
 
-SQL_LIMIT = 2000
 DEFAULT_GAP_US = 5 * 60 * 1_000_000   # a gap longer than this between two sightings makes the same session id a new row
 MAX_HISTORY_ROWS = 500
 
@@ -49,6 +48,12 @@ class SessionStore:
         with closing(self._connect()) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA)
+            # Nullable metadata distinguishes legacy, possibly clipped SQL from new upstream-text captures.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(abnormal)")}
+            for name in ("sql_chars", "sql_truncated"):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE abnormal ADD COLUMN {name} INTEGER")
+            conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=15)
@@ -71,26 +76,32 @@ class SessionStore:
     @staticmethod
     def _merge(conn: sqlite3.Connection, instance: str, node: str, ts_us: int, row: dict[str, Any], gap_us: int) -> None:
         kinds = list(row["kinds"])
-        sql = str(row.get("sql") or "")[:SQL_LIMIT]
+        sql = str(row.get("sql") or "")
+        sql_chars = max(len(sql), int(row.get("sql_chars") or 0))
+        sql_truncated = int(bool(row.get("sql_truncated")) or sql_chars > len(sql))
         previous = conn.execute(
             "SELECT * FROM abnormal WHERE instance=? AND node=? AND session_id=? AND user=? AND client=? AND last_us>=? "
             "ORDER BY last_us DESC LIMIT 1", (instance, node, row["session_id"], row["user"], row["client"], ts_us - gap_us)).fetchone()
         if previous is None:
             conn.execute(
                 "INSERT INTO abnormal (instance,node,session_id,first_us,last_us,seen,user,client,db,command,state,max_seconds,"
-                "max_trx_seconds,kinds,holder,holder_basis,sql) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "max_trx_seconds,kinds,holder,holder_basis,sql,sql_chars,sql_truncated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (instance, node, row["session_id"], ts_us, ts_us, 1, row["user"], row["client"], row["database"], row["command"],
                  row["state"], row["seconds"], row["trx_seconds"], json.dumps(kinds), int(bool(row.get("holder"))),
-                 str(row.get("holder_basis") or ""), sql))
+                 str(row.get("holder_basis") or ""), sql, sql_chars, sql_truncated))
             return
+        # Keep the first statement, but allow its clipped prefix to be completed on a later sighting.
+        # A different statement on a reused connection must not replace the original evidence.
+        if previous["sql"] and not (len(sql) > len(previous["sql"]) and sql.startswith(previous["sql"])):
+            sql, sql_chars, sql_truncated = previous["sql"], previous["sql_chars"], previous["sql_truncated"]
         known = set(json.loads(previous["kinds"])) | set(kinds)
         merged = [kind for kind in KIND_LABELS if kind in known]   # the page's order, not alphabetical
         conn.execute(
             "UPDATE abnormal SET last_us=MAX(last_us,?), seen=seen+1, db=?, command=?, state=?, max_seconds=MAX(max_seconds,?), "
-            "max_trx_seconds=MAX(max_trx_seconds,?), kinds=?, holder=MAX(holder,?), holder_basis=?, sql=? WHERE id=?",
+            "max_trx_seconds=MAX(max_trx_seconds,?), kinds=?, holder=MAX(holder,?), holder_basis=?, sql=?, sql_chars=?, sql_truncated=? WHERE id=?",
             (ts_us, row["database"] or previous["db"], row["command"], row["state"], row["seconds"], row["trx_seconds"],
              json.dumps(merged), int(bool(row.get("holder"))), str(row.get("holder_basis") or previous["holder_basis"]),
-             previous['sql'] or sql, previous["id"]))
+             sql, sql_chars, sql_truncated, previous["id"]))
 
     def history(self, instance: str, node: str, start_us: int, end_us: int, limit: int = MAX_HISTORY_ROWS, cursor: str = '') -> dict[str, Any]:
         """Abnormal sessions seen between two instants (one node, or every node with ``node=""``), lock-holder candidates first and then newest first, and how
@@ -120,6 +131,7 @@ class SessionStore:
                 "seen": row["seen"], "user": row["user"], "client": row["client"], "database": row["db"], "command": row["command"],
                 "state": row["state"], "max_seconds": row["max_seconds"], "max_trx_seconds": row["max_trx_seconds"],
                 "kinds": json.loads(row["kinds"]), "holder": bool(row["holder"]), "holder_basis": row["holder_basis"], "sql": row["sql"],
+                "sql_chars": row["sql_chars"], "sql_truncated": bool(row["sql_truncated"]) if row["sql_truncated"] is not None else None,
             } for row in shown],
             "truncated": len(rows) > limit,
             'next_cursor': json.dumps([shown[-1]['holder'], shown[-1]['first_us'], shown[-1]['id']]) if len(rows) > limit else None,

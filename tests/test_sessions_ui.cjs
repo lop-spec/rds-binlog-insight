@@ -538,6 +538,49 @@ test('mobile session tabs and actions wrap instead of collapsing or clipping', (
   assert.match(css,/\.session-list-head \.session-actions\s*\{[^}]*flex-wrap:\s*wrap/);
 });
 
+test('history SQL opens the selected original, escapes it and copies every character', async () => {
+  const {run, c, nodes} = context();
+  const sql = 'SELECT "<script>x</script>",\n  ' + '商品🧪'.repeat(9000) + '\nGROUP BY c_id LIMIT 50;';
+  c.data = {instance_id: 'rm-x', start_us: SNAP, end_us: SNAP + 60_000_000, nodes: [], coverage: [],
+    sessions: [{...slow, node_id: 'rn-x', first_us: SNAP, last_us: SNAP, max_seconds: 99, sql, sql_chars: Array.from(sql).length, sql_truncated: false}]};
+  run('sessionsState.mode = "history"; sessionsState.history = data');
+  const out = run('sessionHistoryHtml(data)');
+  assert.match(out, /data-session-history-sql="0"/);
+  assert.doesNotMatch(out, /GROUP BY c_id LIMIT 50/); // the list remains a short preview
+  run('sessionsClick({target:{closest:s => s === "[data-session-history-sql]" ? {dataset:{sessionHistorySql:"0"}} : null}})');
+  assert.equal(nodes.drawerShown, true);
+  assert.equal(nodes['#detail-title'].textContent, '会话 SQL 原文');
+  assert.match(nodes['#detail-body'].innerHTML, /GROUP BY c_id LIMIT 50;/);
+  assert.doesNotMatch(nodes['#detail-body'].innerHTML, /<script>x/);
+  assert.match(nodes['#detail-body'].innerHTML, /&lt;script&gt;x&lt;\/script&gt;/);
+  let copied;
+  c.navigator = {clipboard: {writeText: async value => { copied = value; }}};
+  await run('copySessionSql()');
+  assert.equal(copied, sql);
+  c.warningRow = {sql: 'prefix', sql_chars: 5000};
+  assert.equal(run('sessionSqlWarning(warningRow)'), '文本已截断');
+  c.warningRow = {sql: 'legacy', sql_chars: null, sql_truncated: null};
+  assert.equal(run('sessionSqlWarning(warningRow)'), '旧版记录可能截断');
+  c.warningRow = {sql: 'upstream prefix', sql_chars: 15, sql_truncated: true};
+  assert.equal(run('sessionSqlWarning(warningRow)'), '文本已截断');
+});
+
+test('SQL copy falls back on HTTP and never reports a rejected copy as success', async () => {
+  const {run,c,nodes,toasts} = context();
+  c.data = {...slow, sql: 'SELECT 1;'};
+  run('showSessionSql(data)');
+  c.navigator = {clipboard: {writeText: async () => { throw new Error('denied'); }}};
+  let selected = false;
+  nodes['textarea.session-sql-text'] = {select() { selected = true; }};
+  c.document.execCommand = () => true;
+  await run('copySessionSql()');
+  assert.equal(selected, true);
+  assert.deepEqual(toasts.at(-1), ['success', '已复制原文']);
+  c.document.execCommand = () => false;
+  await run('copySessionSql()');
+  assert.equal(toasts.at(-1)[0], 'error');
+});
+
 /* ---------------------------- MongoDB ---------------------------- */
 
 const MONGO = 'dds-example0000000';

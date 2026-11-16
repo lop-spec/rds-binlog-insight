@@ -27,7 +27,6 @@ from typing import Any
 DEFAULT_THRESHOLDS = {"blocking_s": 30, "trx_s": 30, "idle_trx_s": 10}
 # DAS: a session is active when its command is Query or Execute, or when it sits in an unfinished transaction.
 RUNNING_COMMANDS = frozenset({"query", "execute"})
-SQL_LIMIT = 2000
 LIST_ACTIVE_LIMIT = 1000     # rows of one node's list beyond the flagged ones are capped (a node holds ~1200 sessions)
 LIST_OTHER_LIMIT = 1500
 STATS_LIMIT = 30
@@ -126,7 +125,7 @@ def _session(item: dict[str, Any], thresholds: dict[str, int]) -> dict[str, Any]
     return {
         "session_id": session_id, "user": user, "client": str(item.get("Client") or ""), "database": str(item.get("DbName") or ""),
         "command": command, "state": state, "seconds": seconds, "trx_id": trx_id if in_trx else "", "trx_seconds": trx_seconds,
-        "sql": sql[:SQL_LIMIT], "sql_chars": len(sql), "active": running or in_trx, "running": running, "waiting": waiting,
+        "sql": sql, "sql_chars": len(sql), "sql_truncated": False, "active": running or in_trx, "running": running, "waiting": waiting,
         "kinds": kinds, "protected": protected_reason(user, command, session_id), "holder": False,
     }
 

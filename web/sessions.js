@@ -42,6 +42,7 @@ const sessionsState = {
   expanded: new Set(),
   killMode: "connection",
   kill: null,
+  sqlDetail: null,
   mongo: [],
 };
 
@@ -223,6 +224,39 @@ function sessionStatsHtml(data) {
 
 /* ---------------------------- 会话列表 ---------------------------- */
 
+function sessionSqlWarning(row) {
+  if (row.sql_truncated || Number(row.sql_chars) > Array.from(String(row.sql || "")).length) return "文本已截断";
+  if (row.sql_chars == null) return "旧版记录可能截断";
+  return "";
+}
+
+function showSessionSql(row) {
+  if (!row) return;
+  sessionsState.sqlDetail = String(row.sql || "");
+  const warning = sessionSqlWarning(row);
+  $("#detail-title").textContent = sessionsMongoView() ? "会话命令原文" : "会话 SQL 原文";
+  $("#detail-body").innerHTML = `<p class="analytics-note">${escapeHtml(warning || "已保存上游返回的全部文本")} · ${humanCount(Array.from(sessionsState.sqlDetail).length)} 字符。上游未返回的部分无法补齐。</p>
+    <textarea class="session-kill-text session-sql-text" readonly rows="16" spellcheck="false" aria-label="会话原文">${escapeHtml(sessionsState.sqlDetail)}</textarea>
+    <div class="session-kill-actions"><button type="button" class="button primary compact" data-session-copy-sql>复制原文</button></div>`;
+  $("#detail-body").querySelector?.("[data-session-copy-sql]")?.addEventListener("click", copySessionSql);
+  showDetailDrawer();
+}
+
+async function copySessionSql() {
+  const text = sessionsState.sqlDetail;
+  if (text == null) return;
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(text); toast("已复制原文", "success"); return; } catch (_) { /* HTTP pages use selection below. */ }
+    }
+    const area = $("textarea.session-sql-text");
+    if (!area) throw new Error("no text area");
+    area.select();
+    if (!document.execCommand?.("copy")) throw new Error("copy refused");
+    toast("已复制原文", "success");
+  } catch (_) { toast("复制失败，请手动选中文本复制", "error", 6000); }
+}
+
 function sessionRowHtml(row) {
   const key = sessionKey(row);
   const picked = sessionsState.selected.has(key);
@@ -242,7 +276,7 @@ function sessionRowHtml(row) {
     <td>${escapeHtml(row.command)}${row.state ? `<br><span class="muted">${escapeHtml(row.state)}</span>` : ""}</td>
     <td>${escapeHtml(sessionSeconds(row.seconds))}</td>${trx}
     <td>${sessionKindChips(row) || '<span class="muted">—</span>'}</td>
-    <td class="session-sql">${sql ? `<button type="button" class="slow-sql-link" data-session-sql="${escapeHtml(key)}" title="${more || open ? "点击展开 / 收起" : ""}"><code class="sql-cell${open ? " is-open" : ""}">${escapeHtml(shown)}</code></button>` : '<span class="muted">—</span>'}</td>
+    <td class="session-sql">${sql ? `<button type="button" class="slow-sql-link" data-session-sql="${escapeHtml(key)}" title="${more || open ? "点击展开 / 收起" : ""}"><code class="sql-cell${open ? " is-open" : ""}">${escapeHtml(shown)}</code></button><button type="button" class="button ghost compact" data-session-show-sql="${escapeHtml(key)}" title="查看及复制上游原文">原文</button>${sessionSqlWarning(row) ? `<span class="chip warn">${escapeHtml(sessionSqlWarning(row))}</span>` : ""}` : '<span class="muted">—</span>'}</td>
   </tr>`;
 }
 
@@ -485,7 +519,7 @@ function sessionHistoryHtml(data) {
     <ul class="session-holder-list">${lines || "<li>这个窗口里没有任何快照。</li>"}</ul>${thin ? "<span>快照少于应有数量的 70%：留存刚开启，或者那段时间读取失败过。看不到异常不代表当时没有异常。</span>" : ""}</div></div>`;
   const mongo = sessionIsMongo(data.instance_id);
   const labels = sessionLabels(mongo);
-  const rows = (data.sessions || []).map((row) => {
+  const rows = (data.sessions || []).map((row, index) => {
     const span = Math.max(0, Number(row.last_us) - Number(row.first_us));
     const kinds = (row.kinds || []).map((kind) => `<span class="chip warn" title="${escapeHtml(mongo ? "" : SESSION_KIND_HINT[kind] || "")}">${escapeHtml(sessionKindLabel(kind, mongo))}</span>`).join(" ");
     const holder = row.holder ? ' <span class="chip session-holder" title="当时有会话在等锁，这个会话可能是持锁者（推断）">疑似持锁</span>' : "";
@@ -495,7 +529,7 @@ function sessionHistoryHtml(data) {
       `${escapeHtml(sessionTimeText(row.first_us))}<br><span class="muted">→ ${escapeHtml(sessionTimeText(row.last_us))}（${escapeHtml(span ? sessionSeconds(span / 1_000_000) : "单次快照")}）</span>`,
       `${escapeHtml(sessionSeconds(row.max_seconds))}${row.max_trx_seconds ? `<br><span class="muted">事务 ${escapeHtml(sessionSeconds(row.max_trx_seconds))}</span>` : ""}`,
       `${kinds}${holder}`, `${escapeHtml(row.command)}${row.state ? `<br><span class="muted">${escapeHtml(row.state)}</span>` : ""}`,
-      sql ? `<code class="sql-cell">${escapeHtml(sql)}</code>` : '<span class="muted">—</span>',
+      sql ? `<button type="button" class="slow-sql-link" data-session-history-sql="${index}" title="查看及复制留存原文"><code class="sql-cell">${escapeHtml(sql)}</code></button>${sessionSqlWarning(row) ? `<span class="chip warn">${escapeHtml(sessionSqlWarning(row))}</span>` : ""}` : '<span class="muted">—</span>',
       `<button type="button" class="button ghost compact" data-session-around="${escapeHtml(String(row.first_us))}" title="以这一刻为中心看前后 2 分钟里的所有异常会话">同时段</button>`];
   });
   const table = `<div class="session-history-table">${analyticsTable(["节点", labels.id, labels.user, labels.client, labels.database, "首次 → 最后看到", "最长执行", "异常原因", labels.command, labels.sql, ""], rows, `这个窗口里没有留存到异常${mongo ? "操作" : "会话"}`)}</div>`;
@@ -671,6 +705,11 @@ function sessionsClick(event) {
   if (filter) { sessionsFilterBy(filter.dataset.sessionFilter, filter.dataset.sessionValue); return; }
   const clear = find("[data-session-clear]");
   if (clear) { sessionsState.filters[clear.dataset.sessionClear] = ""; renderSessionsLive(); return; }
+  const historySql = find("[data-session-history-sql]");
+  if (historySql) { showSessionSql(sessionsState.history?.sessions?.[Number(historySql.dataset.sessionHistorySql)]); return; }
+  const liveSql = find("[data-session-show-sql]");
+  if (liveSql) { showSessionSql(sessionRows(sessionsState.data).find((row) => sessionKey(row) === liveSql.dataset.sessionShowSql)); return; }
+  if (find("[data-session-copy-sql]")) { copySessionSql(); return; }
   const sql = find("[data-session-sql]");
   if (sql) {
     const key = sql.dataset.sessionSql;

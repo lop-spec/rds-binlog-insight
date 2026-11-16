@@ -30,7 +30,6 @@ from .session_view import DEFAULT_THRESHOLDS, LIST_ACTIVE_LIMIT, LIST_OTHER_LIMI
 
 ACTION = "GetMongoDBCurrentOp"
 DDS_ENDPOINT = "https://mongodb.aliyuncs.com"
-SQL_LIMIT = 2000
 ROLE_NAMES = {"primary": "primary", "secondary": "secondary", "hidden": "hidden"}
 CONNECTION_PATTERN = re.compile(r"conn\d{1,12}")
 HOST_PATTERN = re.compile(r"dds-[a-z0-9-]+\.mongodb\.[a-z0-9-]+\.rds\.aliyuncs\.com")
@@ -170,7 +169,13 @@ def protected_reason(opid: Any, connection: str, namespace: str, driver: str, co
 
 
 def _row(item: dict[str, Any], thresholds: dict[str, int]) -> dict[str, Any]:
-    text, name = command_text(item.get("Command"))
+    raw = item.get("Command")
+    text, name = command_text(raw)
+    try:
+        document = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        document = None
+    source_truncated = isinstance(document, dict) and isinstance(document.get("$truncated"), str)
     opid = _opid(item.get("OpId"))
     connection = str(item.get("Desc") or "")
     namespace = str(item.get("Ns") or "")
@@ -184,7 +189,7 @@ def _row(item: dict[str, Any], thresholds: dict[str, int]) -> dict[str, Any]:
         "session_id": opid, "connection": connection, "connection_id": item.get("ConnectionId"),
         "user": driver, "client": client.rsplit(":", 1)[0] if client.count(":") == 1 else client, "client_port": client.rsplit(":", 1)[-1] if client.count(":") == 1 else "",
         "database": namespace, "command": str(item.get("Op") or ""), "command_name": name, "state": str(item.get("PlanSummary") or ""),
-        "seconds": seconds, "trx_id": "", "trx_seconds": 0, "sql": text[:SQL_LIMIT], "sql_chars": len(text),
+        "seconds": seconds, "trx_id": "", "trx_seconds": 0, "sql": text, "sql_chars": len(text), "sql_truncated": source_truncated,
         "active": active, "running": active, "waiting": False, "kinds": kinds, "protected": protected, "holder": False,
     }
 
