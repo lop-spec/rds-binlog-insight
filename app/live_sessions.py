@@ -1,10 +1,14 @@
 """Sessions of one RDS node as they are right now, read from DAS ``GetMySQLAllSessionAsync`` (a MongoDB member: ``GetMongoDBCurrentOp``).
 
 Slow-log records appear only after a statement finishes, so a query that is still holding the node cannot be seen in them.
-This asks DAS for the node's session list when a person clicks (or when the session retention loop is due), and keeps
+This asks for the node's session list when a person clicks (or when the session retention loop is due), and keeps
 only the last answer for a few seconds. Reads are rate-limited the way a person would not notice: one read per node at a
-time, a short cache shared by every view of the snapshot (running statements, session management, retention), two
-nodes at once at most.
+time, a short cache shared by every view of the snapshot (running statements, session management, retention).
+
+Two sources give the same ``Data`` shape: the database itself (``direct_sessions``: one ``information_schema`` statement,
+tens of milliseconds, used for the instances ``data/session-direct.json`` lists) and DAS (asynchronous, 2-3 s a node, two
+reads at once at most). A direct read that cannot be trusted falls back to DAS for that node and is not tried again for
+30 s (doubling up to 10 minutes while it keeps failing); ``source="das"`` asks for DAS on purpose.
 """
 from __future__ import annotations
 
@@ -12,6 +16,8 @@ import logging
 import threading
 import time
 from typing import Any, Callable
+
+from .direct_sessions import DirectSessionError, DirectSessionReader
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +27,9 @@ POLL_SECONDS = 1.5
 DEADLINE_SECONDS = 25.0
 CACHE_SECONDS = 10.0
 MAX_CONCURRENT_READS = 2
+MAX_DIRECT_READS = 6
+DIRECT_RETRY_SECONDS = 30.0
+DIRECT_RETRY_MAX_SECONDS = 600.0
 MAX_SESSIONS = 50
 # Commands of sessions that are not running a statement: idle clients, replication and background threads.
 IDLE_COMMANDS = frozenset({"sleep", "daemon", "connect", "binlog dump", "binlog dump gtid"})
@@ -95,15 +104,28 @@ class LiveSessions:
     def __init__(self, client_factory: Callable[[str], Any], *, clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep, wall_us: Callable[[], int] = lambda: time.time_ns() // 1000,
                  cache_seconds: float = CACHE_SECONDS, poll_seconds: float = POLL_SECONDS,
-                 deadline_seconds: float = DEADLINE_SECONDS) -> None:
+                 deadline_seconds: float = DEADLINE_SECONDS, direct: DirectSessionReader | None = None) -> None:
         self._client_factory = client_factory
         self._clock, self._sleep, self._wall_us = clock, sleep, wall_us
         self._cache_seconds, self._poll_seconds, self._deadline_seconds = cache_seconds, poll_seconds, deadline_seconds
-        self._cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+        self._direct = direct
+        self._cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
         self._failures = {}
+        self._direct_down: dict[tuple[str, str], tuple[float, str, int]] = {}
         self._locks: dict[tuple[str, str], threading.Lock] = {}
         self._guard = threading.Lock()
         self._gate = threading.BoundedSemaphore(MAX_CONCURRENT_READS)
+        self._direct_gate = threading.BoundedSemaphore(MAX_DIRECT_READS)
+
+    def direct_status(self) -> dict[str, Any]:
+        """Whether sessions are read from the database, for which instances, and the nodes that fell back to DAS just now."""
+        if self._direct is None:
+            return {"enabled": False, "instances": [], "fallbacks": []}
+        config = self._direct.config()
+        now = self._clock()
+        fallbacks = [{"instance_id": instance, "node_id": node, "code": code, "retry_in_seconds": round(until - now), "failures": streak}
+                     for (instance, node), (until, code, streak) in sorted(self._direct_down.items()) if until > now]
+        return {"enabled": bool(config["enabled"]), "instances": sorted(config["instances"]) if config["enabled"] else [], "fallbacks": fallbacks}
 
     def _node_lock(self, key: tuple[str, str]) -> threading.Lock:
         with self._guard:
@@ -113,10 +135,13 @@ class LiveSessions:
         """The statements running on one node (the "看正在跑的查询" view)."""
         return self.view(instance_id, node_id, normalize_sessions)
 
-    def view(self, instance_id: str, node_id: str, build: Callable[[dict[str, Any], int], dict[str, Any]]) -> dict[str, Any]:
-        """One node's snapshot shaped by ``build(data, now_us)``; the read and the cache are shared by every view."""
-        key = (instance_id, node_id)
-        with self._node_lock(key):
+    def view(self, instance_id: str, node_id: str, build: Callable[[dict[str, Any], int], dict[str, Any]], source: str = "auto") -> dict[str, Any]:
+        """One node's snapshot shaped by ``build(data, now_us)``; the read and the cache are shared by every view.
+
+        ``source`` is ``"auto"`` (the database when it is switched on for the instance, else DAS) or ``"das"``."""
+        mode = "das" if source == "das" else "auto"
+        key = (instance_id, node_id, mode)
+        with self._node_lock((instance_id, node_id)):
             failed = self._failures.get(key)
             if failed and self._clock() < failed[0]:
                 raise LiveSessionsError(failed[1], failed[2])
@@ -126,16 +151,44 @@ class LiveSessions:
                 data = hit[1]
             else:
                 try:
-                    with self._gate:
-                        data = self._read(instance_id, node_id)
+                    data, ttl = self._fetch(instance_id, node_id, mode)
                 except LiveSessionsError as exc:
                     self._failures[key] = (self._clock()+10, exc.code, str(exc))
                     raise
                 self._failures.pop(key, None)
-                self._cache[key] = (self._clock() + self._cache_seconds, data)
+                self._cache[key] = (self._clock() + ttl, data)
         payload = build(data, self._wall_us())
         payload.update(instance_id=instance_id, node_id=node_id)
+        payload["source"] = str(data.get("Source") or "das")
+        if data.get("DirectFallback"):
+            payload["fallback"] = data["DirectFallback"]
         return {**payload, "cached": cached}
+
+    def _fetch(self, instance_id: str, node_id: str, mode: str) -> tuple[dict[str, Any], float]:
+        """The node's ``Data`` and how long to keep it: from the database when that is switched on and trustworthy, else DAS."""
+        fallback = ""
+        if mode == "auto" and self._direct is not None and not instance_id.startswith("dds-") and self._direct.enabled_for(instance_id):
+            down = self._direct_down.get((instance_id, node_id))
+            if down and self._clock() < down[0]:
+                fallback = down[1]
+            else:
+                try:
+                    with self._direct_gate:
+                        data = self._direct.read(instance_id, node_id)
+                    self._direct_down.pop((instance_id, node_id), None)
+                    return data, self._direct.cache_seconds()
+                except DirectSessionError as exc:
+                    streak = (down[2] if down else 0) + 1
+                    delay = min(DIRECT_RETRY_SECONDS * 2 ** (streak - 1), DIRECT_RETRY_MAX_SECONDS)
+                    self._direct_down[(instance_id, node_id)] = (self._clock() + delay, exc.code, streak)
+                    LOGGER.warning("live_sessions direct read failed, reading DAS instead: instance=%s node=%s code=%s detail=%s retry_in=%.0fs",
+                                   instance_id, node_id, exc.code, str(exc)[:300], delay)
+                    fallback = exc.code
+        with self._gate:
+            data = self._read(instance_id, node_id)
+        if fallback:
+            data = {**data, "DirectFallback": fallback}
+        return data, self._cache_seconds
 
     def _fail(self, instance_id: str, node_id: str, exc: BaseException) -> LiveSessionsError:
         code = classify_failure(exc)

@@ -185,37 +185,30 @@ class ProtectionTests(unittest.TestCase):
 class KillStatementTests(unittest.TestCase):
     NODE = {"node_id": "rn-lagging", "role": "secondary", "zone": "cn-chengdu-b"}
     HINT = "/*FORCE_NODE='rn-lagging'*/ "
-    CHECK = "SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (44, 312);"
 
     def rows(self):
         return [dict(session_id=312, user="app", client="10.0.0.1", database="shop", command="Sleep", seconds=905, trx_seconds=905,
                      kinds=["long_trx", "idle_trx"]),
                 dict(session_id=44, user="etl", client="10.0.0.9", database="dw", command="Query", seconds=70, trx_seconds=0, kinds=["long_running"])]
 
-    def test_a_standby_gets_one_check_and_one_kill_per_session_and_nothing_else(self):
+    def test_a_standby_gets_one_kill_per_session_and_no_other_statement(self):
         out = build_kill_statements(self.NODE, self.rows(), mode="connection", snapshot_us=1_790_000_000_000_000, generated_us=1_790_000_060_000_000)
-        self.assertEqual(out["text"].splitlines(), [self.HINT + self.CHECK, self.HINT + "KILL 44;", self.HINT + "KILL 312;"])
-        self.assertEqual(out["statements"], [self.HINT + "KILL 44;", self.HINT + "KILL 312;"])
+        self.assertEqual(out["text"].splitlines(), [self.HINT + "KILL 44;", self.HINT + "KILL 312;"])
+        self.assertEqual(out["statements"], out["text"].splitlines())
+        self.assertEqual(out["checks"], [])                                   # no check statement, no lock query: KILL and nothing else
         self.assertEqual((out["session_ids"], out["hint"], out["snapshot_us"]), ([44, 312], "FORCE_NODE='rn-lagging'", 1_790_000_000_000_000))
-        self.assertNotIn("--", out["text"])                                   # no comments: the page says what to look at
-
-    def test_the_lock_check_is_written_only_when_sessions_on_the_node_wait_for_a_lock(self):
-        quiet = build_kill_statements(self.NODE, self.rows(), mode="connection", snapshot_us=1, generated_us=2)
-        self.assertNotIn("schema_table_lock_waits", quiet["text"])
-        busy = build_kill_statements(self.NODE, self.rows(), mode="connection", snapshot_us=1, generated_us=2, lock_waiters=3)
-        self.assertEqual(busy["text"].splitlines(), [self.HINT + self.CHECK, self.HINT + "SELECT * FROM sys.schema_table_lock_waits;",
-                                                     self.HINT + "KILL 44;", self.HINT + "KILL 312;"])
-        for bad in (-1, True, "2", 1.5, None):
-            with self.assertRaises(ValueError):
-                build_kill_statements(self.NODE, self.rows(), mode="connection", snapshot_us=1, generated_us=2, lock_waiters=bad)
+        self.assertNotIn("--", out["text"])                                   # no comments either
+        for line in out["text"].splitlines():
+            self.assertRegex(line, r"^/\*FORCE_NODE='rn-lagging'\*/ KILL \d+;$")
+        self.assertNotRegex(out["text"], r"SELECT|information_schema|sys\.|schema_table_lock_waits|read_only")
 
     def test_query_mode_writes_kill_query(self):
         out = build_kill_statements(self.NODE, self.rows(), mode="query", snapshot_us=1, generated_us=2)
         self.assertEqual(out["statements"], [self.HINT + "KILL QUERY 44;", self.HINT + "KILL QUERY 312;"])
 
-    def test_a_primary_uses_force_master_and_its_check_carries_read_only(self):
+    def test_a_primary_uses_force_master(self):
         out = build_kill_statements({"node_id": "rn-main", "role": "primary", "zone": "cn-chengdu-a"}, self.rows(), mode="connection", snapshot_us=1, generated_us=2)
-        self.assertEqual(out["text"].splitlines(), ["/*FORCE_MASTER*/ " + self.CHECK, "/*FORCE_MASTER*/ KILL 44;", "/*FORCE_MASTER*/ KILL 312;"])
+        self.assertEqual(out["text"].splitlines(), ["/*FORCE_MASTER*/ KILL 44;", "/*FORCE_MASTER*/ KILL 312;"])
         self.assertEqual(out["hint"], "FORCE_MASTER")
 
     def test_protected_sessions_are_skipped_with_the_reason_and_duplicates_collapse(self):
@@ -224,7 +217,7 @@ class KillStatementTests(unittest.TestCase):
         out = build_kill_statements(self.NODE, rows, mode="connection", snapshot_us=1, generated_us=2)
         self.assertEqual(out["session_ids"], [44, 312])
         self.assertEqual(out["skipped"], [{"session_id": 9, "reason": "复制线程（Binlog Dump）"}, {"session_id": 10, "reason": "云内部账号"}])
-        self.assertEqual(out["text"].splitlines()[0], self.HINT + self.CHECK)       # the skipped ids are not in the text at all
+        self.assertEqual(out["text"].splitlines(), [self.HINT + "KILL 44;", self.HINT + "KILL 312;"])   # the skipped ids are not in the text at all
         self.assertNotIn("KILL 9;", out["text"])
         self.assertNotIn("KILL 10;", out["text"])
 
@@ -236,23 +229,18 @@ class KillStatementTests(unittest.TestCase):
         evil = dict(session_id=5, user="x\nKILL 1; --", client="10.0.0.1 */ DROP TABLE t; /*", database="d\r\nSELECT 1;", command="Query KILL 2;",
                     seconds=99, kinds=[])
         out = build_kill_statements({"node_id": "rn-1\nKILL 3;", "role": "primary", "zone": "z\nKILL 4;"}, [evil], mode="connection", snapshot_us=1, generated_us=2)
-        self.assertEqual(out["text"].splitlines(), ["/*FORCE_MASTER*/ SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
-                                                    "FROM information_schema.PROCESSLIST WHERE ID IN (5);", "/*FORCE_MASTER*/ KILL 5;"])
+        self.assertEqual(out["text"].splitlines(), ["/*FORCE_MASTER*/ KILL 5;"])
         self.assertEqual(out["statements"], ["/*FORCE_MASTER*/ KILL 5;"])
 
-    def test_one_text_for_several_nodes_puts_every_check_before_every_kill(self):
+    def test_one_text_for_several_nodes_is_every_nodes_kills_primary_first(self):
         primary = build_kill_statements({"node_id": "rn-main", "role": "primary", "zone": "cn-chengdu-a"}, self.rows()[:1], mode="connection", snapshot_us=1, generated_us=2)
         standby = build_kill_statements(self.NODE, self.rows() + [dict(session_id=9, user="repl", command="Binlog Dump GTID", seconds=1)],
-                                        mode="connection", snapshot_us=3, generated_us=2, lock_waiters=2)
-        self.assertEqual(primary["checks"], ["/*FORCE_MASTER*/ " + self.CHECK.replace("(44, 312)", "(312)")])
+                                        mode="connection", snapshot_us=3, generated_us=2)
+        self.assertEqual(primary["statements"], ["/*FORCE_MASTER*/ KILL 312;"])
         self.assertEqual((primary["node_id"], primary["role"], primary["zone"]), ("rn-main", "primary", "cn-chengdu-a"))
         out = combine_kill_statements([primary, standby], mode="connection", generated_us=2)
-        self.assertEqual(out["text"].splitlines(), [
-            "/*FORCE_MASTER*/ " + self.CHECK.replace("(44, 312)", "(312)"),
-            self.HINT + self.CHECK, self.HINT + "SELECT * FROM sys.schema_table_lock_waits;",
-            "/*FORCE_MASTER*/ KILL 312;", self.HINT + "KILL 44;", self.HINT + "KILL 312;"])
-        self.assertEqual(out["checks"], out["text"].splitlines()[:3])
-        self.assertEqual(out["statements"], out["text"].splitlines()[3:])
+        self.assertEqual(out["text"].splitlines(), ["/*FORCE_MASTER*/ KILL 312;", self.HINT + "KILL 44;", self.HINT + "KILL 312;"])
+        self.assertEqual((out["checks"], out["statements"]), ([], out["text"].splitlines()))
         self.assertEqual(out["session_ids"], [312, 44, 312])                      # the same id on two nodes is two sessions
         self.assertEqual(out["skipped"], [{"node_id": "rn-lagging", "session_id": 9, "reason": "复制线程（Binlog Dump）"}])
         self.assertEqual([(n["node_id"], n["role"], n["hint"], n["snapshot_us"], n["session_ids"], len(n["statements"]), len(n["skipped"])) for n in out["nodes"]],
@@ -264,8 +252,7 @@ class KillStatementTests(unittest.TestCase):
         out = build_kill_statements({"node_id": "rn-1'*/ KILL 3; /*", "role": "secondary", "zone": "z"}, self.rows()[:1], mode="connection", snapshot_us=1, generated_us=2)
         self.assertEqual(out["hint"], "")                                      # the page then asks for a direct connection to the node
         self.assertEqual(out["statements"], ["KILL 312;"])
-        self.assertEqual(out["text"].splitlines(), ["SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (312);",
-                                                    "KILL 312;"])
+        self.assertEqual(out["text"].splitlines(), ["KILL 312;"])
 
     def test_inputs_are_checked(self):
         for kwargs, rows in ((dict(mode="drop"), self.rows()), (dict(mode="connection"), []),

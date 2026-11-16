@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.40.3-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.40.3-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.41.3-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.41.3-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -281,7 +281,7 @@
       <section id="view-sessions" class="view">
         <div class="query-panel">
           <div class="panel-heading">
-            <div><h2>会话管理</h2><p>对齐阿里云会话管理：实时读取 DAS 的会话快照（RDS MySQL 与 MongoDB），列出异常会话和统计。结束会话换成 KILL / killOp 语句，只生成、不执行。</p></div>
+            <div><h2>会话管理</h2><p>对齐阿里云会话管理：实时读取会话快照（RDS MySQL 直连库，失败回落 DAS；MongoDB 读 DAS），列出异常会话和统计。结束会话换成 KILL / killOp 语句，只生成、不执行。</p></div>
             <div class="segmented" id="sessions-modes" aria-label="实时或历史">
               <button data-session-mode="live" class="is-active" type="button">实时</button>
               <button data-session-mode="history" type="button" title="服务后台每分钟留存的异常会话，事后还能看到当时谁持锁">历史（留存）</button>
@@ -536,15 +536,15 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/starrocks.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/instances.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/redis-evidence.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/redis.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/sessions.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.40.3-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.40.3-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/starrocks.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/instances.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/redis-evidence.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/redis.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/sessions.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.41.3-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.41.3-rawoss" defer></script>
 </body>
 </html>

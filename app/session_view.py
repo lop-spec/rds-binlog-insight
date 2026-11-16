@@ -7,9 +7,9 @@ nothing for 10 s (a COMMIT probably forgotten). All of them are derivable from t
 Time, State, TrxId, TrxDuration), so this module computes them itself and adds one thing DAS does not show: when sessions
 wait for a metadata lock, the sessions that can be holding it.
 
-Ending a session is not done here. The service has a read-only cloud identity and no database account, so "kill" is a
-text: ``build_kill_statements`` writes the KILL statements (and the statements to check first) for a person to run on the
-node. Nothing in this module talks to a database.
+Ending a session is not done here. The service has a read-only identity and no account that may kill, so "kill" is a
+text: ``build_kill_statements`` writes the KILL statements, and nothing else, for a person to run on the node. Nothing in
+this module talks to a database.
 
 A cluster-edition instance has no address per node: a person connects to the read/write splitting address, where a plain
 statement lands on a node the proxy picks and the id of a session is only meaningful on its own node. Each statement is
@@ -219,14 +219,12 @@ def route_hint(node: dict[str, Any]) -> tuple[str, str]:
 
 
 def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], *, mode: str, snapshot_us: int,
-                          generated_us: int, lock_waiters: int = 0) -> dict[str, Any]:
-    """The statements to end the given sessions on one node: one check of all of them, the lock check when sessions on the node
-    wait for a lock (``lock_waiters`` > 0), and one KILL per session. Code only, no comments: the page says what to look at.
+                          generated_us: int) -> dict[str, Any]:
+    """The statements to end the given sessions on one node: one KILL per session and nothing else, no check, no comment.
 
     ``sessions`` are rows of a snapshot as the page displayed them; only their integer ids reach the text (and the hint, built
-    from a node id that matched ``NODE_ID_PATTERN``), so a user name cannot smuggle a statement in. The check carries
-    ``@@read_only`` (1 on a standby, 0 on the primary): on the primary's own address a hint is only a comment and the statements
-    run on the primary, and this column is how that shows. Only ``KILL <id>`` and ``KILL QUERY <id>`` are written.
+    from a node id that matched ``NODE_ID_PATTERN``), so a user name cannot smuggle a statement in. Only ``KILL <id>`` and
+    ``KILL QUERY <id>`` are written, each with the node's routing hint (on the primary's own address a hint is only a comment).
     """
     if mode not in ("connection", "query"):
         raise ValueError("mode 必须是 connection 或 query")
@@ -234,8 +232,6 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
         raise ValueError("没有选中会话")
     if len(sessions) > MAX_KILL_SESSIONS:
         raise ValueError(f"一次最多 {MAX_KILL_SESSIONS} 个会话")
-    if isinstance(lock_waiters, bool) or not isinstance(lock_waiters, int) or lock_waiters < 0:
-        raise ValueError("lock_waiters 必须是非负整数")
     keep: dict[int, dict[str, Any]] = {}
     skipped: list[dict[str, Any]] = []
     for row in sessions:
@@ -252,34 +248,22 @@ def build_kill_statements(node: dict[str, Any], sessions: list[dict[str, Any]], 
     verb = "KILL" if mode == "connection" else "KILL QUERY"
     hint_name, hint = route_hint(node)
     ids = sorted(keep)
-    checks: list[str] = []
-    statements: list[str] = []
-    if ids:
-        listing = ", ".join(str(i) for i in ids)
-        read_only = "@@read_only AS ro, " if hint else ""
-        checks.append(hint + f"SELECT {read_only}ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO "
-                      f"FROM information_schema.PROCESSLIST WHERE ID IN ({listing});")
-        if lock_waiters:
-            checks.append(hint + "SELECT * FROM sys.schema_table_lock_waits;")
-        statements.extend(f"{hint}{verb} {session_id};" for session_id in ids)
-    lines = checks + statements
-    return {"text": ("\n".join(lines) + "\n") if lines else "", "checks": checks, "statements": statements, "skipped": skipped,
+    statements = [f"{hint}{verb} {session_id};" for session_id in ids]
+    return {"text": ("\n".join(statements) + "\n") if statements else "", "checks": [], "statements": statements, "skipped": skipped,
             "mode": mode, "session_ids": ids, "snapshot_us": snapshot_us, "generated_us": generated_us, "hint": hint_name,
             "node_id": str(node.get("node_id") or ""), "role": str(node.get("role") or ""), "zone": str(node.get("zone") or "")}
 
 
 def combine_kill_statements(parts: list[dict[str, Any]], *, mode: str, generated_us: int) -> dict[str, Any]:
-    """One text for sessions picked on several nodes: every node's checks first, then every node's KILLs, so a person runs
-    the checks, reads them, then runs the KILLs, whatever node each session is on. Every line keeps its node's hint, so
-    the whole text goes to one connection on the read/write splitting address. ``parts`` are ``build_kill_statements``
-    answers, one per node, in the order the text should follow (the primary first).
+    """One text for sessions picked on several nodes: every node's KILLs, whatever node each session is on. Every line keeps
+    its node's hint, so the whole text goes to one connection on the read/write splitting address. ``parts`` are
+    ``build_kill_statements`` answers, one per node, in the order the text should follow (the primary first).
     """
-    checks = [line for part in parts for line in part["checks"]]
     statements = [line for part in parts for line in part["statements"]]
-    lines = checks + statements
+    lines = statements
     nodes = [{key: part[key] for key in ("node_id", "role", "zone", "hint", "snapshot_us", "session_ids", "statements", "skipped")}
              for part in parts]
-    return {"text": ("\n".join(lines) + "\n") if lines else "", "checks": checks, "statements": statements,
+    return {"text": ("\n".join(lines) + "\n") if lines else "", "checks": [], "statements": statements,
             "skipped": [{"node_id": part["node_id"], **row} for part in parts for row in part["skipped"]],
             "session_ids": [session_id for part in parts for session_id in part["session_ids"]],
             "mode": mode, "generated_us": generated_us, "nodes": nodes}

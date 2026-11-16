@@ -236,7 +236,7 @@ test('a refresh that moves a picked session out of the list drops the pick', () 
   assert.match(run('sessionListHtml()'), /data-session-kill disabled/);
 });
 
-test('KILL statements: one request for every node with what the page showed, each node\'s snapshot time and waiters, and the mode; one text, escaped, copied, regenerated per mode', async () => {
+test('KILL statements: one request for every node with what the page showed, each node\'s snapshot time, and the mode; one text, escaped, copied, regenerated per mode', async () => {
   const written = (url, options) => {
     const body = JSON.parse(options.body);
     const nodes = body.nodes.map((n) => ({node_id: n.node_id, role: n.node_id.startsWith('rn-primary') ? 'primary' : 'secondary', zone: 'cn-example-b',
@@ -263,15 +263,15 @@ test('KILL statements: one request for every node with what the page showed, eac
   const primary = body.nodes.find((n) => n.node_id === 'rn-primary00000001'), standby = body.nodes.find((n) => n.node_id === 'rn-secondary0000b');
   assert.equal(body.nodes.length, 2);
   assert.equal(primary.snapshot_us, SNAP);
-  assert.equal(primary.lock_waiters, 0);                                                   // each node's own waiters decide whether its lock check is written
-  assert.equal(standby.lock_waiters, 16);
+  assert.equal('lock_waiters' in primary || 'lock_waiters' in standby, false);             // no lock check is written any more: nothing to decide
   assert.deepEqual(primary.sessions.map((s) => s.session_id).sort((a, b) => a - b), [9, 44]);
   assert.deepEqual(standby.sessions.map((s) => s.session_id), [312]);
   assert.deepEqual(Object.keys(primary.sessions[0]).sort(), ['client', 'command', 'database', 'kinds', 'seconds', 'session_id', 'trx_seconds', 'user']);
   assert.equal(nodes.drawerShown, true);
   const html = nodes['#detail-body'].innerHTML;
   assert.equal(nodes['#detail-title'].textContent, 'KILL 语句');
-  assert.match(html, /只生成语句，不执行。所有节点的语句合在一起/);
+  assert.match(html, /只生成 KILL 语句，不执行，没有别的 SQL。所有节点的语句合在一起/);
+  assert.doesNotMatch(html, /检查语句|核对语句|先跑|ro<\/code>|schema_table_lock_waits/);       // the text is KILL only, so the page does not send anyone to run a check first
   assert.match(html, /含<strong>主节点<\/strong>的会话：杀错会话会直接影响线上写入/);
   assert.match(html, /跳过 1 个受保护会话：9（复制线程（Binlog Dump））/);
   assert.match(html, /节点 rn-secondary0000b 的 ID 不能写进 Hint/);                         // only the node whose answer had no hint
@@ -296,6 +296,123 @@ test('KILL statements: one request for every node with what the page showed, eac
   assert.deepEqual(copied.split('\n').filter((line) => line.startsWith('KILL ')).sort(), ['KILL 312;', 'KILL 44;', 'KILL 9;']);
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(toasts.some(([kind, message]) => kind === 'success' && /已复制/.test(message)));
+});
+
+function killContext() {
+  const written = (url, options) => {
+    const body = JSON.parse(options.body);
+    const nodes = body.nodes.map((n) => ({node_id: n.node_id, role: 'secondary', zone: 'cn-example-b', hint: 'FORCE_NODE=x', snapshot_us: n.snapshot_us,
+      session_ids: n.sessions.map((s) => s.session_id), statements: n.sessions.map((s) => `KILL ${s.session_id};`), skipped: []}));
+    const statements = nodes.flatMap((n) => n.statements);
+    return {text: `${statements.join('\n')}\n`, checks: [], statements, mode: body.mode, session_ids: [], generated_us: SNAP, nodes, skipped: []};
+  };
+  const listeners = [];
+  const ctx = context({api: async (url, options) => (options ? written(url, options) : {})});
+  ctx.nodes['#detail-drawer'] = {addEventListener(type, handler) { listeners.push([type, handler]); }};
+  ctx.listeners = listeners;
+  ctx.c.data = payload();
+  ctx.run('sessionsState.data = data; sessionsState.tab = "all"; sessionsState.selected = new Set(["rn-secondary0000b:312"])');
+  return ctx;
+}
+const clickOn = (selector, dataset = {}) => ({target: {closest: (wanted) => (wanted === selector ? {dataset} : null)}});
+
+test('the KILL drawer is outside the sessions view, so its copy button and mode switch are wired on the drawer itself', async () => {
+  const sessionsView = html.slice(html.indexOf('<section id="view-sessions"'), html.indexOf('</section>', html.indexOf('<section id="view-sessions"')));
+  assert.ok(html.includes('id="detail-drawer"') && !sessionsView.includes('id="detail-drawer"'), 'the drawer is not part of #view-sessions');
+  const {run, listeners, calls, toasts, c} = killContext();
+  run('initSessionsView()');
+  const onDrawer = listeners.filter(([type]) => type === 'click');
+  assert.equal(onDrawer.length, 1, 'one click listener on the drawer');
+  const handler = onDrawer[0][1];
+  await run('generateSessionKill()');
+  // the copy button inside the drawer reaches the copy
+  let copied = '';
+  c.navigator = {clipboard: {writeText: async (text) => { copied = text; }}};
+  handler(clickOn('[data-session-copy]', {sessionCopy: ''}));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(copied, 'KILL 312;\n');
+  assert.deepEqual(toasts.at(-1), ['success', '已复制 KILL 语句']);
+  // so does the KILL / KILL QUERY switch: it asks for the text again with the other mode
+  const before = calls.length;
+  handler(clickOn('[data-session-killmode]', {sessionKillmode: 'query'}));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls.length, before + 1);
+  assert.equal(JSON.parse(calls.at(-1)[1].body).mode, 'query');
+  // a click on something else in a drawer (another page's content) does nothing here
+  handler({target: {closest: () => null}});
+  assert.equal(calls.length, before + 1);
+});
+
+test('a KILL / KILL QUERY switch the server refuses (an old snapshot) leaves the mode and the text as they were', async () => {
+  let refuse = false;
+  const answer = {text: '/*FORCE_NODE=x*/ KILL 312;\n', checks: [], statements: ['/*FORCE_NODE=x*/ KILL 312;'], mode: 'connection', session_ids: [312], generated_us: SNAP,
+    nodes: [{node_id: 'rn-secondary0000b', role: 'secondary', zone: 'cn-example-b', hint: 'FORCE_NODE=x', snapshot_us: SNAP, session_ids: [312], statements: ['k'], skipped: []}], skipped: []};
+  const {run, nodes} = (() => {
+    const ctx = context({api: async () => { if (refuse) throw new Error('快照已过期，请刷新并重新核对；未生成KILL'); return answer; }});
+    ctx.c.data = payload();
+    ctx.run('sessionsState.data = data; sessionsState.tab = "all"; sessionsState.selected = new Set(["rn-secondary0000b:312"])');
+    return ctx;
+  })();
+  await run('generateSessionKill()');
+  assert.match(nodes['#detail-body'].innerHTML, /data-session-killmode="connection" class="is-active"/);
+  refuse = true;
+  await assert.rejects(run('regenerateSessionKill("query")'), /快照已过期/);
+  assert.equal(run('sessionsState.killMode'), 'connection');
+  assert.match(nodes['#detail-body'].innerHTML, /data-session-killmode="connection" class="is-active"/);
+});
+
+test('the sessions view no longer handles the drawer buttons a second time', async () => {
+  const {run, calls, toasts, c} = killContext();
+  await run('generateSessionKill()');
+  c.navigator = {clipboard: {writeText: async () => {}}};
+  const copies = toasts.length, requests = calls.length;
+  run('sessionsClick({target: {closest: (s) => s === "[data-session-copy]" ? {dataset: {sessionCopy: ""}} : s === "[data-session-killmode]" ? {dataset: {sessionKillmode: "query"}} : null}})');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(toasts.length, copies);
+  assert.equal(calls.length, requests);
+});
+
+test('copying the KILL text over plain http selects the text and asks the browser to copy it, and says so when the browser refuses', async () => {
+  const {run, c, nodes, toasts} = killContext();
+  await run('generateSessionKill()');
+  assert.equal(c.navigator, undefined, 'there is no async clipboard on http');
+  let selected = 0, range = null;
+  nodes['textarea.session-kill-text'] = {focus() {}, select() { selected += 1; }, setSelectionRange(from, to) { range = [from, to]; }};
+  c.document.execCommand = (command) => command === 'copy';
+  await run('copySessionKill()');
+  assert.equal(selected, 1);
+  assert.deepEqual(range, [0, 'KILL 312;\n'.length]);
+  assert.deepEqual(toasts.at(-1), ['success', '已复制 KILL 语句']);
+  c.document.execCommand = () => false;                                                  // the browser refuses: never report success
+  await run('copySessionKill()');
+  assert.equal(toasts.at(-1)[0], 'error');
+  assert.match(toasts.at(-1)[1], /文本已选中，请按 Ctrl\+C/);
+  assert.equal(selected, 2);                                                              // the text stays selected for Ctrl+C
+  c.document.execCommand = () => { throw new Error('not allowed'); };
+  await run('copySessionKill()');
+  assert.equal(toasts.at(-1)[0], 'error');
+  // a rejected async clipboard falls back to the selection as well
+  c.navigator = {clipboard: {writeText: async () => { throw new Error('denied'); }}};
+  c.document.execCommand = () => true;
+  await run('copySessionKill()');
+  assert.deepEqual(toasts.at(-1), ['success', '已复制 KILL 语句']);
+});
+
+test('the snapshot line says which nodes were read from the database and which fell back to DAS', () => {
+  const {run, c, nodes} = context();
+  const data = payload();
+  data.nodes[0].source = 'mysql';
+  data.nodes[1].source = 'das';
+  data.nodes[1].fallback = 'direct_connect_failed';
+  c.data = data;
+  run('sessionsState.data = data; renderSessionsLive()');
+  assert.match(nodes['#sessions-meta'].textContent, /^快照时间 .* · 1 个节点直连库读取，1 个节点直连失败，已回落 DAS$/);
+  data.nodes[1].fallback = undefined;
+  run('renderSessionsLive()');
+  assert.match(nodes['#sessions-meta'].textContent, /^快照时间 .* · 1 个节点直连库读取$/);
+  data.nodes.forEach((node) => { delete node.source; });
+  run('renderSessionsLive()');
+  assert.doesNotMatch(nodes['#sessions-meta'].textContent, /直连/);
 });
 
 test('nothing selected is a message, not a request', async () => {

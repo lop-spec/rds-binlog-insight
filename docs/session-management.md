@@ -1,6 +1,6 @@
 # 会话管理
 
-对齐阿里云 DAS 的「会话管理」：实时看每个节点的会话、异常会话和统计；**结束会话换成 KILL 语句**——服务只有云上只读身份、没有数据库账号，所以只生成语句（连同核对语句）让人在节点上执行，自己不执行任何 kill。另外后台每分钟留存异常会话，事后还能看到「当时谁持锁」。
+对齐阿里云 DAS 的「会话管理」：实时看每个节点的会话、异常会话和统计；**结束会话换成 KILL 语句**——服务没有能 kill 的账号，所以只生成 KILL 语句（没有别的 SQL）让人在节点上执行，自己不执行任何 kill。另外后台每分钟留存异常会话，事后还能看到「当时谁持锁」。
 
 ## 页面
 
@@ -32,23 +32,21 @@
 - 有未结束事务，事务时长 ≥ 最久等待者已等的时间（`holder_basis = transaction`）；
 - 或是正在运行的语句，执行时间 ≥ 最久等待者已等的时间（`holder_basis = statement`）。
 
-这只是按时长推断，DAS 的接口不给阻塞关系。要确切知道是谁，用生成 KILL 语句时附带的核对语句在节点上查 `sys.schema_table_lock_waits`（`performance_schema.metadata_locks`）。**先杀持锁者，不是等待者。** 10-14 事件里那个持锁的空闲事务就是这一类：它不在慢日志里（慢日志要等语句结束），在会话快照里是一个 Sleep 会话，事务时长超过那条 DDL 已等的时间。
+这只是按时长推断，DAS 的接口不给阻塞关系。要确切知道是谁，得在节点上自己查（本页不生成查询语句；2026-11-16 在生产实例实测，6 个节点的 `performance_schema` 都是关的，`metadata_locks` 和 `sys.schema_table_lock_waits` 都查不到）。**先杀持锁者，不是等待者。** 10-14 事件里那个持锁的空闲事务就是这一类：它不在慢日志里（慢日志要等语句结束），在会话快照里是一个 Sleep 会话，事务时长超过那条 DDL 已等的时间。
 
 ## KILL 语句
 
-勾选会话（表头的复选框一次选中 / 取消本页全部可结束的会话，受保护的不选）→「生成 KILL 语句」，不管会话在几个节点上，都合成**一段**文本（`POST /api/sessions/kill-statements` 一次请求，`nodes` 里每个节点带页面当时显示的那些行、该节点的快照时间和当时等锁的会话数 `lock_waiters`，服务端不会再读 DAS，也不连数据库）。勾选只对屏幕上的列表有效：换页签、改关键词或最短时长、排序、翻页、刷新后，不在屏幕上的勾选会被去掉，所以文本里只有看得见的会话。文本只有代码、没有注释，顺序是先全部检查、再全部 KILL，主节点的在前，每条自带所属节点的 Hint，所以在同一个读写分离地址的连接上从头到尾执行即可：
+勾选会话（表头的复选框一次选中 / 取消本页全部可结束的会话，受保护的不选）→「生成 KILL 语句」，不管会话在几个节点上，都合成**一段**文本（`POST /api/sessions/kill-statements` 一次请求，`nodes` 里每个节点带页面当时显示的那些行和该节点的快照时间；老页面还会带 `lock_waiters`，服务端忽略它。服务端按这些会话号重新读一次节点，只写仍在该节点上、用户和来源地址与你选中时一致的会话，不是你选中的那个连接就拒绝）。勾选只对屏幕上的列表有效：换页签、改关键词或最短时长、排序、翻页、刷新后，不在屏幕上的勾选会被去掉，所以文本里只有看得见的会话。文本只有 KILL 语句（每个会话一行，没有检查查询、没有注释），主节点的在前，每条自带所属节点的 Hint，所以在同一个读写分离地址的连接上从头到尾执行即可：
 
-1. 每个节点一条检查，查该节点全部选中的会话：`SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN (…)`。`ro` 备节点应为 1、主节点应为 0，会话对得上再杀；
-2. 只有该节点快照里有会话在等锁（`lock_waiters` > 0）时才有：`SELECT * FROM sys.schema_table_lock_waits;`；
-3. 每个会话一行 `KILL <id>;`（或 `KILL QUERY <id>;`，只终止当前语句，对空闲会话无效），全部节点的连在一起。
+- `KILL <id>;`（结束连接并回滚它没提交的事务），或 `KILL QUERY <id>;`（只终止当前语句，连接和事务还在，对空闲事务无效）；全部节点的连在一起，别的语句一条都没有。
 
-杀完再跑检查：无结果=已杀掉。检查没结果、或 `ro` 不对，说明这条连接不是读写分离（代理）地址、或 Hint 没生效，别杀。
+1.41.3 起去掉了原来的检查语句（`@@read_only` 与 `information_schema.PROCESSLIST` 核对、`sys.schema_table_lock_waits`）：只要 KILL。读写分离地址上 Hint 没生效时，`KILL` 可能落到别的节点；想确认落点，可以在同一连接上自己查一次 `@@server_id`、`@@read_only`。
 
-规则：文本里只有整数会话号和 Hint，用户名、来源、库等不进文本（页面表格里看），所以塞不进第二条语句；一次最多 200 个、重复会话号合并；**受保护的会话不生成**——复制线程（`Binlog Dump*`）、`system user` / `Daemon` / `Connect` 系统线程、`event_scheduler`、`aliyun_` 开头和 `aliyun_root` 的云内部账号、没有会话号的行——页面在文本下面写明跳过了哪些、为什么（接口返回的 `skipped`）。选中的会话含主节点的时多一句红字提醒。生成动作只在服务日志留一行（实例、节点列表、模式、个数，不含 SQL；写明「nothing was executed」）。
+规则：文本里只有整数会话号和 Hint，用户名、来源、库等不进文本（页面表格里看），所以塞不进第二条语句；复制按钮在 HTTP 页面上（没有异步剪贴板）改为选中文本再让浏览器复制，浏览器拒绝时文本保持选中、提示按 Ctrl+C；一次最多 200 个、重复会话号合并；**受保护的会话不生成**——复制线程（`Binlog Dump*`）、`system user` / `Daemon` / `Connect` 系统线程、`event_scheduler`、`aliyun_` 开头和 `aliyun_root` 的云内部账号、没有会话号的行——页面在文本下面写明跳过了哪些、为什么（接口返回的 `skipped`）。选中的会话含主节点的时多一句红字提醒。生成动作只在服务日志留一行（实例、节点列表、模式、个数，不含 SQL；写明「nothing was executed」）。
 
 ### 路由 Hint
 
-集群系列的实例没有每个节点各自的地址，平时只连读写分离地址：普通语句落到代理挑的节点，而会话号只在它所在的节点有意义——核对语句查不到会话、KILL 报 `Unknown thread id`，都是这个原因。所以每条语句都带阿里云读写分离的 Hint：备节点 `/*FORCE_NODE='<节点 ID>'*/`，主节点 `/*FORCE_MASTER*/`。直连节点或主地址时它只是注释；用 mysql 命令行要加 `-c`，否则 Hint 会被命令行工具过滤；节点 ID 只有符合 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` 才会写进 Hint，否则不带 Hint、文本里写明「请连到这个节点执行」。
+集群系列的实例没有每个节点各自的地址，平时只连读写分离地址：普通语句落到代理挑的节点，而会话号只在它所在的节点有意义——KILL 报 `Unknown thread id`，是这个原因。所以每条语句都带阿里云读写分离的 Hint：备节点 `/*FORCE_NODE='<节点 ID>'*/`，主节点 `/*FORCE_MASTER*/`。直连节点或主地址时它只是注释；用 mysql 命令行要加 `-c`，否则 Hint 会被命令行工具过滤；节点 ID 只有符合 `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` 才会写进 Hint，否则不带 Hint、文本里写明「请连到这个节点执行」。
 
 实测过的（2026-10-14 / 15，只读账号和 DBX）：
 
@@ -89,6 +87,17 @@
 
 文本里只有整数 opid 和匹配 `connNNN` 的连接号，客户端发来的内容进不了代码。killOp 只结束操作、连接保留，没有 KILL / KILL QUERY 两种模式；执行账号要有 `killop` 权限（只读账号不行）。隐藏节点没有地址，不生成，提示到 DAS 控制台的会话管理里结束。
 
+## 读取方式：直连库（1.41.3 起）
+
+DAS 的 `GetMySQLAllSessionAsync` 是异步接口（先发起、再每 1.5 秒轮询），一个节点 2–3 秒，六个节点并发只开 2 路，冷读一次约 7 秒。同样的事实一条 `information_schema` 语句就能查到，所以 RDS MySQL 节点改为**直连数据库读取**，DAS 只做回落。线上实测（生产实例，6 节点、每节点约 2100 个会话）：一次查询 20–60 ms，6 节点并行约 0.2 秒。
+
+- **语句**：每个节点一条 `SELECT`（没有 KILL、DDL、SET）：`information_schema.PROCESSLIST` 左连 `INNODB_TRX`（`trx_mysql_thread_id = ID` 且 `trx_autocommit_non_locking = 0`：单条自动提交 SELECT 是语句不是事务），带 `@@server_id`、`@@read_only`，去掉本连接和 RDS 平台账号（`system user` / `event_scheduler` / `aliyun_root` / `replicator` / `rdsadmin` / `rdsinternal` / `rdsrepl`，再加配置文件 `excludeUsers` 里登记的本部署专有账号——DAS 也不列它们，在生产实例上对过；账号名作为绑定参数传入，不拼进语句），加 `MAX_EXECUTION_TIME(5000)`。结果整理成和 DAS 快照一样的 `Data`（`SessionList` 的 `SessionId / User / Client / DbName / Command / State / Time / SqlText`，在事务里才有 `TrxId / TrxDuration`），实时视图、会话管理、留存、KILL 文本都不用改。
+- **账号和地址**：复用 `schema-instances.json`（`RDS_BINLOG_SCHEMA_CONFIG`）里该实例的只读账号（权限 `SELECT, PROCESS, SHOW VIEW`）和读写分离地址；备节点走该地址并带 `/*FORCE_NODE='<节点 ID>'*/`，主节点不在这个只读代理的节点列表里（`FORCE_NODE` 报 `force hint server node is not found`），改连实例自己的地址 `primaryHost`。不新增凭据、不存任何新口令。
+- **开关**：`data/session-direct.json`，没有这个文件就不直连。每次改动后自动重读，不用重启：`{"enabled": true, "instances": {"<实例 ID>": {"primaryHost": "<实例主地址>"}}, "excludeUsers": ["<本部署专有的平台账号>"], "cacheSeconds": 3, "connectTimeoutSeconds": 3, "readTimeoutSeconds": 8, "maxExecutionMs": 5000}`（`excludeUsers` 和后四项可省，范围见 `app/direct_sessions.py`）。`{"enabled": false}` 或删文件立即回到 DAS；只列出的实例才直连，MongoDB 成员不适用。
+- **读不到就回落**：没有凭据 / 角色未知 / 连不上 / 查询失败 / 落点不对（`@@read_only` 与角色不符，或同实例另一个节点已用过这个 `@@server_id`——说明 Hint 没送到）都读 DAS，节点的 `fallback` 写原因码，页面快照行写「N 个节点直连失败，已回落 DAS」。该节点之后 30 秒内不再试直连（连续失败翻倍，最长 10 分钟），日志只在失败那一刻写一条 WARNING（`direct read failed, reading DAS instead`）。
+- **缓存**：直连结果缓存 3 秒（DAS 仍是 10 秒），页面、实时视图、留存循环和 KILL 核对共用。
+- **和 DAS 的差别**：事务字段来自 `INNODB_TRX`，只有真正在事务里的会话才有 `TrxId`；DAS 和库内读取不在同一时刻，时长 0–1 秒的瞬时事务两边可能不一致，不影响三类异常的判定。`performance_schema` 在 6 个节点都是关的，所以仍然没有精确的元数据锁持有者。
+
 ## 留存
 
 后台线程 `session-retention`，随服务启动，默认开启（MongoDB 实例的每个成员同样每分钟读一次、存「操作运行过久」的操作）：**每 60 秒、每个节点读一次**（一个节点每 `interval / 节点数` 秒轮到，至少间隔 5 秒），只留主实例的节点，异常会话和疑似持锁会话存 7 天。它和页面共用同一个读取器（`LiveSessions`），所以共用 10 秒缓存和「同时最多读两个节点」的限制；读的是已登记采集慢日志的节点，不会对别的实例用云身份。
@@ -105,10 +114,10 @@
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/sessions?instance=&nodeId=&blockingSeconds=&trxSeconds=&idleTrxSeconds=` | 实例（或一个节点）的会话视图；`nodeId` 留空读该实例全部已登记节点，最多 3 个并行。每个节点 `status: ok` 带 `overview` / `holders` / `stats` / `sessions` / `truncated` / `observed_at_us` / `cached`，失败的带 `code` / `message`；`partial` 表示有节点失败 |
+| `GET /api/sessions?instance=&nodeId=&blockingSeconds=&trxSeconds=&idleTrxSeconds=&source=` | 实例（或一个节点）的会话视图；`source=das` 强制读 DAS（默认自动：开了直连的实例读库，失败回落 DAS），每个节点带 `source`（`mysql` / `das`）和直连失败时的 `fallback` 原因码；`nodeId` 留空读该实例全部已登记节点，最多 3 个并行。每个节点 `status: ok` 带 `overview` / `holders` / `stats` / `sessions` / `truncated` / `observed_at_us` / `cached`，失败的带 `code` / `message`；`partial` 表示有节点失败 |
 | `GET /api/sessions/history?instance=&nodeId=&startEpochUs=&endEpochUs=&limit=` | 留存的异常会话（默认最近 1 小时，窗口不超过 31 天，最多 500 条）、每个节点的快照覆盖、节点标签和留存状态 |
-| `GET /api/sessions/status` | 留存线程状态 |
-| `POST /api/sessions/kill-statements` | 生成 KILL 语句，`{instance, mode: connection|query, nodes: [{node_id, snapshot_us, lock_waiters, sessions: [...]}, …]}`（顶层直接给 `node_id` / `snapshot_us` / `lock_waiters` / `sessions` 是单节点写法），所有节点合成一段：返回 `text`（先全部检查、再全部 KILL，主节点在前）/ `checks` / `statements` / `session_ids` / `skipped`（每条带 `node_id`）/ `nodes`（每个节点的 `role` / `hint`（节点 ID 不能写进 Hint 时为空，页面提示直连）/ `snapshot_us` / `session_ids` / `statements` / `skipped`） |
+| `GET /api/sessions/status` | 留存线程状态，和 `direct`（直连读取是否开、哪些实例、哪些节点刚回落到 DAS 及原因） |
+| `POST /api/sessions/kill-statements` | 生成 KILL 语句，`{instance, mode: connection|query, nodes: [{node_id, snapshot_us, sessions: [...]}, …]}`（顶层直接给 `node_id` / `snapshot_us` / `sessions` 是单节点写法），所有节点合成一段：返回 `text`（全部 KILL，主节点在前）/ `checks`（恒为空）/ `statements` / `session_ids` / `skipped`（每条带 `node_id`）/ `nodes`（每个节点的 `role` / `hint`（节点 ID 不能写进 Hint 时为空，页面提示直连）/ `snapshot_us` / `session_ids` / `statements` / `skipped`） |
 
 所有接口只接受已登记采集慢日志的（实例，节点），否则 400（`SESSIONS_UNKNOWN_INSTANCE` / `SESSIONS_UNKNOWN_NODE`）；错误码 `DAS_PERMISSION_DENIED`（403 语义，节点级）、`DAS_THROTTLED`、`DAS_TIMEOUT` / `DAS_UNREACHABLE` / `DAS_FAILED` 写在节点的 `code` 里。
 
@@ -117,9 +126,9 @@
 - 不调用 DAS 的结束会话 API（`CreateKillInstanceSessionTask`）：它必填数据库账号和密码，RAM 动作是写权限且不能限定到某个实例，`NodeId` 文档只写给 PolarDB 用，而 8769 没有登录；要做得先有鉴权、专用的最小权限库账号和审计。
 - 不做 SQL 限流、自动限流（DAS 的写操作，本服务只有只读身份）、10 秒 SQL 分析和 SQL 优化（DAS 云端能力；慢日志和分析洞察里已有对应的证据）。
 - 访问保护：1.39.2 起敏感 API 默认只允许回环 TCP 对端；部署可在私有 `data/http-access.json` 显式登记隔离 worker 网络。公网匿名请求一律拒绝，Host、Origin 和 X-Forwarded-For 不能替代身份。公网登录方式和 HTTPS 入口需由部署方另行审定；没有该入口时只用受控 SSH 转发。此边界不授予任何数据库写入或 KILL 权限。
-- 会话号只在同一个节点、同一次服务进程里有意义：节点重启后号会重来，所以核对语句必须先跑。8.0.28 上有过被 KILL 的空闲会话没释放元数据锁的情况（实例现为 8.0.36），杀完用 `sys.schema_table_lock_waits` 确认锁真的没了。
+- 会话号只在同一个节点、同一次服务进程里有意义：节点重启后号会重来，服务端因此在生成前按「会话号 + 用户 + 来源地址」重新核对。8.0.28 上有过被 KILL 的空闲会话没释放元数据锁的情况（实例现为 8.0.36），杀完用 `sys.schema_table_lock_waits` 确认锁真的没了。
 - 留存是每分钟一次的采样：不到一分钟的异常可能漏掉；留存刚开启或某节点读取失败的时间窗有缺口，页面会标出来。
 
 ## 验证
 
-`python -m unittest tests.test_session_view tests.test_session_store tests.test_session_collector tests.test_session_service tests.test_live_sessions tests.test_mongo_sessions tests.test_server_roles_and_windows -q`；`node --test tests/test_sessions_ui.cjs tests/test_workspace.cjs`。用线上节点的真实 DAS 快照回放过判定（事务字段只在有事务的会话上出现、`TrxId` 为 `"0"` 的 Sleep 不算事务、`Binlog Dump GTID` 被保护、运行中会话数与接口的 `ActiveSessionCount` 一致）。
+`python -m unittest tests.test_direct_sessions tests.test_session_view tests.test_session_store tests.test_session_collector tests.test_session_service tests.test_live_sessions tests.test_mongo_sessions tests.test_server_roles_and_windows -q`；`node --test tests/test_sessions_ui.cjs tests/test_workspace.cjs`。用线上节点的真实 DAS 快照回放过判定（事务字段只在有事务的会话上出现、`TrxId` 为 `"0"` 的 Sleep 不算事务、`Binlog Dump GTID` 被保护、运行中会话数与接口的 `ActiveSessionCount` 一致）。

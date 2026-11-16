@@ -66,7 +66,8 @@ from .sync_lifecycle import CollectorLease
 from .sync_watchdog import SyncWatchdog
 from .query_tasks import QueryTaskManager
 from .rds_api import RdsApiError, RdsRpcClient
-from .schema_diff import SchemaDiffError, SchemaDiffService
+from .schema_diff import SchemaDiffError, SchemaDiffService, load_instances
+from .direct_sessions import DirectSessionReader
 from .storage import EventStorage
 from .tabularis_audit import AuditIngestError, TabularisAuditIngest
 from .http_access import load_networks, peer_allowed, validate_event_query
@@ -409,7 +410,10 @@ class Application:
                 raise RuntimeError(f"读不到凭据: target={base.credential_target}")
             return DasRpcClient(replace(base, db_instance_id=instance_id, endpoint=DAS_ENDPOINT), credential, timeout=20)
 
-        self.live_sessions = LiveSessions(das_client)
+        # Sessions are read from the database itself where data/session-direct.json switches that on (the read-only account of schema-instances.json),
+        # and from DAS otherwise or when a direct read cannot be trusted.
+        self.direct_sessions = DirectSessionReader(self.data_dir, instances=load_instances, roles=lambda instance: self.node_roles.lookup(instance))
+        self.live_sessions = LiveSessions(das_client, direct=self.direct_sessions)
         from .mongo_collector import DdsClient
         from .mongo_service import MongoService
         self.mongo = MongoService(self.data_dir, self.metadata.load_settings, self.sync.archive_for_settings)
@@ -1426,7 +1430,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if node_id and not NODE_ID_RE.fullmatch(node_id):
                     raise SessionRequestError("SESSIONS_UNKNOWN_NODE", "Node ID 格式无效")
                 thresholds = parse_thresholds({name: _query_value(query, name) for name in ("blockingSeconds", "trxSeconds", "idleTrxSeconds")})
-                self._json({"ok": True, "data": self.app.sessions.overview(_query_value(query, "instance").strip(), node_id, thresholds)})
+                source = _query_value(query, "source").strip().lower() or "auto"
+                if source not in ("auto", "das"):
+                    raise SessionRequestError("SESSIONS_BAD_SOURCE", "source 只能是 auto 或 das")
+                self._json({"ok": True, "data": self.app.sessions.overview(_query_value(query, "instance").strip(), node_id, thresholds, source)})
             elif parsed.path == "/api/sessions/history":
                 node_id = _query_value(query, "nodeId").strip()
                 if node_id and not NODE_ID_RE.fullmatch(node_id):

@@ -65,8 +65,9 @@ class SessionService:
         return sorted(known, key=lambda node: (ROLE_ORDER.get(self._role(instance, node)["role"], 2), node))
 
     # -- the page -------------------------------------------------------------
-    def overview(self, instance: str, node_id: str, thresholds: dict[str, int]) -> dict[str, Any]:
-        """Every wanted node's session view, read in parallel (the reader still lets only two reads run at once)."""
+    def overview(self, instance: str, node_id: str, thresholds: dict[str, int], source: str = "auto") -> dict[str, Any]:
+        """Every wanted node's session view, read in parallel (``source="das"`` forces the DAS read, which still lets only two
+        reads run at once; the default reads the database directly where that is switched on)."""
         nodes = self._resolve(instance, node_id)
         engine = "mongo" if is_mongo(instance) else "mysql"
         builder = build_mongo_session_view if engine == "mongo" else build_session_view
@@ -75,7 +76,7 @@ class SessionService:
         def one(node: str) -> dict[str, Any]:
             label = {"node_id": node, **self._role(instance, node)}
             try:
-                return {**self.live.view(instance, node, build), **label}
+                return {**self.live.view(instance, node, build, source), **label}
             except LiveSessionsError as exc:
                 return {**label, "status": "error", "code": exc.code.upper(), "message": str(exc)}
 
@@ -105,16 +106,22 @@ class SessionService:
         except Exception:  # noqa: BLE001 - the RDS part of the page must not depend on it
             LOGGER.warning("session management: MongoDB members unavailable", exc_info=True)
             mongo = []
-        return {**self.collector.status(), "mongo": mongo}
+        return {**self.collector.status(), "mongo": mongo, "direct": self.live.direct_status()}
 
     # -- ending sessions is a text -------------------------------------------
     def kill_statements(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """One text for every node in ``payload["nodes"]`` (``{node_id, snapshot_us, lock_waiters, sessions}`` each); a payload
-        with ``node_id`` and ``sessions`` at the top is the one-node form of the same request."""
+        """One text of KILL statements for every node in ``payload["nodes"]`` (``{node_id, snapshot_us, sessions}`` each; a
+        ``lock_waiters`` from an older page is ignored); a payload with ``node_id`` and ``sessions`` at the top is the one-node
+        form of the same request.
+
+        The page's snapshot must be at most 30 s old. What is written comes from a fresh read of the node, not from the rows the
+        page sent: every picked session must still be on the node, and a MySQL session must still belong to the same user and
+        client address it had when the person picked it (a thread id is not reused while the server runs, so that is the same
+        connection)."""
         instance, mode = str(payload.get("instance") or "").strip(), str(payload.get("mode") or "connection")
         nodes = payload.get("nodes")
         if nodes is None:
-            nodes = [{key: payload[key] for key in ("node_id", "snapshot_us", "lock_waiters", "sessions") if key in payload}]
+            nodes = [{key: payload[key] for key in ("node_id", "snapshot_us", "sessions") if key in payload}]
         if not isinstance(nodes, list) or not nodes or not all(isinstance(item, dict) for item in nodes):
             raise ValueError("nodes 必须是非空的节点数组")
         known, generated_us = self._known(instance), self._wall_us()
@@ -137,19 +144,27 @@ class SessionService:
             builder = build_mongo_session_view if mongo else build_session_view
             trusted = self.live.view(instance, node, lambda data, stamp: builder(data, stamp))
             observed = int(trusted['observed_at_us'])
-            if generated_us-observed > 30_000_000 or observed != snapshot_us:
+            if generated_us-observed > 30_000_000 or (mongo and observed != snapshot_us):
                 raise SessionRequestError('SESSIONS_STALE_SNAPSHOT', '快照已变化，请刷新重新选择；未生成KILL')
             wanted = {row.get('session_id') for row in sessions}
             verified = [row for row in trusted['sessions'] if row['session_id'] in wanted]
             if len({row['session_id'] for row in verified}) != len(wanted):
                 raise SessionRequestError('SESSIONS_CHANGED', '所选会话已不存在，请刷新；未生成KILL')
+            if not mongo:
+                shown = {row.get('session_id'): row for row in sessions}
+                for row in verified:
+                    seen = shown[row['session_id']]
+                    if row['protected']:
+                        continue                                       # skipped below whatever the page said this session was
+                    if str(seen.get('user', row['user'])) != row['user'] or str(seen.get('client', row['client'])) != row['client']:
+                        raise SessionRequestError('SESSIONS_CHANGED', f"会话 {row['session_id']} 已不是你选中的那个连接，请刷新；未生成KILL")
             sessions = verified
             if mongo:
                 parts.append(build_mongo_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, snapshot_us=snapshot_us,
                                                          generated_us=generated_us))
                 continue
             parts.append(build_kill_statements({'route_by_identity': True, "node_id": node, **self._role(instance, node)}, sessions, mode=mode, snapshot_us=snapshot_us,
-                                               generated_us=generated_us, lock_waiters=item.get("lock_waiters", 0)))
+                                               generated_us=generated_us))
         parts.sort(key=lambda part: (ROLE_ORDER.get(part["role"], 3), part["node_id"]))
         if mongo:
             mode = "killop"

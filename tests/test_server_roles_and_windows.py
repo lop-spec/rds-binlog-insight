@@ -341,8 +341,8 @@ class FakeSessions:
             raise self.error
         return {"called": name}
 
-    def overview(self, instance, node_id, thresholds):
-        return self._go("overview", instance, node_id, dict(thresholds))
+    def overview(self, instance, node_id, thresholds, source="auto"):
+        return self._go("overview", instance, node_id, dict(thresholds), source)
 
     def history(self, instance, node_id, start_us, end_us, limit):
         return self._go("history", instance, node_id, start_us, end_us, limit)
@@ -365,14 +365,17 @@ class SessionEndpointTests(unittest.TestCase):
         sessions = FakeSessions()
         payload = get(self.app(sessions), "/api/sessions?instance=rm-x&nodeId=rn-1&blockingSeconds=45&idleTrxSeconds=5")
         self.assertEqual((payload["ok"], payload["data"]), (True, {"called": "overview"}))
-        self.assertEqual(sessions.calls, [("overview", "rm-x", "rn-1", {"blocking_s": 45, "trx_s": 30, "idle_trx_s": 5})])
+        self.assertEqual(sessions.calls, [("overview", "rm-x", "rn-1", {"blocking_s": 45, "trx_s": 30, "idle_trx_s": 5}, "auto")])
         get(self.app(sessions), "/api/sessions?instance=rm-x")
         self.assertEqual(sessions.calls[-1][2], "")          # no node means every collected node of the instance
+        get(self.app(sessions), "/api/sessions?instance=rm-x&source=DAS")
+        self.assertEqual(sessions.calls[-1][-1], "das")      # the source is only auto or das
 
     def test_bad_thresholds_and_node_ids_are_refused_before_anything_is_read(self):
         sessions = FakeSessions()
         for query, status, code in (("blockingSeconds=0", 400, "INVALID_REQUEST"), ("trxSeconds=abc", 400, "INVALID_REQUEST"),
-                                    ("nodeId=rn-1%27%3B--", 400, "SESSIONS_UNKNOWN_NODE")):
+                                    ("nodeId=rn-1%27%3B--", 400, "SESSIONS_UNKNOWN_NODE"), ("source=mysql", 400, "SESSIONS_BAD_SOURCE"),
+                                    ("source=das%27", 400, "SESSIONS_BAD_SOURCE")):
             got, body = get_error(self.app(sessions), f"/api/sessions?instance=rm-x&{query}")
             self.assertEqual((got, body["error"]["code"]), (status, code), query)
         self.assertEqual(sessions.calls, [])

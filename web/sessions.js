@@ -2,8 +2,8 @@
 
 /* 会话管理（RDS）：对齐阿里云 DAS 的会话管理——实例会话（异常 / 运行中 / 总数 / 最长运行）、会话统计（按用户 / 来源 / 数据库）、
    会话列表、三类异常会话（语句运行超过 30 秒、事务超过 30 秒、事务开启后 10 秒没再执行语句）；另加一项 DAS 没有的：有会话在等锁时，
-   按快照推断「疑似持锁」的会话。实时部分每次点刷新才读 DAS；历史部分是服务后台每分钟留存的异常会话。
-   「结束会话」换成 KILL 语句：服务只有云上只读身份、没有数据库账号，所以本页只生成语句（带核对语句和路由 Hint）让你执行，自己不执行任何 kill。
+   按快照推断「疑似持锁」的会话。实时部分每次点刷新才读（RDS 直连库读 information_schema，失败回落 DAS）；历史部分是服务后台每分钟留存的异常会话。
+   「结束会话」换成 KILL 语句：服务没有能 kill 的账号，所以本页只生成 KILL 语句（每条带路由 Hint，没有别的 SQL）让你执行，自己不执行任何 kill。
    MongoDB（dds- 实例）共用这一页：DAS GetMongoDBCurrentOp 每个成员一份，一行是一个操作（opid），异常只有「操作运行过久」；
    结束会话换成每个成员一段 mongosh 文本（核对 + 按 opid 与连接号双重匹配才 killOp），要直连该成员执行。 */
 
@@ -94,7 +94,7 @@ function sessionKindChips(row) {
   const chips = (row.kinds || []).map((kind) => `<span class="chip warn" title="${escapeHtml(sessionsMongoView() ? "操作已运行超过阈值（默认 30 秒）" : SESSION_KIND_HINT[kind] || "")}">${escapeHtml(sessionKindLabel(kind))}</span>`);
   if (row.holder) {
     const basis = row.holder_basis === "statement" ? "运行中的语句" : "未结束的事务";
-    chips.push(`<span class="chip session-holder" title="有会话在等锁，这个会话的${basis}比最久的等待者更早开始，可能是持锁者；只是按快照推断，准确的用核对语句在节点上查">疑似持锁</span>`);
+    chips.push(`<span class="chip session-holder" title="有会话在等锁，这个会话的${basis}比最久的等待者更早开始，可能是持锁者；只是按快照推断，不是确证">疑似持锁</span>`);
   }
   if (row.protected) chips.push(`<span class="chip" title="${escapeHtml(row.protected)}：不生成 ${sessionsMongoView() ? "killOp" : "KILL"} 语句">受保护</span>`);
   return chips.join(" ");
@@ -196,7 +196,7 @@ function sessionHolderHtml(data) {
   if (!lines.length) return "";
   return `<div class="notice warning compact-notice session-holders"><svg viewBox="0 0 24 24"><path d="M12 3 2 21h20L12 3Z"/><path d="M12 9v5M12 18h.01"/></svg><div><strong>有会话在等锁</strong>
     <ul class="session-holder-list">${lines.join("")}</ul>
-    <span>推断只用快照里的时长：持有元数据锁的会话一定早于最久的等待者。要确切知道是谁，生成 KILL 语句时附带的核对语句（performance_schema 的 metadata_locks）在节点上查一下。先杀持锁者，不是等待者。</span></div></div>`;
+    <span>推断只用快照里的时长：持有元数据锁的会话一定早于最久的等待者。要确切知道是谁，得在节点上查 performance_schema 的 metadata_locks（本页不生成查询语句）。先杀持锁者，不是等待者。</span></div></div>`;
 }
 
 function sessionStatsHtml(data) {
@@ -242,19 +242,26 @@ function showSessionSql(row) {
   showDetailDrawer();
 }
 
+// The async clipboard API exists only on https and localhost, and this page is served over plain http: there a copy selects the
+// read-only textarea and asks the browser to copy the selection. When the browser refuses, the text stays selected for Ctrl+C.
+async function copyText(text, area) {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(text); return true; } catch (_) { /* fall back to the selection */ }
+  }
+  if (!area) return false;
+  try {
+    area.focus?.();
+    area.select();
+    area.setSelectionRange?.(0, String(text).length);
+    return Boolean(document.execCommand?.("copy"));
+  } catch (_) { return false; }
+}
+
 async function copySessionSql() {
   const text = sessionsState.sqlDetail;
   if (text == null) return;
-  try {
-    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-      try { await navigator.clipboard.writeText(text); toast("已复制原文", "success"); return; } catch (_) { /* HTTP pages use selection below. */ }
-    }
-    const area = $("textarea.session-sql-text");
-    if (!area) throw new Error("no text area");
-    area.select();
-    if (!document.execCommand?.("copy")) throw new Error("copy refused");
-    toast("已复制原文", "success");
-  } catch (_) { toast("复制失败，请手动选中文本复制", "error", 6000); }
+  if (await copyText(text, $("textarea.session-sql-text"))) toast("已复制原文", "success");
+  else toast("复制失败，请手动选中文本复制", "error", 6000);
 }
 
 function sessionRowHtml(row) {
@@ -418,13 +425,23 @@ function sessionsQueryString() {
   return params.toString();
 }
 
+function sessionSourceText(data) {
+  const ok = data.nodes.filter((node) => node.status === "ok");
+  const direct = ok.filter((node) => node.source === "mysql").length;
+  const fallback = ok.filter((node) => node.fallback).length;
+  const parts = [];
+  if (direct) parts.push(`${humanCount(direct)} 个节点直连库读取`);
+  if (fallback) parts.push(`${humanCount(fallback)} 个节点直连失败，已回落 DAS`);
+  return parts.length ? ` · ${parts.join("，")}` : "";
+}
+
 function renderSessionsLive() {
   const data = sessionsState.data;
   $("#sessions-live").hidden = false;
   $("#sessions-history").hidden = true;
   if (!data) return;
   const when = Math.min(...data.nodes.filter((node) => node.status === "ok").map((node) => Number(node.observed_at_us) || Infinity));
-  $("#sessions-meta").textContent = Number.isFinite(when) ? `快照时间 ${formatTime(when)}${data.partial ? " · 有节点读取失败" : ""}` : "没有读到任何节点";
+  $("#sessions-meta").textContent = Number.isFinite(when) ? `快照时间 ${formatTime(when)}${sessionSourceText(data)}${data.partial ? " · 有节点读取失败" : ""}` : "没有读到任何节点";
   $("#sessions-summary").innerHTML = sessionSummaryHtml(data);
   $("#sessions-holders").innerHTML = sessionHolderHtml(data);
   $("#sessions-stats").innerHTML = sessionStatsHtml(data);
@@ -589,7 +606,7 @@ async function generateSessionKill() {
   const nodes = [...byNode].map(([nodeId, picked]) => {
     const node = sessionsState.data.nodes.find((item) => item.node_id === nodeId);
     return {
-      node_id: nodeId, snapshot_us: node.observed_at_us, lock_waiters: Number(node.holders?.waiters) || 0,
+      node_id: nodeId, snapshot_us: node.observed_at_us,
       sessions: picked.map((row) => ({ session_id: row.session_id, user: row.user, client: row.client, database: row.database, command: row.command,
         seconds: row.seconds, trx_seconds: row.trx_seconds, kinds: row.kinds, ...(row.connection ? { connection: row.connection, command_name: row.command_name } : {}) })),
     };
@@ -617,12 +634,12 @@ function sessionKillHtml() {
   if (item.engine === "mongo") return mongoKillHtml(item);
   const modes = `<div class="segmented" id="sessions-kill-mode"><button type="button" data-session-killmode="connection" class="${mode === "connection" ? "is-active" : ""}" title="KILL：结束连接并回滚它没提交的事务">KILL（结束会话）</button><button type="button" data-session-killmode="query" class="${mode === "query" ? "is-active" : ""}" title="KILL QUERY：只终止当前语句，连接和事务还在，对空闲事务无效">KILL QUERY（只终止语句）</button></div>`;
   const nodes = item.nodes || [];
-  const warn = nodes.some((node) => node.role === "primary") ? '<p class="session-kill-warn">含<strong>主节点</strong>的会话：杀错会话会直接影响线上写入，务必先跑检查语句。</p>' : "";
+  const warn = nodes.some((node) => node.role === "primary") ? '<p class="session-kill-warn">含<strong>主节点</strong>的会话：杀错会话会直接影响线上写入，执行前请再核对一遍会话号。</p>' : "";
   const unrouted = nodes.filter((node) => node.hint === "");
   const unroutedNote = unrouted.length ? `<p class="session-kill-warn">节点 ${escapeHtml(unrouted.map((node) => node.node_id).join("、"))} 的 ID 不能写进 Hint：它的语句请直连该节点执行。</p>` : "";
   const skipped = (item.skipped || []).length ? `<p class="analytics-note">跳过 ${humanCount(item.skipped.length)} 个受保护会话：${escapeHtml(item.skipped.map((row) => `${row.session_id}（${row.reason}）`).join("、"))}。</p>` : "";
   const chips = nodes.map((node) => `<span class="session-kill-node">${sessionNodeChip(node)}<span class="muted">${humanCount(node.statements.length)} 条 · 快照 ${escapeHtml(sessionTimeText(node.snapshot_us))}</span></span>`).join("");
-  return `<p class="analytics-note">只生成语句，不执行。所有节点的语句合在一起，每条自带该节点的路由 Hint，在同一个读写分离（代理）地址的连接上按顺序执行就行（主地址上 Hint 只是注释）。先跑开头的检查：<code>ro</code> 备节点应为 1、主节点为 0，会话对得上再跑后面的 KILL；杀完再跑检查，无结果=已杀。</p>
+  return `<p class="analytics-note">只生成 KILL 语句，不执行，没有别的 SQL。所有节点的语句合在一起，每条自带该节点的路由 Hint，在同一个读写分离（代理）地址的连接上按顺序执行就行（主地址上 Hint 只是注释）。</p>
     ${modes}<section class="detail-block">${warn}${unroutedNote}<div class="session-kill-nodes">${chips}</div>
       <textarea class="session-kill-text" readonly rows="${Math.min(32, Math.max(8, String(item.text).split("\n").length + 1))}" spellcheck="false" aria-label="KILL 语句">${escapeHtml(item.text)}</textarea>
       <div class="session-kill-actions"><button type="button" class="button primary compact" data-session-copy${item.statements.length ? "" : " disabled"}>复制语句</button>
@@ -636,22 +653,20 @@ function showSessionKill() {
 }
 
 async function regenerateSessionKill(mode) {
+  const previous = sessionsState.killMode;
   sessionsState.killMode = mode;
-  await generateSessionKill();
+  try { await generateSessionKill(); } catch (error) { sessionsState.killMode = previous; throw error; }   // the text on screen is still the old mode's
 }
 
-function copySessionKill(index = "") {
+async function copySessionKill(index = "") {
   const item = sessionsState.kill;
   if (!item) return;
   const block = item.engine === "mongo" ? (item.nodes || []).filter((node) => node.text)[Number(index) || 0] : null;
   const text = block ? block.text : item.text;
-  const done = () => toast(block ? "已复制这一段 killOp 语句" : "已复制 KILL 语句", "success");
-  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(text).then(done, () => toast("复制失败，请手动选中文本复制", "error", 6000));
-    return;
-  }
-  const area = $$("textarea.session-kill-text")[Number(index) || 0] || $("textarea.session-kill-text");
-  if (area) { area.select(); document.execCommand?.("copy"); done(); }
+  const areas = $$("#detail-body textarea.session-kill-text");
+  const area = areas[Number(index) || 0] || areas[0] || $("textarea.session-kill-text");
+  if (await copyText(text, area)) toast(block ? "已复制这一段 killOp 语句" : "已复制 KILL 语句", "success");
+  else toast("浏览器拒绝了复制，文本已选中，请按 Ctrl+C", "error", 6000);
 }
 
 function sessionCsvCell(value) {
@@ -721,16 +736,22 @@ function sessionsClick(event) {
   if (page) { sessionsState.page = Math.max(0, sessionsState.page + Number(page.dataset.sessionPage)); renderSessionsList(); return; }
   if (find("[data-session-export]")) { exportActiveSessions(); return; }
   if (find("[data-session-kill]")) { generateSessionKill().catch((error) => toast(error.message, "error", 6000)); return; }
-  const killMode = find("[data-session-killmode]");
-  if (killMode) { regenerateSessionKill(killMode.dataset.sessionKillmode).catch((error) => toast(error.message, "error", 6000)); return; }
-  const copy = find("[data-session-copy]");
-  if (copy) { copySessionKill(copy.dataset.sessionCopy); return; }
   const around = find("[data-session-around]");
   if (around) {
     const at = Number(around.dataset.sessionAround);
     setSessionHistoryWindow(at - 120_000_000, at + 120_000_000);
     loadSessionHistory().catch((error) => toast(error.message, "error", 6000));
   }
+}
+
+// The KILL text is drawn into the shared detail drawer, which sits outside #view-sessions: a click inside it never reaches
+// sessionsClick, so the drawer has its own listener (until 1.41.3 the copy button and the KILL / KILL QUERY switch did nothing).
+function sessionsDrawerClick(event) {
+  const find = (selector) => event.target.closest?.(selector);
+  const killMode = find("[data-session-killmode]");
+  if (killMode) { regenerateSessionKill(killMode.dataset.sessionKillmode).catch((error) => toast(error.message, "error", 6000)); return; }
+  const copy = find("[data-session-copy]");
+  if (copy) copySessionKill(copy.dataset.sessionCopy);
 }
 
 function sessionsChange(event) {
@@ -774,6 +795,7 @@ function initSessionsView() {
   syncSessionControls();
   const view = $("#view-sessions");
   view?.addEventListener("click", sessionsClick);
+  $("#detail-drawer")?.addEventListener("click", sessionsDrawerClick);
   view?.addEventListener("change", sessionsChange);
   view?.addEventListener("input", sessionsInput);
   $("#sessions-form")?.addEventListener("submit", async (event) => {

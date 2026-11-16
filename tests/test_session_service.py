@@ -26,12 +26,16 @@ class FakeLive:
     def __init__(self, answers):
         self.answers, self.calls = answers, []
 
-    def view(self, instance, node, build):
+    def view(self, instance, node, build, source="auto"):
         self.calls.append((instance, node))
+        self.sources = getattr(self, "sources", []) + [source]
         answer = self.answers[instance, node]
         if isinstance(answer, BaseException):
             raise answer
         return {**build(answer, 5), "instance_id": instance, "node_id": node, "cached": False}
+
+    def direct_status(self):
+        return {"enabled": False, "instances": [], "fallbacks": []}
 
 
 class ServiceTests(unittest.TestCase):
@@ -103,19 +107,71 @@ class ServiceTests(unittest.TestCase):
         rows = [dict(session_id=2, user="app", client="10.0.0.1", database="shop", command="Sleep", seconds=90, trx_seconds=90, kinds=["idle_trx"])]
         return {"instance": "rm-x", "node_id": "rn-b", "mode": "connection", "snapshot_us": T0, "sessions": rows, **extra}
 
+    def test_the_source_reaches_the_reader_and_the_status_says_how_sessions_are_read(self):
+        self.service.overview("rm-x", "rn-b", {"blocking_s": 30, "trx_s": 30, "idle_trx_s": 10})
+        self.service.overview("rm-x", "rn-b", {"blocking_s": 30, "trx_s": 30, "idle_trx_s": 10}, "das")
+        self.assertEqual(self.live.sources, ["auto", "das"])
+        self.assertEqual(self.service.status()["direct"], {"enabled": False, "instances": [], "fallbacks": []})
+
     def test_kill_statements_are_written_never_run_and_leave_a_log_line(self):
         self.service._wall_us = lambda: T0+10*SEC
         with self.assertLogs("app.session_service", "INFO") as logs:
             out = self.service.kill_statements(self.payload())
         self.assertEqual(out["statements"], ["/*FORCE_NODE='rn-b'*/ KILL 2;"])
+        self.assertEqual(out["text"], "/*FORCE_NODE='rn-b'*/ KILL 2;\n")             # the KILL and nothing else
         self.assertEqual([(node["node_id"], node["role"], node["hint"], node["snapshot_us"]) for node in out["nodes"]], [("rn-b", "secondary", "FORCE_NODE='rn-b'", T0)])
-        self.assertNotIn("schema_table_lock_waits", out["text"])                   # nobody waits for a lock on this node: no lock check
-        self.assertIn("schema_table_lock_waits", self.service.kill_statements(self.payload(lock_waiters=3))["text"])
         self.assertIn("nothing was executed", logs.output[0])
         self.assertIn("nodes=rn-b mode=connection sessions=1", logs.output[0])
-        self.assertEqual(self.live.calls, [('rm-x','rn-b'),('rm-x','rn-b')])  # authoritative snapshots only; no KILL execution
+        self.assertEqual(self.live.calls, [('rm-x', 'rn-b')])  # one authoritative read; no KILL execution
 
-    def test_sessions_on_several_nodes_are_one_request_and_one_text_every_check_first_primary_first(self):
+    def test_a_lock_waiters_field_from_an_older_page_is_ignored(self):
+        self.service._wall_us = lambda: T0+10*SEC
+        for value in (3, 0, -1, True, "2", None):
+            out = self.service.kill_statements(self.payload(lock_waiters=value))
+            self.assertEqual(out["text"], "/*FORCE_NODE='rn-b'*/ KILL 2;\n")
+
+    def test_a_snapshot_the_node_has_moved_past_still_works_when_the_sessions_are_the_same_connections(self):
+        # the node was read again after the page's snapshot (a database read is a few milliseconds old, not 10 s): same sessions, newer time
+        self.service._wall_us = lambda: T0+25*SEC
+        self.answers["rm-x", "rn-b"]["SessionData"]["TimeStamp"] = (T0 + 20 * SEC) // 1000
+        out = self.service.kill_statements(self.payload())
+        self.assertEqual(out["statements"], ["/*FORCE_NODE='rn-b'*/ KILL 2;"])
+
+    def test_a_session_that_is_gone_or_became_another_connection_is_not_killed(self):
+        self.service._wall_us = lambda: T0+10*SEC
+        self.answers["rm-x", "rn-b"] = das(idle_trx(3, 90))
+        with self.assertRaises(SessionRequestError) as caught:
+            self.service.kill_statements(self.payload())
+        self.assertEqual(caught.exception.code, "SESSIONS_CHANGED")
+        other_user = dict(idle_trx(2, 90), User="someone-else")
+        other_client = dict(idle_trx(2, 90), Client="10.9.9.9")
+        for changed in (other_user, other_client):
+            self.answers["rm-x", "rn-b"] = das(changed)
+            with self.assertRaises(SessionRequestError) as caught:
+                self.service.kill_statements(self.payload())
+            self.assertEqual(caught.exception.code, "SESSIONS_CHANGED")
+            self.assertIn("2", str(caught.exception))
+
+    def test_a_protected_session_is_skipped_even_when_the_page_called_it_something_else(self):
+        # the page says "app", the node says a platform account: no statement, and it is reported as skipped, not as a changed session
+        self.service._wall_us = lambda: T0+10*SEC
+        platform = dict(idle_trx(2, 90), User="rdsinternal")
+        self.answers["rm-x", "rn-b"] = das(platform)
+        out = self.service.kill_statements(self.payload())
+        self.assertEqual((out["statements"], out["text"], out["session_ids"]), ([], "", []))
+        self.assertEqual([row["session_id"] for row in out["skipped"]], [2])
+
+    def test_a_page_snapshot_older_than_thirty_seconds_or_from_the_future_is_refused(self):
+        self.service._wall_us = lambda: T0+31*SEC
+        with self.assertRaises(SessionRequestError) as caught:
+            self.service.kill_statements(self.payload())
+        self.assertEqual(caught.exception.code, "SESSIONS_STALE_SNAPSHOT")
+        self.service._wall_us = lambda: T0-6*SEC
+        with self.assertRaises(SessionRequestError):
+            self.service.kill_statements(self.payload())
+        self.assertEqual(self.live.calls, [])                                  # refused before the node is asked
+
+    def test_sessions_on_several_nodes_are_one_request_and_one_text_of_kills_primary_first(self):
         self.service._wall_us = lambda: T0+10*SEC
         self.answers['rm-x','rn-b'] = das(idle_trx(2),idle_trx(3))
         self.answers['rm-x','rn-p'] = das(idle_trx(2))
@@ -124,13 +180,8 @@ class ServiceTests(unittest.TestCase):
         out = self.service.kill_statements({"instance": "rm-x", "mode": "query", "nodes": [
             {"node_id": "rn-b", "snapshot_us": T0, "lock_waiters": 1, "sessions": rows(2, 3)},
             {"node_id": "rn-p", "snapshot_us": T0 + SEC, "sessions": rows(2)}]})
-        check = "SELECT @@read_only AS ro, ID, USER, HOST, DB, COMMAND, TIME, STATE, LEFT(INFO, 80) AS INFO FROM information_schema.PROCESSLIST WHERE ID IN "
-        self.assertEqual(out["text"].splitlines(), [
-            "/*FORCE_NODE='rn-p'*/ " + check + "(2);",
-            "/*FORCE_NODE='rn-b'*/ " + check + "(2, 3);",
-            "/*FORCE_NODE='rn-b'*/ SELECT * FROM sys.schema_table_lock_waits;",
-            "/*FORCE_NODE='rn-p'*/ KILL QUERY 2;", "/*FORCE_NODE='rn-b'*/ KILL QUERY 2;", "/*FORCE_NODE='rn-b'*/ KILL QUERY 3;"])
-        self.assertEqual(out["statements"], out["text"].splitlines()[3:])
+        self.assertEqual(out["text"].splitlines(), ["/*FORCE_NODE='rn-p'*/ KILL QUERY 2;", "/*FORCE_NODE='rn-b'*/ KILL QUERY 2;", "/*FORCE_NODE='rn-b'*/ KILL QUERY 3;"])
+        self.assertEqual(out["statements"], out["text"].splitlines())
         self.assertEqual(out["session_ids"], [2, 2, 3])                                # the same id on two nodes is two sessions
         self.assertEqual([(node["node_id"], node["role"], node["snapshot_us"], node["session_ids"]) for node in out["nodes"]],
                          [("rn-p", "primary", T0 + SEC, [2]), ("rn-b", "secondary", T0, [2, 3])])
@@ -149,8 +200,7 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaises(SessionRequestError):
                 self.service.kill_statements(bad)
         for bad in (self.payload(sessions="x"), self.payload(sessions=[1]), self.payload(snapshot_us=True), self.payload(snapshot_us="1"),
-                    self.payload(snapshot_us=0), self.payload(mode="drop"), self.payload(sessions=[]), self.payload(lock_waiters=-1),
-                    self.payload(lock_waiters=True), self.payload(lock_waiters="2")):
+                    self.payload(snapshot_us=0), self.payload(mode="drop"), self.payload(sessions=[])):
             with self.assertRaises(ValueError):
                 self.service.kill_statements(bad)
 
