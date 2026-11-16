@@ -29,6 +29,11 @@ class FakeLive:
     direct_instances = frozenset()      # instances read directly
     unsupported = frozenset()           # (instance, node) pairs without a direct path
 
+    hint_styles = {}                    # instance -> FORCE_SLAVE for a proxy that does not know node ids
+
+    def standby_hint(self, instance):
+        return self.hint_styles.get(instance, "FORCE_NODE")
+
     def direct_enabled(self, instance):
         return instance in self.direct_instances
 
@@ -143,6 +148,17 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("nothing was executed", logs.output[0])
         self.assertIn("nodes=rn-b mode=connection sessions=1", logs.output[0])
         self.assertEqual(self.live.calls, [('rm-x', 'rn-b')])  # one authoritative read; no KILL execution
+
+    def test_an_instance_whose_proxy_does_not_know_node_ids_gets_the_proxy_keywords_in_its_text(self):
+        self.service._wall_us = lambda: T0+10*SEC
+        self.live.hint_styles = {"rm-x": "FORCE_SLAVE"}
+        self.answers["rm-x", "rn-p"] = das(idle_trx(2, 90))
+        rows = [dict(session_id=2, user="app", client="10.0.0.1", database="shop", command="Sleep", seconds=90)]
+        out = self.service.kill_statements({"instance": "rm-x", "mode": "connection", "nodes": [
+            {"node_id": "rn-b", "snapshot_us": T0, "sessions": rows}, {"node_id": "rn-p", "snapshot_us": T0, "sessions": rows}]})
+        self.assertEqual(out["text"].splitlines(), ["/*FORCE_MASTER*/ KILL 2;", "/*FORCE_SLAVE*/ KILL 2;"])
+        self.live.hint_styles = {}
+        self.assertEqual(self.service.kill_statements(self.payload())["statements"], ["/*FORCE_NODE='rn-b'*/ KILL 2;"])
 
     def test_a_lock_waiters_field_from_an_older_page_is_ignored(self):
         self.service._wall_us = lambda: T0+10*SEC

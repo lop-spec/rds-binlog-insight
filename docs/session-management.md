@@ -54,7 +54,7 @@
 - 经代理地址，带 hint 的 `KILL <id>` 能杀掉备节点上的会话，带 hint 的 `KILL QUERY <id>` 只中断语句、连接保留：在测试实例的代理地址上用 `/*FORCE_SLAVE*/` 实测（该实例只有一个备节点）。`FORCE_NODE` 本身对 KILL 没单独实测，它和 `FORCE_SLAVE` 同属代理的 Hint 路由。
 - 同一次测试里不带 hint 的 `KILL <id>` 也成功了（阿里云文档写的是「SQL 形式的 KILL 只发往主实例」），可能是代理把它送到了刚才那条查询所在的节点；不依赖这个行为，所以文本里的 KILL 仍带 hint。
 - 主地址的连接上 Hint 只是注释：测试实例主地址连接上带 hint 的 `SELECT @@server_id` 返回的是主节点（`read_only=0`），所以检查语句带 `ro`。
-- 测试实例的代理地址不认 `FORCE_NODE`（两个节点 ID 都报 `force hint server node is not found`，原因不明），但认 `FORCE_SLAVE` / `FORCE_MASTER`；该实例只有一个备节点，可把备节点语句的 Hint 换成 `FORCE_SLAVE`。生产实例上试过的两个备节点没有这个问题。
+- 测试实例的代理地址不认 `FORCE_NODE`（两个节点 ID 都报 `force hint server node is not found`），但认 `FORCE_SLAVE` / `FORCE_MASTER`（2026-11-17 在代理上实测：`FORCE_MASTER` 落主节点、`FORCE_SLAVE` 落备节点）。1.42.1 起，`session-direct.json` 里写了 `"standbyHint": "FORCE_SLAVE"` 的实例，KILL 文本自动用 `/*FORCE_MASTER*/`（主）和 `/*FORCE_SLAVE*/`（备）；这个写法只在实例恰好一个备节点时才对（`FORCE_SLAVE` 指的是「那个」备节点）。生产实例上试过的两个备节点没有这个问题，仍写 `FORCE_NODE`。
 - 备选：阿里云 RDS 控制台「自治服务 → 一键诊断 → 会话管理」可以直接结束会话。
 
 ## MongoDB（1.34.6 起）

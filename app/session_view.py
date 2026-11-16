@@ -209,8 +209,14 @@ def route_hint(node: dict[str, Any]) -> tuple[str, str]:
     """The read/write splitting hint that sends a statement to this node, as (name for a comment, text for the statement).
 
     Empty when the node id cannot be written inside a hint safely: the text then asks for a connection to the node itself.
+
+    A proxy that does not know node ids (``hint_style`` ``FORCE_SLAVE``, set per instance in ``session-direct.json``: the test
+    instance, one standby) is told with its own keywords: ``FORCE_MASTER`` for the primary, ``FORCE_SLAVE`` for the standby.
     """
-    if str(node.get('role') or '') == 'primary' and not node.get('route_by_identity'):
+    role = str(node.get('role') or '')
+    if node.get('hint_style') == 'FORCE_SLAVE':
+        return ('FORCE_MASTER', '/*FORCE_MASTER*/ ') if role == 'primary' else ('FORCE_SLAVE', '/*FORCE_SLAVE*/ ') if role == 'secondary' else ('', '')
+    if role == 'primary' and not node.get('route_by_identity'):
         return 'FORCE_MASTER', '/*FORCE_MASTER*/ '
     node_id = str(node.get("node_id") or "")
     if NODE_ID_PATTERN.fullmatch(node_id):

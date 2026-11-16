@@ -129,6 +129,7 @@ class SessionService:
             raise ValueError("nodes 必须是非空的节点数组")
         known, generated_us = self._known(instance), self._wall_us()
         mongo = is_mongo(instance)
+        hint_style = "FORCE_NODE" if mongo else self.live.standby_hint(instance)
         parts: list[dict[str, Any]] = []
         for item in nodes:
             node = str(item.get("node_id") or "").strip()
@@ -169,7 +170,7 @@ class SessionService:
                 parts.append(build_mongo_kill_statements({"node_id": node, **self._role(instance, node)}, sessions, snapshot_us=snapshot_us,
                                                          generated_us=generated_us))
                 continue
-            parts.append(build_kill_statements({'route_by_identity': True, "node_id": node, **self._role(instance, node)}, sessions, mode=mode, snapshot_us=snapshot_us,
+            parts.append(build_kill_statements({'route_by_identity': True, 'hint_style': hint_style, "node_id": node, **self._role(instance, node)}, sessions, mode=mode, snapshot_us=snapshot_us,
                                                generated_us=generated_us))
         parts.sort(key=lambda part: (ROLE_ORDER.get(part["role"], 3), part["node_id"]))
         if mongo:

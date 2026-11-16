@@ -130,6 +130,12 @@ class LiveSessions:
                      for (instance, node), (until, code, streak) in sorted(self._direct_down.items()) if until > now]
         return {"enabled": bool(config["enabled"]), "instances": sorted(config["instances"]) if config["enabled"] else [], "fallbacks": fallbacks}
 
+    def standby_hint(self, instance_id: str) -> str:
+        """How this instance's proxy is told which node a statement is for: ``FORCE_NODE`` (the default) or ``FORCE_SLAVE``."""
+        if self._direct is None:
+            return "FORCE_NODE"
+        return str(self._direct.config()["instances"].get(instance_id, {}).get("standbyHint", "FORCE_NODE"))
+
     def direct_enabled(self, instance_id: str) -> bool:
         return self._direct is not None and self._direct.enabled_for(instance_id)
 

@@ -347,6 +347,12 @@ class LiveSessionsFallbackTests(DirectReaderCase):
         self.assertEqual(server.kwargs, [])
         self.assertEqual(len(client.calls), 2)
 
+    def test_the_hint_style_of_an_instance_comes_from_the_switch_file(self):
+        live, _, _, _ = self.live(self.standby_server(), config={"enabled": True, "instances": {"rm-x": {"primaryHost": PRIMARY_HOST, "standbyHint": "FORCE_SLAVE"}, "rm-y": {"primaryHost": PRIMARY_HOST}}})
+        self.assertEqual([live.standby_hint(i) for i in ("rm-x", "rm-y", "rm-unlisted")], ["FORCE_SLAVE", "FORCE_NODE", "FORCE_NODE"])
+        plain = LiveSessions(lambda _instance: Client(finished([])), clock=Clock(), wall_us=lambda: 5)
+        self.assertEqual(plain.standby_hint("rm-x"), "FORCE_NODE")
+
     def test_without_a_reader_or_with_it_switched_off_everything_stays_on_das(self):
         server = self.standby_server()
         clock = Clock()

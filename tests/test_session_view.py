@@ -267,6 +267,17 @@ class KillStatementTests(unittest.TestCase):
         self.assertEqual(out["hint"], "FORCE_NODE='rn-x'")
         self.assertTrue(all(line.startswith("/*FORCE_NODE='rn-x'*/ ") for line in out["text"].splitlines()))
 
+    def test_a_proxy_that_does_not_know_node_ids_is_told_with_its_own_keywords(self):
+        style = {"hint_style": "FORCE_SLAVE", "route_by_identity": True}
+        self.assertEqual(route_hint({**style, "node_id": "rn-p", "role": "primary"}), ("FORCE_MASTER", "/*FORCE_MASTER*/ "))
+        self.assertEqual(route_hint({**style, "node_id": "rn-s", "role": "secondary"}), ("FORCE_SLAVE", "/*FORCE_SLAVE*/ "))
+        self.assertEqual(route_hint({**style, "node_id": "rn-x", "role": ""}), ("", ""))                    # unknown role: connect to the node itself
+        primary = build_kill_statements({**style, "node_id": "rn-p", "role": "primary", "zone": "a"}, self.rows()[:1], mode="connection", snapshot_us=1, generated_us=2)
+        standby = build_kill_statements({**style, "node_id": "rn-s", "role": "secondary", "zone": "a"}, self.rows(), mode="query", snapshot_us=1, generated_us=2)
+        self.assertEqual(primary["text"], "/*FORCE_MASTER*/ KILL 312;\n")
+        self.assertEqual(standby["text"].splitlines(), ["/*FORCE_SLAVE*/ KILL QUERY 44;", "/*FORCE_SLAVE*/ KILL QUERY 312;"])
+        self.assertNotIn("FORCE_NODE", primary["text"] + standby["text"])
+
     def test_route_hint_takes_only_plain_node_ids(self):
         self.assertEqual(route_hint({"node_id": "rn-2abc3def4ghi5jk01", "role": "secondary"}), ("FORCE_NODE='rn-2abc3def4ghi5jk01'", "/*FORCE_NODE='rn-2abc3def4ghi5jk01'*/ "))
         self.assertEqual(route_hint({"node_id": "rn-x"}), ("FORCE_NODE='rn-x'", "/*FORCE_NODE='rn-x'*/ "))     # an unknown role still goes to its node
