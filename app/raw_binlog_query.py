@@ -83,6 +83,13 @@ def copy_range(archive, item, start, end, target, budget):
     if not 0 <= start < end <= item['size_bytes']:
         raise RawBinlogError('轻量索引字节范围越界')
     budget.check()
+    if 'format' in item:
+        from .raw_frames import chunks
+        def request():
+            budget.requests += 1
+        for data in chunks(archive.bucket, item, start, end, check=budget.check, charge=budget.add, request=request):
+            target.write(data)
+        return
     response = archive.bucket.get_object(item['oss_key'], byte_range=(start, end-1))
     budget.requests += 1
     received = 0

@@ -136,14 +136,17 @@ def decoded_rows(storage, archive, entry, gate):
             raise IndexDeferred('raw-file-staging-reserve')
         source = root/'source.binlog'
         digest, crc, size = hashlib.sha256(), Crc64(), 0
-        response = archive.bucket.get_object(raw['oss_key'])
+        from .raw_frames import chunks
+        response = None
+        if 'format' in raw:
+            payload = chunks(archive.bucket, raw, 0, raw['size_bytes'], check=gate.check)
+        else:
+            response = archive.bucket.get_object(raw['oss_key'])
+            payload = iter(lambda: response.read(1024**2), b'')
         try:
             with source.open('wb') as output:
-                while True:
+                for chunk in payload:
                     gate.check()
-                    chunk = response.read(1024**2)
-                    if not chunk:
-                        break
                     size += len(chunk)
                     if size > raw['size_bytes']:
                         raise RawBinlogError('原档读取超过声明长度', 'RAW_INDEX_VERIFY_FAILED')
@@ -152,7 +155,8 @@ def decoded_rows(storage, archive, entry, gate):
                     output.write(chunk)
                     gate.add(len(chunk))
         finally:
-            response.close()
+            if response is not None:
+                response.close()
         if size != raw['size_bytes'] or digest.hexdigest() != raw['sha256'] or str(crc.crc) != raw['crc64']:
             raise RawBinlogError('原档长度/SHA256/CRC64校验失败', 'RAW_INDEX_VERIFY_FAILED')
         ordinals = {}

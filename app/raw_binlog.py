@@ -128,7 +128,17 @@ class RawBinlogStore:
             plain, summary = opaque_directory(path, ['preserve-first'])
         scan_seconds = time.time() - started
         key_base = f'{archive.prefix}raw-binlog/v1/{file_id}/{sha}'
-        raw = self._put(archive, path, key_base + '.binlog', sha, crc, progress)
+        framed = os.environ.get('RDS_BINLOG_WRITE_FRAMED_ZSTD') == '1'
+        if framed:
+            from .raw_frames import encode
+            # Separate from the v1 expiration rules and legacy compactor.
+            key_base = f'binlog-recovery/v2/{archive.prefix.strip("/")}/{file_id}/{sha}'
+            with tempfile.TemporaryDirectory(dir=path.parent) as tmp:
+                packed_path = Path(tmp) / 'packed.zst'
+                raw, packed_sha, packed_crc = encode(path, packed_path, sha, crc, progress)
+                raw['stored'] = self._put(archive, packed_path, key_base + '.' + packed_sha + '.binlog.zst', packed_sha, packed_crc, progress)
+        else:
+            raw = self._put(archive, path, key_base + '.binlog', sha, crc, progress)
         # Sidecar is content-addressed independently; raw bytes are never changed.
         payload = gzip.compress(plain, compresslevel=1, mtime=0) if len(plain) <= 256*1024**2 else b''
         if not payload or len(payload) > 32*1024**2:
@@ -157,6 +167,17 @@ class RawBinlogStore:
         # FULL synchronous metadata commit happens only after BOTH remote objects
         # have verified size, SHA metadata, and server CRC64. Crash before commit
         # is an idempotent retry, not a completed file.
+        if framed:
+            # Self-contained recovery catalog; no volatile timestamps in its identity.
+            body = compact(dict(raw=raw, index=side, summary=summary, file_id=file_id,
+                                flavor=flavor, instance_id=record['instance_id'],
+                                host_instance_id=item.host_instance_id, source_file_name=item.log_file_name)).encode()
+            h = hashlib.sha256(body).hexdigest()
+            checksum = Crc64(); checksum(body)
+            with tempfile.TemporaryDirectory(dir=path.parent) as tmp:
+                manifest = Path(tmp) / 'manifest.json'
+                manifest.write_bytes(body)
+                descriptor['recovery'] = self._put(archive, manifest, key_base + '.' + h + '.manifest.json', h, str(checksum.crc))
         def commit():
             with self.metadata._write_lock, self.metadata.connection() as conn:
                 conn.execute('''INSERT INTO raw_binlog_archives
@@ -172,8 +193,14 @@ class RawBinlogStore:
     def verify(self, archive, descriptor):
         if archive is None:
             raise RawBinlogError('原文件归档需要 OSS 校验', 'RAW_ARCHIVE_OSS_REQUIRED')
-        for key in ('raw', 'index'):
-            if self._head(archive, descriptor[key]) is None:
+        from .raw_frames import physical, validate
+        raw = descriptor['raw']
+        objects = [physical(raw), descriptor['index']]
+        if 'format' in raw:
+            validate(raw)
+            objects.append(descriptor['recovery'])
+        for obj in objects:
+            if self._head(archive, obj) is None:
                 raise RawBinlogError('原文件或轻量索引缺失，拒绝释放本地文件', 'RAW_ARCHIVE_INCOMPLETE')
 
     @contextmanager

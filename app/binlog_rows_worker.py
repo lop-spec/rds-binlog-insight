@@ -664,6 +664,10 @@ class Worker:
         return [entry for entry in out if entry["kind"] != "raw" or "descriptor" in entry]
 
     # -- ingestion ------------------------------------------------------------
+    def _check_archive_stop(self):
+        if self.stop.is_set():
+            raise RawBinlogError('写入进程停止', 'BINLOG_ROWS_STOPPED')
+
     def ingest_raw(self, ingestor: RowsIngestor, entry: dict[str, Any], lane: int) -> int:
         archive = self.archive()
         descriptor = entry["descriptor"]
@@ -678,7 +682,13 @@ class Worker:
         with tempfile.TemporaryDirectory(prefix=f"lane{lane}-", dir=scratch_root) as scratch:
             root = Path(scratch)
             source = root / "source.binlog"
-            download_ranges(archive.bucket, raw["oss_key"], int(raw["size_bytes"]), source, self.stop)
+            if 'format' in raw:
+                from .raw_frames import chunks
+                with source.open('wb') as out:
+                    for block in chunks(archive.bucket, raw, 0, raw['size_bytes'], check=self._check_archive_stop):
+                        out.write(block)
+            else:
+                download_ranges(archive.bucket, raw["oss_key"], int(raw["size_bytes"]), source, self.stop)
             # SHA256 over the whole file already proves the bytes; a second CRC64 pass (pure-Python
             # crcmod) cost about as much CPU as the parser's I/O and added no protection.
             digest, size = hashlib.sha256(), 0
@@ -743,7 +753,10 @@ class Worker:
                 [*parser_command(), *(["--rowbinary"] if binary else []), "--input", "-", "--source-file-id", entry["file_id"],
                  "--flavor", descriptor.get("flavor") or "mysql"],
                 stdout=subprocess.PIPE, stderr=stderr, stdin=subprocess.PIPE)
-            feed = ParserFeed(stream_ranges(archive.bucket, raw["oss_key"], size, self.stop), process.stdin)
+            from .raw_frames import chunks
+            payload = (chunks(archive.bucket, raw, 0, size, check=self._check_archive_stop)
+                       if 'format' in raw else stream_ranges(archive.bucket, raw['oss_key'], size, self.stop))
+            feed = ParserFeed(payload, process.stdin)
             feed.start()
             stream = LineCountingStream(process.stdout, self.stop, count_lines=not binary)
             try:
