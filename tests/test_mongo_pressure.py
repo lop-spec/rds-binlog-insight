@@ -152,6 +152,25 @@ class AdditionalGates(unittest.TestCase):
         self.assertEqual(result['node_count'],4)
 
 
+    def test_sls_preserves_complete_aggregate_when_sample_request_fails(self):
+        c=SlsReadonly('cn-example-1',None)
+        c.page=Mock(side_effect=[([{'n':'2','nodes':'1'}],True),([{'bucket':str(T//1_000_000),'n':'2','nodes':'1'}],True),TimeoutError()])
+        result=c.collect(dict(id='app',project='fixture-project',logstore='app-logs',endpointTokens=['fixture.invalid']),T,T+MINUTE)
+        self.assertTrue(result['aggregation_complete']);self.assertFalse(result['sample_complete'])
+        self.assertEqual(result['rows'],2);self.assertEqual(result['sample_rows'],0)
+
+    def test_sls_adaptive_buckets_keep_full_range_under_limit(self):
+        c=SlsReadonly('cn-example-1',None)
+        c.page=Mock(side_effect=[([{'n':'0','nodes':'0'}],True),([],True),([],True)])
+        start=T+11_000_000;end=start+7*24*60*MINUTE
+        result=c.collect(dict(id='app',project='fixture-project',logstore='app-logs',endpointTokens=['fixture.invalid']),start,end)
+        step=result['bucket_seconds']*1_000_000
+        self.assertTrue(result['aggregation_complete'])
+        self.assertLessEqual((end-1)//step-start//step+1,400)
+        self.assertEqual(result['rows'],0)
+        for req in c.page.call_args_list:
+            self.assertEqual(req.args[1:3],(start,end))
+
     def test_http_overlap_lower_bound_and_query_data_redacted(self):
         from app.mongo_sls import summarize_http
         rows=[]
@@ -230,12 +249,67 @@ class InvestigationTests(unittest.TestCase):
             c.entry['logSources']=[dict(id='app',project='fixture-project',logstore='app-log',endpointTokens=['fixture.invalid']),dict(id='http',project='fixture-project',logstore='http-log',kind='http',pathToken='getMsgList')]
             with patch('app.mongo_investigation.load_credential',return_value=object()),patch('app.mongo_investigation.SlsReadonly') as sls:
                 sls.return_value.collect.side_effect=[{'rows':100,'complete':True},{'rows':2,'complete':True}]
-                x=service.investigator.run({**self.params(),'logSource':'auto'})
+                x=service.investigator.run(self.params())
                 self.assertEqual(len(x['sls']['sources']),2)
                 self.assertEqual(sls.return_value.collect.call_args_list[0].args[0]['id'],'app')
                 self.assertTrue(x['coverage']['complete']);self.assertFalse(x['workload']['sample_coverage']['complete'])
             with patch('app.mongo_investigation.SlsReadonly') as sls:
-                service.investigator.run({**self.params(),'logSource':''});sls.assert_not_called()
+                for source in ('','auto','app'):
+                    result=service.investigator.run({**self.params(),'logSource':source})
+                    self.assertIs(result,x)
+                sls.assert_not_called()
+
+    def test_long_range_focus_does_not_crop_app_logs_or_repeat_workload(self):
+        with tempfile.TemporaryDirectory() as td:
+            service,c=self.service(Path(td))
+            c.entry['logSources']=[dict(id='app',project='fixture-project',logstore='app-log',endpointTokens=['fixture.invalid'])]
+            end=T+180*MINUTE+12_000_000
+            params={**self.params(),'startEpochUs':T+12_000_000,'endEpochUs':end,'baselineStart':T-180*MINUTE,
+                    'role':'Primary','evidenceOnly':'1','focusEpochUs':T+80*MINUTE}
+            with patch('app.mongo_investigation.load_credential',return_value=object()),patch('app.mongo_investigation.SlsReadonly') as sls:
+                sls.return_value.collect.return_value={'rows':0,'complete':True}
+                x=service.investigator.run(params)
+                self.assertEqual(sls.return_value.collect.call_args.args[1:],(T+12_000_000,end))
+                self.assertEqual(x['sls']['status'],'ok')
+            self.assertEqual((x['start_us'],x['end_us']),(T+65*MINUTE,T+95*MINUTE))
+            self.assertEqual(x['focus_reason'],'metric_peak')
+            self.assertEqual((x['requested_start_us'],x['requested_end_us']),(T+12_000_000,end))
+            self.assertEqual(x['requests'],2)
+            store=service.stores['dds-example']
+            store.read.assert_not_called();store.pressure_records.assert_not_called()
+            store.read_telemetry.assert_called_once_with('dds-example','pressure',T+65*MINUTE,T+95*MINUTE)
+            with self.assertRaisesRegex(ValueError,'outside_window'):
+                service.investigator.run({**params,'focusEpochUs':end})
+
+    def test_second_boundaries_use_dds_minute_format_without_counting_padding(self):
+        from datetime import datetime, timezone
+        with tempfile.TemporaryDirectory() as td:
+            service,c=self.service(Path(td))
+            logs=[dict(CreateTime=datetime.fromtimestamp(T/1e6+s,timezone.utc).isoformat(),
+                       Content='{"msg":"election"}') for s in (2,10,12,30)]
+            c.rpc.return_value.call.side_effect=[{'PerformanceKeys': {'PerformanceKey': []}},
+                                                 {'TotalRecordCount':4,'Items':{'LogRecords':logs}}]
+            x=service.investigator.run({**self.params(),'startEpochUs':T+3_000_000,'endEpochUs':T+12_000_000,
+                                        'role':'Primary','evidenceOnly':'1'})
+            log_request=c.rpc.return_value.call.call_args.args[1]
+            self.assertNotEqual(log_request['StartTime'],log_request['EndTime'])
+            self.assertEqual(x['running_log_coverage'][0]['in_window'],1)
+            self.assertEqual([e['timestamp'] for e in x['running_events']],[(T+10_000_000)//1000])
+
+    def test_no_peak_uses_window_tail_and_cloud_failure_keeps_minute_fallback(self):
+        with tempfile.TemporaryDirectory() as td:
+            service,c=self.service(Path(td));store=service.stores['dds-example']
+            c.rpc.side_effect=RuntimeError('cloud_credential_unavailable')
+            store.read_telemetry.return_value=[dict(metric='WtCacheUpdatesUsage',timestamp=(T+n*MINUTE)//1000,
+                period=60,role='Primary',value=8,timestamp_semantics='period_start') for n in (30,31,60)]
+            x=service.investigator.run({**self.params(),'endEpochUs':T+60*MINUTE,'baselineStart':T-60*MINUTE,
+                                        'role':'Primary','evidenceOnly':'1'})
+            self.assertEqual(x['start_us'],T+30*MINUTE)
+            self.assertEqual(x['focus_reason'],'window_end_no_metric_peak')
+            self.assertIn('performance:Primary',x['gaps'])
+            self.assertEqual(len(x['metric_points']),2)
+            self.assertEqual([node['period'] for node in x['performance']['nodes']],[60])
+            self.assertEqual(x['sls']['status'],'not_configured')
 
     def test_updated_cache_series_converts_dds_start_to_analysis_end(self):
         with tempfile.TemporaryDirectory() as td:

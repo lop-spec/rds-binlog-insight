@@ -16,7 +16,7 @@ test('async Mongo options refresh the empty label but never overwrite another en
   c.$('#analytics-source').value='mongodb';
   const metric=c.$('#mongo-metric');let markup='';
   Object.defineProperty(metric,'innerHTML',{get:()=>markup,set:value=>{markup=value;metric.value=/value="([^"]+)"/.exec(value)?.[1]||'';}});
-  vm.runInContext(source,c);vm.runInContext('syncMongoBaseline=()=>{};syncMongoLogSources=()=>{};mongoMetricChanged()',c);
+  vm.runInContext(source,c);vm.runInContext('syncMongoBaseline=()=>{};mongoMetricChanged()',c);
   assert.match(c.$('#analytics-meta').textContent,/指标加载中/);
   assert.doesNotMatch(c.$('#analytics-meta').textContent,/undefined/);
   const pending=vm.runInContext('syncMongoMode(true)',c);
@@ -174,7 +174,8 @@ test('backend and network errors terminate loading, clear stale data and allow r
   const {c,nodes,run}=requestContext();c.api=async()=>{throw new Error(message);};
   await assert.rejects(run());assert.match(nodes['#analytics-meta'].textContent,/分析未完成/);
   assert.doesNotMatch(nodes['#analytics-meta'].textContent,/正在读取|baseline_must|mongo_window/);
-  assert.equal(nodes['#analytics-panel-sql'].innerHTML,'');assert.equal(nodes['#analytics-empty'].hidden,false);
+  assert.match(nodes['#analytics-panel-sql'].innerHTML,/mongo-auto-evidence/);assert.equal(nodes['#analytics-empty'].hidden,true);
+  assert.match(nodes['#mongo-auto-evidence'].textContent,/补充证据读取失败/);
   c.api=async()=>({});await run();assert.equal(nodes['#analytics-meta'].textContent,'分析完成');
  }
 });
@@ -199,17 +200,48 @@ test('pressure diagnostics render evidence, missing data and escaped sources',()
  c.data={instance:'fixture',requests:3,warning:'未证明唯一根因',performance:{nodes:[]},coverage:{complete:false},baseline_coverage:{complete:false},sls:{status:'not_configured'},audit:{status:'Disabled'},workload:{groups:[]},gaps:{fixture:'missing'}};
  vm.runInContext('renderMongoInvestigation(data)',c);
  let html=nodes['#analytics-panel-sql'].innerHTML;
- assert.match(html,/没有可用五秒性能点/);assert.match(html,/未配置实例SLS映射/);assert.match(html,/不包含该Pod的CPU/);
+ assert.match(html,/没有可用缓存或 ticket 指标/);assert.match(html,/未配置实例SLS映射/);assert.match(html,/不包含该Pod的CPU/);
  assert.match(nodes['#analytics-coverage'].textContent,/完整业务汇总：当前有缺口/);
  c.data.sls={status:'partial',kind:'http',tenants:[{shop:'<script>',requests:2,observed_overlap_lower_bound:5,max_duration_ms:60000,exceeded:true}]};
  vm.runInContext('renderMongoInvestigation(data)',c);html=nodes['#analytics-panel-sql'].innerHTML;
  assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>/);assert.match(html,/保守并发下界/);assert.match(html,/部分结果/);
 });
-test('pressure diagnostics reject a broad range without silently moving it',async()=>{
- const {c,calls}=requestContext();await assert.rejects(vm.runInContext('runMongoInvestigation()',c),/30分钟/);
- assert.equal(calls.length,0);
- assert.match(fs.readFileSync('web/index.html','utf8'),/id="mongo-investigate"/);
- assert.match(source,/更新缓存占比 %/);
+test('all metrics automatically supplement evidence; long ranges use the scoped metric peak',async()=>{
+ for(const metric of ['CPUUtilization','AvgRt','WtCacheUpdatesUsage']) {
+  const {c,calls,nodes,run}=requestContext({'#mongo-metric':metric});
+  const peak=Date.parse('2026-09-16T12:00:00Z');
+  c.analyticsTable=()=>'';
+  c.api=async path=>{calls.push(path);return path.startsWith('/api/mongo/analytics?')?{metric_points:[
+   {metric,role:'Primary',timestamp:peak,value:10},{metric,role:'Secondary',timestamp:peak+60000,value:99},
+   {metric,role:'Primary',timestamp:peak+120000,value:null},{metric,role:'Primary',timestamp:peak+180000,value:10},
+   {metric,role:'Primary',timestamp:peak+48*3600000,value:100}]}:
+   {focus_reason:'metric_peak',sls:{status:'not_configured'}};};
+  await run();assert.equal(calls.length,2);
+  const base=new URL(calls[0],'http://fixture'),evidence=new URL(calls[1],'http://fixture');
+  assert.equal(base.pathname,'/api/mongo/analytics');assert.equal(evidence.pathname,'/api/mongo/investigate');
+  for(const key of ['instance','role','startEpochUs','endEpochUs','baselineStart'])assert.equal(evidence.searchParams.get(key),base.searchParams.get(key));
+  assert.equal(evidence.searchParams.get('focusEpochUs'),String(peak*1000-1));
+  assert.equal(evidence.searchParams.get('evidenceOnly'),'1');assert.equal(evidence.searchParams.has('logSource'),false);
+  assert.match(nodes['#mongo-auto-evidence'].innerHTML,/围绕所选指标峰值/);
+ }
+ const html=fs.readFileSync('web/index.html','utf8');
+ assert.doesNotMatch(html,/id="mongo-investigate"|id="mongo-log-source"/);
+ assert.match(html,/按所选时段自动补充日志与缓存证据/);
+});
+test('evidence failures preserve the ranking and stale evidence cannot replace newer results',async()=>{
+ const {c,run,nodes}=requestContext();
+ vm.runInContext('renderMongoAnalytics=()=>{$("#analytics-panel-sql").innerHTML="current ranking";}',c);
+ c.api=async path=>{if(path.startsWith('/api/mongo/investigate?'))throw Error('fixture failure');return {};};
+ await run();assert.equal(nodes['#analytics-panel-sql'].innerHTML,'current ranking');
+ assert.match(nodes['#mongo-auto-evidence'].textContent,/补充证据读取失败/);
+ let finish, started;
+ const loading=new Promise(r=>{started=r;});
+ c.api=async path=>path.startsWith('/api/mongo/investigate?')?new Promise(r=>{finish=r;started();}):{};
+ const pending=run();await loading;
+ vm.runInContext('mongoMetricChanged()',c);
+ finish({sls:{status:'not_configured'}});await pending;
+ assert.equal(nodes['#mongo-auto-evidence'].innerHTML,'');
+ assert.equal(nodes['#analytics-panel-sql'].innerHTML,'');
 });
 test('workspace includes update cache ratio and no independent sort selector',()=>{
  const c=context();vm.runInContext(source,c);
@@ -259,15 +291,15 @@ test('correlation renders signed real coefficients and missing is not zero',()=>
  assert.match(missing,/暂不可计算/);assert.doesNotMatch(missing,/r 0/);
 });
 test('cache main button uses the incident lane for the user exact whole-minute window',async()=>{
- const {c,nodes,calls,run}=requestContext({'#analytics-start':'2026-11-10T10:16:00+08:00','#analytics-end':'2026-11-10T10:19:00+08:00','#mongo-baseline':'previous','#mongo-metric':'WtCacheUpdatesUsage','#mongo-log-source':''});
+ const {c,nodes,calls,run}=requestContext({'#analytics-start':'2026-11-10T10:16:00+08:00','#analytics-end':'2026-11-10T10:19:00+08:00','#mongo-baseline':'previous','#mongo-metric':'WtCacheUpdatesUsage'});
  c.analyticsTable=(h,r)=>'<table>'+h.join('|')+r.map(x=>x.join('|')).join('\n')+'</table>';c.detailBlock=(a,b)=>a+escape(b);c.switchAnalyticsTab=()=>{};
- c.api=async path=>{calls.push(path);return {start_us:1794276960000000,end_us:1794277140000000,baseline_start:1794276780000000,workload:{groups:[],families:[],total_groups:0},coverage:{complete:true},baseline_coverage:{complete:true},sls:{status:'not_selected'}};};
+ c.api=async path=>{calls.push(path);return {start_us:1794276960000000,end_us:1794277140000000,baseline_start:1794276780000000,workload:{groups:[],families:[],total_groups:0},coverage:{complete:true},baseline_coverage:{complete:true},sls:{status:'ok',rows:0,sample_complete:true,sample_rows:0}};};
  await run();assert.equal(calls.length,1);assert.match(calls[0],/^\/api\/mongo\/investigate\?/);
  const q=new URL(calls[0],'http://fixture').searchParams;
- assert.equal(q.get('startEpochUs'),'1794276960000000');assert.equal(q.get('endEpochUs'),'1794277140000000');assert.equal(q.get('baselineStart'),'1794276780000000');assert.equal(q.get('logSource'),'');
- assert.match(nodes['#analytics-meta'].textContent,/五秒机制/);assert.doesNotMatch(nodes['#analytics-meta'].textContent,/相关度|暂无可计算/);
+ assert.equal(q.get('startEpochUs'),'1794276960000000');assert.equal(q.get('endEpochUs'),'1794277140000000');assert.equal(q.get('baselineStart'),'1794276780000000');assert.equal(q.has('logSource'),false);
+ assert.match(nodes['#analytics-meta'].textContent,/缓存压力诊断/);assert.doesNotMatch(nodes['#analytics-meta'].textContent,/相关度|暂无可计算/);
  const html=nodes['#analytics-panel-sql'].innerHTML;
- assert.match(html,/<section[^>]*><h3>业务读取与成本/);assert.match(html,/<section[^>]*><h3>应用日志关联/);assert.match(html,/未选择关联SLS/);
+ assert.match(html,/<section[^>]*><h3>业务读取与成本/);assert.match(html,/<section[^>]*><h3>应用日志关联/);assert.match(html,/SLS查询完成.*日志 0 条/);
  assert.doesNotMatch(html,/<details[^>]*><summary>业务工作量|<details[^>]*><summary>SLS关联/);
 });
 test('recorded-only cost differences retain coverage and do not become total changes',()=>{

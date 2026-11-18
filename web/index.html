@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>RDS SQL Insight</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/app.css?v=1.42.1-rawoss">
-  <link rel="stylesheet" href="/assets/workspace.css?v=1.42.1-rawoss">
+  <link rel="stylesheet" href="/assets/app.css?v=1.42.2-rawoss">
+  <link rel="stylesheet" href="/assets/workspace.css?v=1.42.2-rawoss">
 </head>
 <body>
   <div class="app-shell">
@@ -201,9 +201,9 @@
             </div></details>
             <div id="mongo-controls" class="query-grid span-8" hidden>
               <label class="field span-2"><span>MongoDB 实例</span><select id="mongo-instance"></select></label>
-              <label class="field"><span>角色</span><select id="mongo-role"><option value="Primary">Primary</option><option value="Secondary">Secondary</option><option value="">全部角色（分开计算）</option></select></label>
-              <label class="field span-2"><span>性能指标</span><select id="mongo-metric"></select></label>
-              <label class="field"><span>对照基线</span><select id="mongo-baseline"><option value="previous">前一个等长窗口</option><option value="yesterday">昨日同窗（手选）</option><option value="custom">指定开始时间</option></select></label>
+              <div class="field"><label for="mongo-role">角色</label><select id="mongo-role"><option value="Primary">Primary</option><option value="Secondary">Secondary</option><option value="">全部角色（分开计算）</option></select></div>
+              <div class="field span-2"><label for="mongo-metric">性能指标</label><select id="mongo-metric"></select></div>
+              <div class="field"><label for="mongo-baseline">对照基线</label><select id="mongo-baseline"><option value="previous">前一个等长窗口</option><option value="yesterday">昨日同窗（手选）</option><option value="custom">指定开始时间</option></select></div>
               <details class="filter-disclosure span-8"><summary>更多条件</summary><div class="query-grid">
               <label class="field"><span>慢记录层级</span><select id="mongo-kind"><option value="command">外层命令</option><option value="suboperation">内部操作</option></select></label>
               <label class="field span-2"><span>判断方式</span><select id="mongo-analysis-mode"><option value="correlation">相关度排序（默认）</option><option value="attribution">成本增量证据排序（旧）</option></select></label>
@@ -213,8 +213,7 @@
               <label class="field span-2"><span>真实问题回放</span><select id="mongo-replay"><option value="">选择已固定的异常与基线</option></select></label>
               </div></details>
               <p id="mongo-baseline-hint" class="analytics-note span-8" role="status" aria-live="polite"></p>
-              <label class="field span-2"><span>关联 SLS</span><select id="mongo-log-source"><option value="">不关联日志</option></select></label>
-              <div class="form-actions span-8"><button id="mongo-investigate" class="button secondary" type="button">缓存与 ticket 专项排查</button><span class="analytics-note">更新缓存指标点“开始排查”即执行；整分钟窗口最多30分钟，不挪时间、不改参数。</span></div>
+              <p class="analytics-note span-8" title="日志按所选时段查询；长时段的缓存和 ticket 细查聚焦在所选指标的峰值附近。">按所选时段自动补充日志与缓存证据。</p>
             </div>
             <div id="redis-controls" class="query-grid span-8" hidden>
               <div class="field span-4"><label for="redis-instance">Redis实例</label><select id="redis-instance" title="已登记只读实例"></select></div>
@@ -536,15 +535,15 @@
   </aside>
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
   <div id="toast-region" class="toast-region" aria-live="polite"></div>
-  <script src="/assets/workspace.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/mongo.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/starrocks.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/instances.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/redis-evidence.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/redis.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/rise.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/sessions.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/indexed-range.js?v=1.42.1-rawoss" defer></script>
-  <script src="/assets/app.js?v=1.42.1-rawoss" defer></script>
+  <script src="/assets/workspace.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/mongo.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/starrocks.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/instances.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/redis-evidence.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/redis.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/rise.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/sessions.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/indexed-range.js?v=1.42.2-rawoss" defer></script>
+  <script src="/assets/app.js?v=1.42.2-rawoss" defer></script>
 </body>
 </html>

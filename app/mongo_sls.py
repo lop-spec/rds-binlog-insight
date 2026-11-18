@@ -7,15 +7,16 @@ from email.utils import formatdate
 import hashlib
 import hmac
 import json
+import logging
 import re
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 
 from .rds_api import shared_ssl_context
 
 MAX_BODY = 4 * 1024 * 1024
+LOGGER = logging.getLogger(__name__)
 
 
 class NoSlsRedirect(urllib.request.HTTPRedirectHandler):
@@ -97,25 +98,35 @@ class SlsReadonly:
 
     def collect(self, source, start_us, end_us, *, max_pages=10, deadline=None):
         aggregate = None
+        # Keep at most 400 time buckets without cropping a wide incident window.
+        step = 5
+        while (end_us - 1) // (step * 1_000_000) - start_us // (step * 1_000_000) >= 400:
+            step *= 2
         if source.get('kind','errors') == 'errors' and (deadline is None or time.monotonic() < deadline-16):
             try:
                 totals, totals_complete = self.page(source,start_us,end_us,0,analysis=
                     ' | select count(*) as n, count(distinct __source__) as nodes limit 1')
                 buckets, buckets_complete = self.page(source,start_us,end_us,0,analysis=
-                    ' | select __time__ - __time__ % 5 as bucket, count(*) as n, count(distinct __source__) as nodes group by bucket order by bucket limit 400')
+                    f' | select __time__ - __time__ % {step} as bucket, count(*) as n, count(distinct __source__) as nodes group by bucket order by bucket limit 400')
                 if totals_complete and buckets_complete and len(totals)==1:
                     count = int(totals[0]['n'])
-                    histogram = [dict(timestamp=int(b['bucket'])*1000,category='all_matching_timeouts',count=int(b['n']),node_count=int(b['nodes'])) for b in buckets]
+                    histogram = [dict(timestamp=max(start_us//1000,int(b['bucket'])*1000),category='all_matching_timeouts',count=int(b['n']),node_count=int(b['nodes'])) for b in buckets]
                     if sum(b['count'] for b in histogram)==count:
-                        aggregate = dict(rows=count,node_count=int(totals[0]['nodes']),buckets=histogram)
-            except (ValueError,KeyError,TypeError,RuntimeError,urllib.error.HTTPError):
+                        aggregate = dict(rows=count,node_count=int(totals[0]['nodes']),buckets=histogram,bucket_seconds=step)
+            except (ValueError,KeyError,TypeError,RuntimeError,OSError):
                 # The raw sampling lane remains usable without SQL analysis.
                 aggregate = None
         rows, complete = [], False
         for page in range(max_pages):
             if deadline is not None and time.monotonic() >= deadline-8:
                 break
-            batch, query_complete = self.page(source, start_us, end_us, page * 100)
+            try:
+                batch, query_complete = self.page(source, start_us, end_us, page * 100)
+            except (ValueError, KeyError, TypeError, RuntimeError, OSError) as exc:
+                if aggregate is None and not rows:
+                    raise
+                LOGGER.warning('Mongo SLS sample partial: source=%s page=%s error=%s', source['id'], page+1, type(exc).__name__)
+                break
             rows.extend(batch)
             if not query_complete:
                 break
@@ -126,7 +137,7 @@ class SlsReadonly:
         result.update(sample_complete=result['complete'],sample_rows=len(rows),aggregation_complete=aggregate is not None)
         if aggregate is not None:
             result.update(aggregate)
-            result['warning'] += ' 总量/五秒分布来自完整系统字段聚合，原始明细仅有界抽样，两种完整性分别标注。'
+            result['warning'] += ' 总量和时段分布来自系统字段聚合，原始明细单独标注抽样覆盖。'
         return result
 
 

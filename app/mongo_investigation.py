@@ -1,6 +1,8 @@
 """On-demand incident lane. Only control-plane reads + retained Insight files."""
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import threading
@@ -16,14 +18,24 @@ from .pod_lookup import inventory_path, resolve_pod
 from .resource_evidence import native_continuity
 
 LOGGER = logging.getLogger(__name__)
+MAX_DETAIL_WINDOW = 30 * MINUTE
+MAX_EVIDENCE_WINDOW = 7 * 24 * 60 * MINUTE
 
 
-def running_event(row, role):
+def lane_failure(exc):
+    LOGGER.exception('Mongo investigation lane failed')
+    message = str(exc).lower()
+    kind = 'throttled' if 'thrott' in message else 'permission_denied' if any(k in message for k in ('forbidden','permission','unauthor')) else 'budget_exhausted' if 'budget' in message else 'unavailable'
+    return {'reason': kind, 'exception_type': type(exc).__name__}
+
+
+def running_event(row, role, timestamp=None):
     """No command payloads, auth metadata, customer messages or raw log text."""
     try:
         content = str(row.get('Content') or '')
         doc = json.loads(content if content.startswith('{') else '{' + content + '}')
-        timestamp = epoch_us(row['CreateTime']) // 1000
+        if timestamp is None:
+            timestamp = epoch_us(row['CreateTime']) // 1000
     except (ValueError, KeyError, TypeError):
         return None
     msg, attr = str(doc.get('msg') or ''), doc.get('attr') or {}
@@ -47,6 +59,7 @@ class MongoInvestigator:
         self.service = service
         self.lock = threading.Lock()
         self.cache = {}
+        self.running_log_calls = deque()
 
     def run(self, params):
         def get(k, default=''):
@@ -57,28 +70,42 @@ class MongoInvestigator:
         if collector is None or instance not in self.service.stores:
             raise ValueError('configured_mongo_instance_required')
         start, end = int(get('startEpochUs')), int(get('endEpochUs'))
-        if not 0 < end-start <= 30*MINUTE or start % MINUTE or end % MINUTE:
-            raise ValueError('pressure_requires_whole_minute_window_up_to_thirty_minutes')
+        evidence_only = get('evidenceOnly') == '1'
+        if start < 0 or not 0 < end-start <= MAX_EVIDENCE_WINDOW or start % 1_000_000 or end % 1_000_000:
+            raise ValueError('invalid_mongo_evidence_window')
         base = int(get('baselineStart', start-(end-start)))
-        if base < 0 or base % MINUTE or base+(end-start) > start:
+        if not evidence_only and (end-start > MAX_DETAIL_WINDOW or start % MINUTE or end % MINUTE or base % MINUTE):
+            raise ValueError('pressure_requires_whole_minute_window_up_to_thirty_minutes')
+        if base < 0 or base+(end-start) > start:
             raise ValueError('baseline_must_not_overlap_current_window')
         role = get('role')
-        if role not in ('', 'Primary', 'Secondary'):
+        if role not in ('', 'Primary', 'Secondary', 'Unknown'):
             raise ValueError('invalid_role')
-        entry = collector.entry
-        source_id = get('logSource')
-        sources = validate_sources(entry.get('logSources', []))
-        selected = sources if source_id == 'auto' else [s for s in sources if s['id'] == source_id]
-        if source_id and source_id != 'auto' and not selected:
+        sources = validate_sources(collector.entry.get('logSources', []))
+        # Older callers can still send a registered source ID; all configured sources are automatic.
+        if get('logSource') not in ('', 'auto', *(s['id'] for s in sources)):
             raise ValueError('unconfigured_mongo_log_source')
-        key = (instance, start, end, base, role, json.dumps(selected, sort_keys=True))
+        focus_start, focus_end, focus_reason = start, end, 'entire_window'
+        if end-start > MAX_DETAIL_WINDOW:
+            anchor = int(get('focusEpochUs') or end-1)
+            if not start <= anchor < end:
+                raise ValueError('mongo_evidence_focus_outside_window')
+            focus_start = max(start, min(end-MAX_DETAIL_WINDOW, (anchor // MINUTE - 15) * MINUTE))
+            focus_end = focus_start + MAX_DETAIL_WINDOW
+            focus_reason = 'metric_peak' if get('focusEpochUs') else 'window_end_no_metric_peak'
+        key = (instance, start, end, base, role, evidence_only, focus_start, focus_end, focus_reason, json.dumps(sources, sort_keys=True))
         saved = self.cache.get(key)
         if saved and saved[0] > time.monotonic():
             return saved[1]
         if not self.lock.acquire(blocking=False):
             raise ValueError('mongo_investigation_busy')
         try:
-            result = self._run(collector, start, end, base, role, selected)
+            deadline = time.monotonic()+90
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                logs = pool.submit(self._sls, collector, sources, start, end, deadline) if sources else None
+                result = self._run(collector, focus_start, focus_end, base, role, deadline, evidence_only=evidence_only)
+                result['sls'] = logs.result() if logs else dict(status='not_configured', complete=False)
+            result.update(requested_start_us=start, requested_end_us=end, focus_reason=focus_reason)
             self.cache = {k: v for k, v in self.cache.items() if v[0] > time.monotonic()}
             if len(self.cache) >= 8:
                 self.cache.pop(next(iter(self.cache)))
@@ -87,31 +114,64 @@ class MongoInvestigator:
         finally:
             self.lock.release()
 
-    def _run(self, collector, start, end, base, role, sources):
-        deadline = time.monotonic()+90
-        dds = collector.rpc()
-        # Interactive reads have their own short budget, never retry a failed page.
-        dds.timeout = 8
-        dds.RETRY_DELAYS = ()
+    @staticmethod
+    def _sls(collector, sources, start, end, deadline):
+        results = []
+        for ix, source in enumerate(sources):
+            try:
+                now = time.monotonic()
+                if now >= deadline-8:
+                    raise RuntimeError('investigation_budget_exhausted')
+                credential = load_credential(collector.settings_loader().credential_target)
+                if credential is None:
+                    raise RuntimeError('cloud_credential_unavailable')
+                source_deadline = now + (deadline-now)/(len(sources)-ix)
+                item = SlsReadonly(collector.entry['region'], credential).collect(
+                    source, start, end, max_pages=5, deadline=source_deadline)
+                item['status'] = 'ok' if item['complete'] else 'partial'
+            except Exception as exc:
+                item = dict(status='unavailable', complete=False, **lane_failure(exc))
+            item.update(source=source['id'], label=source.get('label',source['id']))
+            results.append(item)
+        return results[0] if len(results)==1 else dict(status='configured_sources', sources=results,
+            complete=all(s.get('complete') for s in results))
+
+    def _run(self, collector, start, end, base, role, deadline, *, evidence_only):
+        dds, rpc_error = None, None
+        try:
+            dds = collector.rpc()
+            # Interactive reads have their own short budget, never retry a failed page.
+            dds.timeout = 8
+            dds.RETRY_DELAYS = ()
+        except Exception as exc:
+            rpc_error = exc
         gaps = {}
         calls = 0
         def call(action, params):
             nonlocal calls
-            if calls >= 14 or time.monotonic() >= deadline:
+            if rpc_error is not None:
+                raise rpc_error
+            if calls >= 14 or time.monotonic() >= deadline-8:
                 raise RuntimeError('investigation_budget_exhausted')
+            if action == 'DescribeRunningLogRecords':
+                now = time.monotonic()
+                while self.running_log_calls and self.running_log_calls[0] <= now-60:
+                    self.running_log_calls.popleft()
+                if len(self.running_log_calls) >= 24:
+                    raise RuntimeError('running_log_throttled')
+                self.running_log_calls.append(now)
             calls += 1
             return dds.call(action, params)
-        def failure(exc):
-            LOGGER.exception('Mongo investigation lane failed')
-            message = str(exc).lower()
-            kind = 'throttled' if 'thrott' in message else 'permission_denied' if any(k in message for k in ('forbidden','permission','unauthor')) else 'budget_exhausted' if 'budget' in message else 'unavailable'
-            return {'reason': kind, 'exception_type': type(exc).__name__}
+        failure = lane_failure
         points, events, logs = [], [], []
-        roles = [role] if role else ['Primary', 'Secondary']
+        roles = [role] if role in ('Primary','Secondary') else ['Primary', 'Secondary']
+        # DDS request parameters are whole-minute UTC strings. Fetch enclosing
+        # minutes, while accepting only samples and log rows inside the exact slice.
+        dds_start, dds_end = iso(start), iso((end+MINUTE-1)//MINUTE*MINUTE)
         for r in roles:
             try:
                 payload = call('DescribeDBInstancePerformance', dict(
-                    DBInstanceId=collector.instance, ReplicaSetRole=r, StartTime=iso(start), EndTime=iso(end),
+                    DBInstanceId=collector.instance, ReplicaSetRole=r, StartTime=dds_start, EndTime=dds_end,
                     Interval='5', Key=','.join(dict.fromkeys(s[0] for s in PERFORMANCE.values()))))
                 batch = performance_points(payload, r, start, end, 5)
                 points.extend(batch)
@@ -119,11 +179,11 @@ class MongoInvestigator:
                 if absent: gaps['performance:'+r] = dict(missing_metrics=absent)
             except Exception as exc:
                 gaps['performance:'+r] = failure(exc)
-            got, total, complete = 0, None, False
+            got, total, in_window, invalid_time, complete = 0, None, 0, 0, False
             try:
                 for page in range(1, 4):
                     payload = call('DescribeRunningLogRecords', dict(DBInstanceId=collector.instance,
-                        RoleType=r.lower(), StartTime=iso(start), EndTime=iso(end), PageSize=100, PageNumber=page,
+                        RoleType=r.lower(), StartTime=dds_start, EndTime=dds_end, PageSize=100, PageNumber=page,
                         QueryKeywords='checkpoint election stepdown shutdown', LogicalOperator='or', OrderType='asc'))
                     count = int(payload['TotalRecordCount'])
                     if total is not None and count != total:
@@ -133,21 +193,53 @@ class MongoInvestigator:
                     batch = payload.get('Items', {}).get('LogRecords', [])
                     got += len(batch)
                     for row in batch:
-                        e = running_event(row, r)
-                        if e: events.append(e)
+                        try:
+                            ts = epoch_us(row['CreateTime'])
+                        except (ValueError, KeyError, TypeError):
+                            invalid_time += 1
+                            continue
+                        if start <= ts < end:
+                            in_window += 1
+                            e = running_event(row, r, ts//1000)
+                            if e: events.append(e)
                     if got >= total:
-                        complete = True; break
+                        complete = not invalid_time; break
                     if not batch: break
             except Exception as exc:
                 gaps['running_logs:'+r] = failure(exc)
-            logs.append(dict(role=r, total=total, fetched=got, complete=complete, remaining=max(total-got,0) if total is not None else None,
+            logs.append(dict(role=r, total=total, fetched=got, in_window=in_window, invalid_time=invalid_time,
+                             complete=complete, remaining=max(total-got,0) if total is not None else None,
                              filter='checkpoint/election/stepdown/shutdown'))
+        store = self.service.stores[collector.instance]
+        detail = pressure_evidence(points, start, end)
+        missing_roles = set(roles) - {n['role'] for n in detail['nodes'] if n['complete']}
+        if missing_roles:
+            try:
+                if time.monotonic() >= deadline: raise RuntimeError('investigation_budget_exhausted')
+                retained = [p for p in store.read_telemetry(collector.instance, 'pressure', start, end)
+                            if p.get('role') in missing_roles and p.get('period') == 60
+                            and p.get('timestamp_semantics') == 'period_start'
+                            and start <= p['timestamp']*1000 <= end-MINUTE]
+                points.extend(retained)
+                detail = pressure_evidence(points, start, end)
+                if not retained: gaps['retained_pressure'] = dict(reason='no_retained_minutes')
+            except Exception as exc:
+                gaps['retained_pressure'] = failure(exc)
+        result = dict(instance=collector.instance, start_us=start, end_us=end, baseline_start=base,
+                      metric='WtCacheUpdatesUsage', performance=detail, metric_points=points,
+                      metric_labels={k: v[2] for k, v in PERFORMANCE.items()},
+                      running_events=sorted(events, key=lambda e: e['timestamp'])[:200], running_log_coverage=logs,
+                      gaps=gaps, requests=calls, causal=False, root_cause='unresolved')
+        if evidence_only:
+            if gaps:
+                LOGGER.warning('mongo_investigation partial: instance=%s lanes=%s', collector.instance, ','.join(gaps))
+            return result
+
         audit = dict(status='unknown')
         try:
             audit['status'] = call('DescribeAuditPolicy', {'DBInstanceId': collector.instance}).get('LogAuditStatus', 'unknown')
         except Exception as exc:
             gaps['audit'] = failure(exc)
-        store = self.service.stores[collector.instance]
         prefixes = collector.entry.get('families', [])
         rows, before = [], []
         coverage, baseline = dict(complete=False), dict(complete=False)
@@ -180,31 +272,10 @@ class MongoInvestigator:
                                    'tracked dirty bytes in the cache','bytes allocated for updates') if k in cache}})
         except Exception as exc:
             gaps['native_history'] = failure(exc)
-        sls = dict(status='not_configured' if not collector.entry.get('logSources') else 'not_selected', complete=False)
-        if sources:
-            results = []
-            for source in sources:
-                try:
-                    if time.monotonic() >= deadline-8:
-                        raise RuntimeError('investigation_budget_exhausted')
-                    credential = load_credential(collector.settings_loader().credential_target)
-                    if credential is None: raise RuntimeError('cloud_credential_unavailable')
-                    item = SlsReadonly(collector.entry['region'], credential).collect(source, start, end, max_pages=5, deadline=deadline)
-                    item['status'] = 'ok' if item['complete'] else 'partial'
-                except Exception as exc:
-                    item = dict(status='unavailable', complete=False, **failure(exc))
-                item.update(source=source['id'],label=source.get('label',source['id']))
-                results.append(item)
-            sls = results[0] if len(results)==1 else dict(status='configured_sources',sources=results,
-                complete=all(s.get('complete') for s in results))
         if gaps:
             LOGGER.warning('mongo_investigation partial: instance=%s lanes=%s', collector.instance, ','.join(gaps))
-        return dict(instance=collector.instance, start_us=start, end_us=end, baseline_start=base,
-                    metric='WtCacheUpdatesUsage', performance=pressure_evidence(points, start, end),
-                    metric_points=points, metric_labels={k: v[2] for k, v in PERFORMANCE.items()},
-                    running_events=events[:200], running_log_coverage=logs, audit=audit,
-                    workload=workload, coverage=coverage, baseline_coverage=baseline, sls=sls, gaps=gaps,
-                    native_snapshots=native[:200], native_continuity=native_continuity(native),
-                    pod_scope='historical_ip_bindings_only_no_pod_cpu_or_restart_history',
-                    requests=calls, causal=False, root_cause='unresolved',
-                    warning='节点级更新缓存不归属到单条命令；仅有时序与成本增量不能证明唯一触发源。历史快照持有者、全量快速写入及隐藏节点未覆盖时明确保留缺口。')
+        result.update(audit=audit, workload=workload, coverage=coverage, baseline_coverage=baseline,
+                      native_snapshots=native[:200], native_continuity=native_continuity(native), requests=calls,
+                      pod_scope='historical_ip_bindings_only_no_pod_cpu_or_restart_history',
+                      warning='节点级更新缓存不归属到单条命令；仅有时序与成本增量不能证明唯一触发源。历史快照持有者、全量快速写入及隐藏节点未覆盖时明确保留缺口。')
+        return result
