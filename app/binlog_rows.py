@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable
 from urllib.parse import urlencode
 
 from .binlog_lite import RawBinlogError
+from . import binlog_last_change as last_change
 
 LOGGER = logging.getLogger(__name__)
 
@@ -655,7 +656,8 @@ def keyword_uses_scan(query: dict[str, Any]) -> bool:
     return any(not TOKEN.findall(t) for t in str(query.get("keyword") or "").strip().lower().split()[:20])
 
 
-def primary_key_condition(query: dict[str, Any], params: dict[str, Any], row_image_key: str | None) -> str:
+def primary_key_condition(query: dict[str, Any], params: dict[str, Any], row_image_key: str | None,
+                          *, archived: bool = False) -> str:
     exact = query.get("exact")
     if not isinstance(exact, dict) or str(exact.get("kind") or "").upper() != "PRIMARY_KEY":
         return ""
@@ -665,6 +667,9 @@ def primary_key_condition(query: dict[str, Any], params: dict[str, Any], row_ima
     if not value:
         raise RawBinlogError("主键值不能为空", "INVALID_QUERY")
     params.update(pk_key=row_image_key, pk_raw=value, pk_quoted=json.dumps(value, ensure_ascii=False))
+    if archived:
+        return ("(JSONExtractRaw(key_after_json, {pk_key:String}) IN ({pk_raw:String}, {pk_quoted:String}) "
+                "OR JSONExtractRaw(key_before_json, {pk_key:String}) IN ({pk_raw:String}, {pk_quoted:String}))")
     cond = ("(JSONExtractRaw(after_json, {pk_key:String}) IN ({pk_raw:String}, {pk_quoted:String}) "
             "OR JSONExtractRaw(before_json, {pk_key:String}) IN ({pk_raw:String}, {pk_quoted:String}))")
     low = value.lower()
@@ -674,8 +679,8 @@ def primary_key_condition(query: dict[str, Any], params: dict[str, Any], row_ima
     return cond
 
 
-def build_query(query: dict[str, Any], start: int, end: int, *, row_image_key: str | None = None
-                ) -> tuple[str, dict[str, Any], int, int]:
+def build_query(query: dict[str, Any], start: int, end: int, *, row_image_key: str | None = None,
+                archived: bool = False) -> tuple[str, dict[str, Any], int, int]:
     instance = str(query.get("instance") or "").strip()
     database = str(query.get("database") or "").strip()
     table = str(query.get("table") or "").strip()
@@ -705,11 +710,20 @@ def build_query(query: dict[str, Any], start: int, end: int, *, row_image_key: s
     if transaction:
         params["txn"] = transaction
         where.append("(transaction_id = {txn:String} OR gtid = {txn:String})")
-    for clause in (keyword_conditions(query, params), primary_key_condition(query, params, row_image_key)):
+    pk = primary_key_condition(query, params, row_image_key, archived=archived)
+    for clause in (keyword_conditions(query, params), pk):
         if clause:
             where.append(clause)
-    sql = (f"SELECT {', '.join(RESULT_COLUMNS)} FROM {ROWS_TABLE} WHERE " + " AND ".join(where)
-           + " ORDER BY event_epoch_us DESC, end_position DESC, row_index DESC")
+    if archived:
+        where.append("window_id = {wid:String}")
+        columns = last_change.select_columns(RESULT_COLUMNS)
+        columns += ", key_before_json, key_after_json"
+        source = last_change.TABLE
+    else:
+        columns, source = ', '.join(RESULT_COLUMNS), ROWS_TABLE
+    sql = (f"SELECT {columns} FROM {source} WHERE " + " AND ".join(where)
+           + " ORDER BY event_epoch_us DESC, end_position DESC, row_index DESC"
+           + (", event_id DESC" if archived else ""))
     return sql, params, limit, offset
 
 
@@ -773,8 +787,9 @@ def present(row: dict[str, Any], statements: dict[int, str]) -> dict[str, Any]:
     out["event_epoch_us"] = epoch
     out["event_time_utc"] = datetime.fromtimestamp(epoch / 1e6, UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     rq_hash = int(out.pop("row_query_hash", 0) or 0)
-    out["row_query"] = statements.get(rq_hash, "") if rq_hash else ""
-    out["sql_text"] = render_sql(out)
+    archived = out.get('sql_kind') == 'LAST_CHANGE'
+    out["row_query"] = statements.get(rq_hash, "") if rq_hash and not archived else ""
+    out["sql_text"] = "" if archived else render_sql(out)
     if not out.get("sql_kind"):
         out["sql_kind"] = "PSEUDO"
     out["event_locator"] = encode_locator(out)
@@ -837,6 +852,17 @@ class BinlogRows:
         self.ch = http_client
         self.registry = registry or (lambda _db, _tbl: None)
         self._ingested_cache: dict[str, tuple[float, set[str]]] = {}
+        meta_path = getattr(metadata, 'path', None)
+        self.last_change_catalog = (meta_path.parent / last_change.CATALOG if isinstance(meta_path, Path) else None)
+
+    def _archive_windows(self, instance: str, database: str, table: str) -> list[last_change.Window]:
+        path = getattr(self, 'last_change_catalog', None)
+        if path is None:
+            return []
+        try:
+            return last_change.load(path, instance, database, table)
+        except (OSError, ValueError) as exc:
+            raise RawBinlogError("旧档切换目录不可用，不返回不完整结果", "CLICKHOUSE_BINLOG_ROWS_UNAVAILABLE") from exc
 
     @classmethod
     def from_env(cls, metadata: Any, *, registry: Callable[[str, str], str | None] | None = None) -> "BinlogRows | None":
@@ -918,28 +944,36 @@ class BinlogRows:
 
     def query(self, query: dict[str, Any], start: int, end: int, *, control: Any | None = None) -> dict[str, Any]:
         database, table = str(query.get("database") or "").strip(), str(query.get("table") or "").strip()
-        sql, params, limit, offset = build_query(query, start, end, row_image_key=self.registry(database, table))
+        row_key = self.registry(database, table)
+        sql, params, limit, offset = build_query(query, start, end, row_image_key=row_key)
         if control is not None:
             control.check_cancelled()
         started = time.monotonic()
-        summary = self.coverage(str(query.get("instance") or "").strip(), start, end)
+        instance = str(query.get("instance") or "").strip()
+        windows = [w for w in self._archive_windows(instance, database, table)
+                   if last_change.intersects(w, start, end)]
+        archived_sql, archived_params = (build_query(query, start, end, row_image_key=row_key, archived=True)[:2]
+                                         if windows else (None, None))
+        summary = self.coverage(instance, start, end)
         # Newest-first day slices: each touches one day's partitions (bounded memory) and the scan stops as
         # soon as offset + limit + 1 rows exist, so common keywords over long ranges return quickly.
         wanted = offset + limit + 1
         rows: list[dict[str, Any]] = []
         deadline = time.monotonic() + QUERY_DEADLINE_SECONDS
-        pending = day_slices(start, end)
+        pending = [part for lo, hi in day_slices(start, end) for part in last_change.slices(lo, hi, windows)]
         try:
             while pending:
-                lo, hi = pending.pop(0)
+                lo, hi, window = pending.pop(0)
                 remaining = deadline - time.monotonic()
                 if remaining <= 1:
                     raise RawBinlogError("TIMEOUT_EXCEEDED across day slices", "CLICKHOUSE_BINLOG_ROWS_UNAVAILABLE")
                 if control is not None:
                     control.check_cancelled()
-                slice_params = dict(params, lo=lo, hi=hi,
+                slice_params = dict(archived_params if window else params, lo=lo, hi=hi,
                                     d0=datetime.fromtimestamp(lo / 1e6, UTC).date().isoformat(),
                                     d1=datetime.fromtimestamp(hi / 1e6, UTC).date().isoformat())
+                if window:
+                    slice_params['wid'] = window.window_id
                 # Wide row images: reading in-order across many parts keeps one block per part in memory;
                 # 8192-row blocks and no per-part read-ahead buffering (read_in_order_use_buffering) keep it
                 # near 26 MB per overlapping part.
@@ -947,9 +981,10 @@ class BinlogRows:
                             "max_memory_usage": QUERY_MEMORY_BYTES, "read_in_order_use_buffering": 0,
                             "timeout_overflow_mode": "throw", "log_comment": "binlog-rows-query"}
                 try:
-                    rows += self.ch.rows(sql + f" LIMIT {wanted - len(rows)}", params=slice_params,
+                    stmt = archived_sql if window else sql
+                    rows += self.ch.rows(stmt + f" LIMIT {wanted - len(rows)}", params=slice_params,
                                          settings=settings, timeout=int(remaining) + 15,
-                                         query_id=f"binlog-rows-{int(time.time() * 1000)}-{os.getpid()}")
+                                         query_id=f"binlog-rows-{time.time_ns()}-{os.getpid()}")
                 except RawBinlogError as exc:
                     if not memory_limited(exc) or hi - lo < 2 * QUERY_SPLIT_MIN_US:
                         raise
@@ -957,7 +992,7 @@ class BinlogRows:
                     mid = lo + (hi - lo) // 2
                     LOGGER.warning("BINLOG_ROWS_QUERY_SPLIT table=%s.%s lo=%s hi=%s reason=%s",
                                    database, table, lo, hi, "total" if "(total)" in str(exc) else "query")
-                    pending[0:0] = [(mid + 1, hi), (lo, mid)]
+                    pending[0:0] = [(mid + 1, hi, window), (lo, mid, window)]
                     continue
                 if len(rows) >= wanted:
                     break
@@ -973,15 +1008,20 @@ class BinlogRows:
         rows = rows[:limit]
         statements = self._statements(rows)
         presented = [present(r, statements) for r in rows]
+        note = coverage_note(summary)
+        if windows:
+            note = f"{note}；" if note else ""
+            note += "部分区间只保留末次有效修改，关键词也只查保留字段"
         return {
             "rows": presented, "has_more": has_more, "limit": limit, "offset": offset,
-            "tiers_used": [TIER], "range_requests": 0, "range_bytes": 0,
-            "exact_index_complete": not summary["gaps"], "coverage_found": bool(summary["intervals"]),
+            "tiers_used": [TIER, last_change.TIER] if windows else [TIER], "range_requests": 0, "range_bytes": 0,
+            "exact_index_complete": not summary["gaps"] and not windows, "coverage_found": bool(summary["intervals"]),
             "range_start_epoch_us": start, "range_end_epoch_us": end,
             "covered_intervals": summary["intervals"], "coverage_gaps": summary["gaps"][:200],
             "coverage_gap_count": len(summary["gaps"]), "covered_us": summary.get("covered_us", 0),
-            "requested_us": summary.get("requested_us", 0), "coverage_note": coverage_note(summary),
+            "requested_us": summary.get("requested_us", 0), "coverage_note": note,
             "query_ms": int((time.monotonic() - started) * 1000),
+            **({"last_change_windows": [w.for_display() for w in windows]} if windows else {}),
         }
 
     def _statements(self, rows: list[dict[str, Any]]) -> dict[int, str]:
@@ -1003,15 +1043,26 @@ class BinlogRows:
         if decoded is None:
             return None
         instance, database, table, epoch, event_id = decoded
+        windows = self._archive_windows(instance, database, table)
+        window = next((w for w in windows if last_change.intersects(w, epoch, epoch)), None)
+        params = {"i": instance, "db": database, "tbl": table, "e": epoch, "id": event_id}
+        if window:
+            source = last_change.TABLE
+            cols = last_change.select_columns(RESULT_COLUMNS) + ", key_before_json, key_after_json"
+            extra = " AND window_id = {wid:String}"
+            params['wid'] = window.window_id
+        else:
+            source, cols, extra = ROWS_TABLE, ', '.join(RESULT_COLUMNS), ""
         rows = self.ch.rows(
-            f"SELECT {', '.join(RESULT_COLUMNS)} FROM {ROWS_TABLE} WHERE instance_id = {{i:String}} "
+            f"SELECT {cols} FROM {source} WHERE instance_id = {{i:String}} "
             f"AND tbl_bucket = cityHash64(lower({{db:String}}), lower({{tbl:String}})) % {BUCKETS} "
             "AND database_name = {db:String} AND table_name = {tbl:String} "
             "AND event_date = toDate(fromUnixTimestamp64Micro({e:Int64}, 'UTC')) "
-            "AND event_epoch_us = {e:Int64} AND event_id = {id:String} LIMIT 1",
-            params={"i": instance, "db": database, "tbl": table, "e": epoch, "id": event_id},
-            settings={"max_execution_time": 30, "max_threads": 4}, timeout=40)
+            "AND event_epoch_us = {e:Int64} AND event_id = {id:String}" + extra + " LIMIT 1",
+            params=params, settings={"max_execution_time": 30, "max_threads": 4}, timeout=40)
         if not rows:
+            if window:
+                raise RawBinlogError("该旧窗口只留末次有效修改，这条事件未保留", "EVENT_DETAIL_NOT_RETAINED")
             return None
         return present(rows[0], self._statements(rows))
 

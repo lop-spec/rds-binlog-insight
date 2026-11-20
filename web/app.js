@@ -427,6 +427,9 @@ function rowSql(row) {
   if (row.row_query && String(row.sql_kind || "").toUpperCase() !== "ORIGINAL") {
     return row.row_query;
   }
+  if (String(row.sql_kind || "").toUpperCase() === "LAST_CHANGE") {
+    return row.after_json || row.key_before_json || row.before_json || "末次修改";
+  }
   if (row.sql_text) return row.sql_text;
   if (row.after_json) return row.after_json;
   if (row.before_json) return row.before_json;
@@ -458,7 +461,8 @@ function renderEvents(result) {
   $("#event-empty").hidden = rows.length > 0;
   const rowsResult = (result.tiers_used || []).includes("clickhouse-binlog-rows");
   const indexedResult = rowsResult || (result.tiers_used || []).includes("raw-event-index");
-  $("#event-empty strong").textContent = indexedResult ? "所查区间没有匹配记录" : "还没有查询结果";
+  const lastChanges = Boolean(result.last_change_windows?.length);
+  $("#event-empty strong").textContent = indexedResult ? (lastChanges ? "没有符合条件的保留记录" : "所查区间没有匹配记录") : "还没有查询结果";
   $("#event-empty span").textContent = rowsResult
     ? (result.coverage_note || "所选时段已检索")
     : indexedResult ? "仅检查结果标题显示的时间段；其他历史尚未查询。" : "完成一次同步，或调整上方时间范围后查询。";
@@ -484,6 +488,8 @@ function renderEvents(result) {
     const hasRowQuery = Boolean(row.row_query) && sqlKind !== "ORIGINAL";
     const sqlLabel = auditEvent
       ? "执行"
+      : sqlKind === "LAST_CHANGE"
+      ? "末次修改"
       : hasRowQuery
       ? "原始"
       : sqlKind === "PSEUDO"
@@ -514,7 +520,7 @@ function renderEvents(result) {
   $("#page-prev").disabled = state.queryOffset === 0;
   $("#page-next").disabled = !state.hasMore;
   const tierNames = (result.tiers_used || []).map((tier) => (
-    tier === "raw-event-index" ? "Binlog 行级索引" : tier === "clickhouse-binlog-rows" ? "Binlog 按表索引" : tier === "exact-index"
+    tier === "clickhouse-binlog-last-change" ? "末次修改" : tier === "raw-event-index" ? "Binlog 行级索引" : tier === "clickhouse-binlog-rows" ? "Binlog 按表索引" : tier === "exact-index"
       ? "主键精确索引 · 0 OSS"
       : tier === "slowlog-index"
       ? "慢日志专用索引 · 0 OSS"
@@ -551,6 +557,10 @@ function renderEvents(result) {
         const lines = gaps.slice(0, 40).map((gap) => `${formatTime(gap.start)} — ${formatTime(gap.end)} · ${GAP_LABELS[gap.reason] || gap.reason}${gap.files ? `（${gap.files} 个文件）` : ""}`);
         const more = (result.coverage_gap_count || gaps.length) > lines.length ? `\n…共 ${result.coverage_gap_count} 段` : "";
         $("#result-meta").title = "未覆盖时段：\n" + lines.join("\n") + more;
+      }
+      if (lastChanges) {
+        const intervals = result.last_change_windows.map((w) => `${formatTime(w.start)} — ${formatTime(w.end)}`);
+        $("#result-meta").title += `${gaps.length ? "\n" : ""}只查保留下来的末次修改（结束时间不含）：\n${intervals.join("\n")}`;
       }
     } else if (indexedResult) {
       const query = state.activeQuery || {};
@@ -776,7 +786,8 @@ async function openDetail(eventId, locator = "", instance = "") {
       ${auditDetails}
       ${slowDetails}
       ${row.sql_truncated ? '<p class="analytics-note">SQL为截断预览，不可直接回放。</p>' : ''}
-      ${detailBlock(`SQL · ${sqlKind}`, row.sql_text || row.row_query || "—")}
+      ${normalizedKind === "LAST_CHANGE" ? '<p class="analytics-note">该窗口只保留末次有效修改，不含原 SQL。</p>' : detailBlock(`SQL · ${sqlKind}`, row.sql_text || row.row_query || "—")}
+      ${normalizedKind === "LAST_CHANGE" ? detailBlock("行定位", prettyJson(row.key_after_json || row.key_before_json)) : ""}
       ${auditEvent || slowEvent ? "" : detailBlock("变更前 BEFORE", prettyJson(row.before_json))}
       ${auditEvent || slowEvent ? "" : detailBlock("变更后 AFTER", prettyJson(row.after_json))}
       ${auditEvent || slowEvent ? "" : detailBlock("列信息", prettyJson(row.columns_json))}

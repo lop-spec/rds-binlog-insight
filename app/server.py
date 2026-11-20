@@ -1546,7 +1546,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             status = (
                 404
-                if code == "BINLOG_RANGE_NOT_FOUND"
+                if code in {"BINLOG_RANGE_NOT_FOUND", "EVENT_DETAIL_NOT_RETAINED"}
                 else 422
                 if code in {"QUERY_END_AFTER_LATEST", "QUERY_BINLOG_LIMIT", "QUERY_BINLOG_BYTE_LIMIT", "RAW_QUERY_PAGE_LIMIT"}
                 else 409
