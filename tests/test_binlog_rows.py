@@ -441,12 +441,16 @@ class BackgroundRecoveryTests(unittest.TestCase):
     """1.33.12: markers left by a predecessor are purged while the lanes run; their files stay claimed until then."""
 
     def worker(self, tmp):
+        import threading
         from pathlib import Path
         from app import binlog_rows_worker as worker_module
         worker = worker_module.Worker.__new__(worker_module.Worker)
         worker.storage = mock.Mock(paths={"index": Path(tmp)})
         worker.ingested = mock.Mock(return_value=set())
         worker.claims = worker_module.Claims()
+        worker.stop = threading.Event()
+        worker.ingest_slots = threading.BoundedSemaphore(1)
+        worker.capacity_reason = mock.Mock(return_value="")
         worker.ch = mock.Mock()
         worker.ch.rows.return_value = []
         return worker
@@ -487,6 +491,76 @@ class BackgroundRecoveryTests(unittest.TestCase):
             worker.recover_in_background().join(5)
             self.assertTrue(path.exists())
             self.assertTrue(worker.claims.take("bad"))
+
+    def test_recovery_cannot_overlap_an_active_ingest(self):
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self.worker(tmp)
+            marker = self.marker(worker.inflight_dir(), "old")
+            capacity_checked = threading.Event()
+            worker.capacity_reason.side_effect = lambda lane: capacity_checked.set() or ""
+            worker.purge_marker = mock.Mock(return_value=True)
+            self.assertTrue(worker.ingest_slots.acquire(blocking=False))
+            thread = worker.recover_in_background()
+            try:
+                self.assertTrue(capacity_checked.wait(2))
+                self.assertFalse(worker.claims.take("old"))
+                worker.purge_marker.assert_not_called()
+            finally:
+                worker.ingest_slots.release()
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            worker.purge_marker.assert_called_once_with(marker, reason="inflight-recovery")
+            self.assertTrue(worker.claims.take("old"))
+
+    def test_pressure_pause_keeps_markers_and_releases_claims_on_stop(self):
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self.worker(tmp)
+            markers = [self.marker(worker.inflight_dir(), name) for name in ("old1", "old2")]
+            checked = threading.Event()
+            worker.capacity_reason.side_effect = lambda lane: checked.set() or "clickhouse-memory"
+            worker.purge_marker = mock.Mock()
+            with self.assertLogs("binlog_rows_worker", level="WARNING"):
+                thread = worker.recover_in_background()
+                self.assertTrue(checked.wait(2))
+                worker.purge_marker.assert_not_called()
+                worker.stop.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(all(marker.exists() for marker in markers))
+            self.assertTrue(worker.claims.take("old1"))
+            self.assertTrue(worker.claims.take("old2"))
+            self.assertTrue(worker.ingest_slots.acquire(blocking=False))
+            worker.ingest_slots.release()
+
+    def test_pressure_change_after_slot_acquisition_releases_slot(self):
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = self.worker(tmp)
+            marker = self.marker(worker.inflight_dir(), "old")
+            rechecked = threading.Event()
+            def capacity(lane):
+                if worker.capacity_reason.call_count == 1:
+                    return ""
+                rechecked.set()
+                return "clickhouse-memory"
+            worker.capacity_reason.side_effect = capacity
+            worker.purge_marker = mock.Mock()
+            with self.assertLogs("binlog_rows_worker", level="WARNING"):
+                thread = worker.recover_in_background()
+                self.assertTrue(rechecked.wait(2))
+                worker.stop.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+            worker.purge_marker.assert_not_called()
+            self.assertTrue(marker.exists())
+            self.assertTrue(worker.claims.take("old"))
+            self.assertTrue(worker.ingest_slots.acquire(blocking=False))
+            worker.ingest_slots.release()
 
     def test_nothing_left_means_no_thread(self):
         import tempfile

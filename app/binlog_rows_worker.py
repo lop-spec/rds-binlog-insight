@@ -509,26 +509,61 @@ class Worker:
         marker.unlink(missing_ok=True)
         return True
 
-    def recover_inflight(self, markers: list[Path] | None = None) -> int:
-        """Purge rows of moves that never reached the manifest (crash, kill, container stop).
+    def guarded_recover_marker(self, marker: Path) -> bool | None:
+        """Recover under the same slot as ingestion; None means shutdown before recovery."""
+        while not self.stop.is_set():
+            # Lane zero is always a live lane. Do not hold the slot while
+            # waiting, so live collection can use it if its gate permits.
+            reason = self.capacity_reason(0)
+            if reason:
+                LOGGER.warning("BINLOG_ROWS_RECOVERY_PAUSED reason=%s", reason)
+                self.stop.wait(15)
+                continue
+            if not self.acquire_ingest_slot():
+                return None
+            try:
+                if self.stop.is_set():
+                    return None
+                # Another lane may have changed pressure while we waited.
+                reason = self.capacity_reason(0)
+                if not reason:
+                    return self.purge_marker(marker, reason="inflight-recovery")
+            finally:
+                self.ingest_slots.release()
+            LOGGER.warning("BINLOG_ROWS_RECOVERY_PAUSED reason=%s", reason)
+            self.stop.wait(15)
+        return None
 
-        Each purge is a lightweight DELETE over the file's days (10-21: about 13 minutes each, six markers held every lane
-        for 85 minutes), so ``run`` hands the markers found at start to a background thread: their files are claimed
-        first, lanes skip them, and each claim is released once its rows are gone. A purge that fails keeps its marker
-        and is retried on the next start (or by ``commit`` when a lane takes the file).
+    def recover_inflight(self, markers: list[Path] | None = None) -> int:
+        """Recover unfinished moves; background recovery shares the ingestion safety slot.
+
+        Background markers are claimed before lanes start. A failed or interrupted
+        recovery keeps its durable marker; all remaining claims are released on exit.
         """
         purged = 0
-        for marker in sorted(self.inflight_dir().glob("*.json")) if markers is None else markers:
-            file_id = marker.stem
-            try:
-                purged += self.purge_marker(marker, reason="inflight-recovery")
-            except ValueError:
-                LOGGER.error("BINLOG_ROWS_INFLIGHT_UNREADABLE marker=%s", marker.name)
-            except Exception as exc:  # noqa: BLE001 - the marker stays; never take the lanes down with it
-                LOGGER.error("BINLOG_ROWS_INFLIGHT_PURGE_FAILED marker=%s error=%s", marker.name, str(exc)[:300])
-            finally:
-                if markers is not None:
-                    self.claims.release(file_id)
+        background = markers is not None
+        pending = list(markers if background else sorted(self.inflight_dir().glob("*.json")))
+        claimed = {marker.stem for marker in pending} if background else set()
+        try:
+            for marker in pending:
+                file_id = marker.stem
+                try:
+                    result = (self.guarded_recover_marker(marker) if background
+                              else self.purge_marker(marker, reason="inflight-recovery"))
+                    if result is None:
+                        break
+                    purged += result
+                except ValueError:
+                    LOGGER.error("BINLOG_ROWS_INFLIGHT_UNREADABLE marker=%s", marker.name)
+                except Exception as exc:  # noqa: BLE001 - retain the marker for the next retry
+                    LOGGER.error("BINLOG_ROWS_INFLIGHT_PURGE_FAILED marker=%s error=%s", marker.name, str(exc)[:300])
+                finally:
+                    if file_id in claimed:
+                        self.claims.release(file_id)
+                        claimed.remove(file_id)
+        finally:
+            for file_id in claimed:
+                self.claims.release(file_id)
         return purged
 
     def recover_in_background(self) -> threading.Thread | None:
