@@ -1,0 +1,24 @@
+name: ingest-mutation-diagnostic
+on:
+  push:
+    branches:
+      - fix/binlog-ingest-backpressure
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  isolated:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare mutation scope on the deployed ClickHouse version
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='clickhouse/clickhouse-server@sha256:2ef11bbe2e44ab7022f37ff3019b3f2125ed09e919ea6194660be6130b7ca4b7'
+          docker pull "$image"
+          docker run --rm -i --network none --no-healthcheck --cpus=0.5 --memory=512m --memory-swap=512m \
+            --pids-limit=96 --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --tmpfs /tmp:rw,size=128m,mode=1777 --entrypoint sh "$image" -s \
+            < tests/clickhouse-ingest-diagnostic.sh
