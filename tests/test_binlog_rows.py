@@ -383,6 +383,9 @@ class Release1293Tests(unittest.TestCase):
         worker = worker_module.Worker.__new__(worker_module.Worker)
         worker.storage = mock.Mock(paths={"index": Path(tmp)})
         worker.ch = mock.Mock()
+        worker.ch.rows.return_value = []
+        worker.ch.execute.side_effect = lambda sql, **kwargs: "1\n" if sql.startswith("SELECT count()") else ""
+        worker.clickhouse_memory = mock.Mock(return_value=0)
         worker.ingested = mock.Mock(return_value=set(manifest))
         return worker
 
@@ -445,6 +448,7 @@ class BackgroundRecoveryTests(unittest.TestCase):
         worker.ingested = mock.Mock(return_value=set())
         worker.claims = worker_module.Claims()
         worker.ch = mock.Mock()
+        worker.ch.rows.return_value = []
         return worker
 
     @staticmethod
@@ -460,7 +464,7 @@ class BackgroundRecoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             worker = self.worker(tmp)
             release = threading.Event()
-            worker.ch.execute.side_effect = lambda *a, **k: release.wait(5)
+            worker.ch.execute.side_effect = lambda sql, **k: (release.wait(5), "1\n" if sql.startswith("SELECT count()") else "")[1]
             folder = worker.inflight_dir()
             for name in ("old1", "old2"):
                 self.marker(folder, name)
@@ -653,7 +657,8 @@ class Release12911Tests(unittest.TestCase):
 
     def test_failed_move_purges_only_the_files_days(self):
         client = mock.Mock()
-        client.execute.side_effect = [None, RawBinlogError("memory", "X"), None, None]
+        client.rows.return_value = []
+        client.execute.side_effect = [None, RawBinlogError("memory", "X"), None, "1\n", None]
         lo = 1789430400000000  # 2026-09-15T00:00Z
         with self.assertRaises(RawBinlogError):
             br.RowsIngestor(client).move(["raw:f"], "t", lo_us=lo, hi_us=lo + 3_600_000_000)
@@ -666,6 +671,15 @@ class Release12911Tests(unittest.TestCase):
         call = client.execute.call_args_list[-1]
         self.assertIn("DELETE FROM insight.binlog_rows_v1 WHERE event_date BETWEEN {d0:Date} AND {d1:Date}", call.args[0])
         self.assertEqual((call.kwargs["params"]["d0"], call.kwargs["params"]["d1"]), ("2026-09-14", "2026-09-16"))
+
+    def test_unconfirmed_failed_move_never_starts_cleanup(self):
+        client = mock.Mock()
+        client.execute.side_effect = [RawBinlogError("memory", "X"), RawBinlogError("kill unavailable", "X")]
+        with self.assertLogs("app.binlog_rows", level="WARNING"), self.assertRaises(RawBinlogError):
+            br.RowsIngestor(client).move(["raw:f"], "t", lo_us=1, hi_us=2,
+                                         partitions=[("2026-09-15", 0)])
+        self.assertFalse(any(c.args[0].startswith("DELETE") for c in client.execute.call_args_list))
+        self.assertFalse(client.rows.called)
 
     def test_unbounded_purge_is_logged(self):
         client = mock.Mock()
@@ -683,6 +697,9 @@ class Release12911Tests(unittest.TestCase):
             worker = worker_module.Worker.__new__(worker_module.Worker)
             worker.storage = mock.Mock(paths={"index": Path(tmp)})
             worker.ch = mock.Mock()
+            worker.ch.rows.return_value = []
+            worker.ch.execute.side_effect = lambda sql, **kwargs: "1\n" if sql.startswith("SELECT count()") else ""
+            worker.clickhouse_memory = mock.Mock(return_value=0)
             worker.ingested = mock.Mock(return_value=set())
             ingestor = mock.Mock()
             ingestor.partitions.return_value = [("2026-09-15", 2), ("2026-09-15", 6)]
@@ -695,8 +712,10 @@ class Release12911Tests(unittest.TestCase):
                              {"lo_us": entry["lo"], "hi_us": entry["hi"],
                               "partitions": [("2026-09-15", 2), ("2026-09-15", 6)]})
             self.assertEqual(worker.recover_inflight(), 1)
-            call = worker.ch.execute.call_args
-            self.assertIn("event_date IN ('2026-09-15') AND tbl_bucket IN (2, 6)", call.args[0])
+            deletes = [c.args[0] for c in worker.ch.execute.call_args_list if c.args[0].startswith("DELETE")]
+            self.assertEqual(len(deletes), 2)
+            self.assertIn("IN PARTITION ('2026-09-15', 2)", deletes[0])
+            self.assertIn("IN PARTITION ('2026-09-15', 6)", deletes[1])
             # a marker written before 1.29.14 has no partitions: the purge falls back to the file's days
             marker = Path(tmp) / "binlog-rows-inflight" / "f8.json"
             marker.write_text(json.dumps({"instance_id": "i", "file_id": "f8", "part_keys": ["raw:f8"],
@@ -785,11 +804,16 @@ class Release12914Tests(unittest.TestCase):
         from app.binlog_rows import purge_file_rows
 
         ch = mock.Mock()
+        ch.rows.return_value = []
+        ch.execute.side_effect = lambda sql, **kwargs: "1\n" if sql.startswith("SELECT count()") else ""
         purge_file_rows(ch, ["raw:a"], 1, 2, partitions=[("2026-09-23", 0), ("2026-09-23", 3), ("2026-09-24", 0)],
                         reason="t")
-        sql = ch.execute.call_args.args[0]
-        self.assertIn("event_date IN ('2026-09-23', '2026-09-24') AND tbl_bucket IN (0, 3) AND _source_part_key", sql)
-        self.assertNotIn("BETWEEN", sql)
+        deletes = [c.args[0] for c in ch.execute.call_args_list if c.args[0].startswith("DELETE")]
+        self.assertEqual(len(deletes), 3)
+        for sql, day, bucket in zip(deletes, ("2026-09-23", "2026-09-23", "2026-09-24"), (0, 3, 0)):
+            self.assertIn(f"IN PARTITION ('{day}', {bucket})", sql)
+            self.assertIn(f"event_date IN ('{day}') AND tbl_bucket IN ({bucket}) AND _source_part_key", sql)
+            self.assertNotIn("BETWEEN", sql)
         ch.reset_mock()
         purge_file_rows(ch, ["raw:a"], 1, 2, partitions=[], reason="t")
         ch.execute.assert_not_called()
@@ -808,15 +832,17 @@ class Release12914Tests(unittest.TestCase):
             seen.append(sql)
             if "% 8 = 2" in sql:
                 raise br.RawBinlogError("Code: 241. memory", "X")
-            return ""
+            return "1\n" if sql.startswith("SELECT count()") else ""
 
+        ing.ch.rows.return_value = []
         ing.ch.execute.side_effect = execute
         parts = [("2026-09-23", b) for b in range(8)]
         with self.assertRaises(br.RawBinlogError):
             ing.move(["raw:a"], "t", lo_us=1, hi_us=2, partitions=parts)
         purge = [s for s in seen if s.startswith("DELETE")]
-        self.assertEqual(len(purge), 1)
-        self.assertIn("tbl_bucket IN (0, 1, 2)", purge[0])
+        self.assertEqual(len(purge), 3)
+        for bucket, sql in enumerate(purge):
+            self.assertIn(f"IN PARTITION ('2026-09-23', {bucket})", sql)
 
     def test_partitions_read_from_buffer(self):
         from app import binlog_rows as br
@@ -869,6 +895,8 @@ class Release12916Tests(unittest.TestCase):
         worker = worker_module.Worker.__new__(worker_module.Worker)
         worker.storage = mock.Mock(paths={"index": Path(tmp)})
         worker.ch = mock.Mock()
+        worker.ch.rows.return_value = []
+        worker.clickhouse_memory = mock.Mock(return_value=0)
         worker.ingested = mock.Mock(return_value=set())
         return worker
 
@@ -888,11 +916,14 @@ class Release12916Tests(unittest.TestCase):
             ingestor.move.side_effect = lambda *a, **k: calls.append("move")
             ingestor.aggregate.side_effect = lambda *a, **k: calls.append("aggregate")
             ingestor.record.side_effect = lambda *a, **k: calls.append("record")
-            worker.ch.execute.side_effect = lambda sql, **k: calls.append("purge" if sql.startswith("DELETE") else sql)
+            def execute(sql, **kwargs):
+                calls.append("purge" if sql.startswith("DELETE") else sql)
+                return "1\n" if sql.startswith("SELECT count()") else ""
+            worker.ch.execute.side_effect = execute
             worker.commit(ingestor, entry, ["raw:f7"], 1, "raw", True, 0)
             steps = [c for c in calls if c in ("purge", "move", "aggregate", "record")]
             self.assertEqual(steps, ["purge", "move", "aggregate", "record"])
-            # 1.34.14: the retry first asks whether rows of the file are left; no answer means delete as before
+            # A numeric count is required before a partition-specific delete.
             self.assertTrue(str(calls[0]).startswith("SELECT count() FROM insight.binlog_rows_v1"), calls[0])
             self.assertEqual(list(worker.inflight_dir().glob("*.json")), [])
 
@@ -1243,6 +1274,7 @@ class BatchCommitTests(unittest.TestCase):
         w._archive = mock.Mock()
         w.archive = mock.Mock(return_value=w._archive)
         w.ch = mock.Mock()
+        w.clickhouse_memory = mock.Mock(return_value=0)
         return w
 
     @staticmethod

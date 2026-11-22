@@ -285,6 +285,26 @@ class MoveSlotTests(unittest.TestCase):
         self.assertIn("BINLOG_ROWS_MOVE_WAIT", logs.output[0])
         w.publish.assert_called_once_with(1, state="waiting", reason="move-memory")
 
+    def test_memory_wait_timeout_never_starts_a_move(self):
+        w, module = self.worker(lambda: 5 * 1024 ** 3)
+        w.move_slots = threading.BoundedSemaphore(1)
+        with mock.patch.object(module, "MOVE_MEMORY_MAX", 3 * 1024 ** 3), \
+                mock.patch.object(module, "MOVE_WAIT_SECONDS", 0), \
+                self.assertLogs("binlog_rows_worker", level="WARNING"), self.assertRaises(RawBinlogError):
+            with w.move_slot(0):
+                self.fail("unsafe move started")
+        self.assertTrue(w.move_slots.acquire(blocking=False))
+        w.move_slots.release()
+
+    def test_unavailable_memory_never_starts_a_move(self):
+        w, module = self.worker(lambda: (_ for _ in ()).throw(RawBinlogError("unavailable", "X")))
+        w.move_slots = threading.BoundedSemaphore(1)
+        with mock.patch.object(module, "MOVE_MEMORY_MAX", 1), self.assertRaises(RawBinlogError):
+            with w.move_slot(0):
+                self.fail("unsafe move started")
+        self.assertTrue(w.move_slots.acquire(blocking=False))
+        w.move_slots.release()
+
     def test_a_stopped_lane_leaves_no_marker(self):
         w, module = self.worker(lambda: 0)
         w.move_slots = threading.BoundedSemaphore(1)
@@ -301,6 +321,131 @@ class MoveSlotTests(unittest.TestCase):
                 w.commit_batch(ingestor, entries, {e["file_id"]: 1 for e in entries}, 0)
             self.assertEqual(list(w.inflight_dir().glob("*.json")), [])
             ingestor.move.assert_not_called()
+
+
+class IngestCapacityTests(unittest.TestCase):
+    def worker(self):
+        from app import binlog_rows_worker as module
+        w = module.Worker.__new__(module.Worker)
+        w.ch = mock.Mock()
+        w.stop = threading.Event()
+        w.ingest_slots = threading.BoundedSemaphore(1)
+        return w, module
+
+    def test_memory_uses_larger_of_tracked_and_resident(self):
+        w, _ = self.worker()
+        w.ch.execute.return_value = "tracked\t4000000000\nresident\t5900000000\n"
+        self.assertEqual(w.clickhouse_memory(), 5900000000)
+        sql = w.ch.execute.call_args.args[0]
+        self.assertIn("system.asynchronous_metrics", sql)
+        self.assertIn("system.metrics", sql)
+
+    def test_missing_or_invalid_memory_metric_is_an_error(self):
+        for value in ("tracked\t100\n", "resident\t0\ntracked\t3\n", "bad", "tracked\t1\ntracked\t2\n"):
+            w, _ = self.worker()
+            w.ch.execute.return_value = value
+            with self.subTest(value=value), self.assertRaises(RawBinlogError):
+                w.clickhouse_memory()
+
+    def test_live_headroom_cannot_bypass_move_budget(self):
+        w, module = self.worker()
+        w.lane_specs = [("live", None)]
+        w.publish = mock.Mock()
+        w.clickhouse_memory = mock.Mock(return_value=4 * 1024 ** 3)
+        w.stop = mock.Mock()
+        w.stop.is_set.side_effect = [False, True]
+        with mock.patch.object(module, "MOVE_MEMORY_MAX", int(3.9 * 1024 ** 3)), \
+                mock.patch.dict("os.environ", {"RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB": "4.8",
+                                             "RDS_BINLOG_ROWS_LIVE_HEADROOM_GIB": "0.75",
+                                             "RDS_BINLOG_ROWS_SLICE_STAT_FILE": ""}), \
+                self.assertLogs("binlog_rows_worker", level="WARNING"):
+            self.assertFalse(w.wait_for_capacity(0))
+        self.assertEqual(w.publish.call_args.kwargs["reason"], "clickhouse-memory")
+
+    def test_only_one_ingest_runs_at_once(self):
+        w, _ = self.worker()
+        active, peak, lock = [0], [0], threading.Lock()
+
+        def ingest():
+            if not w.acquire_ingest_slot():
+                return
+            try:
+                with lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                time.sleep(0.03)
+                with lock:
+                    active[0] -= 1
+            finally:
+                w.ingest_slots.release()
+
+        threads = [threading.Thread(target=ingest) for _ in range(3)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(peak[0], 1)
+
+    def test_stopped_worker_does_not_take_ingest_slot(self):
+        w, _ = self.worker()
+        w.stop.set()
+        self.assertFalse(w.acquire_ingest_slot())
+        self.assertTrue(w.ingest_slots.acquire(blocking=False))
+        w.ingest_slots.release()
+
+    def test_three_live_lanes_process_distinct_files_serially(self):
+        w, module = self.worker()
+        w.lane_specs = [("live", None)] * 3
+        w.claims = module.Claims()
+        w.candidates = lambda lane: [{"file_id": f"f{lane}", "instance_id": "i", "kind": "raw"}]
+        w.due = mock.Mock(return_value=True)
+        w.wait_for_capacity = mock.Mock(return_value=True)
+        w.capacity_reason = mock.Mock(return_value="")
+        w.ingested = mock.Mock(return_value=set())
+        w.publish = mock.Mock()
+        active, peak, completed, lock = [0], [0], [], threading.Lock()
+
+        def batch(_ingestor, lane, first, _rest, _failures):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.03)
+            with lock:
+                active[0] -= 1
+                completed.append(first["file_id"])
+                w.claims.finish(first["file_id"])
+                if len(completed) == 3:
+                    w.stop.set()
+
+        w.run_batch = batch
+        with mock.patch.object(module, "RowsIngestor"), mock.patch.object(module, "STREAM_INGEST", True), \
+                mock.patch.object(module, "BATCH_FILES", 4):
+            threads = [threading.Thread(target=w.run_lane, args=(lane,)) for lane in range(3)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(peak[0], 1)
+        self.assertCountEqual(completed, ["f0", "f1", "f2"])
+        self.assertTrue(w.ingest_slots.acquire(blocking=False))
+        w.ingest_slots.release()
+
+    def test_late_window_pause_releases_slot_without_claiming(self):
+        w, module = self.worker()
+        w.lane_specs = [("window", ("i", "a", "b"))]
+        w.claims = mock.Mock()
+        w.candidates = mock.Mock(return_value=[{"file_id": "f"}])
+        w.due = mock.Mock(return_value=True)
+        w.wait_for_capacity = mock.Mock(return_value=True)
+        w.capacity_reason = mock.Mock(return_value="collector-lag")
+        w.publish = mock.Mock(side_effect=lambda *args, **kwargs: w.stop.set())
+        with mock.patch.object(module, "RowsIngestor"), self.assertLogs("binlog_rows_worker", level="WARNING"):
+            w.run_lane(0)
+        w.claims.take.assert_not_called()
+        self.assertTrue(w.ingest_slots.acquire(blocking=False))
+        w.ingest_slots.release()
 
 
 class PurgeDedupTests(unittest.TestCase):
@@ -336,25 +481,44 @@ class PurgeDedupTests(unittest.TestCase):
         br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="retry", check_remaining=True)
         self.assertEqual(self.deletes(ch), [])
 
-    def test_rows_left_are_deleted_within_the_partitions(self):
+    def test_rows_left_are_deleted_only_in_explicit_partitions(self):
         ch = self.client(count="12\n")
         br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="retry", check_remaining=True)
-        (delete,) = self.deletes(ch)
-        self.assertIn("event_date IN ('2026-10-29') AND tbl_bucket IN (0, 3)", delete.args[0])
+        deletes = self.deletes(ch)
+        self.assertEqual(len(deletes), 2)
+        for call, bucket in zip(deletes, (0, 3)):
+            self.assertIn(f"IN PARTITION ('2026-10-29', {bucket})", call.args[0])
+            self.assertIn(f"event_date IN ('2026-10-29') AND tbl_bucket IN ({bucket})", call.args[0])
+            self.assertIn("_source_part_key IN", call.args[0])
+            self.assertEqual(call.kwargs["settings"]["lightweight_deletes_sync"], 2)
 
-    def test_a_failed_move_deletes_without_counting_first(self):
+    def test_a_failed_move_with_no_rows_creates_no_mutation(self):
         ch = self.client(count="0")
         br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="move-failed")
-        self.assertEqual(len(self.deletes(ch)), 1)
-        self.assertFalse(any(c.args[0].startswith("SELECT count()") for c in ch.execute.call_args_list))
+        self.assertEqual(len(self.deletes(ch)), 0)
+        self.assertEqual(sum(c.args[0].startswith("SELECT count()") for c in ch.execute.call_args_list), 2)
 
-    def test_an_unanswered_count_falls_back_to_the_delete(self):
+    def test_an_unanswered_count_never_creates_a_mutation(self):
         ch = self.client()
         ch.execute.side_effect = lambda sql, **kwargs: (_ for _ in ()).throw(RawBinlogError("down", "X")) \
             if sql.startswith("SELECT count()") else ""
-        with self.assertLogs("app.binlog_rows", level="WARNING"):
+        with self.assertLogs("app.binlog_rows", level="WARNING"), self.assertRaises(RawBinlogError):
             br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="retry", check_remaining=True)
-        self.assertEqual(len(self.deletes(ch)), 1)
+        self.assertEqual(len(self.deletes(ch)), 0)
+
+    def test_failed_pending_check_never_creates_a_mutation(self):
+        ch = self.client()
+        ch.rows.side_effect = RawBinlogError("down", "X")
+        with self.assertLogs("app.binlog_rows", level="WARNING"), self.assertRaises(RawBinlogError):
+            br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="retry")
+        self.assertEqual(len(self.deletes(ch)), 0)
+
+    def test_missing_pending_status_never_proceeds_to_delete(self):
+        ch = self.client()
+        ch.rows.side_effect = [[{"mutation_id": "mutation_8.txt"}], []]
+        with self.assertLogs("app.binlog_rows", level="WARNING"), self.assertRaises(RawBinlogError):
+            br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="retry")
+        self.assertEqual(self.deletes(ch), [])
 
     def test_a_purge_that_outlives_the_wait_keeps_its_marker(self):
         ch = self.client(pending=["mutation_8.txt"], done_after=10 ** 9)

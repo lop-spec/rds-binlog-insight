@@ -120,8 +120,9 @@ PARSED_RE = re.compile(rb"parsed (\d+) audit records")
 # lanes moving at once next to the merges went past the server limit: 10-29/30, 25 batches in 15 hours were
 # killed by the overcommit tracker, and each failure queued lightweight DELETE mutations that rewrite the
 # version of every row-store part (~6,500) and held the lanes for up to 30 minutes. Moves take a slot and
-# start only while ClickHouse is below RDS_BINLOG_ROWS_MOVE_CH_MEMORY_MAX_GIB (waiting at most
-# RDS_BINLOG_ROWS_MOVE_WAIT_SECONDS); loading and parsing stay parallel.
+# start only while ClickHouse is below RDS_BINLOG_ROWS_MOVE_CH_MEMORY_MAX_GIB. Limit the whole
+# load and move path too: parallel loads can exhaust RSS before the move semaphore is reached.
+INGEST_SLOTS = max(1, min(int(os.environ.get("RDS_BINLOG_ROWS_INGEST_SLOTS", "1") or 1), WORKER_LANES_MAX))
 MOVE_SLOTS = max(1, min(int(os.environ.get("RDS_BINLOG_ROWS_MOVE_SLOTS", "2") or 2), WORKER_LANES_MAX))
 MOVE_MEMORY_MAX = int(float(os.environ.get("RDS_BINLOG_ROWS_MOVE_CH_MEMORY_MAX_GIB", "3.9") or 0) * 1024 ** 3)
 MOVE_WAIT_SECONDS = max(0.0, float(os.environ.get("RDS_BINLOG_ROWS_MOVE_WAIT_SECONDS", "300") or 0))
@@ -322,6 +323,7 @@ class Worker:
         self._ingested: dict[str, tuple[float, set[str]]] = {}
         self._archive = None
         self._archive_at = 0.0
+        self.ingest_slots = threading.BoundedSemaphore(INGEST_SLOTS)
         self.move_slots = threading.BoundedSemaphore(MOVE_SLOTS)
 
     # -- shared helpers -------------------------------------------------------
@@ -402,6 +404,16 @@ class Worker:
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def acquire_ingest_slot(self) -> bool:
+        """Acquire before checking capacity; stop never leaves a slot held."""
+        while not self.stop.is_set():
+            if self.ingest_slots.acquire(timeout=5):
+                if self.stop.is_set():
+                    self.ingest_slots.release()
+                    return False
+                return True
+        return False
+
     @contextlib.contextmanager
     def move_slot(self, lane: int):
         """One of MOVE_SLOTS concurrent moves, entered once ClickHouse has room for it (see MOVE_SLOTS).
@@ -419,17 +431,16 @@ class Worker:
             deadline = time.monotonic() + MOVE_WAIT_SECONDS
             waited = False
             while MOVE_MEMORY_MAX > 0:
-                try:
-                    used = int(self.clickhouse_memory())
-                except Exception:  # noqa: BLE001 - advisory only; the move reports an unavailable server itself
-                    break
+                # Unknown pressure or an expired wait is not permission to start
+                # a move: the caller will retry without leaving a new marker.
+                used = int(self.clickhouse_memory())
                 if used <= MOVE_MEMORY_MAX:
                     break
                 if stop.is_set():
                     raise RawBinlogError("写入进程停止", "BINLOG_ROWS_STOPPED")
                 if time.monotonic() >= deadline:
                     LOGGER.warning("BINLOG_ROWS_MOVE_MEMORY_WAIT_EXPIRED lane=%s used=%s max=%s", lane, used, MOVE_MEMORY_MAX)
-                    break
+                    raise RawBinlogError("ClickHouse 内存等待超时，暂不写入", "BINLOG_ROWS_MOVE_MEMORY_WAIT_EXPIRED")
                 if not waited:
                     LOGGER.info("BINLOG_ROWS_MOVE_WAIT lane=%s used=%s max=%s", lane, used, MOVE_MEMORY_MAX)
                     self.publish(lane, state="waiting", reason="move-memory")
@@ -549,34 +560,53 @@ class Worker:
         return int(time.time() - _epoch_us(row["e"]) / 1e6)
 
     def clickhouse_memory(self) -> int:
-        text = self.ch.execute("SELECT value FROM system.metrics WHERE metric = 'MemoryTracking' FORMAT TSV",
-                               settings={"max_execution_time": 20}, timeout=30)
-        return int(text.strip() or 0)
+        # The server's total limit also considers RSS; tracked allocations can
+        # be well below RSS. Missing either metric must not permit a write.
+        sql = ("SELECT 'tracked', toInt64(value) FROM system.metrics WHERE metric = 'MemoryTracking' "
+               "UNION ALL SELECT 'resident', toInt64(value) FROM system.asynchronous_metrics "
+               "WHERE metric = 'MemoryResident' FORMAT TSV")
+        text = self.ch.execute(sql, settings={"max_execution_time": 10}, timeout=15)
+        values: dict[str, int] = {}
+        try:
+            for line in text.splitlines():
+                key, value = line.split("\t")
+                if key in values or key not in {"tracked", "resident"}:
+                    raise ValueError("unexpected memory metric")
+                values[key] = int(value)
+            if set(values) != {"tracked", "resident"} or min(values.values()) <= 0:
+                raise ValueError("missing memory metric")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RawBinlogError("ClickHouse 内存读数不可用", "BINLOG_ROWS_MEMORY_UNAVAILABLE") from exc
+        return max(values.values())
 
-    def wait_for_capacity(self, lane: int) -> bool:
-        """Yield to the collector and interactive queries; every pause reason is logged."""
+    def capacity_reason(self, lane: int) -> str:
+        """One nonblocking decision; the caller decides when to wait."""
         limit = int(float(os.environ.get("RDS_BINLOG_ROWS_CH_MEMORY_LIMIT_GIB", "4.2")) * 1024 ** 3)
         slice_path, slice_limit = slice_memory_limits()
         if self.lane_specs[lane][0] == "live":
-            # live lanes keep headroom above both lines: under pressure window lanes pause first
             headroom = int(float(os.environ.get("RDS_BINLOG_ROWS_LIVE_HEADROOM_GIB", "0.75") or 0) * 1024 ** 3)
             limit += headroom
             slice_limit += headroom
+        if MOVE_MEMORY_MAX > 0:
+            limit = min(limit, MOVE_MEMORY_MAX)
+        used = read_slice_memory(slice_path) if slice_path else None
+        if slice_path and used is None:
+            return f"slice-memory-unreadable: {slice_path}"
+        if used is not None and used > slice_limit:
+            return "slice-anon-memory"
+        try:
+            if self.clickhouse_memory() > limit:
+                return "clickhouse-memory"
+        except RawBinlogError as exc:
+            return f"clickhouse-unavailable: {exc}"
+        if self.lane_specs[lane][0] == "window" and self.collector_lag_seconds() > 1200:
+            return "collector-lag"
+        return ""
+
+    def wait_for_capacity(self, lane: int) -> bool:
+        """Yield to the collector and interactive queries; every pause reason is logged."""
         while not self.stop.is_set():
-            reason = ""
-            used = read_slice_memory(slice_path) if slice_path else None
-            if slice_path and used is None:
-                reason = f"slice-memory-unreadable: {slice_path}"
-            elif used is not None and used > slice_limit:
-                reason = "slice-anon-memory"
-            if not reason:
-                try:
-                    if self.clickhouse_memory() > limit:
-                        reason = "clickhouse-memory"
-                except RawBinlogError as exc:
-                    reason = f"clickhouse-unavailable: {exc}"
-            if not reason and self.lane_specs[lane][0] == "window" and self.collector_lag_seconds() > 1200:
-                reason = "collector-lag"
+            reason = self.capacity_reason(lane)
             if not reason:
                 return True
             LOGGER.warning("BINLOG_ROWS_PAUSED lane=%s reason=%s", lane, reason)
@@ -918,46 +948,58 @@ class Worker:
                 self.stop.wait(30)
                 continue
             for position, entry in enumerate(todo):
-                if self.stop.is_set() or not self.wait_for_capacity(lane):
+                # Do not hold the shared slot while a window lane yields to live
+                # collection. Recheck after acquisition because pressure can rise.
+                if self.stop.is_set() or not self.wait_for_capacity(lane) or not self.acquire_ingest_slot():
                     break
-                if not self.claims.take(entry["file_id"]):
-                    continue
-                if entry["file_id"] in self.ingested(entry["instance_id"]):
-                    self.claims.finish(entry["file_id"])  # committed by another lane after this list was built
-                    continue
-                if entry["kind"] == "raw" and STREAM_INGEST and BATCH_FILES > 1:
-                    self.run_batch(ingestor, lane, entry, todo[position + 1:], failures)
-                    if self.lane_specs[lane][0] == "live":
-                        break
-                    continue
-                started = time.monotonic()
-                committed = False
                 try:
-                    self.publish(lane, state="running", file=entry["source_file_name"], kind=entry["kind"])
-                    rows = (self.ingest_raw if entry["kind"] == "raw" else self.ingest_parquet)(ingestor, entry, lane)
-                    self.mark_ingested(entry["instance_id"], entry["file_id"])
-                    committed = True
-                    seconds = round(time.monotonic() - started, 1)
-                    LOGGER.info("BINLOG_ROWS_INGESTED lane=%s file=%s kind=%s rows=%s seconds=%s",
-                                lane, entry["source_file_name"], entry["kind"], rows, seconds)
-                    self.publish(lane, state="running", lastFile=entry["source_file_name"], lastRows=rows,
-                                 lastSeconds=seconds, lastEventEnd=entry["hi"])
-                    self.succeeded(entry["file_id"])
-                except Exception as exc:
-                    delay = self.failed(entry, failures, exc)
-                    LOGGER.error("BINLOG_ROWS_INGEST_FAILED lane=%s file=%s kind=%s attempt=%s retry_in=%.0fs error=%s",
-                                 lane, entry["source_file_name"], entry["kind"], failures[entry["file_id"]], delay,
-                                 str(exc)[:300])
-                    self.publish(lane, state="error", lastError=str(exc)[:300], errorFile=entry["source_file_name"])
+                    if self.stop.is_set():
+                        break
+                    reason = self.capacity_reason(lane)
+                    if reason:
+                        LOGGER.warning("BINLOG_ROWS_PAUSED lane=%s reason=%s", lane, reason)
+                        self.publish(lane, state="paused", reason=reason)
+                        continue
+                    if not self.claims.take(entry["file_id"]):
+                        continue
+                    if entry["file_id"] in self.ingested(entry["instance_id"]):
+                        self.claims.finish(entry["file_id"])  # committed by another lane after this list was built
+                        continue
+                    if entry["kind"] == "raw" and STREAM_INGEST and BATCH_FILES > 1:
+                        self.run_batch(ingestor, lane, entry, todo[position + 1:], failures)
+                        if self.lane_specs[lane][0] == "live":
+                            break
+                        continue
+                    started = time.monotonic()
+                    committed = False
                     try:
-                        ingestor.truncate()
-                    except RawBinlogError:
-                        pass
-                    self.stop.wait(10)
+                        self.publish(lane, state="running", file=entry["source_file_name"], kind=entry["kind"])
+                        rows = (self.ingest_raw if entry["kind"] == "raw" else self.ingest_parquet)(ingestor, entry, lane)
+                        self.mark_ingested(entry["instance_id"], entry["file_id"])
+                        committed = True
+                        seconds = round(time.monotonic() - started, 1)
+                        LOGGER.info("BINLOG_ROWS_INGESTED lane=%s file=%s kind=%s rows=%s seconds=%s",
+                                    lane, entry["source_file_name"], entry["kind"], rows, seconds)
+                        self.publish(lane, state="running", lastFile=entry["source_file_name"], lastRows=rows,
+                                     lastSeconds=seconds, lastEventEnd=entry["hi"])
+                        self.succeeded(entry["file_id"])
+                    except Exception as exc:
+                        delay = self.failed(entry, failures, exc)
+                        LOGGER.error("BINLOG_ROWS_INGEST_FAILED lane=%s file=%s kind=%s attempt=%s retry_in=%.0fs error=%s",
+                                     lane, entry["source_file_name"], entry["kind"], failures[entry["file_id"]], delay,
+                                     str(exc)[:300])
+                        self.publish(lane, state="error", lastError=str(exc)[:300], errorFile=entry["source_file_name"])
+                        try:
+                            ingestor.truncate()
+                        except RawBinlogError:
+                            pass
+                        self.stop.wait(10)
+                    finally:
+                        (self.claims.finish if committed else self.claims.release)(entry["file_id"])
+                    if self.lane_specs[lane][0] == "live":
+                        break  # re-rank so the newest unclaimed file is always next
                 finally:
-                    (self.claims.finish if committed else self.claims.release)(entry["file_id"])
-                if self.lane_specs[lane][0] == "live":
-                    break  # re-rank so the newest unclaimed file is always next
+                    self.ingest_slots.release()
 
     def run_batch(self, ingestor: RowsIngestor, lane: int, first: dict[str, Any], rest: list[dict[str, Any]],
                   failures: dict[str, int]) -> None:

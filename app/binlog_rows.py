@@ -370,12 +370,11 @@ def purge_file_rows(ch: Any, part_keys: list[str], lo_us: int | None = None, hi_
                     check_remaining: bool = False) -> None:
     """Delete one file's rows from the row store.
 
-    The mutation still visits every part of the table (and waits behind merges for a pool slot), but parts
-    outside the predicate's partitions are skipped without reading data. ``partitions`` (the
-    (event_date, bucket) pairs the move could have written, from the buffer) leave ~40-150 parts whose
-    _source_part_key is read, against ~380 for the file's day span with one day of slack each side (the
-    fallback for markers without partitions). An empty list means nothing could have been written.
-    Unbounded, every part is read; that is kept only for spans that cannot be determined and is logged.
+    For known (event_date, bucket) pairs, scope each lightweight mutation to one explicit partition.
+    A non-replicated MergeTree otherwise versions every part, even when the WHERE excludes almost all
+    of them. Check each partition first and keep the caller's durable marker on an unknown result.
+    Markers without recorded partitions retain the older time-bounded fallback. An empty list means
+    nothing could have been written; the unbounded legacy fallback is logged.
     """
     where = "_source_part_key IN (SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))"
     params: dict[str, Any] = {"k": json.dumps(part_keys)}
@@ -394,31 +393,44 @@ def purge_file_rows(ch: Any, part_keys: list[str], lo_us: int | None = None, hi_
         ch.execute(f"DELETE FROM {ROWS_TABLE} WHERE {where}", params=params,
                    settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
         return
-    # Every DELETE is a mutation that gives all ~6,500 parts of the table a new version, whatever its WHERE (10-30:
-    # 16k MutatePart an hour and cleanup passes of up to 225 s). A purge that timed out keeps running on the server
-    # and its marker brings the file back here: wait for that mutation instead of queueing another, and (for a
-    # marker, ``check_remaining``) delete only when rows of these files are still there. The count reads the
-    # source-key column of the partitions (~20 s for a day), still far less than a redundant mutation.
+    # A timed-out mutation keeps running on the server. Never schedule another if
+    # checking the prior one failed; the caller must keep its recovery marker.
     pending = _pending_purges(ch, part_keys)
     if pending:
         LOGGER.warning("BINLOG_ROWS_PURGE_WAIT parts=%s mutations=%s reason=%s", len(part_keys), ",".join(pending), reason)
         _wait_mutations_done(ch, pending, timeout=PURGE_WAIT_SECONDS)
-    if pending or check_remaining:
+
+    def count_left(predicate: str) -> int:
         try:
-            text = ch.execute(f"SELECT count() FROM {ROWS_TABLE} WHERE {where} FORMAT TSV", params=params,
-                              settings={"max_execution_time": 600, "max_threads": 2}, timeout=660)
+            text = ch.execute(f"SELECT count() FROM {ROWS_TABLE} WHERE {predicate} FORMAT TSV", params=params,
+                              settings={"max_execution_time": 120, "max_threads": 1}, timeout=140)
         except RawBinlogError as exc:
-            text, error = None, str(exc)[:200]
-        else:
-            error = f"unexpected count {str(text)[:40]!r}"
-        if isinstance(text, str) and text.strip().isdigit():
-            left = int(text.strip())
-        else:  # unknown: delete as before
-            LOGGER.warning("BINLOG_ROWS_PURGE_COUNT_FAILED parts=%s error=%s", len(part_keys), error)
-            left = -1
-        if left == 0:
+            LOGGER.warning("BINLOG_ROWS_PURGE_COUNT_FAILED parts=%s error=%s", len(part_keys), str(exc)[:200])
+            raise
+        if not isinstance(text, str) or not text.strip().isdigit():
+            raise RawBinlogError("清理前行数不可用，保留恢复标记", "BINLOG_ROWS_PURGE_COUNT_UNKNOWN")
+        return int(text.strip())
+
+    if partitions is not None:
+        # IN PARTITION is required on non-replicated MergeTree: WHERE alone
+        # causes every part to be versioned. One statement per pair is supported
+        # by the deployed ClickHouse 26.3 parser and limits each mutation.
+        source_where = "_source_part_key IN (SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))"
+        deleted = False
+        for day, bucket in sorted({(str(d), int(b)) for d, b in partitions}):
+            predicate = partition_filter([(day, bucket)]) + " AND " + source_where
+            if count_left(predicate) == 0:
+                continue
+            ch.execute(f"DELETE FROM {ROWS_TABLE} IN PARTITION ('{day}', {bucket}) WHERE {predicate}", params=params,
+                       settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
+            deleted = True
+        if not deleted:
             LOGGER.info("BINLOG_ROWS_PURGE_NOTHING_LEFT parts=%s reason=%s", len(part_keys), reason)
-            return
+        return
+
+    if (pending or check_remaining) and count_left(where) == 0:
+        LOGGER.info("BINLOG_ROWS_PURGE_NOTHING_LEFT parts=%s reason=%s", len(part_keys), reason)
+        return
     ch.execute(f"DELETE FROM {ROWS_TABLE} WHERE {where}", params=params,
                settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
 
@@ -439,10 +451,10 @@ def _pending_purges(ch: Any, part_keys: list[str]) -> list[str]:
             settings={"max_execution_time": 30}, timeout=40)
     except RawBinlogError as exc:
         LOGGER.warning("BINLOG_ROWS_PURGE_PENDING_CHECK_FAILED error=%s", str(exc)[:200])
-        return []
-    if not isinstance(rows, list):
-        return []
-    return [str(row["mutation_id"]) for row in rows if isinstance(row, dict) and row.get("mutation_id")]
+        raise
+    if (not isinstance(rows, list) or any(not isinstance(row, dict) or not row.get("mutation_id") for row in rows)):
+        raise RawBinlogError("无法确认已有清理任务，保留恢复标记", "BINLOG_ROWS_PURGE_PENDING_UNKNOWN")
+    return [str(row["mutation_id"]) for row in rows]
 
 
 def _wait_mutations_done(ch: Any, mutation_ids: list[str], *, timeout: float) -> None:
@@ -454,7 +466,10 @@ def _wait_mutations_done(ch: Any, mutation_ids: list[str], *, timeout: float) ->
             "AND NOT is_done AND has(JSONExtract({ids:String}, 'Array(String)'), mutation_id)",
             params={"db": DATABASE, "tbl": ROWS_TABLE.split(".", 1)[1], "ids": json.dumps(mutation_ids)},
             settings={"max_execution_time": 30}, timeout=40)
-        if not rows or int(rows[0]["n"]) == 0:
+        if (not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)
+                or not str(rows[0].get("n", "")).isdigit()):
+            raise RawBinlogError("无法确认清理任务状态，保留恢复标记", "BINLOG_ROWS_PURGE_PENDING_UNKNOWN")
+        if int(rows[0]["n"]) == 0:
             return
         if time.monotonic() >= deadline:
             raise RawBinlogError(f"等待清理 mutation 超时：{','.join(mutation_ids)}", "BINLOG_ROWS_PURGE_TIMEOUT")
@@ -1188,12 +1203,13 @@ class RowsIngestor:
         except RawBinlogError as exc:
             self.stop_query(query_id)
             attempted = None if partitions is None else [p for p in partitions if p[1] <= bucket]
-            purge_file_rows(self.ch, part_keys, lo_us, hi_us, partitions=attempted, reason="move-failed")
+            purge_file_rows(self.ch, part_keys, lo_us, hi_us, partitions=attempted, reason="move-failed",
+                            check_remaining=True)
             exc.rows_purged = True  # the caller may drop its inflight marker: nothing of this file is left
             raise
 
     def stop_query(self, query_id: str) -> None:
-        """Wait until a server-side query is gone (KILL ... SYNC); failure is logged, the purge still runs."""
+        """Wait until the server-side query is gone; never purge while its state is unknown."""
         if not query_id:
             return
         try:
@@ -1201,6 +1217,7 @@ class RowsIngestor:
                             settings={"max_execution_time": 600}, timeout=660)
         except RawBinlogError as exc:
             LOGGER.warning("BINLOG_ROWS_KILL_FAILED query_id=%s error=%s", query_id, str(exc)[:200])
+            raise
 
     def aggregate(self, file_id: str, tag: str, *, only_file: bool = False) -> None:
         """Buffer -> analytics aggregates, once per file (a retry with the same token is skipped).
