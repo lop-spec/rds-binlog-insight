@@ -22,3 +22,7 @@ jobs:
             --pids-limit=96 --read-only --cap-drop=ALL --security-opt=no-new-privileges \
             --tmpfs /tmp:rw,size=128m,mode=1777 --entrypoint sh "$image" -s \
             < tests/clickhouse-ingest-diagnostic.sh
+          docker run --rm -i --network none --no-healthcheck --cpus=0.5 --memory=512m --memory-swap=512m \
+            --pids-limit=96 --read-only --cap-drop=ALL --security-opt=no-new-privileges \
+            --tmpfs /tmp:rw,size=128m,mode=1777 --entrypoint sh "$image" -s \
+            < tests/clickhouse-ingest-purge-fixture.sh

@@ -713,9 +713,8 @@ class Release12911Tests(unittest.TestCase):
                               "partitions": [("2026-09-15", 2), ("2026-09-15", 6)]})
             self.assertEqual(worker.recover_inflight(), 1)
             deletes = [c.args[0] for c in worker.ch.execute.call_args_list if c.args[0].startswith("DELETE")]
-            self.assertEqual(len(deletes), 2)
-            self.assertIn("IN PARTITION ('2026-09-15', 2)", deletes[0])
-            self.assertIn("IN PARTITION ('2026-09-15', 6)", deletes[1])
+            self.assertEqual(len(deletes), 1)
+            self.assertIn("event_date IN ('2026-09-15') AND tbl_bucket IN (2, 6)", deletes[0])
             # a marker written before 1.29.14 has no partitions: the purge falls back to the file's days
             marker = Path(tmp) / "binlog-rows-inflight" / "f8.json"
             marker.write_text(json.dumps({"instance_id": "i", "file_id": "f8", "part_keys": ["raw:f8"],
@@ -809,11 +808,9 @@ class Release12914Tests(unittest.TestCase):
         purge_file_rows(ch, ["raw:a"], 1, 2, partitions=[("2026-09-23", 0), ("2026-09-23", 3), ("2026-09-24", 0)],
                         reason="t")
         deletes = [c.args[0] for c in ch.execute.call_args_list if c.args[0].startswith("DELETE")]
-        self.assertEqual(len(deletes), 3)
-        for sql, day, bucket in zip(deletes, ("2026-09-23", "2026-09-23", "2026-09-24"), (0, 3, 0)):
-            self.assertIn(f"IN PARTITION ('{day}', {bucket})", sql)
-            self.assertIn(f"event_date IN ('{day}') AND tbl_bucket IN ({bucket}) AND _source_part_key", sql)
-            self.assertNotIn("BETWEEN", sql)
+        self.assertEqual(len(deletes), 1)
+        self.assertIn("event_date IN ('2026-09-23', '2026-09-24') AND tbl_bucket IN (0, 3) AND _source_part_key", deletes[0])
+        self.assertNotIn("BETWEEN", deletes[0])
         ch.reset_mock()
         purge_file_rows(ch, ["raw:a"], 1, 2, partitions=[], reason="t")
         ch.execute.assert_not_called()
@@ -840,9 +837,8 @@ class Release12914Tests(unittest.TestCase):
         with self.assertRaises(br.RawBinlogError):
             ing.move(["raw:a"], "t", lo_us=1, hi_us=2, partitions=parts)
         purge = [s for s in seen if s.startswith("DELETE")]
-        self.assertEqual(len(purge), 3)
-        for bucket, sql in enumerate(purge):
-            self.assertIn(f"IN PARTITION ('2026-09-23', {bucket})", sql)
+        self.assertEqual(len(purge), 1)
+        self.assertIn("tbl_bucket IN (0, 1, 2)", purge[0])
 
     def test_partitions_read_from_buffer(self):
         from app import binlog_rows as br
@@ -923,7 +919,7 @@ class Release12916Tests(unittest.TestCase):
             worker.commit(ingestor, entry, ["raw:f7"], 1, "raw", True, 0)
             steps = [c for c in calls if c in ("purge", "move", "aggregate", "record")]
             self.assertEqual(steps, ["purge", "move", "aggregate", "record"])
-            # A numeric count is required before a partition-specific delete.
+            # A numeric count is required before the single scoped delete.
             self.assertTrue(str(calls[0]).startswith("SELECT count() FROM insight.binlog_rows_v1"), calls[0])
             self.assertEqual(list(worker.inflight_dir().glob("*.json")), [])
 

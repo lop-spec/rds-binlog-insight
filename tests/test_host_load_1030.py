@@ -481,22 +481,20 @@ class PurgeDedupTests(unittest.TestCase):
         br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="retry", check_remaining=True)
         self.assertEqual(self.deletes(ch), [])
 
-    def test_rows_left_are_deleted_only_in_explicit_partitions(self):
+    def test_rows_left_use_one_bounded_mutation_for_the_batch(self):
         ch = self.client(count="12\n")
         br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="retry", check_remaining=True)
-        deletes = self.deletes(ch)
-        self.assertEqual(len(deletes), 2)
-        for call, bucket in zip(deletes, (0, 3)):
-            self.assertIn(f"IN PARTITION ('2026-10-29', {bucket})", call.args[0])
-            self.assertIn(f"event_date IN ('2026-10-29') AND tbl_bucket IN ({bucket})", call.args[0])
-            self.assertIn("_source_part_key IN", call.args[0])
-            self.assertEqual(call.kwargs["settings"]["lightweight_deletes_sync"], 2)
+        (delete,) = self.deletes(ch)
+        self.assertIn("event_date IN ('2026-10-29') AND tbl_bucket IN (0, 3)", delete.args[0])
+        self.assertIn("_source_part_key IN", delete.args[0])
+        self.assertNotIn("IN PARTITION", delete.args[0])
+        self.assertEqual(delete.kwargs["settings"]["lightweight_deletes_sync"], 2)
 
     def test_a_failed_move_with_no_rows_creates_no_mutation(self):
         ch = self.client(count="0")
         br.purge_file_rows(ch, ["raw:a"], 1, 2, partitions=self.PARTS, reason="move-failed")
         self.assertEqual(len(self.deletes(ch)), 0)
-        self.assertEqual(sum(c.args[0].startswith("SELECT count()") for c in ch.execute.call_args_list), 2)
+        self.assertEqual(sum(c.args[0].startswith("SELECT count()") for c in ch.execute.call_args_list), 1)
 
     def test_an_unanswered_count_never_creates_a_mutation(self):
         ch = self.client()

@@ -19,20 +19,12 @@ INSERT INTO fixture VALUES
  ('2026-10-29',0,'test',3,'raw:c','keep-other-instance'),
  ('2026-10-29',3,'prod',4,'raw:a','keep-other-bucket'),
  ('2026-10-30',0,'prod',5,'raw:a','keep-other-day');
-CREATE TABLE untouched_before ENGINE=Memory AS
- SELECT partition_id,name,data_version FROM system.parts WHERE active AND database=currentDatabase()
- AND table='fixture' AND partition_id!='20261029-0';
-SELECT throwIf(count()!=2,'fixture_unrelated_partition_count') FROM untouched_before FORMAT Null;
-DELETE FROM fixture IN PARTITION ('2026-10-29',0)
- WHERE event_date IN ('2026-10-29') AND tbl_bucket IN (0)
+DELETE FROM fixture WHERE event_date IN ('2026-10-29') AND tbl_bucket IN (0)
  AND _source_part_key IN (SELECT arrayJoin(JSONExtract('["raw:a"]', 'Array(String)')))
  SETTINGS lightweight_deletes_sync=2;
 SELECT throwIf(arraySort(groupArray((event_id,value))) != [(2,'keep-other-file'),(3,'keep-other-instance'),
  (4,'keep-other-bucket'),(5,'keep-other-day')],'delete_scope_mismatch') FROM fixture FORMAT Null;
-SELECT throwIf(
- (SELECT arraySort(groupArray((partition_id,name,data_version))) FROM system.parts
-  WHERE active AND database=currentDatabase() AND table='fixture' AND partition_id!='20261029-0')
- != (SELECT arraySort(groupArray((partition_id,name,data_version))) FROM untouched_before),
- 'unrelated_part_versions_changed') FORMAT Null;
-SELECT 'partition_scoped_lightweight_purge_passed' AS result;
+SELECT throwIf(count()!=1,'unexpected_mutation_count') FROM system.mutations
+ WHERE database=currentDatabase() AND table='fixture' FORMAT Null;
+SELECT 'single_mutation_and_logical_scope_passed' AS result;
 SQL

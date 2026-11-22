@@ -260,7 +260,7 @@ jobs:
           docker run --rm --entrypoint python "$LOCAL_IMAGE" -c \
             "import sqlite3; assert sqlite3.sqlite_version == '3.53.4'"
 
-      - name: Verify partition-scoped ingest recovery in isolated ClickHouse
+      - name: Verify one bounded ingest recovery mutation in isolated ClickHouse
         shell: bash
         run: |
           set -euo pipefail

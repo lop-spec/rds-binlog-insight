@@ -370,11 +370,10 @@ def purge_file_rows(ch: Any, part_keys: list[str], lo_us: int | None = None, hi_
                     check_remaining: bool = False) -> None:
     """Delete one file's rows from the row store.
 
-    For known (event_date, bucket) pairs, scope each lightweight mutation to one explicit partition.
-    A non-replicated MergeTree otherwise versions every part, even when the WHERE excludes almost all
-    of them. Check each partition first and keep the caller's durable marker on an unknown result.
-    Markers without recorded partitions retain the older time-bounded fallback. An empty list means
-    nothing could have been written; the unbounded legacy fallback is logged.
+    Non-replicated MergeTree versions every part for a mutation, including with IN PARTITION on the
+    deployed engine. Count within the known (event_date, bucket) pairs first and issue at most one
+    delete for the batch. Unknown results keep the caller's durable marker. Markers without recorded
+    partitions retain the older time-bounded fallback; an empty list means nothing was written.
     """
     where = "_source_part_key IN (SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))"
     params: dict[str, Any] = {"k": json.dumps(part_keys)}
@@ -411,24 +410,9 @@ def purge_file_rows(ch: Any, part_keys: list[str], lo_us: int | None = None, hi_
             raise RawBinlogError("清理前行数不可用，保留恢复标记", "BINLOG_ROWS_PURGE_COUNT_UNKNOWN")
         return int(text.strip())
 
-    if partitions is not None:
-        # IN PARTITION is required on non-replicated MergeTree: WHERE alone
-        # causes every part to be versioned. One statement per pair is supported
-        # by the deployed ClickHouse 26.3 parser and limits each mutation.
-        source_where = "_source_part_key IN (SELECT arrayJoin(JSONExtract({k:String}, 'Array(String)')))"
-        deleted = False
-        for day, bucket in sorted({(str(d), int(b)) for d, b in partitions}):
-            predicate = partition_filter([(day, bucket)]) + " AND " + source_where
-            if count_left(predicate) == 0:
-                continue
-            ch.execute(f"DELETE FROM {ROWS_TABLE} IN PARTITION ('{day}', {bucket}) WHERE {predicate}", params=params,
-                       settings={"lightweight_deletes_sync": 2, "max_execution_time": 1800}, timeout=1900)
-            deleted = True
-        if not deleted:
-            LOGGER.info("BINLOG_ROWS_PURGE_NOTHING_LEFT parts=%s reason=%s", len(part_keys), reason)
-        return
-
-    if (pending or check_remaining) and count_left(where) == 0:
+    # On ClickHouse 26.3, splitting into IN PARTITION mutations still versions
+    # unrelated parts; doing so would multiply the cost. Keep one scoped delete.
+    if (partitions is not None or pending or check_remaining) and count_left(where) == 0:
         LOGGER.info("BINLOG_ROWS_PURGE_NOTHING_LEFT parts=%s reason=%s", len(part_keys), reason)
         return
     ch.execute(f"DELETE FROM {ROWS_TABLE} WHERE {where}", params=params,
