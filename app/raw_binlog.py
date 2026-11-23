@@ -131,8 +131,8 @@ class RawBinlogStore:
         framed = os.environ.get('RDS_BINLOG_WRITE_FRAMED_ZSTD') == '1'
         if framed:
             from .raw_frames import encode
-            # Separate from the v1 expiration rules and legacy compactor.
-            key_base = f'binlog-recovery/v2/{archive.prefix.strip("/")}/{file_id}/{sha}'
+            # Existing v2 descriptors keep their original keys and retention.
+            key_base = f'binlog-recovery/forward-v2/{archive.prefix.strip("/")}/{file_id}/{sha}'
             with tempfile.TemporaryDirectory(dir=path.parent) as tmp:
                 packed_path = Path(tmp) / 'packed.zst'
                 raw, packed_sha, packed_crc = encode(path, packed_path, sha, crc, progress)

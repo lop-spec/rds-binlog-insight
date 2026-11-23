@@ -58,6 +58,7 @@ class FrameTest(unittest.TestCase):
     def test_single_payload_and_recover_without_sqlite(self):
         d = self.write(); self.db.verify(self.oss,d)
         self.assertEqual(len(self.oss.objects),3)
+        self.assertTrue(all(k.startswith('binlog-recovery/forward-v2/mysql-binlog/test/') for k in self.oss.objects))
         self.assertFalse(any(k.endswith('.binlog') for k in self.oss.objects))
         m = json.loads(self.oss.objects[d['recovery']['oss_key']]); r=m['raw']
         self.assertEqual(m['file_id'],self.fid)
