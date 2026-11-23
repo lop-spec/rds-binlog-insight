@@ -69,3 +69,37 @@ printf '%s\n' "$limited" | awk -F '\t' '$1 >= 3 && $2 == 3 && $3 == 0 {ok=1} END
 sql "SELECT throwIf(count()!=0) FROM fixture.control"
 sql "SELECT throwIf(count()!=0) FROM fixture.limited"
 printf '%s\n' ttl_drop_batch_cap_observed
+
+# Keep the existing protection in force in this synthetic test. Choose the
+# numeric limit from actual part metadata: one part fits, three do not.
+for shape in rows statements; do
+  if [ "$shape" = rows ]; then
+    engine=MergeTree; key='(d,bucket)'; old='20261023-2'
+  else
+    engine=ReplacingMergeTree; key=d; old=20261023
+  fi
+  target=fixture.cap_$shape
+  sql "CREATE TABLE $target (d Date,bucket UInt8,id UInt64,s String) ENGINE=$engine PARTITION BY $key ORDER BY id"
+  sql "SYSTEM STOP MERGES $target"
+  for i in 0 1 2; do
+    sql "INSERT INTO $target SELECT toDate('2026-10-23'),2,$i*256+number,hex(SHA256(toString($i*256+number))) FROM numbers(256)"
+  done
+  sql "INSERT INTO $target VALUES ('2026-10-24',2,1000,'keep')"
+  pred="database='fixture' AND table='cap_$shape' AND partition_id='$old' AND active"
+  test "$(sql "SELECT count() FROM system.parts WHERE $pred")" = 3
+  limit=$(sql "SELECT sum(bytes_on_disk)-min(bytes_on_disk) FROM system.parts WHERE $pred")
+  part=$(sql "SELECT name FROM system.parts WHERE $pred ORDER BY bytes_on_disk DESC,name LIMIT 1")
+  test "$(sql "SELECT max(bytes_on_disk)<=$limit AND sum(bytes_on_disk)>$limit FROM system.parts WHERE $pred")" = 1
+  capped() { clickhouse client --host 127.0.0.1 --port 19000 --max_partition_size_to_drop="$limit" --query "$1"; }
+  if capped "ALTER TABLE $target DROP PARTITION ID '$old'" > "$base/cap.log" 2>&1; then
+    printf '%s\n' 'size limit did not block the whole partition' >&2; exit 1
+  fi
+  grep -F 'TABLE_SIZE_EXCEEDS_MAX_DROP_SIZE' "$base/cap.log" >/dev/null || { tail -12 "$base/cap.log" >&2; exit 1; }
+  test "$(sql "SELECT count() FROM system.parts WHERE $pred")" = 3
+  capped "ALTER TABLE $target DROP PART '$part'"
+  test "$(sql "SELECT count(),sum(rows) FROM system.parts WHERE $pred")" = "$(printf '2\t512')"
+  capped "ALTER TABLE $target DROP PARTITION ID '$old'"
+  test "$(sql "SELECT count() FROM system.parts WHERE $pred AND rows>0")" = 0
+  test "$(sql "SELECT id,s FROM $target")" = "$(printf '1000\tkeep')"
+  printf 'size_limited_drop_part_passed\t%s\n' "$shape"
+done
