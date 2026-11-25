@@ -88,13 +88,14 @@ class RedisContext:
 
     def run(self,entry,nodes):
         identity=entry['instanceId'];now=self.service.clock();errors={}
+        cloud_nodes=self.service.cloud_meta.get(identity,nodes)
         tasks=[]
         if self.due(entry,'source',60) and entry.get('sources'):tasks.append(('sources',lambda:self.sources(entry,now)))
-        if self.due(entry,'keys',60):tasks.append(('keys',lambda:self.keys(entry,nodes,now)))
+        if self.due(entry,'keys',60):tasks.append(('keys',lambda:self.keys(entry,cloud_nodes,now)))
         if self.due(entry,'queues',60):tasks.append(('queues',lambda:self.queues(entry,now)))
         if self.due(entry,'events',300):tasks.append(('cloud_events',lambda:self.events(entry,now)))
         if entry.get('prefixProfile',False) and self.due(entry,'profile',20):tasks.append(('profile',lambda:self.profile(entry,nodes,now)))
-        if self.due(entry,'night',3600):tasks.append(('night',lambda:self.night(entry,nodes,now)))
+        if self.due(entry,'night',3600):tasks.append(('night',lambda:self.night(entry,cloud_nodes,now)))
         for name,fn in tasks:
             if self.service.stop_event.is_set():break
             try:fn();self.state[name]={'last_success':self.service.clock()}

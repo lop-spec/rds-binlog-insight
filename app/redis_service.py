@@ -70,6 +70,7 @@ class RedisService:
         self.entries = []
         self.last = {}
         self.meta = {}
+        self.cloud_meta = {}
         self.next_cloud = {}
         self.next_topology = {}
         self.next_buckets = {}
@@ -231,6 +232,12 @@ class RedisService:
                 result.append({'index': int(m[1]), 'node': 'db-'+m[1], 'node_id': name})
         if not result or len(result) > 32 or len({n['index'] for n in result}) != len(result):
             raise RuntimeError('redis_topology_unavailable')
+        # Proxy db_idx is zero-based, not the numeric suffix of a RAM NodeId.
+        cloud=[{**n,'node':'cloud-'+n['node']} for n in result]
+        generation=hashlib.sha256(json.dumps(sorted(n['node_id'] for n in cloud)).encode()).hexdigest()[:16]
+        result=[{'index':i,'node':'db-'+str(i),'node_id':e['instanceId']+':proxy-index:'+str(i)+':'+generation,
+                 'identity_scope':'proxy_index','cloud_node_id':None} for i in range(len(cloud))]
+        self.cloud_meta[e['instanceId']]=cloud
         self.meta[e['instanceId']] = result
         with self.db() as c:
             c.execute('INSERT OR REPLACE INTO topology VALUES(?,?,?)', (e['instanceId'], self.clock(), json.dumps(result)))
@@ -238,6 +245,7 @@ class RedisService:
 
     def record(self, e, node, raw, ts):
         snap = dict(parse_info(raw), ts=ts, node_id=node['node_id'])
+        if node.get('identity_scope')=='proxy_index':snap['identity_method']='proxy_index_topology_generation_and_uptime'
         key = (e['instanceId'], node['node'])
         diff, reason = delta(self.last.get(key), snap, e['intervalSeconds'])
         with self.db() as c:
@@ -298,6 +306,7 @@ class RedisService:
         self.housekeeping()
 
     def cloud_poll(self, e, nodes, now):
+        nodes=self.cloud_meta.get(e['instanceId'],nodes)
         for node in nodes:
             r = self.rpc(e, 'DescribeHistoryMonitorValues', {'NodeId': node['node_id'], 'StartTime': iso(now-300), 'EndTime': iso(now), 'IntervalForHistory': '01m', 'MonitorKeys': 'CpuUsage,TotalQps,Redis_Keys_Monitor,Redis_Zset_Monitor,Redis_Scripting_Monitor'})
             history = json.loads(r.get('MonitorHistory') or '{}')
@@ -360,7 +369,7 @@ class RedisService:
             sample_time = self.last_sample.get(ident)
             recent_sample = sample_time is not None and sample_time > self.clock()-3600
             active.append({'id': ident, 'label': e['label'], 'nodes': [{**n,'latest':self.last.get((ident,n['node']),{}).get('ts')} for n in self.meta.get(ident, [])], 'first': first, 'latest': latest,
-                           'interval_seconds': e['intervalSeconds'], 'retention_days': e['retentionDays'], 'max_mib': e['maxMiB'], 'health': self.health.get(ident, {}),
+                           'interval_seconds': e['intervalSeconds'], 'retention_days': e['retentionDays'], 'max_mib': e['maxMiB'], 'identity_scope':'proxy_index', 'cloud_nodes':self.cloud_meta.get(ident,[]), 'node_id_mapping':'not_assumed', 'health': self.health.get(ident, {}),
                            'last_key_sample': sample_time, 'key_sampling': 'receiving' if recent_sample else 'not_connected'})
         return {'schema':'redis-five-layer-v1','status': 'unavailable' if self.error else 'ok' if active else 'not_configured', 'instances': active,
                 'storage': '保留期为配置上限，不代表已有完整历史；实际起止见实例first/latest；容量不足停止采集',
@@ -376,7 +385,7 @@ class RedisService:
             raise ValueError('redis_window_max_one_day')
         base_start,base_end=previous_window(start,end)
         node_filter = one(params, 'node')
-        if node_filter and not re.fullmatch(r'db-\d{1,2}', node_filter):
+        if node_filter and not re.fullmatch(r'(?:cloud-)?db-\d{1,2}', node_filter):
             raise ValueError('invalid_redis_node')
         node_sql, args = (' AND node=?', [node_filter]) if node_filter else ('', [])
         def read_window(c, lo, hi):
