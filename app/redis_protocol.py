@@ -43,9 +43,9 @@ def load_instances(root):
             raise ValueError('redis_fixed_proxy_required')
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', str(e.get('username', ''))) or not isinstance(e.get('enabled', False), bool):
             raise ValueError('redis_readonly_identity_required')
-        for k, lo, hi, default in [('intervalSeconds', 10, 60, 20), ('retentionDays', 2, 90, 30), ('maxMiB', 64, 4096, 2048)]:
+        for k, lo, hi, default in [('intervalSeconds', 10, 60, 20), ('retentionDays', 2, 90, 30), ('maxMiB', 64, None, 2048)]:
             v = e.get(k, default)
-            if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo or (hi is not None and v > hi):
                 raise ValueError('invalid_redis_' + k)
             e[k] = v
         label = e.get('label', identity)
