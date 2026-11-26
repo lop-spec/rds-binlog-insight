@@ -105,11 +105,15 @@ def statement(query, lo, hi, keys, *, change_id=None):
         search.append(f"positionCaseInsensitiveUTF8(concat(`column`,' ',ifNull(before_value,''),' ',ifNull(after_value,''),' ',ifNull(key_before_json,''),' ',ifNull(key_after_json,'')),{{w{i}:String}})>0")
     if search:
         terms.append('('+(' OR ' if str(query.get('keyword_mode')).upper()=='OR' else ' AND ').join(search)+')')
-    return (f'SELECT {FIELDS} FROM {TABLE} FINAL WHERE '+' AND '.join(terms)
+    # Prune by the sorting-key fields before fetching wide audit values.
+    clause = ' PREWHERE '+' AND '.join(terms[:5])
+    if terms[5:]:
+        clause += ' WHERE '+' AND '.join(terms[5:])
+    return (f'SELECT {FIELDS} FROM {TABLE} FINAL'+clause
             +' ORDER BY event_epoch_us DESC, source_file_name DESC, end_position DESC, row_index DESC, change_id DESC'), params
 
 
-SETTINGS = {'max_threads': 1, 'max_final_threads': 1, 'max_memory_usage': 250000000,
+SETTINGS = {'max_threads': 1, 'optimize_read_in_order': 0, 'max_final_threads': 1, 'max_memory_usage': 250000000,
             'max_block_size': 2048, 'max_execution_time': 20,
             'remote_filesystem_read_method': 'read', 'allow_prefetched_read_pool_for_remote_filesystem': 0}
 
