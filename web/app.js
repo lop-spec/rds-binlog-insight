@@ -427,6 +427,7 @@ function rowSql(row) {
   if (row.row_query && String(row.sql_kind || "").toUpperCase() !== "ORIGINAL") {
     return row.row_query;
   }
+  if (row.sql_kind === "CORE_HISTORY") return row.after_json || row.before_json || "列变更";
   if (String(row.sql_kind || "").toUpperCase() === "LAST_CHANGE") {
     return row.after_json || row.key_before_json || row.before_json || "末次修改";
   }

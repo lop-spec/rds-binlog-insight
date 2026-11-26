@@ -3152,6 +3152,12 @@ class EventStorage:
         from .query_tasks import QueryBatchControl
         from .raw_binlog_query import query_raw
         start, end = self._query_window(query, settings.retention_days)
+        if str(query.get('source') or '').lower() == 'binlog' and self.binlog_rows is not None:
+            from . import binlog_core_history
+            configured = (binlog_core_history.scope(getattr(getattr(self, 'metadata', None), 'path', None), query.get('instance'))
+                          if start < binlog_core_history.cutoff() else None)
+            if configured:
+                query = {**query, 'indexed_only':True}
         if query.get('indexed_only'):
             if query.get('start_epoch_us') != start or query.get('end_epoch_us') != end:
                 from .binlog_lite import RawBinlogError
@@ -4617,7 +4623,7 @@ class EventStorage:
         )
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             if rows:
-                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                writer = csv.DictWriter(handle, fieldnames=list(dict.fromkeys(key for row in rows for key in row)))
                 writer.writeheader()
                 writer.writerows(self._csv_safe_row(row) for row in rows)
         return path, len(rows)

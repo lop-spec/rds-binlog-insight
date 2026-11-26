@@ -25,6 +25,7 @@ from urllib.parse import urlencode
 
 from .binlog_lite import RawBinlogError
 from . import binlog_last_change as last_change
+from . import binlog_core_history as core_history
 
 LOGGER = logging.getLogger(__name__)
 
@@ -786,7 +787,7 @@ def present(row: dict[str, Any], statements: dict[int, str]) -> dict[str, Any]:
     out["event_epoch_us"] = epoch
     out["event_time_utc"] = datetime.fromtimestamp(epoch / 1e6, UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     rq_hash = int(out.pop("row_query_hash", 0) or 0)
-    archived = out.get('sql_kind') == 'LAST_CHANGE'
+    archived = out.get('sql_kind') in ('LAST_CHANGE', 'CORE_HISTORY')
     out["row_query"] = statements.get(rq_hash, "") if rq_hash and not archived else ""
     out["sql_text"] = "" if archived else render_sql(out)
     if not out.get("sql_kind"):
@@ -942,6 +943,14 @@ class BinlogRows:
         return BinlogRowsAnalytics(self).write_hotspots(instance, start, end)
 
     def query(self, query: dict[str, Any], start: int, end: int, *, control: Any | None = None) -> dict[str, Any]:
+        bound = core_history.cutoff()
+        if start < bound:
+            configured = core_history.scope(getattr(getattr(self, 'metadata', None), 'path', None), query.get('instance'))
+            if configured:
+                return core_history.routed(self, query, start, end, bound, configured, control=control)
+        return self._query_full(query, start, end, control=control)
+
+    def _query_full(self, query: dict[str, Any], start: int, end: int, *, control: Any | None = None) -> dict[str, Any]:
         database, table = str(query.get("database") or "").strip(), str(query.get("table") or "").strip()
         row_key = self.registry(database, table)
         sql, params, limit, offset = build_query(query, start, end, row_image_key=row_key)
@@ -1042,6 +1051,16 @@ class BinlogRows:
         if decoded is None:
             return None
         instance, database, table, epoch, event_id = decoded
+        if epoch < core_history.cutoff():
+            configured = core_history.scope(getattr(self.metadata, 'path', None), instance)
+            if configured:
+                span, keys = core_history.source_span(self.metadata.path, configured, database, table)
+                if span and span[0] <= epoch <= span[1]:
+                    sql, params = core_history.statement({'instance': instance, 'database': database, 'table': table}, epoch, epoch, keys, change_id=event_id)
+                    result = self.ch.rows(sql + ' LIMIT 1', params=params, settings=core_history.SETTINGS, timeout=22)
+                    if result:
+                        return present(core_history.present(result[0]), {})
+                raise RawBinlogError('此旧链接不对应已覆盖的列审计记录，请重新按库表查询', 'EVENT_DETAIL_NOT_RETAINED')
         windows = self._archive_windows(instance, database, table)
         window = next((w for w in windows if last_change.intersects(w, epoch, epoch)), None)
         params = {"i": instance, "db": database, "tbl": table, "e": epoch, "id": event_id}
