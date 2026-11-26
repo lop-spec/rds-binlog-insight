@@ -14,14 +14,14 @@ from .binlog_lite import RawBinlogError
 
 TIER = 'clickhouse-core-history'
 TABLE = 'insight.binlog_core_changes_v1'
-TWO_DAYS_US = 2 * 86400 * 1_000_000
+FULL_HISTORY_US = 14 * 86400 * 1_000_000
 FIELDS = ('instance_id,database_name,table_name,event_epoch_us,operation,transaction_id,gtid,'
           'source_file_name,start_position,end_position,row_index,`column`,before_present,after_present,'
           'before_value,after_value,redacted,key_before_json,key_after_json,change_id')
 
 
 def cutoff():
-    return time.time_ns() // 1000 - TWO_DAYS_US
+    return time.time_ns() // 1000 - FULL_HISTORY_US
 
 
 def load(path):
@@ -195,5 +195,5 @@ def routed(rows, query, start, end, bound, configured, *, control=None):
             'exact_index_complete':False,'coverage_found':bool(intervals),'covered_intervals':intervals,
             'coverage_gaps':gaps[:200],'coverage_gap_count':len(gaps),'covered_us':covered,'requested_us':end-start+1,
             'range_start_epoch_us':start,'range_end_epoch_us':end,
-            'coverage_note':coverage_note(summary)+'；两天内查完整记录，两天前只查已覆盖列审计，旧记录无原 SQL',
+            'coverage_note':coverage_note(summary)+'；14 天内查完整行明细，14 天前只查已覆盖的列审计，不保留原 SQL',
             'core_history':True, 'raw_cutoff_epoch_us':bound}
