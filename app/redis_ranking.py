@@ -57,7 +57,7 @@ def ranked_evidence(service,identity,start,end,base_start,base_end,records,befor
     # Epoch changes include topology flips between windows, not merely resets in a window.
     filt,args=(' AND node=?',[node]) if node else ('',[])
     epochs=defaultdict(set)
-    with service.db() as c:
+    with service.raw(base_start, end) as c:
         for snap in c.execute('SELECT node,payload FROM snapshots WHERE instance=? AND ts>=? AND ts<=?'+filt,(identity,base_start,end,*args)):
             s=decode(snap['payload']);epochs[snap['node']].add((s.get('node_id'),s.get('run_id')))
     discontinuous=broken|old_broken|{n for n,values in epochs.items() if len(values)>1}

@@ -47,7 +47,7 @@ def diagnosis(service,entry,start,end,node,current,baseline):
     nodes=defaultdict(lambda:{'process_cpu_seconds':0,'process_cpu_known_seconds':0,'counter_deltas':{},'cost_numerator_cpu_seconds':0,'cost_denominator_commands':0,'cost_matched_seconds':0})
     latest={};initial={};latencies=[]
     filt,args=(' AND node=?',[node]) if node else ('',[])
-    with service.db() as c:
+    with service.raw(start, end) as c:
         records=c.execute('SELECT node,start,end,payload,reason FROM intervals WHERE instance=? AND start>=? AND end<=?'+filt+' ORDER BY end LIMIT 50001',[identity,start,end]+args).fetchall()
         if len(records)>50000:raise ValueError('redis_diagnosis_row_budget')
         for r in records:

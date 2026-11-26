@@ -23,7 +23,8 @@ async function syncRedisMode(enabled){
     const item=data.instances?.[0];
     const stale=!item?.latest || Date.now()/1000-item.latest>90;
     const failed=stale||item?.health?.errors?.length||item?.health?.last_error;
-    $('#analytics-meta').textContent=data.status==='ok'?`${failed?'采集待恢复':'持续记录'} · ${item?.interval_seconds||20}秒 · 本机保留${item?.retention_days||30}天`:'Redis 尚未登记或配置不可用';
+    const store=data.storage?.mode==='host_disk_rotation'?` · 数据盘 ${data.storage.used_percent ?? '—'}% / ${data.storage.threshold_percent}% 轮转`:'';
+    $('#analytics-meta').textContent=data.status==='ok'?`${failed?'采集待恢复':'持续记录'} · ${item?.interval_seconds||20}秒${store}`:'Redis 尚未登记或配置不可用';
     $('#analytics-coverage').textContent=data.warning||'未连接，不把缺失数据当作零。';
   }catch(error){if(request===redisRequest&&redisVisible())$('#analytics-meta').textContent='Redis状态读取失败：'+error.message;}
 }
@@ -68,8 +69,9 @@ async function runRedis(){
   const request=++redisRequest;$('#analytics-panel-sql').innerHTML='';$('#analytics-empty').hidden=true;$('#analytics-meta').textContent='正在读取Redis记录…';
   try{
     const query=new URLSearchParams({instance,node:$('#redis-node').value,order:$('#redis-order')?.value||'correlation',startEpochUs:String(start),endEpochUs:String(end)});
-    const rawDays=redisStatus?.instances?.find(x=>x.id===instance)?.retention_days||30;
-    const history=end-start>86400e6||start<(Date.now()-rawDays*86400e3)*1000;
+    const item=redisStatus?.instances?.find(x=>x.id===instance);
+    const firstRaw=item?.first;
+    const history=end-start>86400e6||(Boolean(firstRaw)&&start<firstRaw*1e6);
     if(history){query.set('period',end-start>31*86400e6?'86400':'3600');query.set('summary','1');}
     const data=await api((history?'/api/redis/history?':'/api/redis/investigate?')+query);if(request!==redisRequest||!redisVisible())return;
     if(history)renderRedisHistory(data);else renderRedis(data);switchAnalyticsTab('sql');

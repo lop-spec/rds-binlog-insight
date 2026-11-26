@@ -75,16 +75,17 @@ class History(unittest.TestCase):
     def test_missing_node_not_zero_activity(self):
         self.seed(self.now-40);r=self.query(self.now-40,self.now,'db-3');self.assertEqual(r['rows'],[])
     def test_old_cloud_rate_does_not_invent_command_duration(self):
-        with self.s.db() as c:
-            for shift, rate in [(0, 10), (-40, 5), (-86400,99)]:
-                c.execute('INSERT INTO metrics VALUES(?,?,?,?)', ('r-example01','db-1',self.now-20+shift,json.dumps({'CpuUsage':80,'del':rate})))
+        for shift, rate in [(0, 10), (-40, 5), (-86400,99)]:
+            ts=self.now-20+shift
+            with self.s.rotation.write(ts) as c:
+                c.execute('INSERT INTO metrics VALUES(?,?,?,?)', ('r-example01','db-1',ts,json.dumps({'CpuUsage':80,'del':rate})))
         r=self.query(self.now-40,self.now)
         self.assertEqual(r['rows'],[])
         self.assertEqual(r['rate_rows'][0]['qps'],10)
         self.assertEqual(r['rate_rows'][0]['baseline_qps'],5)
         self.assertEqual(r['rate_rows'][0]['source'],'cloud_rates_no_duration')
     def test_no_future_bucket(self):
-        with self.s.db() as c:c.execute('INSERT INTO buckets VALUES(?,?,?)',('r-example01',self.now+1,'[]'))
+        with self.s.rotation.write(self.now+1) as c:c.execute('INSERT INTO buckets VALUES(?,?,?)',('r-example01',self.now+1,'[]'))
         self.assertIsNone(self.query(self.now-40,self.now)['buckets'])
     def test_bad_target_and_window(self):
         for node in ['db-1 OR 1=1','<script>']:
@@ -104,14 +105,57 @@ class History(unittest.TestCase):
         return {'id':'unique_sample_123456','time':self.now,'command':'eval','keys':['pre:follow_order:outbox:zset:{fo:2}'],'category':'claim_due','script':'a'*40,'pod':'worker-abc','sample_rate':.001,'client_us':321,'failed':False}
     def test_ingest_rejects_values_no_cpu_claim_and_dedups(self):
         sample=self.sample()
-        with patch('app.redis_service.shutil.disk_usage',return_value=type('D',(),{'free':200*1024**3})()):
+        with patch.object(self.s.rotation,'disk_usage',return_value=(79,21)):
             self.s.ingest({'instance':'r-example01','samples':[sample]});self.s.ingest({'instance':'r-example01','samples':[sample]})
             with self.assertRaises(ValueError):self.s.ingest({'instance':'r-example01','samples':[dict(sample,value='secret')]})
             with self.assertRaises(ValueError):self.s.ingest({'instance':'r-example01','samples':[dict(sample,failed={'value':'private'})]})
         r=self.query(self.now-40,self.now+1);self.assertEqual(len(r['key_samples']),1);self.assertEqual(r['key_samples'][0]['latency_scope'],'client_round_trip');self.assertIsNone(r['key_samples'][0]['server_usec'])
-    def test_storage_fuse(self):
-        with patch('app.redis_service.shutil.disk_usage',return_value=type('D',(),{'free':1024})()):
-            with self.assertRaises(RuntimeError):self.s.check_storage(ENTRY)
+    def test_host_threshold_reclaims_oldest_and_keeps_writing(self):
+        self.seed(self.now-86460)
+        self.seed(self.now-40)
+        files=self.s.rotation.files()
+        self.assertEqual(len(files),2)
+        with patch.object(self.s.rotation,'disk_usage',return_value=(79,21)):
+            self.s.check_storage(ENTRY)
+        self.assertEqual(self.s.rotation.files(),files)
+        with patch.object(self.s.rotation,'disk_usage',side_effect=[(80,20),(79,21)]):
+            self.s.check_storage(ENTRY)
+        self.assertEqual(self.s.rotation.files(),files[1:])
+        self.assertEqual(self.s.status()['storage']['last_evicted'],files[0].name)
+        self.seed(self.now+86400-40)
+        self.assertEqual(len(self.s.rotation.files()),2)
+    def test_rotation_migrates_control_and_keeps_legacy_until_pressure(self):
+        from app.redis_service import RAW_SCHEMA
+        from app.redis_rotation import connection
+        # Fresh legacy fixture with one historic row and a control watermark.
+        s=self.s
+        raw=s.rotation.legacy
+        c=connection(raw)
+        with c:
+            c.executescript(RAW_SCHEMA)
+            c.execute('CREATE TABLE redis_maintenance(instance TEXT,name TEXT,watermark REAL,PRIMARY KEY(instance,name))')
+            c.execute('INSERT INTO redis_maintenance VALUES(?,?,?)',('r-example01','minute',self.now-60))
+            c.execute('INSERT INTO metrics VALUES(?,?,?,?)',('r-example01','db-1',self.now-40,'{}'))
+        c.close()
+        with s.db() as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM snapshots').fetchone()[0],0)
+        s.dbpath.unlink()
+        s=RedisService(self.root,lambda:None,lambda _:None,clock=lambda:self.now)
+        with s.db() as c:
+            self.assertEqual(c.execute('SELECT watermark FROM redis_maintenance').fetchone()[0],self.now-60)
+        with s.rotation.write(self.now-40) as c:
+            c.execute('INSERT INTO metrics VALUES(?,?,?,?)',('r-example01','db-1',self.now-40,'{"dup":true}'))
+        with s.raw(self.now-60,self.now) as c:
+            self.assertEqual(c.execute('SELECT count(*) FROM metrics').fetchone()[0],1)
+            with patch.object(s.rotation,'disk_usage',return_value=(80,20)):
+                self.assertFalse(s.rotation.reclaim())
+        self.assertTrue(raw.exists())
+        with patch.object(s.rotation,'disk_usage',side_effect=[(80,20),(79,21)]):
+            self.assertTrue(s.rotation.reclaim())
+        self.assertFalse(raw.exists())
+        self.assertTrue(s.dbpath.exists())
+        self.assertEqual(len(s.rotation.files()),1)
+
     def test_no_config_no_worker_or_files(self):
         with tempfile.TemporaryDirectory() as d:
             s=RedisService(Path(d),None,None);s.start();self.assertIsNone(s.thread);self.assertEqual(s.status()['status'],'not_configured');self.assertFalse(s.dbpath.exists())

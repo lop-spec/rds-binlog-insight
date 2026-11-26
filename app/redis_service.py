@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import re
-import shutil
 import sqlite3
 import threading
 import time
@@ -19,11 +18,26 @@ from pathlib import Path
 
 from .redis_protocol import RedisWire, delta, load_instances, parse_info, private_json, safe_key, error_code
 from .redis_telemetry import SECTIONS
+from .redis_rotation import RedisRotation
 from .comparison_window import previous_window
 from .slow_log_collector import DasRpcClient
 
 LOGGER = logging.getLogger(__name__)
 DAY = 86400
+RAW_SCHEMA = """
+                CREATE TABLE IF NOT EXISTS snapshots(instance TEXT,node TEXT,ts REAL,payload TEXT,PRIMARY KEY(instance,node,ts));
+                CREATE INDEX IF NOT EXISTS snapshot_time ON snapshots(instance,ts);
+                CREATE TABLE IF NOT EXISTS intervals(instance TEXT,node TEXT,start REAL,end REAL,payload TEXT,reason TEXT,PRIMARY KEY(instance,node,end));
+                CREATE INDEX IF NOT EXISTS interval_time ON intervals(instance,start,end,node);
+                CREATE TABLE IF NOT EXISTS topology(instance TEXT,ts REAL,payload TEXT,PRIMARY KEY(instance,ts));
+                CREATE TABLE IF NOT EXISTS buckets(instance TEXT,ts REAL,payload TEXT,PRIMARY KEY(instance,ts));
+                CREATE TABLE IF NOT EXISTS metrics(instance TEXT,node TEXT,ts REAL,payload TEXT,PRIMARY KEY(instance,node,ts));
+                CREATE TABLE IF NOT EXISTS slow_events(instance TEXT,node TEXT,ts REAL,id TEXT,payload TEXT,PRIMARY KEY(instance,node,id));
+                CREATE INDEX IF NOT EXISTS slow_time ON slow_events(instance,ts,node);
+                CREATE TABLE IF NOT EXISTS samples(instance TEXT,ts REAL,id TEXT,payload TEXT,PRIMARY KEY(instance,id));
+                CREATE INDEX IF NOT EXISTS sample_time ON samples(instance,ts);
+                CREATE TABLE IF NOT EXISTS collection(instance TEXT,node TEXT,ts REAL,error TEXT,PRIMARY KEY(instance,node,ts));
+"""
 WARNING = ('累计usec是命令执行耗时，不直接等同CPU；EVAL/EXEC与内部命令可能嵌套，禁止相加计算总CPU。'
            '键级样本是客户端耗时（含网络排队），不等同服务端执行耗时；缺失不补零。')
 
@@ -83,8 +97,10 @@ class RedisService:
             self.entries = [e for e in load_instances(self.root) if e.get('enabled')]
         except Exception as exc:
             self.error = error_code(exc)
-        self.dbpath = self.root / 'redis-history.sqlite3'
+        self.rotation = RedisRotation(self.root, self.clock, RAW_SCHEMA)
+        self.dbpath = self.rotation.control
         if self.entries:
+            self.rotation.initialize()
             self._init_db()
             from .redis_history import EvidenceHistory
             from .redis_context import RedisContext
@@ -92,16 +108,25 @@ class RedisService:
             self.evidence = EvidenceHistory(self)
             self.aggregates = RedisAggregates(self,aggregate_client_factory)
             self.context = RedisContext(self,context_reader)
-            with self.db() as c:
-                for r in c.execute('SELECT instance,node,payload FROM snapshots WHERE (instance,node,ts) IN (SELECT instance,node,MAX(ts) FROM snapshots GROUP BY instance,node)'):
-                    self.last[(r['instance'], r['node'])] = unpack(r['payload'])
-                for e in self.entries:
-                    ident = e['instanceId']
-                    first = c.execute('SELECT ts FROM snapshots WHERE instance=? ORDER BY ts LIMIT 1', (ident,)).fetchone()
-                    latest = c.execute('SELECT ts FROM snapshots WHERE instance=? ORDER BY ts DESC LIMIT 1', (ident,)).fetchone()
-                    sample = c.execute('SELECT ts FROM samples WHERE instance=? ORDER BY ts DESC LIMIT 1', (ident,)).fetchone()
-                    self.bounds[ident] = [first[0] if first else None, latest[0] if latest else None]
-                    self.last_sample[ident] = sample[0] if sample else None
+            for r in self.rotation.extreme(
+                'SELECT instance,node,payload FROM snapshots WHERE (instance,node,ts) IN (SELECT instance,node,MAX(ts) FROM snapshots GROUP BY instance,node)',
+                (), newest=True):
+                self.last[(r['instance'], r['node'])] = unpack(r['payload'])
+            self.refresh_bounds()
+            for e in self.entries:
+                ident = e['instanceId']
+                sample = self.rotation.extreme('SELECT ts FROM samples WHERE instance=? ORDER BY ts DESC LIMIT 1', (ident,), newest=True)
+                self.last_sample[ident] = sample[0][0] if sample else None
+
+    def refresh_bounds(self):
+        for e in self.entries:
+            ident = e['instanceId']
+            a = self.rotation.extreme('SELECT ts FROM snapshots WHERE instance=? ORDER BY ts LIMIT 1', (ident,))
+            b = self.rotation.extreme('SELECT ts FROM snapshots WHERE instance=? ORDER BY ts DESC LIMIT 1', (ident,), newest=True)
+            self.bounds[ident] = [a[0][0] if a else None, b[0][0] if b else None]
+
+    def raw(self, start, end):
+        return self.rotation.read(start, end)
 
     @contextmanager
     def db(self):
@@ -123,22 +148,7 @@ class RedisService:
         if os.name != 'nt':
             self.dbpath.chmod(0o600)
         with self.db() as c:
-            c.executescript('''
-                PRAGMA journal_mode=WAL;
-                PRAGMA auto_vacuum=INCREMENTAL;
-                CREATE TABLE IF NOT EXISTS snapshots(instance TEXT,node TEXT,ts REAL,payload TEXT,PRIMARY KEY(instance,node,ts));
-                CREATE INDEX IF NOT EXISTS snapshot_time ON snapshots(instance,ts);
-                CREATE TABLE IF NOT EXISTS intervals(instance TEXT,node TEXT,start REAL,end REAL,payload TEXT,reason TEXT,PRIMARY KEY(instance,node,end));
-                CREATE INDEX IF NOT EXISTS interval_time ON intervals(instance,start,end,node);
-                CREATE TABLE IF NOT EXISTS topology(instance TEXT,ts REAL,payload TEXT,PRIMARY KEY(instance,ts));
-                CREATE TABLE IF NOT EXISTS buckets(instance TEXT,ts REAL,payload TEXT,PRIMARY KEY(instance,ts));
-                CREATE TABLE IF NOT EXISTS metrics(instance TEXT,node TEXT,ts REAL,payload TEXT,PRIMARY KEY(instance,node,ts));
-                CREATE TABLE IF NOT EXISTS slow_events(instance TEXT,node TEXT,ts REAL,id TEXT,payload TEXT,PRIMARY KEY(instance,node,id));
-                CREATE INDEX IF NOT EXISTS slow_time ON slow_events(instance,ts,node);
-                CREATE TABLE IF NOT EXISTS samples(instance TEXT,ts REAL,id TEXT,payload TEXT,PRIMARY KEY(instance,id));
-                CREATE INDEX IF NOT EXISTS sample_time ON samples(instance,ts);
-                CREATE TABLE IF NOT EXISTS collection(instance TEXT,node TEXT,ts REAL,error TEXT,PRIMARY KEY(instance,node,ts));
-            ''')
+            c.executescript('PRAGMA journal_mode=WAL; PRAGMA auto_vacuum=INCREMENTAL;' + RAW_SCHEMA)
         if os.name != 'nt':
             self.dbpath.chmod(0o600)
 
@@ -239,7 +249,7 @@ class RedisService:
                  'identity_scope':'proxy_index','cloud_node_id':None} for i in range(len(cloud))]
         self.cloud_meta[e['instanceId']]=cloud
         self.meta[e['instanceId']] = result
-        with self.db() as c:
+        with self.rotation.write(self.clock()) as c:
             c.execute('INSERT OR REPLACE INTO topology VALUES(?,?,?)', (e['instanceId'], self.clock(), json.dumps(result)))
         return result
 
@@ -248,7 +258,7 @@ class RedisService:
         if node.get('identity_scope')=='proxy_index':snap['identity_method']='proxy_index_topology_generation_and_uptime'
         key = (e['instanceId'], node['node'])
         diff, reason = delta(self.last.get(key), snap, e['intervalSeconds'])
-        with self.db() as c:
+        with self.rotation.write(ts) as c:
             c.execute('INSERT OR REPLACE INTO snapshots VALUES(?,?,?,?)', (*key, ts, pack(snap)))
             c.execute('INSERT OR REPLACE INTO intervals VALUES(?,?,?,?,?,?)', (*key, diff['start'] if diff else ts, ts, pack(diff), reason))
             c.execute('INSERT OR REPLACE INTO collection VALUES(?,?,?,?)', (*key, ts, ''))
@@ -279,7 +289,7 @@ class RedisService:
                     self.record(e, node, raw, self.clock())
                 except Exception as exc:
                     errors.append(node['node']+':'+error_code(exc))
-                    with self.db() as c:
+                    with self.rotation.write(self.clock()) as c:
                         c.execute('INSERT OR REPLACE INTO collection VALUES(?,?,?,?)', (identity, node['node'], self.clock(), error_code(exc)))
                     # Never reuse a desynchronized RESP socket; reconnect for
                     # the NEXT shard so one slow shard cannot hide every peer.
@@ -297,7 +307,7 @@ class RedisService:
                         LOGGER.warning('Redis bucket mapping unavailable; node snapshots remain valid')
                         return
                     rows.append({'bucket': b, 'slot': int(m[1]), 'node_index': int(m[2])})
-                with self.db() as c:
+                with self.rotation.write(self.clock()) as c:
                     c.execute('INSERT OR REPLACE INTO buckets VALUES(?,?,?)', (identity, self.clock(), json.dumps(rows)))
                 self.next_buckets[identity] = now + 600
         finally:
@@ -310,56 +320,38 @@ class RedisService:
         for node in nodes:
             r = self.rpc(e, 'DescribeHistoryMonitorValues', {'NodeId': node['node_id'], 'StartTime': iso(now-300), 'EndTime': iso(now), 'IntervalForHistory': '01m', 'MonitorKeys': 'CpuUsage,TotalQps,Redis_Keys_Monitor,Redis_Zset_Monitor,Redis_Scripting_Monitor'})
             history = json.loads(r.get('MonitorHistory') or '{}')
-            with self.db() as c:
-                for t, values in history.items():
-                    ts = datetime.fromisoformat(t.replace('Z', '+00:00')).timestamp()
-                    cleaned = {k: float(values[k]) for k in ('CpuUsage', 'TotalQps', 'GetQps', 'PutQps', 'OtherOps', 'del', 'zrangebyscore', 'eval', 'evalsha') if k in values and math.isfinite(float(values[k]))}
-                    if now-360 <= ts < now and cleaned:
+            for t, values in history.items():
+                ts = datetime.fromisoformat(t.replace('Z', '+00:00')).timestamp()
+                cleaned = {k: float(values[k]) for k in ('CpuUsage', 'TotalQps', 'GetQps', 'PutQps', 'OtherOps', 'del', 'zrangebyscore', 'eval', 'evalsha') if k in values and math.isfinite(float(values[k]))}
+                if now-360 <= ts < now and cleaned:
+                    with self.rotation.write(ts) as c:
                         c.execute('INSERT OR REPLACE INTO metrics VALUES(?,?,?,?)', (e['instanceId'], node['node'], ts, json.dumps(cleaned)))
             # Existing slow-log evidence only; no threshold changes or command replay.
             r = self.rpc(e, 'DescribeSlowLogRecords', {'NodeId': node['node_id'].split('#')[0], 'StartTime': iso(now-600)[:16]+'Z', 'EndTime': iso(now)[:16]+'Z', 'PageSize': 100, 'PageNumber': 1})
             logs = r.get('Items', {}).get('LogRecords', [])
-            with self.db() as c:
-                for row in logs:
-                    raw = str(row.get('Command', ''))
-                    cmd = raw.split(None, 1)[0].lower() if raw else 'unknown'
-                    keys = re.findall(r'[A-Za-z0-9_][A-Za-z0-9_:{}.-]{3,250}', raw)
-                    keys = [safe_key(k) for k in keys if ':' in k][:8]
-                    ts = datetime.fromisoformat(row['ExecuteTime'].replace('Z', '+00:00')).timestamp()
-                    if not now-900 <= ts <= now:
-                        continue
-                    event_id = hashlib.sha256(json.dumps([node['node'], row.get('ExecuteTime'), row.get('ElapsedTime'), row.get('IPAddress'), raw]).encode()).hexdigest()
-                    event = {'command': cmd, 'usec': row.get('ElapsedTime'), 'keys': keys, 'client': row.get('IPAddress'), 'thresholded': True,
-                             'source_partial': int(r.get('TotalRecordCount', 0)) > len(logs), 'raw_command_retained': False}
+            for row in logs:
+                raw = str(row.get('Command', ''))
+                cmd = raw.split(None, 1)[0].lower() if raw else 'unknown'
+                keys = re.findall(r'[A-Za-z0-9_][A-Za-z0-9_:{}.-]{3,250}', raw)
+                keys = [safe_key(k) for k in keys if ':' in k][:8]
+                ts = datetime.fromisoformat(row['ExecuteTime'].replace('Z', '+00:00')).timestamp()
+                if not now-900 <= ts <= now:
+                    continue
+                event_id = hashlib.sha256(json.dumps([node['node'], row.get('ExecuteTime'), row.get('ElapsedTime'), row.get('IPAddress'), raw]).encode()).hexdigest()
+                event = {'command': cmd, 'usec': row.get('ElapsedTime'), 'keys': keys, 'client': row.get('IPAddress'), 'thresholded': True,
+                         'source_partial': int(r.get('TotalRecordCount', 0)) > len(logs), 'raw_command_retained': False}
+                with self.rotation.write(ts) as c:
                     c.execute('INSERT OR IGNORE INTO slow_events VALUES(?,?,?,?,?)', (e['instanceId'], node['node'], ts, event_id, json.dumps(event)))
 
     def check_storage(self, e):
-        with self.db() as c:
-            used = (c.execute('PRAGMA page_count').fetchone()[0]-c.execute('PRAGMA freelist_count').fetchone()[0])*c.execute('PRAGMA page_size').fetchone()[0]
-        if used >= e['maxMiB']*1024**2 or shutil.disk_usage(self.root).free < 120*1024**3:
-            raise RuntimeError('redis_history_storage_fuse')
+        if self.rotation.reclaim():
+            self.refresh_bounds()
 
     def housekeeping(self, force=False):
         now = self.clock()
-        if not force and now-self.last_housekeeping < 3600:
-            return
-        self.last_housekeeping = now
-        with self.db() as c:
-            for e in self.entries:
-                for table in ('snapshots', 'intervals', 'topology', 'buckets', 'metrics', 'slow_events', 'samples', 'collection'):
-                    col = 'end' if table == 'intervals' else 'ts'
-                    # Bounded deletes. A backlog is retried hourly, never an unbounded VACUUM.
-                    cutoff=now-(min(e['retentionDays'], 7) if table == 'samples' else e['retentionDays'])*DAY
-                    if table=='intervals':
-                        watermark=c.execute('SELECT watermark FROM redis_maintenance WHERE instance=? AND name=?',(e['instanceId'],'minute')).fetchone()
-                        if not watermark:continue
-                        cutoff=min(cutoff,watermark[0])
-                    c.execute(f'DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE instance=? AND {col}<? LIMIT 20000)', (e['instanceId'],cutoff))
-                ident = e['instanceId']
-                first = c.execute('SELECT ts FROM snapshots WHERE instance=? ORDER BY ts LIMIT 1', (ident,)).fetchone()
-                if first:
-                    self.bounds.setdefault(ident, [None, None])[0] = first[0]
-            c.execute('PRAGMA incremental_vacuum(1024)')
+        if force or now-self.last_housekeeping >= 3600:
+            self.last_housekeeping = now
+            self.refresh_bounds()
 
     def status(self):
         active = []
@@ -369,10 +361,10 @@ class RedisService:
             sample_time = self.last_sample.get(ident)
             recent_sample = sample_time is not None and sample_time > self.clock()-3600
             active.append({'id': ident, 'label': e['label'], 'nodes': [{**n,'latest':self.last.get((ident,n['node']),{}).get('ts')} for n in self.meta.get(ident, [])], 'first': first, 'latest': latest,
-                           'interval_seconds': e['intervalSeconds'], 'retention_days': e['retentionDays'], 'max_mib': e['maxMiB'], 'identity_scope':'proxy_index', 'cloud_nodes':self.cloud_meta.get(ident,[]), 'node_id_mapping':'not_assumed', 'health': self.health.get(ident, {}),
+                           'interval_seconds': e['intervalSeconds'], 'retention_days': e['retentionDays'], 'identity_scope':'proxy_index', 'cloud_nodes':self.cloud_meta.get(ident,[]), 'node_id_mapping':'not_assumed', 'health': self.health.get(ident, {}),
                            'last_key_sample': sample_time, 'key_sampling': 'receiving' if recent_sample else 'not_connected'})
         return {'schema':'redis-five-layer-v1','status': 'unavailable' if self.error else 'ok' if active else 'not_configured', 'instances': active,
-                'storage': '保留期为配置上限，不代表已有完整历史；实际起止见实例first/latest；容量不足停止采集',
+                'storage': dict(self.rotation.state),
                 'context': dict(self.context.state) if self.context else {}, 'aggregates': dict(self.aggregates.state) if self.aggregates else {}, 'warning': WARNING}
 
     def query(self, params):
@@ -410,7 +402,7 @@ class RedisService:
                             g[field]=g.get(field,0)+costs[field]
                             g[field+'_known_seconds']=g.get(field+'_known_seconds',0)+sec
             return groups, durations, resets, curve, rows
-        with self.db() as c:
+        with self.raw(base_start, end) as c:
             current, durations, resets, curve, records = read_window(c, start, end)
             baseline, base_durations, base_resets, _, before_records = read_window(c, base_start, base_end)
             output = []
@@ -434,7 +426,8 @@ class RedisService:
             rate_rows = [{'node':n, 'command':cmd, 'qps':sum(v['current'])/len(v['current']) if v.get('current') else None,
                           'baseline_qps':sum(v['previous'])/len(v['previous']) if v.get('previous') else None,
                           'samples':len(v.get('current', [])), 'baseline_samples':len(v.get('previous', [])), 'source':'cloud_rates_no_duration'} for (n,cmd),v in sorted(rate_groups.items())]
-            bucket = c.execute('SELECT ts,payload FROM buckets WHERE instance=? AND ts<=? ORDER BY ts DESC LIMIT 1', (identity, end)).fetchone()
+            buckets = self.rotation.extreme('SELECT ts,payload FROM buckets WHERE instance=? AND ts<=? ORDER BY ts DESC LIMIT 1', (identity, end), newest=True, before=end)
+            bucket = buckets[0] if buckets else None
             events = [{'node': r['node'], 'time': r['ts'], **json.loads(r['payload'])} for r in c.execute('SELECT * FROM slow_events WHERE instance=? AND ts>=? AND ts<?'+node_sql+' ORDER BY ts DESC LIMIT 101', [identity, start, end]+args)]
             samples = [{**json.loads(r['payload']), 'time': r['ts']} for r in c.execute('SELECT * FROM samples WHERE instance=? AND ts>=? AND ts<? ORDER BY ts DESC LIMIT 101', (identity, start, end))]
         limit=int(one(params,'limit','300'))
@@ -524,8 +517,9 @@ class RedisService:
             self.ingest_times = [t for t in self.ingest_times if now-t<60]
             if len(self.ingest_times)>=600:
                 raise ValueError('redis_sample_ingest_rate_limit')
-            with self.db() as c:
-                c.executemany('INSERT OR IGNORE INTO samples VALUES(?,?,?,?)', validated)
+            for sample in validated:
+                with self.rotation.write(sample[1]) as c:
+                    c.execute('INSERT OR IGNORE INTO samples VALUES(?,?,?,?)', sample)
             self.ingest_times.append(now)
             self.last_sample[identity] = max(s[1] for s in validated)
         return {'accepted':len(validated), 'deduplication':'instance_and_id', 'scope':'client_round_trip_only'}

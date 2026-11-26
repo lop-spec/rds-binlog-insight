@@ -62,18 +62,18 @@ class EvidenceHistory:
             instance=entry['instanceId'];end=int((now-120)//60)*60
             with self.service.db() as c:
                 row=c.execute('SELECT watermark FROM redis_maintenance WHERE instance=? AND name=?',(instance,'minute')).fetchone()
-                if row:start=int(row[0])
-                else:
-                    first=c.execute('SELECT start FROM intervals WHERE instance=? ORDER BY start LIMIT 1',(instance,)).fetchone()
-                    start=int((first[0] if first else end)//60)*60
+                first_rows=self.service.rotation.extreme('SELECT start FROM intervals WHERE instance=? ORDER BY start LIMIT 1',(instance,))
+                first=int((first_rows[0][0] if first_rows else end)//60)*60
+                start=min(end,max(int(row[0]),first)) if row else min(end,first)
                 # Up to six hours per pass; never scan all 30 days on each poll.
                 end=min(end,start+21600)
-                records=c.execute('SELECT node,start,end,payload,reason FROM intervals WHERE instance=? AND end>=? AND end<? ORDER BY end LIMIT 12001',(instance,start,end)).fetchall()
+                with self.service.raw(start, end) as raw:
+                    records=raw.execute('SELECT node,start,end,payload,reason FROM intervals WHERE instance=? AND end>=? AND end<? ORDER BY end LIMIT 12001',(instance,start,end)).fetchall()
+                    snap_rows=raw.execute('SELECT node,ts,payload FROM snapshots WHERE instance=? AND ts>=? AND ts<? ORDER BY ts LIMIT 12001',(instance,start,end)).fetchall()
                 if len(records)>12000:raise RuntimeError('redis_rollup_input_budget')
                 groups=defaultdict(list);snapshots=defaultdict(list)
                 for r in records:
                     if not r['reason']:groups[(r['node'],int(r['end']//60)*60)].append(r)
-                snap_rows=c.execute('SELECT node,ts,payload FROM snapshots WHERE instance=? AND ts>=? AND ts<? ORDER BY ts LIMIT 12001',(instance,start,end)).fetchall()
                 if len(snap_rows)>12000:raise RuntimeError('redis_rollup_snapshot_budget')
                 for snap in snap_rows:
                     key=(snap['node'],int(snap['ts']//60)*60);snapshots[key].append(snap);groups.setdefault(key,[])
